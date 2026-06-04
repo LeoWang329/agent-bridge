@@ -46,6 +46,20 @@ Agent Bridge exposes a small MCP tool surface:
 
 The bridge keeps in-memory session objects for the lifetime of the MCP server process. A session is not persisted by Agent Bridge itself.
 
+## Process Lifecycle
+
+Agent Bridge owns every child process it starts and records those process ids in:
+
+```text
+~/.agent-bridge/pids/
+```
+
+The MCP server cleans up active sessions when it receives `SIGTERM`, `SIGINT`, or `SIGHUP`, when MCP stdin closes, when stdout closes with `EPIPE`, or when an uncaught exception/unhandled rejection reaches the process boundary.
+
+Normal `agent_bridge_close_session` calls remove the pid record immediately. Process-level shutdown leaves pid records in place after sending `SIGTERM`; this is intentional. If a child ignores termination or Agent Bridge is killed abruptly, the next MCP startup reads those records, verifies that the process command still matches an Agent Bridge backend such as `omp --mode rpc`, `opencode serve`, or `opencode run --attach`, and terminates the recorded process tree. Stale records for already-exited processes are removed.
+
+This cleanup cannot run after `SIGKILL` (`kill -9`) because no Node.js code can execute in that case, but the pid-record sweep on the next startup is designed to catch leftovers from that kind of hard exit.
+
 ## OMP Backend
 
 The OMP backend starts:
@@ -170,9 +184,10 @@ codex plugin add agent-bridge@personal
 1. Update `BRIDGE_VERSION` in `scripts/agent-bridge.mjs`.
 2. Update `.codex-plugin/plugin.json`.
 3. Run syntax and plugin validation.
-4. Reinstall the plugin through Codex.
-5. Run the Codex CLI smoke tests.
-6. Confirm no delegated backend processes are left running:
+4. Run the process-cleanup smoke test if lifecycle code changed.
+5. Reinstall the plugin through Codex.
+6. Run the Codex CLI smoke tests.
+7. Confirm no delegated backend processes are left running:
 
 ```sh
 ps -axo pid,ppid,command | rg 'agent-bridge|omp --mode rpc|opencode serve' || true

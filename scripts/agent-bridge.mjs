@@ -7,13 +7,14 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 
-const BRIDGE_VERSION = "0.2.1";
+const BRIDGE_VERSION = "0.2.2";
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const DEFAULT_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_EVENTS = 300;
 const MAX_TEXT = 400_000;
 const STATE_ROOT = process.env.AGENT_BRIDGE_STATE_DIR || path.join(os.homedir(), ".agent-bridge");
 const LOG_DIR = path.join(STATE_ROOT, "logs");
+const PID_DIR = path.join(STATE_ROOT, "pids");
 const OPENCODE_DB_PATH =
   process.env.OPENCODE_DB_PATH ||
   path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share"), "opencode", "opencode.db");
@@ -32,6 +33,8 @@ const AGENTS = {
 };
 
 const sessions = new Map();
+let processHandlersInstalled = false;
+let shuttingDown = false;
 
 const TOOLS = [
   {
@@ -149,6 +152,7 @@ function usage() {
 
 function ensureDirs() {
   fs.mkdirSync(LOG_DIR, { recursive: true });
+  fs.mkdirSync(PID_DIR, { recursive: true });
 }
 
 function nowIso() {
@@ -211,6 +215,92 @@ function shellQuote(value) {
   return `'${s.replace(/'/g, "'\\''")}'`;
 }
 
+function pidRecordPath(id) {
+  return path.join(PID_DIR, `${id}.json`);
+}
+
+function writePidRecord(file, record) {
+  if (!file) return;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `${JSON.stringify({ ...record, updatedAt: nowIso() }, null, 2)}\n`, "utf8");
+}
+
+function removePidRecord(file) {
+  try {
+    if (file) fs.rmSync(file, { force: true });
+  } catch {}
+}
+
+function listChildPids(pid) {
+  const result = spawnSync("pgrep", ["-P", String(pid)], { encoding: "utf8" });
+  if (result.status !== 0 || !result.stdout) return [];
+  return result.stdout
+    .split(/\s+/)
+    .map(value => Number(value))
+    .filter(value => Number.isInteger(value) && value > 1);
+}
+
+function processCommand(pid) {
+  const result = spawnSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8" });
+  if (result.status !== 0) return "";
+  return stripAnsi(result.stdout || "").trim();
+}
+
+function roleMatchesCommand(role, command) {
+  if (!command) return false;
+  if (role === "omp-rpc") return /\bomp\b/.test(command) && /--mode\s+rpc|--mode.*\brpc\b/.test(command);
+  if (role === "opencode-serve") return /\bopencode\b/.test(command) && /\bserve\b/.test(command);
+  if (role === "opencode-run") {
+    return /\bopencode\b/.test(command) && /\brun\b/.test(command) && /--attach\b/.test(command);
+  }
+  return false;
+}
+
+function ownerStillRunning(record) {
+  const ownerPid = Number(record?.ownerPid);
+  if (!Number.isInteger(ownerPid) || ownerPid <= 1 || ownerPid === process.pid) return false;
+  const command = processCommand(ownerPid);
+  return /\bnode\b/.test(command) && /agent-bridge\.mjs/.test(command) && /\bmcp\b/.test(command);
+}
+
+function terminateProcessTree(pid, signal = "SIGTERM") {
+  if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) return false;
+  for (const childPid of listChildPids(pid)) terminateProcessTree(childPid, signal);
+  try {
+    process.kill(pid, signal);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function cleanupStalePidRecords() {
+  ensureDirs();
+  for (const name of fs.readdirSync(PID_DIR)) {
+    if (!name.endsWith(".json")) continue;
+    const file = path.join(PID_DIR, name);
+    let record;
+    try {
+      record = JSON.parse(fs.readFileSync(file, "utf8"));
+    } catch {
+      removePidRecord(file);
+      continue;
+    }
+    if (ownerStillRunning(record)) continue;
+
+    const processes = Array.isArray(record.processes) ? record.processes : [];
+    for (const child of processes) {
+      const pid = Number(child.pid);
+      if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) continue;
+      const command = processCommand(pid);
+      if (roleMatchesCommand(child.role, command)) {
+        terminateProcessTree(pid);
+      }
+    }
+    removePidRecord(file);
+  }
+}
+
 class OmpRpcSession {
   constructor(options) {
     this.id = makeId("omp");
@@ -230,6 +320,7 @@ class OmpRpcSession {
     this.pending = new Map();
     this.requestCounter = 0;
     this.logFile = path.join(LOG_DIR, `${this.id}.log`);
+    this.pidFile = pidRecordPath(this.id);
     this.proc = null;
     this.readyPromise = null;
     this.readyResolve = null;
@@ -257,6 +348,7 @@ class OmpRpcSession {
       env: process.env,
       stdio: ["pipe", "pipe", "pipe"],
     });
+    this.#writePidRecord(args);
 
     this.proc.stderr.on("data", chunk => {
       const text = chunk.toString("utf8");
@@ -276,6 +368,11 @@ class OmpRpcSession {
     });
 
     this.proc.on("close", code => {
+      removePidRecord(this.pidFile);
+      if (this.status === "closed") {
+        this.isStreaming = false;
+        return;
+      }
       this.status = code === 0 && this.status !== "failed" ? "closed" : "failed";
       this.isStreaming = false;
       this.lastError = code === 0 ? this.lastError : `OMP RPC exited with code ${code}`;
@@ -286,6 +383,23 @@ class OmpRpcSession {
 
     await withTimeout(this.readyPromise, 20000, "Timed out waiting for OMP RPC ready.");
     return this;
+  }
+
+  #writePidRecord(args) {
+    writePidRecord(this.pidFile, {
+      id: this.id,
+      agent: this.agent,
+      ownerPid: process.pid,
+      cwd: this.cwd,
+      createdAt: this.createdAt,
+      processes: [
+        {
+          role: "omp-rpc",
+          pid: this.proc?.pid || null,
+          command: [agentBin("omp"), ...args],
+        },
+      ].filter(item => item.pid),
+    });
   }
 
   #handleLine(line) {
@@ -441,15 +555,14 @@ class OmpRpcSession {
     };
   }
 
-  close() {
+  close(options = {}) {
     this.status = "closed";
     this.isStreaming = false;
     try {
       this.proc?.stdin?.end();
     } catch {}
-    try {
-      this.proc?.kill("SIGTERM");
-    } catch {}
+    terminateProcessTree(this.proc?.pid);
+    if (options.removePidRecord !== false) removePidRecord(this.pidFile);
     return { closed: true, session_id: this.id };
   }
 }
@@ -476,18 +589,24 @@ class OpenCodeServerSession {
     this.lastError = null;
     this.events = [];
     this.logFile = path.join(LOG_DIR, `${this.id}.log`);
+    this.pidFile = pidRecordPath(this.id);
+    this.serverArgs = null;
+    this.currentClientArgs = null;
+    this.expectedClientExit = false;
   }
 
   async start() {
     const port = await getFreePort();
     this.serverUrl = `http://127.0.0.1:${port}`;
     const args = ["serve", "--hostname", "127.0.0.1", "--port", String(port)];
+    this.serverArgs = args;
     appendLog(this.logFile, `$ ${[agentBin("opencode"), ...args.map(shellQuote)].join(" ")}\n`);
     this.server = spawn(agentBin("opencode"), args, {
       cwd: this.cwd,
       env: process.env,
       stdio: ["ignore", "pipe", "pipe"],
     });
+    this.#writePidRecord();
 
     this.server.stdout.on("data", chunk => appendLog(this.logFile, chunk.toString("utf8")));
     this.server.stderr.on("data", chunk => {
@@ -496,6 +615,9 @@ class OpenCodeServerSession {
       this.lastError = clampText(stripAnsi(text), 4000);
     });
     this.server.on("close", code => {
+      if (!this.currentClient) removePidRecord(this.pidFile);
+      else this.#writePidRecord();
+      if (this.status === "closed") return;
       if (this.status !== "closed") {
         this.status = "failed";
         this.lastError = `opencode serve exited with code ${code}`;
@@ -503,9 +625,16 @@ class OpenCodeServerSession {
       }
     });
 
-    await waitForHttp(this.serverUrl, 20000, () => this.server?.exitCode !== null);
-    this.status = "idle";
-    return this;
+    try {
+      await waitForHttp(this.serverUrl, 20000, () => this.server?.exitCode !== null);
+      this.status = "idle";
+      this.#writePidRecord();
+      return this;
+    } catch (err) {
+      this.lastError = err instanceof Error ? err.message : String(err);
+      this.close();
+      throw err;
+    }
   }
 
   async send(message, options = {}) {
@@ -541,6 +670,8 @@ class OpenCodeServerSession {
         stdio: ["ignore", "pipe", "pipe"],
       });
       this.currentClient = child;
+      this.currentClientArgs = args;
+      this.#writePidRecord();
 
       child.stdout.on("data", chunk => {
         const text = chunk.toString("utf8");
@@ -555,16 +686,27 @@ class OpenCodeServerSession {
       });
       child.on("error", err => {
         this.currentClient = null;
+        this.currentClientArgs = null;
+        this.#writePidRecord();
         this.status = "failed";
         this.isStreaming = false;
         this.lastError = err.message;
         reject(err);
       });
       child.on("close", code => {
+        const expectedExit = this.expectedClientExit || this.status === "closed";
+        this.expectedClientExit = false;
         this.currentClient = null;
+        this.currentClientArgs = null;
+        if (this.server && this.server.exitCode === null) this.#writePidRecord();
+        else removePidRecord(this.pidFile);
         this.isStreaming = false;
         this.updatedAt = nowIso();
         this.turnCount += 1;
+        if (expectedExit) {
+          resolve(this.result());
+          return;
+        }
         if (code === 0) {
           this.status = "idle";
           if (!this.lastAssistantText) this.lastAssistantText = extractLikelyText(this.lastRawOutput);
@@ -587,6 +729,38 @@ class OpenCodeServerSession {
       this.lastError = err.message;
     });
     return { accepted: true, session_id: this.id, status: this.status, server_url: this.serverUrl };
+  }
+
+  #writePidRecord() {
+    const processes = [];
+    if (this.server?.pid && this.server.exitCode === null) {
+      processes.push({
+        role: "opencode-serve",
+        pid: this.server.pid,
+        command: [agentBin("opencode"), ...(this.serverArgs || [])],
+      });
+    }
+    if (this.currentClient?.pid) {
+      processes.push({
+        role: "opencode-run",
+        pid: this.currentClient.pid,
+        command: [agentBin("opencode"), ...(this.currentClientArgs || [])],
+      });
+    }
+
+    if (!processes.length) {
+      removePidRecord(this.pidFile);
+      return;
+    }
+    writePidRecord(this.pidFile, {
+      id: this.id,
+      agent: this.agent,
+      ownerPid: process.pid,
+      cwd: this.cwd,
+      serverUrl: this.serverUrl,
+      createdAt: this.createdAt,
+      processes,
+    });
   }
 
   #consumeJsonLines(text) {
@@ -621,9 +795,8 @@ class OpenCodeServerSession {
 
   async abort() {
     if (this.currentClient) {
-      try {
-        this.currentClient.kill("SIGTERM");
-      } catch {}
+      this.expectedClientExit = true;
+      terminateProcessTree(this.currentClient.pid);
       this.currentClient = null;
     }
     this.status = "idle";
@@ -652,15 +825,13 @@ class OpenCodeServerSession {
     };
   }
 
-  close() {
+  close(options = {}) {
     this.status = "closed";
     this.isStreaming = false;
-    try {
-      this.currentClient?.kill("SIGTERM");
-    } catch {}
-    try {
-      this.server?.kill("SIGTERM");
-    } catch {}
+    if (this.currentClient) this.expectedClientExit = true;
+    terminateProcessTree(this.currentClient?.pid);
+    terminateProcessTree(this.server?.pid);
+    if (options.removePidRecord !== false) removePidRecord(this.pidFile);
     return { closed: true, session_id: this.id };
   }
 }
@@ -780,11 +951,17 @@ function findFirstKey(value, keys) {
 async function openSession(params) {
   ensureDirs();
   assertAgent(params.agent);
-  const session =
-    params.agent === "omp"
-      ? await new OmpRpcSession(params).start()
-      : await new OpenCodeServerSession(params).start();
+  const session = params.agent === "omp" ? new OmpRpcSession(params) : new OpenCodeServerSession(params);
   sessions.set(session.id, session);
+  try {
+    await session.start();
+  } catch (err) {
+    sessions.delete(session.id);
+    try {
+      session.close({ removePidRecord: false });
+    } catch {}
+    throw err;
+  }
 
   let initial = null;
   if (params.initial_prompt) {
@@ -932,6 +1109,9 @@ async function callTool(name, args) {
 }
 
 function serveMcp() {
+  ensureDirs();
+  cleanupStalePidRecords();
+  installProcessHandlers();
   const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
   rl.on("line", line => {
     if (!line.trim()) return;
@@ -945,8 +1125,7 @@ function serveMcp() {
     if (message.id === undefined) return;
     handleMcp(message).catch(err => rpcError(message.id, -32000, err instanceof Error ? err.message : String(err)));
   });
-  process.on("SIGTERM", cleanupAndExit);
-  process.on("SIGINT", cleanupAndExit);
+  rl.on("close", () => cleanupAndExit(0, "stdin closed"));
 }
 
 async function handleMcp(message) {
@@ -980,9 +1159,42 @@ function rpcError(id, code, message) {
   process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } })}\n`);
 }
 
-function cleanupAndExit() {
-  for (const session of sessions.values()) session.close();
-  process.exit(0);
+function cleanupSessions(options = {}) {
+  for (const session of sessions.values()) {
+    try {
+      session.close(options);
+    } catch (err) {
+      process.stderr.write(`Failed to close ${session.id}: ${err instanceof Error ? err.message : String(err)}\n`);
+    }
+  }
+  sessions.clear();
+}
+
+function cleanupAndExit(code = 0, reason = "shutdown", error = null) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  if (error) {
+    process.stderr.write(`${reason}: ${error instanceof Error ? error.stack || error.message : String(error)}\n`);
+  }
+  cleanupSessions({ removePidRecord: false });
+  process.exit(code);
+}
+
+function installProcessHandlers() {
+  if (processHandlersInstalled) return;
+  processHandlersInstalled = true;
+  for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+    process.once(signal, () => cleanupAndExit(0, signal));
+  }
+  process.once("uncaughtException", err => cleanupAndExit(1, "uncaughtException", err));
+  process.once("unhandledRejection", err => cleanupAndExit(1, "unhandledRejection", err));
+  process.once("exit", () => {
+    if (!shuttingDown) cleanupSessions({ removePidRecord: false });
+  });
+  process.stdout.on("error", err => {
+    if (err?.code === "EPIPE") cleanupAndExit(0, "stdout closed");
+    else cleanupAndExit(1, "stdout error", err);
+  });
 }
 
 function sleep(ms) {
@@ -1029,5 +1241,6 @@ async function waitForHttp(url, timeoutMs, exited) {
 
 runCli(process.argv.slice(2)).catch(err => {
   process.stderr.write(`${err instanceof Error ? err.message : String(err)}\n`);
+  cleanupSessions({ removePidRecord: false });
   process.exit(1);
 });

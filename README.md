@@ -91,6 +91,8 @@ Keep `write: false` for review, diagnosis, planning, or research. Set `write: tr
 - OMP write mode adds `--auto-approve --approval-mode yolo`.
 - OpenCode write mode adds `--dangerously-skip-permissions`.
 - Always close sessions after use so no backend process remains running.
+- On normal MCP shutdown, Agent Bridge closes all active OMP/OpenCode child processes.
+- Agent Bridge records its child process ids under `~/.agent-bridge/pids/` and removes stale recorded children on the next MCP startup.
 - Do not commit personal access tokens, local secrets, or machine-specific absolute paths.
 
 ## Development
