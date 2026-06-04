@@ -4,6 +4,8 @@ Agent Bridge is a session-first MCP bridge that lets Codex delegate work to loca
 
 It is intentionally not a one-shot command wrapper. Codex opens a delegated-agent session, sends one or more messages into that same session, checks status/result, can abort the active turn, and closes the session when the work is done.
 
+MCP tools, the CLI facade, and the local web monitor all share the same daemon-backed session manager. A session opened from Codex can be observed in the UI and managed from the CLI; a session opened from the UI can be closed from the CLI.
+
 ## Backends
 
 - `omp`: starts a persistent `omp --mode rpc` process and communicates through JSONL stdio RPC.
@@ -35,6 +37,22 @@ node scripts/agent-bridge.mjs result <session_id> --json
 node scripts/agent-bridge.mjs close <session_id>
 node scripts/agent-bridge.mjs stop
 ```
+
+## Web UI Monitor
+
+The UI monitor starts or reuses the local daemon, then serves a localhost-only HTTP/SSE facade:
+
+```sh
+node scripts/agent-bridge.mjs ui
+```
+
+For automation or headless checks:
+
+```sh
+node scripts/agent-bridge.mjs ui --no-open --json
+```
+
+The monitor exposes `GET /sessions`, `POST /sessions`, `GET /sessions/:id`, `POST /sessions/:id/messages`, `GET /sessions/:id/result`, `GET /sessions/:id/events`, `POST /sessions/:id/abort`, `DELETE /sessions/:id`, and `POST /daemon/stop`. SSE events stream status changes and assistant-visible text while raw/debug JSON stays behind the collapsible Debug panel.
 
 ## Requirements
 
@@ -109,8 +127,9 @@ Keep `write: false` for review, diagnosis, planning, or research. Set `write: tr
 - OMP write mode adds `--auto-approve --approval-mode yolo`.
 - OpenCode write mode adds `--dangerously-skip-permissions`.
 - Always close sessions after use so no backend process remains running.
-- On normal MCP shutdown, Agent Bridge closes all active OMP/OpenCode child processes.
+- On normal daemon shutdown, Agent Bridge closes all active daemon-owned OMP/OpenCode child processes.
 - `agent-bridge stop` closes daemon-owned sessions and their OMP/OpenCode child processes.
+- `agent-bridge ui` listens only on `127.0.0.1` by default.
 - Agent Bridge records its child process ids under `~/.agent-bridge/pids/`, skips records whose MCP/daemon owner is still running, and removes stale recorded children on the next startup or `cleanup`.
 - Do not commit personal access tokens, local secrets, or machine-specific absolute paths.
 

@@ -2,16 +2,20 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
+import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 
-const BRIDGE_VERSION = "0.2.3";
+const BRIDGE_VERSION = "0.3.0";
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const DEFAULT_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_EVENTS = 300;
 const MAX_TEXT = 400_000;
+const MAX_HTTP_BODY = 1024 * 1024;
+const DEFAULT_UI_HOST = "127.0.0.1";
+const SSE_HEARTBEAT_MS = 15_000;
 const STATE_ROOT = process.env.AGENT_BRIDGE_STATE_DIR || path.join(os.homedir(), ".agent-bridge");
 const LOG_DIR = path.join(STATE_ROOT, "logs");
 const PID_DIR = path.join(STATE_ROOT, "pids");
@@ -38,6 +42,9 @@ const sessions = new Map();
 let processHandlersInstalled = false;
 let shuttingDown = false;
 let daemonServer = null;
+let uiServer = null;
+let uiServerUrl = null;
+const sseClients = new Set();
 
 const TOOLS = [
   {
@@ -151,6 +158,7 @@ function usage() {
     "  agent-bridge cleanup [--json]",
     "  agent-bridge start [--json]",
     "  agent-bridge stop [--json]",
+    "  agent-bridge ui [--port PORT] [--no-open] [--json]",
     "  agent-bridge sessions [--json]",
     "  agent-bridge open --agent omp|opencode [--cwd DIR] [--write] [--json]",
     "  agent-bridge send <session_id> <message...> [--wait] [--json]",
@@ -211,8 +219,22 @@ function clampText(text, max = MAX_TEXT) {
 }
 
 function pushEvent(session, event) {
-  session.events.push({ at: nowIso(), event });
+  const record = { at: nowIso(), event };
+  session.updatedAt = record.at;
+  session.events.push(record);
   while (session.events.length > MAX_EVENTS) session.events.shift();
+  broadcastSessionEvent(session, record);
+}
+
+function setSessionStatus(session, status, isStreaming = session.isStreaming, extra = {}) {
+  const nextStreaming = Boolean(isStreaming);
+  const changed = session.status !== status || session.isStreaming !== nextStreaming;
+  session.status = status;
+  session.isStreaming = nextStreaming;
+  session.updatedAt = nowIso();
+  if (changed || extra.force) {
+    pushEvent(session, { type: "status", status, isStreaming: nextStreaming, ...extra });
+  }
 }
 
 function compactEvent(event) {
@@ -232,6 +254,65 @@ function compactValue(value, depth = 0) {
     copy[key] = compactValue(child, depth + 1);
   }
   return copy;
+}
+
+function sanitizeEventForUi(value, depth = 0) {
+  if (typeof value === "string") return value.length > 1000 ? `${value.slice(0, 1000)}...` : value;
+  if (!value || typeof value !== "object") return value;
+  if (depth >= 6) return Array.isArray(value) ? `[${value.length} items]` : "[object]";
+  if (Array.isArray(value)) return value.map(item => sanitizeEventForUi(item, depth + 1));
+
+  const copy = {};
+  for (const [key, child] of Object.entries(value)) {
+    if (/thinking|reasoning|thought|analysis/i.test(key)) continue;
+    copy[key] = sanitizeEventForUi(child, depth + 1);
+  }
+  return copy;
+}
+
+function uiEventKind(event) {
+  const type = String(event?.type || event?.event || event?.kind || "");
+  if (type === "status" || /start|end|ready|closed|failed|abort/i.test(type)) return "status";
+  if (extractVisibleTextDelta(event)) return "text";
+  if (/error|fail/i.test(type)) return "error";
+  return "event";
+}
+
+function extractVisibleTextDelta(event) {
+  if (!event || typeof event !== "object") return "";
+  if (event.type === "status") return "";
+  return clampText(extractAssistantText(event), 4000);
+}
+
+function sessionEventPayload(session, record) {
+  return {
+    at: record.at,
+    kind: uiEventKind(record.event),
+    status: session.status,
+    isStreaming: session.isStreaming,
+    text_delta: extractVisibleTextDelta(record.event) || null,
+    session: sanitizeEventForUi(session.summary()),
+    event: sanitizeEventForUi(record.event),
+    log_file: session.logFile,
+  };
+}
+
+function sendSse(client, eventName, payload) {
+  try {
+    client.res.write(`event: ${eventName}\n`);
+    client.res.write(`data: ${JSON.stringify(payload)}\n\n`);
+  } catch {
+    sseClients.delete(client);
+  }
+}
+
+function broadcastSessionEvent(session, record) {
+  if (!sseClients.size) return;
+  const payload = sessionEventPayload(session, record);
+  for (const client of [...sseClients]) {
+    if (client.sessionId && client.sessionId !== session.id) continue;
+    sendSse(client, "session-event", payload);
+  }
 }
 
 function shellQuote(value) {
@@ -410,8 +491,8 @@ class OmpRpcSession {
     rl.on("line", line => this.#handleLine(line));
 
     this.proc.on("error", err => {
-      this.status = "failed";
       this.lastError = err.message;
+      setSessionStatus(this, "failed", false, { source: "process_error", error: err.message });
       this.readyReject?.(err);
       for (const pending of this.pending.values()) pending.reject(err);
       this.pending.clear();
@@ -421,12 +502,15 @@ class OmpRpcSession {
       appendLog(this.logFile, `[agent-bridge] OMP RPC exited code=${code} signal=${signal || ""}\n`);
       removePidRecord(this.pidFile);
       if (this.status === "closed") {
-        this.isStreaming = false;
+        setSessionStatus(this, "closed", false, { source: "process_close", code, signal });
         return;
       }
-      this.status = code === 0 && this.status !== "failed" ? "closed" : "failed";
-      this.isStreaming = false;
       this.lastError = code === 0 ? this.lastError : `OMP RPC exited with code ${code}`;
+      setSessionStatus(this, code === 0 && this.status !== "failed" ? "closed" : "failed", false, {
+        source: "process_close",
+        code,
+        signal,
+      });
       this.readyReject?.(new Error(this.lastError || "OMP RPC exited before ready."));
       for (const pending of this.pending.values()) pending.reject(new Error(this.lastError || "OMP RPC exited."));
       this.pending.clear();
@@ -467,7 +551,7 @@ class OmpRpcSession {
 
     this.updatedAt = nowIso();
     if (message.type === "ready") {
-      this.status = "idle";
+      setSessionStatus(this, "idle", false, { source: "ready" });
       this.readyResolve?.();
       return;
     }
@@ -486,14 +570,12 @@ class OmpRpcSession {
 
   #applyEvent(message) {
     if (message.type === "agent_start" || message.type === "turn_start") {
-      this.status = "running";
-      this.isStreaming = true;
       this.lastAssistantText = "";
+      setSessionStatus(this, "running", true, { source: message.type });
       return;
     }
     if (message.type === "agent_end" || message.type === "turn_end") {
-      this.status = "idle";
-      this.isStreaming = false;
+      setSessionStatus(this, "idle", false, { source: message.type });
       return;
     }
     if (message.type === "message_update") {
@@ -522,8 +604,7 @@ class OmpRpcSession {
 
   async send(message, options = {}) {
     if (!message || !String(message).trim()) throw new Error("message is required.");
-    this.status = "running";
-    this.isStreaming = true;
+    setSessionStatus(this, "running", true, { source: "send" });
     await this.request("prompt", { message: String(message) });
     if (options.wait) {
       await this.waitIdle(options.timeout_ms || DEFAULT_WAIT_TIMEOUT_MS);
@@ -536,8 +617,9 @@ class OmpRpcSession {
     const response = await this.request("get_state");
     this.sessionState = response.data || null;
     if (this.sessionState) {
-      this.isStreaming = Boolean(this.sessionState.isStreaming);
-      this.status = this.isStreaming ? "running" : "idle";
+      setSessionStatus(this, this.sessionState.isStreaming ? "running" : "idle", Boolean(this.sessionState.isStreaming), {
+        source: "state",
+      });
     }
     return this.sessionState;
   }
@@ -561,8 +643,7 @@ class OmpRpcSession {
 
   async abort() {
     await this.request("abort");
-    this.status = "idle";
-    this.isStreaming = false;
+    setSessionStatus(this, "idle", false, { source: "abort" });
     return { aborted: true, session_id: this.id };
   }
 
@@ -594,6 +675,7 @@ class OmpRpcSession {
       createdAt: this.createdAt,
       updatedAt: this.updatedAt,
       lastError: this.lastError,
+      logFile: this.logFile,
       sessionState: this.sessionState
         ? {
             sessionId: this.sessionState.sessionId,
@@ -607,8 +689,7 @@ class OmpRpcSession {
   }
 
   close(options = {}) {
-    this.status = "closed";
-    this.isStreaming = false;
+    setSessionStatus(this, "closed", false, { source: "close" });
     try {
       this.proc?.stdin?.end();
     } catch {}
@@ -637,6 +718,7 @@ class OpenCodeServerSession {
     this.turnCount = 0;
     this.lastAssistantText = "";
     this.lastRawOutput = "";
+    this.stdoutBuffer = "";
     this.lastError = null;
     this.events = [];
     this.logFile = path.join(LOG_DIR, `${this.id}.log`);
@@ -670,15 +752,14 @@ class OpenCodeServerSession {
       else this.#writePidRecord();
       if (this.status === "closed") return;
       if (this.status !== "closed") {
-        this.status = "failed";
         this.lastError = `opencode serve exited with code ${code}`;
-        this.isStreaming = false;
+        setSessionStatus(this, "failed", false, { source: "server_close", code });
       }
     });
 
     try {
       await waitForHttp(this.serverUrl, 20000, () => this.server?.exitCode !== null);
-      this.status = "idle";
+      setSessionStatus(this, "idle", false, { source: "ready" });
       this.#writePidRecord();
       return this;
     } catch (err) {
@@ -709,10 +790,10 @@ class OpenCodeServerSession {
     args.push(String(message));
 
     appendLog(this.logFile, `$ ${[agentBin("opencode"), ...args.map(shellQuote)].join(" ")}\n`);
-    this.status = "running";
-    this.isStreaming = true;
     this.lastAssistantText = "";
     this.lastRawOutput = "";
+    this.stdoutBuffer = "";
+    setSessionStatus(this, "running", true, { source: "send" });
 
     const done = new Promise((resolve, reject) => {
       const child = spawn(agentBin("opencode"), args, {
@@ -739,9 +820,8 @@ class OpenCodeServerSession {
         this.currentClient = null;
         this.currentClientArgs = null;
         this.#writePidRecord();
-        this.status = "failed";
-        this.isStreaming = false;
         this.lastError = err.message;
+        setSessionStatus(this, "failed", false, { source: "client_error", error: err.message });
         reject(err);
       });
       child.on("close", code => {
@@ -751,23 +831,24 @@ class OpenCodeServerSession {
         this.currentClientArgs = null;
         if (this.server && this.server.exitCode === null) this.#writePidRecord();
         else removePidRecord(this.pidFile);
-        this.isStreaming = false;
         this.updatedAt = nowIso();
         this.turnCount += 1;
+        this.#flushJsonBuffer();
         if (expectedExit) {
+          setSessionStatus(this, this.status === "closed" ? "closed" : "idle", false, { source: "client_close", code });
           resolve(this.result());
           return;
         }
         if (code === 0) {
-          this.status = "idle";
           if (!this.lastAssistantText) this.lastAssistantText = extractLikelyText(this.lastRawOutput);
           if (!this.lastAssistantText && this.openCodeSessionId) {
             this.lastAssistantText = readOpenCodeAssistantTextFromDb(this.openCodeSessionId);
           }
+          setSessionStatus(this, "idle", false, { source: "client_close", code });
           resolve(this.result());
         } else {
-          this.status = "failed";
           const err = new Error(this.lastError || `opencode run --attach exited with code ${code}`);
+          setSessionStatus(this, "failed", false, { source: "client_close", code, error: err.message });
           reject(err);
         }
       });
@@ -815,19 +896,38 @@ class OpenCodeServerSession {
   }
 
   #consumeJsonLines(text) {
-    for (const rawLine of text.split(/\r?\n/)) {
+    this.stdoutBuffer += text;
+    const lines = this.stdoutBuffer.split(/\r?\n/);
+    this.stdoutBuffer = lines.pop() || "";
+    for (const rawLine of lines) {
       const line = rawLine.trim();
       if (!line.startsWith("{") && !line.startsWith("[")) continue;
       try {
         const parsed = JSON.parse(line);
-        pushEvent(this, compactEvent(parsed));
         const sessionId = findFirstKey(parsed, ["sessionID", "sessionId", "session_id"]);
         if (typeof sessionId === "string") this.openCodeSessionId = sessionId;
         const assistantText = extractAssistantText(parsed);
         if (assistantText) this.lastAssistantText = clampText(this.lastAssistantText + assistantText);
+        pushEvent(this, compactEvent(parsed));
       } catch {
         // OpenCode may emit non-JSON framing even in json mode; keep raw log.
       }
+    }
+  }
+
+  #flushJsonBuffer() {
+    const tail = this.stdoutBuffer.trim();
+    this.stdoutBuffer = "";
+    if (!tail || (!tail.startsWith("{") && !tail.startsWith("["))) return;
+    try {
+      const parsed = JSON.parse(tail);
+      const sessionId = findFirstKey(parsed, ["sessionID", "sessionId", "session_id"]);
+      if (typeof sessionId === "string") this.openCodeSessionId = sessionId;
+      const assistantText = extractAssistantText(parsed);
+      if (assistantText) this.lastAssistantText = clampText(this.lastAssistantText + assistantText);
+      pushEvent(this, compactEvent(parsed));
+    } catch {
+      // Keep the raw tail in the log when OpenCode closes after a partial JSON frame.
     }
   }
 
@@ -850,8 +950,7 @@ class OpenCodeServerSession {
       terminateProcessTree(this.currentClient.pid);
       this.currentClient = null;
     }
-    this.status = "idle";
-    this.isStreaming = false;
+    setSessionStatus(this, "idle", false, { source: "abort" });
     return { aborted: true, session_id: this.id };
   }
 
@@ -873,12 +972,12 @@ class OpenCodeServerSession {
       createdAt: this.createdAt,
       updatedAt: this.updatedAt,
       lastError: this.lastError,
+      logFile: this.logFile,
     };
   }
 
   close(options = {}) {
-    this.status = "closed";
-    this.isStreaming = false;
+    setSessionStatus(this, "closed", false, { source: "close" });
     if (this.currentClient) this.expectedClientExit = true;
     terminateProcessTree(this.currentClient?.pid);
     terminateProcessTree(this.server?.pid);
@@ -1139,6 +1238,918 @@ function printCliResult(value, args = {}) {
   }
 }
 
+function jsonHeaders(extra = {}) {
+  return {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+    "x-content-type-options": "nosniff",
+    ...extra,
+  };
+}
+
+function sendJson(res, statusCode, value) {
+  res.writeHead(statusCode, jsonHeaders());
+  res.end(`${JSON.stringify(value, null, 2)}\n`);
+}
+
+function sendHttpError(res, statusCode, err) {
+  sendJson(res, statusCode, { error: err instanceof Error ? err.message : String(err) });
+}
+
+function httpStatusForError(err) {
+  const message = err instanceof Error ? err.message : String(err);
+  if (/^Unknown session:/.test(message)) return 404;
+  if (/Request body is too large/.test(message)) return 413;
+  if (err instanceof SyntaxError) return 400;
+  return 500;
+}
+
+async function readJsonBody(req) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > MAX_HTTP_BODY) throw new Error("Request body is too large.");
+    chunks.push(chunk);
+  }
+  if (!chunks.length) return {};
+  const text = Buffer.concat(chunks).toString("utf8").trim();
+  if (!text) return {};
+  return JSON.parse(text);
+}
+
+function routeParts(urlPath) {
+  return urlPath
+    .split("/")
+    .filter(Boolean)
+    .map(part => decodeURIComponent(part));
+}
+
+function noCacheHtmlHeaders() {
+  return {
+    "content-type": "text/html; charset=utf-8",
+    "cache-control": "no-store",
+    "x-content-type-options": "nosniff",
+    "referrer-policy": "no-referrer",
+  };
+}
+
+async function startUiServer(params = {}) {
+  ensureDirs();
+  if (uiServer && uiServerUrl) {
+    return {
+      running: true,
+      reused: true,
+      url: uiServerUrl,
+      host: DEFAULT_UI_HOST,
+      port: Number(new URL(uiServerUrl).port),
+      daemonPid: process.pid,
+      socket: DAEMON_SOCKET,
+    };
+  }
+
+  const requestedPort = parseNumber(params.port, 0);
+  if (!Number.isInteger(requestedPort) || requestedPort < 0 || requestedPort > 65535) {
+    throw new Error(`Invalid UI port: ${params.port}`);
+  }
+
+  uiServer = http.createServer((req, res) => {
+    handleUiRequest(req, res).catch(err => {
+      if (!res.headersSent) sendHttpError(res, httpStatusForError(err), err);
+      else {
+        try {
+          res.end();
+        } catch {}
+      }
+    });
+  });
+
+  await new Promise((resolve, reject) => {
+    uiServer.once("error", reject);
+    uiServer.listen(requestedPort, DEFAULT_UI_HOST, () => {
+      uiServer.off("error", reject);
+      const address = uiServer.address();
+      uiServerUrl = `http://${DEFAULT_UI_HOST}:${address.port}`;
+      uiServer.on("error", err => cleanupAndExit(1, "ui server error", err));
+      resolve();
+    });
+  });
+
+  appendLog(path.join(LOG_DIR, "daemon.log"), `[${nowIso()}] Agent Bridge UI listening at ${uiServerUrl}\n`);
+  return {
+    running: true,
+    reused: false,
+    url: uiServerUrl,
+    host: DEFAULT_UI_HOST,
+    port: Number(new URL(uiServerUrl).port),
+    daemonPid: process.pid,
+    socket: DAEMON_SOCKET,
+  };
+}
+
+async function handleUiRequest(req, res) {
+  const url = new URL(req.url || "/", "http://127.0.0.1");
+  const parts = routeParts(url.pathname);
+
+  if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
+    res.writeHead(200, noCacheHtmlHeaders());
+    res.end(renderUiHtml());
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/health") {
+    sendJson(res, 200, { ok: true, bridgeVersion: BRIDGE_VERSION, daemonPid: process.pid });
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/config") {
+    sendJson(res, 200, {
+      bridgeVersion: BRIDGE_VERSION,
+      daemonPid: process.pid,
+      socket: DAEMON_SOCKET,
+      stateRoot: STATE_ROOT,
+      logDir: LOG_DIR,
+      cwd: process.cwd(),
+      ui: { url: uiServerUrl, host: DEFAULT_UI_HOST },
+    });
+    return;
+  }
+
+  if (parts[0] === "sessions") {
+    await handleSessionHttp(req, res, parts, url);
+    return;
+  }
+
+  if (parts[0] === "daemon" && parts[1] === "stop" && req.method === "POST") {
+    sendJson(res, 200, stopDaemonSoon());
+    return;
+  }
+
+  sendJson(res, 404, { error: "Not found." });
+}
+
+async function handleSessionHttp(req, res, parts, url) {
+  if (parts.length === 1 && req.method === "GET") {
+    sendJson(res, 200, await status(undefined));
+    return;
+  }
+
+  if (parts.length === 1 && req.method === "POST") {
+    const params = await readJsonBody(req);
+    if (!params.cwd) params.cwd = process.cwd();
+    sendJson(res, 201, await openSession(params));
+    return;
+  }
+
+  const sessionId = parts[1];
+  if (!sessionId) {
+    sendJson(res, 404, { error: "Session id is required." });
+    return;
+  }
+
+  if (parts.length === 2 && req.method === "GET") {
+    sendJson(res, 200, await status(sessionId));
+    return;
+  }
+
+  if (parts.length === 2 && req.method === "DELETE") {
+    sendJson(res, 200, closeSession(sessionId));
+    return;
+  }
+
+  if (parts.length === 3 && parts[2] === "messages" && req.method === "POST") {
+    const params = await readJsonBody(req);
+    sendJson(
+      res,
+      202,
+      await sendMessage({
+        session_id: sessionId,
+        message: params.message,
+        wait: Boolean(params.wait),
+        timeout_ms: params.timeout_ms,
+      }),
+    );
+    return;
+  }
+
+  if (parts.length === 3 && parts[2] === "result" && req.method === "GET") {
+    sendJson(res, 200, await result(sessionId));
+    return;
+  }
+
+  if (parts.length === 3 && parts[2] === "events" && req.method === "GET") {
+    handleSessionEvents(req, res, sessionId, url.searchParams.get("raw") === "1");
+    return;
+  }
+
+  if (parts.length === 3 && parts[2] === "abort" && req.method === "POST") {
+    sendJson(res, 200, await abortSession(sessionId));
+    return;
+  }
+
+  sendJson(res, 404, { error: "Not found." });
+}
+
+function handleSessionEvents(req, res, sessionId, includeRaw = false) {
+  const session = getSession(sessionId);
+  res.writeHead(200, {
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-store, no-transform",
+    connection: "keep-alive",
+    "x-accel-buffering": "no",
+  });
+  res.write(": connected\n\n");
+
+  const client = { id: makeId("sse"), sessionId, res, includeRaw };
+  sseClients.add(client);
+  sendSse(client, "session", {
+    at: nowIso(),
+    session: sanitizeEventForUi(session.summary()),
+    recent_events: session.events.slice(-50).map(record => sessionEventPayload(session, record)),
+    log_file: session.logFile,
+  });
+
+  const heartbeat = setInterval(() => {
+    try {
+      res.write(`: ${nowIso()}\n\n`);
+    } catch {
+      clearInterval(heartbeat);
+      sseClients.delete(client);
+    }
+  }, SSE_HEARTBEAT_MS);
+  heartbeat.unref?.();
+
+  req.on("close", () => {
+    clearInterval(heartbeat);
+    sseClients.delete(client);
+  });
+}
+
+function stopDaemonSoon() {
+  const sessionCount = sessions.size;
+  cleanupSessions({ removePidRecord: false });
+  setTimeout(() => {
+    for (const client of [...sseClients]) {
+      try {
+        client.res.end();
+      } catch {}
+    }
+    sseClients.clear();
+    try {
+      uiServer?.close();
+    } catch {}
+    try {
+      daemonServer?.close();
+    } catch {}
+    try {
+      fs.rmSync(DAEMON_SOCKET, { force: true });
+    } catch {}
+    try {
+      fs.rmSync(DAEMON_PID_FILE, { force: true });
+    } catch {}
+    process.exit(0);
+  }, 100).unref?.();
+  return { stopping: true, sessions_closed: sessionCount, ui: uiServerUrl, socket: DAEMON_SOCKET };
+}
+
+function openLocalUrl(url) {
+  let command = null;
+  let args = [];
+  if (process.platform === "darwin") {
+    command = "open";
+    args = [url];
+  } else if (process.platform === "win32") {
+    command = "cmd";
+    args = ["/c", "start", "", url];
+  } else {
+    command = "xdg-open";
+    args = [url];
+  }
+  try {
+    const child = spawn(command, args, { detached: true, stdio: "ignore" });
+    child.unref();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function renderUiHtml() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Agent Bridge Monitor</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f7f8fa;
+      --surface: #ffffff;
+      --surface-2: #f0f3f6;
+      --border: #d7dde5;
+      --text: #18202a;
+      --muted: #657386;
+      --accent: #2563eb;
+      --danger: #b42318;
+      --warning: #a15c07;
+      --ok: #0f7a42;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      font-size: 14px;
+      letter-spacing: 0;
+    }
+    button, input, select, textarea {
+      font: inherit;
+    }
+    button {
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text);
+      min-height: 34px;
+      border-radius: 6px;
+      padding: 6px 10px;
+      cursor: pointer;
+    }
+    button:hover { border-color: #9eabbc; }
+    button.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+    button.danger {
+      border-color: #f0b8b2;
+      color: var(--danger);
+    }
+    button:disabled {
+      opacity: .52;
+      cursor: not-allowed;
+    }
+    .app {
+      display: grid;
+      grid-template-columns: 320px minmax(0, 1fr);
+      min-height: 100vh;
+    }
+    header {
+      grid-column: 1 / -1;
+      height: 56px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 0 18px;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+    }
+    .brand {
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+      min-width: 0;
+    }
+    h1 {
+      margin: 0;
+      font-size: 17px;
+      font-weight: 700;
+    }
+    .version, .meta, .muted {
+      color: var(--muted);
+      font-size: 12px;
+    }
+    aside {
+      border-right: 1px solid var(--border);
+      background: var(--surface);
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+    }
+    main {
+      min-width: 0;
+      display: grid;
+      grid-template-rows: auto minmax(220px, 1fr) auto;
+    }
+    .section {
+      padding: 14px;
+      border-bottom: 1px solid var(--border);
+    }
+    .section-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 10px;
+      font-weight: 700;
+    }
+    .session-list {
+      overflow: auto;
+      padding: 8px;
+      display: grid;
+      gap: 8px;
+    }
+    .session-row {
+      width: 100%;
+      text-align: left;
+      display: grid;
+      gap: 5px;
+      padding: 10px;
+      border-radius: 7px;
+      background: var(--surface);
+    }
+    .session-row.active {
+      border-color: var(--accent);
+      box-shadow: inset 3px 0 0 var(--accent);
+    }
+    .session-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      min-width: 0;
+    }
+    .session-id {
+      font-family: var(--mono);
+      font-size: 12px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      min-height: 22px;
+      border-radius: 999px;
+      padding: 2px 8px;
+      border: 1px solid var(--border);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .badge.running { color: var(--accent); border-color: #b8cdfc; background: #edf3ff; }
+    .badge.idle { color: var(--ok); border-color: #bae5cc; background: #eefaf3; }
+    .badge.failed, .badge.closed { color: var(--danger); border-color: #f0b8b2; background: #fff1f0; }
+    .badge.write { color: var(--warning); border-color: #f4c889; background: #fff7e8; }
+    .form-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+    .form-grid .wide { grid-column: 1 / -1; }
+    label {
+      display: grid;
+      gap: 5px;
+      color: var(--muted);
+      font-size: 12px;
+      min-width: 0;
+    }
+    input, select, textarea {
+      width: 100%;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text);
+      border-radius: 6px;
+      padding: 7px 9px;
+      min-height: 34px;
+    }
+    textarea {
+      min-height: 88px;
+      resize: vertical;
+      line-height: 1.45;
+    }
+    .checkbox {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--text);
+      min-height: 34px;
+    }
+    .checkbox input {
+      width: 16px;
+      height: 16px;
+      min-height: 16px;
+    }
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+    }
+    .summary {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+    }
+    .output {
+      margin: 0;
+      padding: 14px;
+      overflow: auto;
+      background: #111827;
+      color: #ecfdf5;
+      font-family: var(--mono);
+      font-size: 13px;
+      line-height: 1.55;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .details {
+      background: var(--surface);
+      border-top: 1px solid var(--border);
+      max-height: 280px;
+      overflow: auto;
+    }
+    details {
+      padding: 12px 14px;
+    }
+    summary {
+      cursor: pointer;
+      font-weight: 700;
+    }
+    .raw {
+      margin: 10px 0 0;
+      padding: 10px;
+      border-radius: 6px;
+      background: var(--surface-2);
+      color: #263241;
+      font-family: var(--mono);
+      font-size: 12px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 210px;
+      overflow: auto;
+    }
+    .status-line {
+      min-height: 20px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .empty {
+      color: var(--muted);
+      padding: 18px 10px;
+      text-align: center;
+    }
+    @media (max-width: 820px) {
+      .app { grid-template-columns: 1fr; }
+      aside { border-right: 0; border-bottom: 1px solid var(--border); max-height: 48vh; }
+      main { min-height: 52vh; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app" data-version="${BRIDGE_VERSION}">
+    <header>
+      <div class="brand">
+        <h1>Agent Bridge Monitor</h1>
+        <span class="version">v${BRIDGE_VERSION}</span>
+      </div>
+      <div class="toolbar">
+        <button id="refresh" type="button">Refresh</button>
+        <button id="stopDaemon" class="danger" type="button">Stop Daemon</button>
+      </div>
+    </header>
+    <aside>
+      <section class="section">
+        <div class="section-title">
+          <span>Sessions</span>
+          <span id="sessionCount" class="meta">0</span>
+        </div>
+        <form id="openForm" class="form-grid">
+          <label>Agent
+            <select id="agent">
+              <option value="omp">OMP</option>
+              <option value="opencode">OpenCode</option>
+            </select>
+          </label>
+          <label class="checkbox">
+            <input id="write" type="checkbox">
+            <span>Write</span>
+          </label>
+          <label class="wide">cwd
+            <input id="cwd" autocomplete="off">
+          </label>
+          <button class="primary wide" type="submit">Open Session</button>
+        </form>
+      </section>
+      <div id="sessions" class="session-list"></div>
+    </aside>
+    <main>
+      <section class="section">
+        <div class="summary">
+          <strong id="activeTitle">No session</strong>
+          <span id="activeStatus" class="badge">none</span>
+          <span id="writeBadge" class="badge write" hidden>write enabled</span>
+          <span id="pidInfo" class="meta"></span>
+        </div>
+      </section>
+      <pre id="output" class="output"></pre>
+      <section class="section">
+        <form id="sendForm">
+          <label>Message
+            <textarea id="message" placeholder="Send a message to the selected session"></textarea>
+          </label>
+          <div class="toolbar" style="margin-top:8px">
+            <button class="primary" type="submit">Send</button>
+            <button id="abort" type="button">Abort</button>
+            <button id="close" class="danger" type="button">Close Session</button>
+          </div>
+        </form>
+        <div id="statusLine" class="status-line"></div>
+      </section>
+      <div class="details">
+        <details>
+          <summary>Debug</summary>
+          <div id="logPath" class="meta"></div>
+          <pre id="raw" class="raw"></pre>
+        </details>
+      </div>
+    </main>
+  </div>
+  <script>
+    const state = { sessions: [], activeId: null, events: null, config: null };
+    const el = {};
+
+    function byId(id) { return document.getElementById(id); }
+
+    function setStatus(text) {
+      el.statusLine.textContent = text || "";
+    }
+
+    async function api(path, options) {
+      const response = await fetch(path, Object.assign({
+        headers: { "content-type": "application/json" }
+      }, options || {}));
+      const text = await response.text();
+      const data = text ? JSON.parse(text) : {};
+      if (!response.ok) throw new Error(data.error || response.statusText);
+      return data;
+    }
+
+    function upsertSession(session) {
+      if (!session || !session.id) return;
+      const index = state.sessions.findIndex(item => item.id === session.id);
+      if (index === -1) state.sessions.push(session);
+      else state.sessions[index] = session;
+    }
+
+    function activeSession() {
+      return state.sessions.find(session => session.id === state.activeId) || null;
+    }
+
+    function pidText(session) {
+      if (!session) return "";
+      const pids = [];
+      if (session.pid) pids.push("pid " + session.pid);
+      if (session.serverPid) pids.push("server " + session.serverPid);
+      if (session.currentClientPid) pids.push("client " + session.currentClientPid);
+      return pids.join(" | ");
+    }
+
+    function shortTime(value) {
+      if (!value) return "";
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return "";
+      return date.toLocaleString();
+    }
+
+    function statusClass(status) {
+      return "badge " + (status || "none");
+    }
+
+    function renderSessions() {
+      el.sessionCount.textContent = String(state.sessions.length);
+      el.sessions.innerHTML = "";
+      if (!state.sessions.length) {
+        const empty = document.createElement("div");
+        empty.className = "empty";
+        empty.textContent = "No sessions";
+        el.sessions.appendChild(empty);
+        return;
+      }
+      for (const session of state.sessions) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "session-row" + (session.id === state.activeId ? " active" : "");
+        button.dataset.testid = "session-row";
+        button.dataset.sessionId = session.id;
+        button.addEventListener("click", () => selectSession(session.id));
+
+        const head = document.createElement("div");
+        head.className = "session-head";
+        const id = document.createElement("span");
+        id.className = "session-id";
+        id.textContent = session.id;
+        const badge = document.createElement("span");
+        badge.className = statusClass(session.status);
+        badge.textContent = session.status || "unknown";
+        head.append(id, badge);
+
+        const meta = document.createElement("div");
+        meta.className = "meta";
+        meta.textContent = session.agent + " | " + pidText(session) + " | " + shortTime(session.createdAt);
+
+        const cwd = document.createElement("div");
+        cwd.className = "meta";
+        cwd.textContent = session.cwd || "";
+
+        button.append(head, meta, cwd);
+        el.sessions.appendChild(button);
+      }
+    }
+
+    function renderActive() {
+      const session = activeSession();
+      el.activeTitle.textContent = session ? session.id : "No session";
+      el.activeStatus.className = statusClass(session ? session.status : "none");
+      el.activeStatus.textContent = session ? session.status : "none";
+      el.writeBadge.hidden = !session || !session.write;
+      el.pidInfo.textContent = pidText(session);
+      el.abort.disabled = !session;
+      el.close.disabled = !session;
+      el.sendForm.querySelector("button[type=submit]").disabled = !session;
+      el.logPath.textContent = session && session.logFile ? session.logFile : "";
+    }
+
+    function appendOutput(text) {
+      if (!text) return;
+      el.output.textContent += text;
+      el.output.scrollTop = el.output.scrollHeight;
+    }
+
+    function appendRaw(payload) {
+      const line = JSON.stringify(payload, null, 2);
+      el.raw.textContent += (el.raw.textContent ? "\\n" : "") + line;
+      const lines = el.raw.textContent.split("\\n");
+      if (lines.length > 900) el.raw.textContent = lines.slice(lines.length - 900).join("\\n");
+      el.raw.scrollTop = el.raw.scrollHeight;
+    }
+
+    async function refreshSessions() {
+      const data = await api("/sessions");
+      state.sessions = data.sessions || [];
+      if (state.activeId && !state.sessions.some(session => session.id === state.activeId)) {
+        disconnectEvents();
+        state.activeId = null;
+      }
+      if (!state.activeId && state.sessions.length) selectSession(state.sessions[0].id);
+      renderSessions();
+      renderActive();
+    }
+
+    function disconnectEvents() {
+      if (state.events) state.events.close();
+      state.events = null;
+    }
+
+    async function loadResult(id) {
+      try {
+        const data = await api("/sessions/" + encodeURIComponent(id) + "/result");
+        el.output.textContent = data.text || "";
+        el.logPath.textContent = data.log_file || "";
+      } catch (err) {
+        setStatus(err.message);
+      }
+    }
+
+    function connectEvents(id) {
+      disconnectEvents();
+      el.raw.textContent = "";
+      const events = new EventSource("/sessions/" + encodeURIComponent(id) + "/events");
+      state.events = events;
+      events.addEventListener("session", event => {
+        const payload = JSON.parse(event.data);
+        upsertSession(payload.session);
+        appendRaw(payload);
+        renderSessions();
+        renderActive();
+      });
+      events.addEventListener("session-event", event => {
+        const payload = JSON.parse(event.data);
+        upsertSession(payload.session);
+        if (payload.text_delta) appendOutput(payload.text_delta);
+        appendRaw(payload);
+        renderSessions();
+        renderActive();
+      });
+      events.onerror = () => setStatus("event stream disconnected");
+    }
+
+    async function selectSession(id) {
+      if (state.activeId === id) return;
+      state.activeId = id;
+      el.output.textContent = "";
+      renderSessions();
+      renderActive();
+      connectEvents(id);
+      await loadResult(id);
+    }
+
+    async function openSession(event) {
+      event.preventDefault();
+      setStatus("opening");
+      const data = await api("/sessions", {
+        method: "POST",
+        body: JSON.stringify({
+          agent: el.agent.value,
+          cwd: el.cwd.value || (state.config && state.config.cwd) || "",
+          write: el.write.checked
+        })
+      });
+      upsertSession(data.session);
+      renderSessions();
+      await selectSession(data.session.id);
+      setStatus("opened");
+    }
+
+    async function sendMessage(event) {
+      event.preventDefault();
+      const session = activeSession();
+      if (!session) return;
+      const message = el.message.value.trim();
+      if (!message) return;
+      setStatus("sending");
+      await api("/sessions/" + encodeURIComponent(session.id) + "/messages", {
+        method: "POST",
+        body: JSON.stringify({ message })
+      });
+      el.message.value = "";
+      setStatus("sent");
+      await refreshSessions();
+    }
+
+    async function abortSession() {
+      const session = activeSession();
+      if (!session) return;
+      await api("/sessions/" + encodeURIComponent(session.id) + "/abort", { method: "POST" });
+      setStatus("aborted");
+      await refreshSessions();
+    }
+
+    async function closeSession() {
+      const session = activeSession();
+      if (!session) return;
+      await api("/sessions/" + encodeURIComponent(session.id), { method: "DELETE" });
+      state.sessions = state.sessions.filter(item => item.id !== session.id);
+      disconnectEvents();
+      state.activeId = null;
+      el.output.textContent = "";
+      renderSessions();
+      renderActive();
+      setStatus("closed");
+    }
+
+    async function stopDaemon() {
+      await api("/daemon/stop", { method: "POST" });
+      setStatus("daemon stopping");
+    }
+
+    async function init() {
+      el.refresh = byId("refresh");
+      el.stopDaemon = byId("stopDaemon");
+      el.sessions = byId("sessions");
+      el.sessionCount = byId("sessionCount");
+      el.openForm = byId("openForm");
+      el.agent = byId("agent");
+      el.cwd = byId("cwd");
+      el.write = byId("write");
+      el.activeTitle = byId("activeTitle");
+      el.activeStatus = byId("activeStatus");
+      el.writeBadge = byId("writeBadge");
+      el.pidInfo = byId("pidInfo");
+      el.output = byId("output");
+      el.raw = byId("raw");
+      el.logPath = byId("logPath");
+      el.sendForm = byId("sendForm");
+      el.message = byId("message");
+      el.abort = byId("abort");
+      el.close = byId("close");
+      el.statusLine = byId("statusLine");
+
+      state.config = await api("/config");
+      el.cwd.value = state.config.cwd || "";
+      el.openForm.addEventListener("submit", event => openSession(event).catch(err => setStatus(err.message)));
+      el.sendForm.addEventListener("submit", event => sendMessage(event).catch(err => setStatus(err.message)));
+      el.refresh.addEventListener("click", () => refreshSessions().catch(err => setStatus(err.message)));
+      el.abort.addEventListener("click", () => abortSession().catch(err => setStatus(err.message)));
+      el.close.addEventListener("click", () => closeSession().catch(err => setStatus(err.message)));
+      el.stopDaemon.addEventListener("click", () => stopDaemon().catch(err => setStatus(err.message)));
+      renderActive();
+      await refreshSessions();
+      setInterval(() => refreshSessions().catch(() => {}), 2500);
+    }
+
+    init().catch(err => setStatus(err.message));
+  </script>
+</body>
+</html>`;
+}
+
 function connectDaemon(timeoutMs = 2000) {
   return new Promise((resolve, reject) => {
     const socket = net.createConnection(DAEMON_SOCKET);
@@ -1343,12 +2354,15 @@ async function handleDaemonRequest(request) {
         bridgeVersion: BRIDGE_VERSION,
         pid: process.pid,
         socket: DAEMON_SOCKET,
+        ui: uiServerUrl ? { running: true, url: uiServerUrl, host: DEFAULT_UI_HOST } : { running: false },
         sessions: [...sessions.values()].map(session => session.summary()),
       };
     case "doctor":
       return doctor();
     case "cleanup":
       return cleanupStalePidRecords();
+    case "ui_start":
+      return await startUiServer(params);
     case "open":
       return await openSession(params);
     case "send":
@@ -1364,21 +2378,7 @@ async function handleDaemonRequest(request) {
     case "close":
       return closeSession(params.session_id);
     case "stop": {
-      const sessionCount = sessions.size;
-      cleanupSessions({ removePidRecord: false });
-      setTimeout(() => {
-        try {
-          daemonServer?.close();
-        } catch {}
-        try {
-          fs.rmSync(DAEMON_SOCKET, { force: true });
-        } catch {}
-        try {
-          fs.rmSync(DAEMON_PID_FILE, { force: true });
-        } catch {}
-        process.exit(0);
-      }, 25).unref?.();
-      return { stopping: true, sessions_closed: sessionCount };
+      return stopDaemonSoon();
     }
     default:
       throw new Error(`Unknown daemon method: ${request.method}`);
@@ -1447,6 +2447,16 @@ async function runCli(argv) {
       printCliResult(await requestDaemon("stop", {}, { autoStart: false, timeoutMs: 5000 }), args);
       return;
     }
+    case "ui": {
+      const value = await requestDaemon(
+        "ui_start",
+        { port: parseNumber(args.port, 0) },
+        { timeoutMs: 10000 },
+      );
+      if (args.open !== false && !args.json) openLocalUrl(value.url);
+      printCliResult(args.json ? value : `Agent Bridge UI: ${value.url}\n`, args);
+      return;
+    }
     case "sessions":
       printCliResult(await requestDaemon("sessions", {}, { timeoutMs: 10000 }), args);
       return;
@@ -1506,17 +2516,21 @@ function mcpText(value, isError = false) {
 async function callTool(name, args) {
   switch (name) {
     case "agent_bridge_open_session":
-      return mcpText(await openSession(args || {}));
+      return mcpText(await requestDaemon("open", args || {}, { timeoutMs: 30000 }));
     case "agent_bridge_send_message":
-      return mcpText(await sendMessage(args || {}));
+      return mcpText(
+        await requestDaemon("send", args || {}, {
+          timeoutMs: parseNumber(args?.timeout_ms, DEFAULT_WAIT_TIMEOUT_MS) + 30000,
+        }),
+      );
     case "agent_bridge_status":
-      return mcpText(await status(args?.session_id));
+      return mcpText(await requestDaemon("status", { session_id: args?.session_id }, { timeoutMs: 10000 }));
     case "agent_bridge_result":
-      return mcpText(await result(args?.session_id));
+      return mcpText(await requestDaemon("result", { session_id: args?.session_id }, { timeoutMs: 10000 }));
     case "agent_bridge_abort":
-      return mcpText(await abortSession(args?.session_id));
+      return mcpText(await requestDaemon("abort", { session_id: args?.session_id }, { timeoutMs: 10000 }));
     case "agent_bridge_close_session":
-      return mcpText(closeSession(args?.session_id));
+      return mcpText(await requestDaemon("close", { session_id: args?.session_id }, { timeoutMs: 10000 }));
     case "agent_bridge_doctor":
       return mcpText(renderDoctor(doctor()));
     default:
@@ -1529,6 +2543,11 @@ function serveMcp() {
   cleanupStalePidRecords();
   installProcessHandlers();
   const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+  let activeRequests = 0;
+  let inputClosed = false;
+  const maybeExit = () => {
+    if (inputClosed && activeRequests === 0) cleanupAndExit(0, "stdin closed");
+  };
   rl.on("line", line => {
     if (!line.trim()) return;
     let message;
@@ -1539,9 +2558,18 @@ function serveMcp() {
       return;
     }
     if (message.id === undefined) return;
-    handleMcp(message).catch(err => rpcError(message.id, -32000, err instanceof Error ? err.message : String(err)));
+    activeRequests += 1;
+    handleMcp(message)
+      .catch(err => rpcError(message.id, -32000, err instanceof Error ? err.message : String(err)))
+      .finally(() => {
+        activeRequests -= 1;
+        maybeExit();
+      });
   });
-  rl.on("close", () => cleanupAndExit(0, "stdin closed"));
+  rl.on("close", () => {
+    inputClosed = true;
+    maybeExit();
+  });
 }
 
 async function handleMcp(message) {
@@ -1594,6 +2622,15 @@ function cleanupAndExit(code = 0, reason = "shutdown", error = null) {
     process.stderr.write(`${reason}: ${error instanceof Error ? error.stack || error.message : String(error)}\n`);
   }
   cleanupSessions({ removePidRecord: false });
+  for (const client of [...sseClients]) {
+    try {
+      client.res.end();
+    } catch {}
+  }
+  sseClients.clear();
+  try {
+    uiServer?.close();
+  } catch {}
   try {
     daemonServer?.close();
   } catch {}

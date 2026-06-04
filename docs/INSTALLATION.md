@@ -52,7 +52,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | nod
 `doctor` 里应该看到类似：
 
 ```text
-Agent Bridge 0.2.3
+Agent Bridge 0.3.0
 omp: ok (...) omp/15.9.0
 opencode: ok (...) 1.15.13
 ```
@@ -136,6 +136,8 @@ codex -a never -s danger-full-access -C "$PWD" exec --json --skip-git-repo-check
 ## 5. 使用方式
 
 Codex 正式调用 Agent Bridge 时，应该优先使用 MCP 工具。CLI facade 主要给人类调试、smoke test、清理残留进程、临时操作使用。
+
+从 0.3.0 开始，MCP tools、CLI facade、Web UI monitor 共享同一个本地 daemon/session manager。Codex 通过 MCP 打开的 session 可以在 UI 中看到，也可以用 CLI 查看或关闭。
 
 Codex 使用 Agent Bridge 时应该遵循这个流程：
 
@@ -231,7 +233,46 @@ node scripts/agent-bridge.mjs cleanup --json
 
 `cleanup` 会跳过仍由当前 MCP server 或 CLI daemon 拥有的进程，只清理 stale pid record 和确认已失去 owner 的子进程。
 
-## 7. 写权限模式
+## 7. UI 实时监控
+
+启动本地 Web UI：
+
+```sh
+node scripts/agent-bridge.mjs ui
+```
+
+默认会自动启动或复用 `agent-bridge daemon`，并只监听 `127.0.0.1:<port>`。命令会打开浏览器；如果你只想拿到 URL：
+
+```sh
+node scripts/agent-bridge.mjs ui --no-open --json
+```
+
+UI 可以：
+
+- 查看 daemon 内已有的 OMP/OpenCode sessions
+- 打开新的 OMP/OpenCode session
+- 发送消息、abort 当前 turn、关闭 session
+- 通过 SSE 实时看到状态变化和 assistant 可见文本
+- 在折叠的 Debug 面板里查看经过裁剪和脱敏的事件 JSON 与 log file 路径
+- 停止 daemon，并关闭 daemon 持有的所有后端进程
+
+HTTP API：
+
+```text
+GET    /sessions
+POST   /sessions
+GET    /sessions/:id
+POST   /sessions/:id/messages
+GET    /sessions/:id/result
+GET    /sessions/:id/events
+POST   /sessions/:id/abort
+DELETE /sessions/:id
+POST   /daemon/stop
+```
+
+`/sessions/:id/events` 是 Server-Sent Events 流。默认输出状态事件和 assistant 可见文本；完整 thinking/raw internal payload 不会在主输出区展示。
+
+## 8. 写权限模式
 
 默认使用 `write: false`。适合：
 
@@ -255,7 +296,7 @@ node scripts/agent-bridge.mjs cleanup --json
 
 让委托代理改完后，Codex 自己仍然应该检查 git diff、运行测试，再向用户报告。
 
-## 8. 会话和进程清理
+## 9. 会话和进程清理
 
 正常关闭会话：
 
@@ -271,7 +312,9 @@ node scripts/agent-bridge.mjs cleanup --json
 - OpenCode 的 `opencode serve` 会退出
 - 当前 OpenCode attach client 也会退出
 
-如果 Codex 关闭 MCP server，Agent Bridge 会在 `SIGTERM`、`SIGINT`、`SIGHUP`、stdin 关闭、stdout `EPIPE`、未捕获异常等情况下清理所有子进程。
+如果 daemon 进程退出，Agent Bridge 会在 `SIGTERM`、`SIGINT`、`SIGHUP`、stdout `EPIPE`、未捕获异常等情况下清理自己持有的所有子进程。
+
+0.3.0 之后，MCP session 默认由本地 daemon 持有。MCP server 自身 stdin 关闭时会等 pending MCP 响应写完再退出，不会误删 daemon 里仍在运行、且可能正被 UI/CLI 观察的 session；仍然建议在任务完成后显式调用 `agent_bridge_close_session`。
 
 如果关闭 CLI daemon，`node scripts/agent-bridge.mjs stop` 会关闭 daemon 持有的所有 session，并让对应 OMP/OpenCode 服务退出。
 
@@ -286,7 +329,7 @@ ps -axo pid,ppid,command | rg 'agent-bridge|omp --mode rpc|opencode serve' || tr
 find "$HOME/.agent-bridge/pids" -type f -maxdepth 1 -print 2>/dev/null || true
 ```
 
-## 9. 升级
+## 10. 升级
 
 ```sh
 cd "$HOME/projects/agent-bridge"
@@ -304,7 +347,7 @@ codex plugin list | rg agent-bridge
 codex mcp list | rg agent-bridge
 ```
 
-## 10. 卸载
+## 11. 卸载
 
 如果 Codex CLI 支持插件移除命令，可以使用对应的 `codex plugin` 子命令卸载。
 
@@ -326,7 +369,7 @@ node scripts/agent-bridge.mjs stop
 rm -rf "$HOME/.agent-bridge"
 ```
 
-## 11. 常见问题
+## 12. 常见问题
 
 ### `agent_bridge_doctor` 找不到 OMP
 
