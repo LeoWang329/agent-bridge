@@ -10,6 +10,7 @@ agent-bridge/
   .mcp.json                      MCP server declaration used by the plugin
   scripts/agent-bridge.mjs       MCP server and backend adapter implementation
   skills/agent-bridge/SKILL.md   Instructions Codex should follow when using the bridge
+  docs/INSTALLATION.md           Installation and usage guide
   docs/DEVELOPMENT.md            Development notes
   README.md                      User-facing documentation
 ```

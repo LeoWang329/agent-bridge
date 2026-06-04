@@ -39,6 +39,8 @@ export OPENCODE_DB_PATH="$HOME/.local/share/opencode/opencode.db"
 
 ## Quick Start
 
+For a complete Chinese installation and usage guide, see [docs/INSTALLATION.md](docs/INSTALLATION.md).
+
 Clone the repository:
 
 ```sh
