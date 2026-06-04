@@ -1,6 +1,6 @@
 {
   "name": "agent-bridge",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Persistent RPC bridge from Codex to OMP and OpenCode.",
   "author": {
     "name": "LeoWang329"

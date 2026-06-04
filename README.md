@@ -21,6 +21,21 @@ OpenCode 1.15.13 does not expose the same stdio JSONL RPC mode that OMP does. Ag
 - `agent_bridge_close_session`
 - `agent_bridge_doctor`
 
+## CLI Facade
+
+Codex should use the MCP server as the primary interface. The CLI facade is for human debugging, smoke tests, cleanup, and operational control.
+
+The CLI facade auto-starts a local Agent Bridge daemon and talks to it through a Unix socket, so sessions persist across separate CLI invocations:
+
+```sh
+node scripts/agent-bridge.mjs start
+node scripts/agent-bridge.mjs open --agent omp --cwd "$PWD" --json
+node scripts/agent-bridge.mjs send <session_id> "Only inspect the repo. Do not edit files." --wait --json
+node scripts/agent-bridge.mjs result <session_id> --json
+node scripts/agent-bridge.mjs close <session_id>
+node scripts/agent-bridge.mjs stop
+```
+
 ## Requirements
 
 - Node.js 20 or newer
@@ -53,6 +68,7 @@ Run local checks:
 ```sh
 node --check scripts/agent-bridge.mjs
 node scripts/agent-bridge.mjs doctor
+node scripts/agent-bridge.mjs cleanup
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | node scripts/agent-bridge.mjs mcp
 ```
 
@@ -94,7 +110,8 @@ Keep `write: false` for review, diagnosis, planning, or research. Set `write: tr
 - OpenCode write mode adds `--dangerously-skip-permissions`.
 - Always close sessions after use so no backend process remains running.
 - On normal MCP shutdown, Agent Bridge closes all active OMP/OpenCode child processes.
-- Agent Bridge records its child process ids under `~/.agent-bridge/pids/` and removes stale recorded children on the next MCP startup.
+- `agent-bridge stop` closes daemon-owned sessions and their OMP/OpenCode child processes.
+- Agent Bridge records its child process ids under `~/.agent-bridge/pids/`, skips records whose MCP/daemon owner is still running, and removes stale recorded children on the next startup or `cleanup`.
 - Do not commit personal access tokens, local secrets, or machine-specific absolute paths.
 
 ## Development

@@ -26,13 +26,16 @@ There are no npm dependencies. The runtime uses Node built-ins plus external CLI
 ```mermaid
 flowchart LR
   Codex["Codex MCP client"] --> Bridge["agent-bridge MCP server"]
-  Bridge --> OMP["OMP RPC process"]
-  Bridge --> OCS["OpenCode server"]
-  Bridge --> OCR["OpenCode run attach client"]
+  CLI["agent-bridge CLI facade"] --> Daemon["agent-bridge daemon"]
+  Daemon --> BridgeCore["session manager"]
+  Bridge --> BridgeCore
+  BridgeCore --> OMP["OMP RPC process"]
+  BridgeCore --> OCS["OpenCode server"]
+  BridgeCore --> OCR["OpenCode run attach client"]
   OMP --> OMPIO["JSONL stdio"]
   OCS --> OCDB["OpenCode SQLite DB"]
   OCR --> OCS
-  Bridge -. "fallback read" .-> OCDB
+  BridgeCore -. "fallback read" .-> OCDB
 ```
 
 Agent Bridge exposes a small MCP tool surface:
@@ -47,6 +50,10 @@ Agent Bridge exposes a small MCP tool surface:
 
 The bridge keeps in-memory session objects for the lifetime of the MCP server process. A session is not persisted by Agent Bridge itself.
 
+The CLI facade starts a separate local daemon and communicates over `~/.agent-bridge/agent-bridge.sock`. That daemon uses the same in-memory session manager, so CLI sessions persist across separate CLI invocations until `agent-bridge close <session_id>` or `agent-bridge stop`.
+
+Codex should still use MCP as the primary interface. CLI commands are for humans, CI smoke tests, process cleanup, and debugging.
+
 ## Process Lifecycle
 
 Agent Bridge owns every child process it starts and records those process ids in:
@@ -57,7 +64,9 @@ Agent Bridge owns every child process it starts and records those process ids in
 
 The MCP server cleans up active sessions when it receives `SIGTERM`, `SIGINT`, or `SIGHUP`, when MCP stdin closes, when stdout closes with `EPIPE`, or when an uncaught exception/unhandled rejection reaches the process boundary.
 
-Normal `agent_bridge_close_session` calls remove the pid record immediately. Process-level shutdown leaves pid records in place after sending `SIGTERM`; this is intentional. If a child ignores termination or Agent Bridge is killed abruptly, the next MCP startup reads those records, verifies that the process command still matches an Agent Bridge backend such as `omp --mode rpc`, `opencode serve`, or `opencode run --attach`, and terminates the recorded process tree. Stale records for already-exited processes are removed.
+Normal `agent_bridge_close_session` calls remove the pid record immediately. `agent-bridge stop` closes daemon-owned sessions and their OMP/OpenCode child processes. Process-level shutdown leaves pid records in place after sending `SIGTERM`; this is intentional. If a child ignores termination or Agent Bridge is killed abruptly, the next MCP startup reads those records, verifies that the process command still matches an Agent Bridge backend such as `omp --mode rpc`, `opencode serve`, or `opencode run --attach`, and terminates the recorded process tree. Stale records for already-exited processes are removed.
+
+Pid-record cleanup must treat both `agent-bridge mcp` and `agent-bridge daemon` as live owners. A short-lived MCP process may start while the CLI daemon owns sessions, and cleanup must skip those daemon-owned children instead of terminating active OMP/OpenCode processes.
 
 This cleanup cannot run after `SIGKILL` (`kill -9`) because no Node.js code can execute in that case, but the pid-record sweep on the next startup is designed to catch leftovers from that kind of hard exit.
 
@@ -113,6 +122,7 @@ Run these before installing or publishing:
 ```sh
 node --check scripts/agent-bridge.mjs
 node scripts/agent-bridge.mjs doctor
+node scripts/agent-bridge.mjs cleanup
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | node scripts/agent-bridge.mjs mcp
 ```
 
@@ -143,6 +153,28 @@ Real message exchange test:
 ```sh
 codex -a never -s danger-full-access -C "$PWD" exec --json --skip-git-repo-check \
   'Use only agent_bridge MCP tools. Open an opencode session with write=false. Send: "Only reply EXACT_OPENCODE_BRIDGE_OK." with wait=true. Close the session and report whether the exact text was returned.'
+```
+
+## Agent Bridge CLI Facade Tests
+
+The facade auto-starts a daemon when a session command needs it:
+
+```sh
+node scripts/agent-bridge.mjs cleanup --json
+node scripts/agent-bridge.mjs start --json
+node scripts/agent-bridge.mjs sessions --json
+node scripts/agent-bridge.mjs open --agent omp --cwd "$PWD" --json
+node scripts/agent-bridge.mjs status <session_id> --json
+node scripts/agent-bridge.mjs close <session_id> --json
+node scripts/agent-bridge.mjs stop --json
+```
+
+For a real message exchange test, send a bounded prompt and close the session afterward:
+
+```sh
+node scripts/agent-bridge.mjs open --agent opencode --cwd "$PWD" --json
+node scripts/agent-bridge.mjs send <session_id> "Only reply EXACT_OPENCODE_BRIDGE_OK. Do not read or write files." --wait --json
+node scripts/agent-bridge.mjs close <session_id> --json
 ```
 
 ## Personal Marketplace Example
@@ -185,10 +217,11 @@ codex plugin add agent-bridge@personal
 1. Update `BRIDGE_VERSION` in `scripts/agent-bridge.mjs`.
 2. Update `.codex-plugin/plugin.json`.
 3. Run syntax and plugin validation.
-4. Run the process-cleanup smoke test if lifecycle code changed.
-5. Reinstall the plugin through Codex.
-6. Run the Codex CLI smoke tests.
-7. Confirm no delegated backend processes are left running:
+4. Run the CLI facade smoke tests if CLI or daemon code changed.
+5. Run the process-cleanup smoke test if lifecycle code changed.
+6. Reinstall the plugin through Codex.
+7. Run the Codex CLI smoke tests.
+8. Confirm no delegated backend processes are left running:
 
 ```sh
 ps -axo pid,ppid,command | rg 'agent-bridge|omp --mode rpc|opencode serve' || true

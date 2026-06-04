@@ -52,7 +52,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | nod
 `doctor` 里应该看到类似：
 
 ```text
-Agent Bridge 0.2.2
+Agent Bridge 0.2.3
 omp: ok (...) omp/15.9.0
 opencode: ok (...) 1.15.13
 ```
@@ -135,6 +135,8 @@ codex -a never -s danger-full-access -C "$PWD" exec --json --skip-git-repo-check
 
 ## 5. 使用方式
 
+Codex 正式调用 Agent Bridge 时，应该优先使用 MCP 工具。CLI facade 主要给人类调试、smoke test、清理残留进程、临时操作使用。
+
 Codex 使用 Agent Bridge 时应该遵循这个流程：
 
 1. `agent_bridge_open_session`
@@ -173,7 +175,63 @@ Codex 使用 Agent Bridge 时应该遵循这个流程：
 }
 ```
 
-## 6. 写权限模式
+## 6. CLI facade
+
+CLI facade 会自动启动一个本地 Agent Bridge daemon，并通过 Unix socket 和它通信。这样 `open`、`send`、`status`、`result`、`close` 可以跨多次 CLI 调用复用同一个持久 session。
+
+启动 daemon：
+
+```sh
+node scripts/agent-bridge.mjs start
+```
+
+查看 daemon 里的 sessions：
+
+```sh
+node scripts/agent-bridge.mjs sessions --json
+```
+
+打开 OMP session：
+
+```sh
+node scripts/agent-bridge.mjs open --agent omp --cwd "$PWD" --json
+```
+
+发送消息：
+
+```sh
+node scripts/agent-bridge.mjs send <session_id> "请只读代码，帮我检查潜在问题。不要修改文件。" --wait --json
+```
+
+读取结果：
+
+```sh
+node scripts/agent-bridge.mjs result <session_id> --json
+```
+
+关闭 session：
+
+```sh
+node scripts/agent-bridge.mjs close <session_id>
+```
+
+停止 daemon：
+
+```sh
+node scripts/agent-bridge.mjs stop
+```
+
+`stop` 会关闭 daemon 内所有 session，并退出对应的 `omp --mode rpc`、`opencode serve` 和正在运行的 OpenCode attach client。
+
+清理 stale pid record：
+
+```sh
+node scripts/agent-bridge.mjs cleanup --json
+```
+
+`cleanup` 会跳过仍由当前 MCP server 或 CLI daemon 拥有的进程，只清理 stale pid record 和确认已失去 owner 的子进程。
+
+## 7. 写权限模式
 
 默认使用 `write: false`。适合：
 
@@ -197,7 +255,7 @@ Codex 使用 Agent Bridge 时应该遵循这个流程：
 
 让委托代理改完后，Codex 自己仍然应该检查 git diff、运行测试，再向用户报告。
 
-## 7. 会话和进程清理
+## 8. 会话和进程清理
 
 正常关闭会话：
 
@@ -215,7 +273,11 @@ Codex 使用 Agent Bridge 时应该遵循这个流程：
 
 如果 Codex 关闭 MCP server，Agent Bridge 会在 `SIGTERM`、`SIGINT`、`SIGHUP`、stdin 关闭、stdout `EPIPE`、未捕获异常等情况下清理所有子进程。
 
+如果关闭 CLI daemon，`node scripts/agent-bridge.mjs stop` 会关闭 daemon 持有的所有 session，并让对应 OMP/OpenCode 服务退出。
+
 如果 Agent Bridge 被 `kill -9` 硬杀，清理逻辑来不及执行。此时它会依赖 `~/.agent-bridge/pids/` 里的 pid record，在下一次 MCP server 启动时清理上次残留的 OMP/OpenCode 子进程。
+
+正常运行的 MCP server 或 CLI daemon 会被识别为 pid record owner，`cleanup` 不会误杀它们仍在使用的 OMP/OpenCode 子进程。
 
 检查是否有残留：
 
@@ -224,13 +286,14 @@ ps -axo pid,ppid,command | rg 'agent-bridge|omp --mode rpc|opencode serve' || tr
 find "$HOME/.agent-bridge/pids" -type f -maxdepth 1 -print 2>/dev/null || true
 ```
 
-## 8. 升级
+## 9. 升级
 
 ```sh
 cd "$HOME/projects/agent-bridge"
 git pull
 node --check scripts/agent-bridge.mjs
 node scripts/agent-bridge.mjs doctor
+node scripts/agent-bridge.mjs cleanup
 codex plugin add agent-bridge@personal
 ```
 
@@ -241,7 +304,7 @@ codex plugin list | rg agent-bridge
 codex mcp list | rg agent-bridge
 ```
 
-## 9. 卸载
+## 10. 卸载
 
 如果 Codex CLI 支持插件移除命令，可以使用对应的 `codex plugin` 子命令卸载。
 
@@ -251,13 +314,19 @@ codex mcp list | rg agent-bridge
 rm -f "$HOME/plugins/agent-bridge"
 ```
 
+停止 CLI daemon：
+
+```sh
+node scripts/agent-bridge.mjs stop
+```
+
 如果不再使用 Agent Bridge，也可以删除本地状态目录：
 
 ```sh
 rm -rf "$HOME/.agent-bridge"
 ```
 
-## 10. 常见问题
+## 11. 常见问题
 
 ### `agent_bridge_doctor` 找不到 OMP
 

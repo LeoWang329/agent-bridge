@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 
-const BRIDGE_VERSION = "0.2.2";
+const BRIDGE_VERSION = "0.2.3";
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const DEFAULT_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_EVENTS = 300;
@@ -15,6 +15,8 @@ const MAX_TEXT = 400_000;
 const STATE_ROOT = process.env.AGENT_BRIDGE_STATE_DIR || path.join(os.homedir(), ".agent-bridge");
 const LOG_DIR = path.join(STATE_ROOT, "logs");
 const PID_DIR = path.join(STATE_ROOT, "pids");
+const DAEMON_SOCKET = process.env.AGENT_BRIDGE_SOCKET || path.join(STATE_ROOT, "agent-bridge.sock");
+const DAEMON_PID_FILE = path.join(STATE_ROOT, "agent-bridge-daemon.pid");
 const OPENCODE_DB_PATH =
   process.env.OPENCODE_DB_PATH ||
   path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share"), "opencode", "opencode.db");
@@ -35,6 +37,7 @@ const AGENTS = {
 const sessions = new Map();
 let processHandlersInstalled = false;
 let shuttingDown = false;
+let daemonServer = null;
 
 const TOOLS = [
   {
@@ -143,10 +146,21 @@ function usage() {
   return [
     "Usage:",
     "  agent-bridge mcp",
+    "  agent-bridge daemon",
     "  agent-bridge doctor [--json]",
+    "  agent-bridge cleanup [--json]",
+    "  agent-bridge start [--json]",
+    "  agent-bridge stop [--json]",
+    "  agent-bridge sessions [--json]",
+    "  agent-bridge open --agent omp|opencode [--cwd DIR] [--write] [--json]",
+    "  agent-bridge send <session_id> <message...> [--wait] [--json]",
+    "  agent-bridge status [session_id] [--json]",
+    "  agent-bridge result <session_id> [--json]",
+    "  agent-bridge abort <session_id> [--json]",
+    "  agent-bridge close <session_id> [--json]",
     "",
-    "This adapter is intentionally session-first. Use MCP tools to open a persistent session,",
-    "send messages, inspect status/result, abort turns, and close sessions.",
+    "Codex should use the MCP server as the primary interface. The CLI facade is for",
+    "human debugging, smoke tests, cleanup, and operational control.",
   ].join("\n");
 }
 
@@ -202,10 +216,21 @@ function pushEvent(session, event) {
 }
 
 function compactEvent(event) {
-  if (!event || typeof event !== "object") return event;
-  const copy = { ...event };
-  if (typeof copy.delta === "string" && copy.delta.length > 300) copy.delta = `${copy.delta.slice(0, 300)}...`;
-  if (typeof copy.text === "string" && copy.text.length > 300) copy.text = `${copy.text.slice(0, 300)}...`;
+  return compactValue(event);
+}
+
+function compactValue(value, depth = 0) {
+  if (typeof value === "string") {
+    return value.length > 300 ? `${value.slice(0, 300)}...` : value;
+  }
+  if (!value || typeof value !== "object") return value;
+  if (depth >= 6) return Array.isArray(value) ? `[${value.length} items]` : "[object]";
+  if (Array.isArray(value)) return value.map(item => compactValue(item, depth + 1));
+
+  const copy = {};
+  for (const [key, child] of Object.entries(value)) {
+    copy[key] = compactValue(child, depth + 1);
+  }
   return copy;
 }
 
@@ -260,7 +285,8 @@ function ownerStillRunning(record) {
   const ownerPid = Number(record?.ownerPid);
   if (!Number.isInteger(ownerPid) || ownerPid <= 1 || ownerPid === process.pid) return false;
   const command = processCommand(ownerPid);
-  return /\bnode\b/.test(command) && /agent-bridge\.mjs/.test(command) && /\bmcp\b/.test(command);
+  const argv0LooksLikeNode = /^(?:\S*\/)?node(?:\s|$)/.test(command);
+  return argv0LooksLikeNode && /agent-bridge\.mjs/.test(command) && /\b(?:mcp|daemon)\b/.test(command);
 }
 
 function terminateProcessTree(pid, signal = "SIGTERM") {
@@ -276,17 +302,28 @@ function terminateProcessTree(pid, signal = "SIGTERM") {
 
 function cleanupStalePidRecords() {
   ensureDirs();
+  const summary = {
+    records: 0,
+    removed: 0,
+    skippedRunningOwners: 0,
+    terminated: [],
+  };
   for (const name of fs.readdirSync(PID_DIR)) {
     if (!name.endsWith(".json")) continue;
+    summary.records += 1;
     const file = path.join(PID_DIR, name);
     let record;
     try {
       record = JSON.parse(fs.readFileSync(file, "utf8"));
     } catch {
       removePidRecord(file);
+      summary.removed += 1;
       continue;
     }
-    if (ownerStillRunning(record)) continue;
+    if (ownerStillRunning(record)) {
+      summary.skippedRunningOwners += 1;
+      continue;
+    }
 
     const processes = Array.isArray(record.processes) ? record.processes : [];
     for (const child of processes) {
@@ -294,11 +331,15 @@ function cleanupStalePidRecords() {
       if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) continue;
       const command = processCommand(pid);
       if (roleMatchesCommand(child.role, command)) {
-        terminateProcessTree(pid);
+        if (terminateProcessTree(pid)) {
+          summary.terminated.push({ pid, role: child.role, command });
+        }
       }
     }
     removePidRecord(file);
+    summary.removed += 1;
   }
+  return summary;
 }
 
 class OmpRpcSession {
@@ -338,6 +379,10 @@ class OmpRpcSession {
     }
 
     appendLog(this.logFile, `$ ${[agentBin("omp"), ...args.map(shellQuote)].join(" ")}\n`);
+    appendLog(
+      this.logFile,
+      `[agent-bridge] owner pid=${process.pid} ppid=${process.ppid} stdinTTY=${Boolean(process.stdin.isTTY)} stdoutTTY=${Boolean(process.stdout.isTTY)}\n`,
+    );
     this.readyPromise = new Promise((resolve, reject) => {
       this.readyResolve = resolve;
       this.readyReject = reject;
@@ -348,7 +393,12 @@ class OmpRpcSession {
       env: process.env,
       stdio: ["pipe", "pipe", "pipe"],
     });
+    appendLog(this.logFile, `[agent-bridge] spawned OMP pid=${this.proc.pid}\n`);
     this.#writePidRecord(args);
+
+    this.proc.stdin.on("close", () => appendLog(this.logFile, "[agent-bridge] OMP stdin closed\n"));
+    this.proc.stdout.on("close", () => appendLog(this.logFile, "[agent-bridge] OMP stdout closed\n"));
+    this.proc.stderr.on("close", () => appendLog(this.logFile, "[agent-bridge] OMP stderr closed\n"));
 
     this.proc.stderr.on("data", chunk => {
       const text = chunk.toString("utf8");
@@ -367,7 +417,8 @@ class OmpRpcSession {
       this.pending.clear();
     });
 
-    this.proc.on("close", code => {
+    this.proc.on("close", (code, signal) => {
+      appendLog(this.logFile, `[agent-bridge] OMP RPC exited code=${code} signal=${signal || ""}\n`);
       removePidRecord(this.pidFile);
       if (this.status === "closed") {
         this.isStreaming = false;
@@ -1042,20 +1093,317 @@ function renderDoctor(value) {
   return `${lines.join("\n")}\n`;
 }
 
+const BOOLEAN_ARGS = new Set(["json", "write", "wait", "help", "noStart"]);
+
 function parseArgs(argv) {
   const out = { _: [] };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
-    if (arg === "--json") {
-      out.json = true;
+    if (arg === "--") {
+      out._.push(...argv.slice(i + 1));
+      break;
     } else if (arg.startsWith("--")) {
       const [key, inline] = arg.slice(2).split(/=(.*)/s, 2);
-      out[key.replace(/-([a-z])/g, (_, ch) => ch.toUpperCase())] = inline !== undefined ? inline : argv[++i];
+      const normalized = key.replace(/-([a-z])/g, (_, ch) => ch.toUpperCase());
+      if (normalized.startsWith("no") && normalized.length > 2 && inline === undefined) {
+        const positive = normalized.slice(2, 3).toLowerCase() + normalized.slice(3);
+        out[positive] = false;
+      } else if (inline !== undefined) {
+        out[normalized] = inline;
+      } else if (BOOLEAN_ARGS.has(normalized)) {
+        out[normalized] = true;
+      } else if (argv[i + 1] !== undefined && !argv[i + 1].startsWith("--")) {
+        out[normalized] = argv[++i];
+      } else {
+        out[normalized] = true;
+      }
     } else {
       out._.push(arg);
     }
   }
   return out;
+}
+
+function parseNumber(value, fallback = undefined) {
+  if (value === undefined || value === null || value === "") return fallback;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) throw new Error(`Expected a number, got: ${value}`);
+  return parsed;
+}
+
+function printCliResult(value, args = {}) {
+  if (args.json || typeof value !== "string") {
+    process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
+  } else {
+    process.stdout.write(value.endsWith("\n") ? value : `${value}\n`);
+  }
+}
+
+function connectDaemon(timeoutMs = 2000) {
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection(DAEMON_SOCKET);
+    let done = false;
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      socket.destroy();
+      reject(new Error(`Timed out connecting to Agent Bridge daemon at ${DAEMON_SOCKET}.`));
+    }, timeoutMs);
+    timer.unref?.();
+    socket.once("connect", () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve(socket);
+    });
+    socket.once("error", err => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      reject(err);
+    });
+  });
+}
+
+async function requestDaemon(method, params = {}, options = {}) {
+  if (options.autoStart !== false) await ensureDaemon();
+  const socket = await connectDaemon(options.connectTimeoutMs || 2000);
+  const request = { id: makeId("cli"), method, params };
+  return await new Promise((resolve, reject) => {
+    const timeoutMs = options.timeoutMs || DEFAULT_WAIT_TIMEOUT_MS + 30000;
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new Error(`Timed out waiting for daemon response to ${method}.`));
+    }, timeoutMs);
+    timer.unref?.();
+
+    const rl = readline.createInterface({ input: socket, crlfDelay: Infinity });
+    rl.once("line", line => {
+      clearTimeout(timer);
+      socket.end();
+      let response;
+      try {
+        response = JSON.parse(line);
+      } catch (err) {
+        reject(new Error(`Invalid daemon response: ${err instanceof Error ? err.message : String(err)}`));
+        return;
+      }
+      if (response.ok === false) reject(new Error(response.error || "Daemon request failed."));
+      else resolve(response.result);
+    });
+    socket.once("error", err => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    socket.write(`${JSON.stringify(request)}\n`);
+  });
+}
+
+async function tryDaemonPing() {
+  try {
+    return await requestDaemon("ping", {}, { autoStart: false, timeoutMs: 2000, connectTimeoutMs: 1000 });
+  } catch {
+    return null;
+  }
+}
+
+async function ensureDaemon() {
+  const existing = await tryDaemonPing();
+  if (existing) return existing;
+  cleanupStaleDaemons();
+  try {
+    fs.rmSync(DAEMON_SOCKET, { force: true });
+  } catch {}
+
+  ensureDirs();
+  const logFile = path.join(LOG_DIR, "daemon.log");
+  const logFd = fs.openSync(logFile, "a");
+  const child = spawn(process.execPath, [process.argv[1], "daemon"], {
+    cwd: process.cwd(),
+    env: process.env,
+    detached: true,
+    stdio: ["ignore", logFd, logFd],
+  });
+  child.unref();
+
+  const started = Date.now();
+  while (Date.now() - started < 20000) {
+    await sleep(250);
+    const ping = await tryDaemonPing();
+    if (ping) return ping;
+  }
+  throw new Error(`Timed out starting Agent Bridge daemon. See ${logFile}.`);
+}
+
+function daemonPid() {
+  try {
+    return Number(fs.readFileSync(DAEMON_PID_FILE, "utf8").trim()) || null;
+  } catch {
+    return null;
+  }
+}
+
+function listDaemonPids() {
+  const result = spawnSync("ps", ["-axo", "pid=,command="], { encoding: "utf8" });
+  if (result.status !== 0 || !result.stdout) return [];
+  return result.stdout
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean)
+    .map(line => {
+      const match = line.match(/^(\d+)\s+(.+)$/);
+      if (!match) return null;
+      return { pid: Number(match[1]), command: match[2] };
+    })
+    .filter(row => {
+      if (!row || row.pid === process.pid) return false;
+      const argv0LooksLikeNode = /^(?:\S*\/)?node(?:\s|$)/.test(row.command);
+      return argv0LooksLikeNode && /agent-bridge\.mjs/.test(row.command) && /\bdaemon\b/.test(row.command);
+    });
+}
+
+function cleanupStaleDaemons() {
+  const terminated = [];
+  for (const row of listDaemonPids()) {
+    if (terminateProcessTree(row.pid)) terminated.push(row);
+  }
+  try {
+    fs.rmSync(DAEMON_SOCKET, { force: true });
+  } catch {}
+  try {
+    fs.rmSync(DAEMON_PID_FILE, { force: true });
+  } catch {}
+  return { terminated };
+}
+
+async function serveDaemon() {
+  ensureDirs();
+  cleanupStalePidRecords();
+  installProcessHandlers();
+
+  const existing = await tryDaemonPing();
+  if (existing) throw new Error(`Agent Bridge daemon is already running at ${DAEMON_SOCKET}.`);
+  cleanupStaleDaemons();
+  try {
+    fs.rmSync(DAEMON_SOCKET, { force: true });
+  } catch {}
+
+  daemonServer = net.createServer(socket => {
+    const rl = readline.createInterface({ input: socket, crlfDelay: Infinity });
+    rl.on("line", line => {
+      if (!line.trim()) return;
+      let request;
+      try {
+        request = JSON.parse(line);
+      } catch (err) {
+        socket.write(`${JSON.stringify({ id: null, ok: false, error: `Invalid JSON: ${err instanceof Error ? err.message : String(err)}` })}\n`);
+        return;
+      }
+      handleDaemonRequest(request)
+        .then(result => socket.write(`${JSON.stringify({ id: request.id, ok: true, result })}\n`))
+        .catch(err =>
+          socket.write(
+            `${JSON.stringify({
+              id: request.id,
+              ok: false,
+              error: err instanceof Error ? err.message : String(err),
+            })}\n`,
+          ),
+        );
+    });
+  });
+
+  daemonServer.on("error", err => cleanupAndExit(1, "daemon server error", err));
+
+  await new Promise((resolve, reject) => {
+    daemonServer.once("error", reject);
+    daemonServer.listen(DAEMON_SOCKET, () => {
+      daemonServer.off("error", reject);
+      fs.chmodSync(DAEMON_SOCKET, 0o600);
+      fs.writeFileSync(DAEMON_PID_FILE, `${process.pid}\n`, "utf8");
+      resolve();
+    });
+  });
+
+  appendLog(path.join(LOG_DIR, "daemon.log"), `[${nowIso()}] Agent Bridge daemon ${BRIDGE_VERSION} listening at ${DAEMON_SOCKET}\n`);
+  const keepAlive = setInterval(() => {}, 60_000);
+  try {
+    await new Promise(resolve => daemonServer.once("close", resolve));
+  } finally {
+    clearInterval(keepAlive);
+  }
+}
+
+async function handleDaemonRequest(request) {
+  const params = request.params || {};
+  switch (request.method) {
+    case "ping":
+      return {
+        ok: true,
+        bridgeVersion: BRIDGE_VERSION,
+        pid: process.pid,
+        socket: DAEMON_SOCKET,
+        sessions: [...sessions.values()].map(session => session.summary()),
+      };
+    case "doctor":
+      return doctor();
+    case "cleanup":
+      return cleanupStalePidRecords();
+    case "open":
+      return await openSession(params);
+    case "send":
+      return await sendMessage(params);
+    case "sessions":
+      return await status(undefined);
+    case "status":
+      return await status(params.session_id);
+    case "result":
+      return await result(params.session_id);
+    case "abort":
+      return await abortSession(params.session_id);
+    case "close":
+      return closeSession(params.session_id);
+    case "stop": {
+      const sessionCount = sessions.size;
+      cleanupSessions({ removePidRecord: false });
+      setTimeout(() => {
+        try {
+          daemonServer?.close();
+        } catch {}
+        try {
+          fs.rmSync(DAEMON_SOCKET, { force: true });
+        } catch {}
+        try {
+          fs.rmSync(DAEMON_PID_FILE, { force: true });
+        } catch {}
+        process.exit(0);
+      }, 25).unref?.();
+      return { stopping: true, sessions_closed: sessionCount };
+    }
+    default:
+      throw new Error(`Unknown daemon method: ${request.method}`);
+  }
+}
+
+function cliOpenParams(args) {
+  const agent = args.agent || args._[0];
+  if (!agent) throw new Error("open requires --agent omp|opencode.");
+  return {
+    agent,
+    cwd: args.cwd || process.cwd(),
+    write: Boolean(args.write),
+    model: args.model,
+    effort: args.effort,
+    initial_prompt: args.initialPrompt,
+    wait: Boolean(args.wait),
+    timeout_ms: parseNumber(args.timeoutMs, undefined),
+  };
+}
+
+function cliSessionId(args, command) {
+  const sessionId = args.sessionId || args._[0];
+  if (!sessionId) throw new Error(`${command} requires a session_id.`);
+  return sessionId;
 }
 
 async function runCli(argv) {
@@ -1066,11 +1414,79 @@ async function runCli(argv) {
     case "serve-mcp":
       serveMcp();
       return;
+    case "daemon":
+    case "serve-daemon":
+      await serveDaemon();
+      return;
     case "doctor": {
       const value = doctor();
       process.stdout.write(args.json ? `${JSON.stringify(value, null, 2)}\n` : renderDoctor(value));
       return;
     }
+    case "cleanup": {
+      const ping = await tryDaemonPing();
+      printCliResult(
+        {
+          daemon: ping ? { running: true, pid: ping.pid, socket: ping.socket } : { running: false, ...cleanupStaleDaemons() },
+          child_processes: cleanupStalePidRecords(),
+        },
+        args,
+      );
+      return;
+    }
+    case "start":
+      printCliResult(await ensureDaemon(), args);
+      return;
+    case "stop": {
+      const ping = await tryDaemonPing();
+      if (!ping) {
+        cleanupStaleDaemons();
+        printCliResult({ stopping: false, running: false, socket: DAEMON_SOCKET, pid: daemonPid() }, args);
+        return;
+      }
+      printCliResult(await requestDaemon("stop", {}, { autoStart: false, timeoutMs: 5000 }), args);
+      return;
+    }
+    case "sessions":
+      printCliResult(await requestDaemon("sessions", {}, { timeoutMs: 10000 }), args);
+      return;
+    case "open":
+      printCliResult(await requestDaemon("open", cliOpenParams(args), { timeoutMs: 30000 }), args);
+      return;
+    case "send": {
+      const sessionId = cliSessionId(args, "send");
+      const message = args.message || args._.slice(1).join(" ");
+      if (!message.trim()) throw new Error("send requires a message.");
+      printCliResult(
+        await requestDaemon(
+          "send",
+          {
+            session_id: sessionId,
+            message,
+            wait: Boolean(args.wait),
+            timeout_ms: parseNumber(args.timeoutMs, undefined),
+          },
+          { timeoutMs: parseNumber(args.timeoutMs, DEFAULT_WAIT_TIMEOUT_MS) + 30000 },
+        ),
+        args,
+      );
+      return;
+    }
+    case "status":
+      printCliResult(
+        await requestDaemon("status", { session_id: args.sessionId || args._[0] }, { timeoutMs: 10000 }),
+        args,
+      );
+      return;
+    case "result":
+      printCliResult(await requestDaemon("result", { session_id: cliSessionId(args, "result") }, { timeoutMs: 10000 }), args);
+      return;
+    case "abort":
+      printCliResult(await requestDaemon("abort", { session_id: cliSessionId(args, "abort") }, { timeoutMs: 10000 }), args);
+      return;
+    case "close":
+      printCliResult(await requestDaemon("close", { session_id: cliSessionId(args, "close") }, { timeoutMs: 10000 }), args);
+      return;
     case undefined:
     case "help":
     case "--help":
@@ -1173,10 +1589,21 @@ function cleanupSessions(options = {}) {
 function cleanupAndExit(code = 0, reason = "shutdown", error = null) {
   if (shuttingDown) return;
   shuttingDown = true;
+  appendLog(path.join(LOG_DIR, "daemon.log"), `[${nowIso()}] Agent Bridge shutdown code=${code} reason=${reason}\n`);
   if (error) {
     process.stderr.write(`${reason}: ${error instanceof Error ? error.stack || error.message : String(error)}\n`);
   }
   cleanupSessions({ removePidRecord: false });
+  try {
+    daemonServer?.close();
+  } catch {}
+  const ownsDaemonState = Boolean(daemonServer) || daemonPid() === process.pid;
+  try {
+    if (ownsDaemonState && fs.existsSync(DAEMON_SOCKET)) fs.rmSync(DAEMON_SOCKET, { force: true });
+  } catch {}
+  try {
+    if (ownsDaemonState && fs.existsSync(DAEMON_PID_FILE) && daemonPid() === process.pid) fs.rmSync(DAEMON_PID_FILE, { force: true });
+  } catch {}
   process.exit(code);
 }
 
@@ -1190,6 +1617,9 @@ function installProcessHandlers() {
   process.once("unhandledRejection", err => cleanupAndExit(1, "unhandledRejection", err));
   process.once("exit", () => {
     if (!shuttingDown) cleanupSessions({ removePidRecord: false });
+  });
+  process.once("beforeExit", code => {
+    appendLog(path.join(LOG_DIR, "daemon.log"), `[${nowIso()}] Agent Bridge beforeExit code=${code}\n`);
   });
   process.stdout.on("error", err => {
     if (err?.code === "EPIPE") cleanupAndExit(0, "stdout closed");
