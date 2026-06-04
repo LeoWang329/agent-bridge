@@ -117,3 +117,5 @@ Keep `write: false` for review, diagnosis, planning, or research. Set `write: tr
 ## Development
 
 See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
+
+For planned work and TODOs, see [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md).
