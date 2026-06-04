@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "agent-bridge": {
+      "command": "node",
+      "args": [
+        "./scripts/agent-bridge.mjs",
+        "mcp"
+      ],
+      "cwd": "."
+    }
+  }
+}

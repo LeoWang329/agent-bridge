@@ -1,0 +1,41 @@
+{
+  "name": "agent-bridge",
+  "version": "0.2.1",
+  "description": "Persistent RPC bridge from Codex to OMP and OpenCode.",
+  "author": {
+    "name": "LeoWang329"
+  },
+  "homepage": "https://github.com/LeoWang329/agent-bridge",
+  "license": "MIT",
+  "keywords": [
+    "agent",
+    "bridge",
+    "omp",
+    "opencode",
+    "mcp",
+    "rpc"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Agent Bridge",
+    "shortDescription": "Use persistent OMP and OpenCode sessions from Codex",
+    "longDescription": "Agent Bridge gives Codex a persistent session bridge to local OMP and OpenCode agents. Codex opens a delegated-agent session, sends messages into it, polls status/result, can abort active turns, and closes the session when finished.",
+    "developerName": "LeoWang329",
+    "category": "Productivity",
+    "capabilities": [
+      "Tool",
+      "Interactive",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Open an OMP session and ask for a second pass",
+      "Use OpenCode to investigate this repository",
+      "Delegate a write-capable fix to OMP"
+    ],
+    "brandColor": "#2563EB",
+    "websiteURL": "https://github.com/LeoWang329/agent-bridge",
+    "privacyPolicyURL": "https://github.com/LeoWang329/agent-bridge",
+    "termsOfServiceURL": "https://github.com/LeoWang329/agent-bridge"
+  }
+}
