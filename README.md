@@ -144,6 +144,8 @@ Codex should use the bridge like this:
 
 Keep `write: false` for review, diagnosis, planning, or research. Set `write: true` only when the user explicitly wants the delegated agent to edit files.
 
+You can also pin a model and reasoning effort when opening a session. These are per-session — they are set on `agent_bridge_open_session` and cannot be changed per message, so open a new session to switch models. Pass `model` (forwarded verbatim to the backend's `--model`) and optional `effort`, which maps to OMP's `--thinking` (`minimal|low|medium|high|xhigh`) and OpenCode's `--variant`. Omit both to use each backend's default.
+
 ## Use With Claude Code
 
 Agent Bridge is a standard stdio MCP server, so Claude Code can use it with no code changes — it speaks the same MCP protocol as Codex. You only need to register the server, and the backend agents must already be installed (see [Requirements](#requirements)).

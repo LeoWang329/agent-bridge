@@ -220,6 +220,18 @@ Codex 使用 Agent Bridge 时应该遵循这个流程：
 }
 ```
 
+可以在**打开会话时**指定模型与推理强度。模型是会话级参数：在 `agent_bridge_open_session` 时用 `model` 指定，整个会话内固定，`agent_bridge_send_message` 不能逐条切换；想换模型就新开一个 session。`model` 会原样传给后端的 `--model`，取值格式由后端决定。可选的 `effort` 在 OMP 映射为 `--thinking`（`minimal|low|medium|high|xhigh`），在 OpenCode 映射为 `--variant`。不传 `model` / `effort` 时使用后端默认值。
+
+```json
+{
+  "agent": "omp",
+  "cwd": "/absolute/path/to/workspace",
+  "write": false,
+  "model": "<模型名>",
+  "effort": "high"
+}
+```
+
 ## 7. CLI facade
 
 CLI facade 会自动启动一个本地 Agent Bridge daemon，并通过 Unix socket 和它通信。这样 `open`、`send`、`status`、`result`、`close` 可以跨多次 CLI 调用复用同一个持久 session。
@@ -240,6 +252,12 @@ node scripts/agent-bridge.mjs sessions --json
 
 ```sh
 node scripts/agent-bridge.mjs open --agent omp --cwd "$PWD" --json
+```
+
+也可以在打开时指定模型与推理强度（`--model` / `--effort`，均为会话级）：
+
+```sh
+node scripts/agent-bridge.mjs open --agent opencode --cwd "$PWD" --model "<模型名>" --effort medium --json
 ```
 
 发送消息：
