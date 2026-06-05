@@ -1,8 +1,8 @@
 # Agent Bridge 安装与使用
 
-这份文档面向想把 Agent Bridge 装进 Codex 并实际调用 OMP/OpenCode 的用户。
+这份文档面向想把 Agent Bridge 装进 Codex 或 Claude Code 并实际调用 OMP/OpenCode 的用户。
 
-Agent Bridge 是一个 session-first 的 Codex MCP 插件。它不是一次性命令封装，而是让 Codex 先打开一个持久会话，再向同一个会话连续发送消息，最后显式关闭会话。
+Agent Bridge 是一个 session-first 的 MCP 桥接器（可作为 Codex 插件使用，也可以直接注册到 Claude Code）。它不是一次性命令封装，而是让客户端先打开一个持久会话，再向同一个会话连续发送消息，最后显式关闭会话。
 
 ## 1. 前置依赖
 
@@ -19,10 +19,12 @@ sqlite3 --version
 最低要求：
 
 - Node.js 20 或更高
-- Codex CLI 或 Codex app
-- OMP 已安装，并且 `omp` 在 PATH 中
-- OpenCode 已安装，并且 `opencode` 在 PATH 中
+- 一个 MCP 客户端：Codex（CLI 或 app）或 Claude Code
+- OMP 已安装，并且 `omp` 在 PATH 中（如果要委托给 OMP）
+- OpenCode 已安装，并且 `opencode` 在 PATH 中（如果要委托给 OpenCode）
 - `sqlite3` 在 PATH 中，用于 OpenCode 结果兜底读取
+
+**必须先装好要委托的 coding agent。** Agent Bridge 只是桥接到 OMP / OpenCode，本身不包含也不会自动安装它们。如果对应后端没装，session 根本无法启动。请先把你打算委托的后端装好，再用 `node scripts/agent-bridge.mjs doctor` 确认每个后端都被检测到。
 
 如果 OMP 或 OpenCode 不在 PATH 中，可以用环境变量覆盖：
 
@@ -133,7 +135,48 @@ codex -a never -s danger-full-access -C "$PWD" exec --json --skip-git-repo-check
 
 这个测试只会启动、查看、关闭会话，不会让 OMP/OpenCode 执行具体任务。
 
-## 5. 使用方式
+## 5. 在 Claude Code 中使用
+
+Agent Bridge 是标准的 stdio MCP server，和 Codex 用的是同一套 MCP 协议，所以 Claude Code 无需改任何代码即可使用，只需要注册这个 server。同样需要先装好后端 coding agent（见第 1 节）。
+
+在 Claude Code 里，这些工具会带命名空间前缀，例如 `mcp__agent-bridge__agent_bridge_open_session`、`mcp__agent-bridge__agent_bridge_send_message`。
+
+### 5.1 项目级（仅当前仓库）
+
+Claude Code 会自动识别仓库根目录的 `.mcp.json`。在仓库根目录运行 `claude`，按提示批准 `agent-bridge` server，然后确认：
+
+```sh
+claude mcp list
+```
+
+仓库自带的 `.mcp.json` 用的是相对路径（`./scripts/agent-bridge.mjs`），所以项目级注册只在「从仓库根目录启动 Claude Code」时才能解析到。
+
+### 5.2 用户级（任意目录可用，推荐）
+
+用绝对路径注册一次，之后在任何目录的 Claude Code 会话里都能用：
+
+```sh
+claude mcp add agent-bridge --scope user -- node "$PWD/scripts/agent-bridge.mjs" mcp
+```
+
+在仓库根目录执行这条命令，`$PWD` 会展开成绝对路径。以后想移除：
+
+```sh
+claude mcp remove agent-bridge --scope user
+```
+
+### 5.3 可选：安装 skill
+
+`skills/agent-bridge/SKILL.md` 里的中文使用指引与 Claude Code skill 兼容，软链到用户 skill 目录即可：
+
+```sh
+mkdir -p ~/.claude/skills
+ln -sfn "$PWD/skills/agent-bridge" ~/.claude/skills/agent-bridge
+```
+
+不装 skill 也能直接调用 MCP 工具，skill 只是补充「何时该委托」的判断指引。会话流程（open → send → status/result → 复用 → close）以及写权限、清理规则都与 Codex 完全一致。
+
+## 6. 使用方式
 
 Codex 正式调用 Agent Bridge 时，应该优先使用 MCP 工具。CLI facade 主要给人类调试、smoke test、清理残留进程、临时操作使用。
 
@@ -177,7 +220,7 @@ Codex 使用 Agent Bridge 时应该遵循这个流程：
 }
 ```
 
-## 6. CLI facade
+## 7. CLI facade
 
 CLI facade 会自动启动一个本地 Agent Bridge daemon，并通过 Unix socket 和它通信。这样 `open`、`send`、`status`、`result`、`close` 可以跨多次 CLI 调用复用同一个持久 session。
 
@@ -233,7 +276,7 @@ node scripts/agent-bridge.mjs cleanup --json
 
 `cleanup` 会跳过仍由当前 MCP server 或 CLI daemon 拥有的进程，只清理 stale pid record 和确认已失去 owner 的子进程。
 
-## 7. UI 实时监控
+## 8. UI 实时监控
 
 启动本地 Web UI：
 
@@ -241,9 +284,16 @@ node scripts/agent-bridge.mjs cleanup --json
 node scripts/agent-bridge.mjs ui
 ```
 
-默认会自动启动或复用 `agent-bridge daemon`，并只监听 `127.0.0.1:<port>`。命令会打开浏览器；如果你只想拿到 URL：
+默认会自动启动或复用 `agent-bridge daemon`，只监听 `127.0.0.1`，随机选一个空闲端口并自动打开浏览器。命令会打印实际地址，例如 `Agent Bridge UI: http://127.0.0.1:52799`。无需提前手动 `start` daemon，`ui` 会自动拉起或复用它。
+
+参数：
+
+- `--port PORT` 固定端口（默认随机空闲端口）
+- `--no-open` 不打开浏览器，只打印地址（适合远程 / 无头环境）
+- `--json` 以 JSON 打印地址（同样不打开浏览器）
 
 ```sh
+node scripts/agent-bridge.mjs ui --port 8787
 node scripts/agent-bridge.mjs ui --no-open --json
 ```
 
@@ -272,7 +322,7 @@ POST   /daemon/stop
 
 `/sessions/:id/events` 是 Server-Sent Events 流。默认输出状态事件和 assistant 可见文本；完整 thinking/raw internal payload 不会在主输出区展示。
 
-## 8. 写权限模式
+## 9. 写权限模式
 
 默认使用 `write: false`。适合：
 
@@ -296,7 +346,7 @@ POST   /daemon/stop
 
 让委托代理改完后，Codex 自己仍然应该检查 git diff、运行测试，再向用户报告。
 
-## 9. 会话和进程清理
+## 10. 会话和进程清理
 
 正常关闭会话：
 
@@ -329,7 +379,7 @@ ps -axo pid,ppid,command | rg 'agent-bridge|omp --mode rpc|opencode serve' || tr
 find "$HOME/.agent-bridge/pids" -type f -maxdepth 1 -print 2>/dev/null || true
 ```
 
-## 10. 升级
+## 11. 升级
 
 ```sh
 cd "$HOME/projects/agent-bridge"
@@ -347,7 +397,7 @@ codex plugin list | rg agent-bridge
 codex mcp list | rg agent-bridge
 ```
 
-## 11. 卸载
+## 12. 卸载
 
 如果 Codex CLI 支持插件移除命令，可以使用对应的 `codex plugin` 子命令卸载。
 
@@ -369,7 +419,7 @@ node scripts/agent-bridge.mjs stop
 rm -rf "$HOME/.agent-bridge"
 ```
 
-## 12. 常见问题
+## 13. 常见问题
 
 ### `agent_bridge_doctor` 找不到 OMP
 

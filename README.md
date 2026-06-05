@@ -1,6 +1,6 @@
 # Agent Bridge
 
-Agent Bridge is a session-first MCP bridge that lets Codex delegate work to local OMP and OpenCode agents.
+Agent Bridge is a session-first MCP bridge that lets MCP clients such as Codex and Claude Code delegate work to local OMP and OpenCode agents.
 
 It is intentionally not a one-shot command wrapper. Codex opens a delegated-agent session, sends one or more messages into that same session, checks status/result, can abort the active turn, and closes the session when the work is done.
 
@@ -40,27 +40,50 @@ node scripts/agent-bridge.mjs stop
 
 ## Web UI Monitor
 
-The UI monitor starts or reuses the local daemon, then serves a localhost-only HTTP/SSE facade:
+The UI monitor starts or reuses the local daemon, then serves a localhost-only HTTP/SSE facade. It binds to `127.0.0.1` only and, by default, picks a free port and opens your browser automatically:
 
 ```sh
 node scripts/agent-bridge.mjs ui
 ```
 
-For automation or headless checks:
+You do not need to start the daemon first — `ui` auto-starts (or reuses) it. The command prints the address it bound to, for example `Agent Bridge UI: http://127.0.0.1:52799`.
+
+Flags:
+
+- `--port PORT` pins a fixed port (default is a random free port).
+- `--no-open` skips opening the browser and just prints the address (useful for headless or remote use).
+- `--json` prints the address as JSON (also skips opening the browser).
 
 ```sh
+node scripts/agent-bridge.mjs ui --port 8787
 node scripts/agent-bridge.mjs ui --no-open --json
 ```
 
 The monitor exposes `GET /sessions`, `POST /sessions`, `GET /sessions/:id`, `POST /sessions/:id/messages`, `GET /sessions/:id/result`, `GET /sessions/:id/events`, `POST /sessions/:id/abort`, `DELETE /sessions/:id`, and `POST /daemon/stop`. SSE events stream status changes and assistant-visible text while raw/debug JSON stays behind the collapsible Debug panel.
 
+The UI keeps running in the background together with the daemon. Stop everything (UI, daemon, and any daemon-owned sessions) with:
+
+```sh
+node scripts/agent-bridge.mjs stop
+```
+
+> Tip: alias the CLI for convenience, e.g. `alias agent-bridge='node /absolute/path/to/agent-bridge/scripts/agent-bridge.mjs'`, then run `agent-bridge ui` from any directory.
+
 ## Requirements
 
 - Node.js 20 or newer
-- Codex CLI or Codex app with MCP/plugin support
-- OMP installed and available as `omp`
-- OpenCode installed and available as `opencode`
+- An MCP client: Codex (CLI or app with MCP/plugin support) or Claude Code
+- OMP installed and available as `omp` (if you delegate to OMP)
+- OpenCode installed and available as `opencode` (if you delegate to OpenCode)
 - `sqlite3` on PATH for the OpenCode result fallback
+
+**Install the delegated coding agents first.** Agent Bridge only bridges to OMP and OpenCode; it does not bundle or install them. If the backend you want to delegate to is not installed, the session cannot start. Install at least the backend(s) you plan to use before opening a session, then confirm each one is detected:
+
+```sh
+node scripts/agent-bridge.mjs doctor
+```
+
+`doctor` reports `ok` for each backend it finds and flags anything missing, so run it whenever a session fails to open.
 
 You can override binary paths with environment variables:
 
@@ -90,9 +113,9 @@ node scripts/agent-bridge.mjs cleanup
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | node scripts/agent-bridge.mjs mcp
 ```
 
-## Install As A Codex Plugin
+## Use With Codex
 
-This repository is laid out as a Codex plugin:
+Codex consumes Agent Bridge as a plugin that registers the MCP server, so no code changes are needed — make sure the backend agents are installed first (see [Requirements](#requirements)). This repository is already laid out as a Codex plugin:
 
 - `.codex-plugin/plugin.json`
 - `.mcp.json`
@@ -120,6 +143,43 @@ Codex should use the bridge like this:
 5. Call `agent_bridge_close_session` when finished.
 
 Keep `write: false` for review, diagnosis, planning, or research. Set `write: true` only when the user explicitly wants the delegated agent to edit files.
+
+## Use With Claude Code
+
+Agent Bridge is a standard stdio MCP server, so Claude Code can use it with no code changes — it speaks the same MCP protocol as Codex. You only need to register the server, and the backend agents must already be installed (see [Requirements](#requirements)).
+
+In Claude Code the tools appear namespaced, for example `mcp__agent-bridge__agent_bridge_open_session` and `mcp__agent-bridge__agent_bridge_send_message`.
+
+### Project scope (this repository)
+
+Claude Code automatically detects the project `.mcp.json` at the repository root. Launch `claude` from the repository root and approve the `agent-bridge` server when prompted, then confirm with:
+
+```sh
+claude mcp list
+```
+
+The bundled `.mcp.json` uses a relative path (`./scripts/agent-bridge.mjs`), so project scope only resolves when Claude Code is launched from the repository root.
+
+### User scope (available in every directory)
+
+Register the server once with an absolute path so the tools are available in any Claude Code session:
+
+```sh
+claude mcp add agent-bridge --scope user -- node "$PWD/scripts/agent-bridge.mjs" mcp
+```
+
+Run that from the repository root so `$PWD` expands to an absolute path. Remove it later with `claude mcp remove agent-bridge --scope user`.
+
+### Optional: install the skill
+
+The usage guidance in `skills/agent-bridge/SKILL.md` is compatible with Claude Code skills. Link it into your user skills directory:
+
+```sh
+mkdir -p ~/.claude/skills
+ln -sfn "$PWD/skills/agent-bridge" ~/.claude/skills/agent-bridge
+```
+
+The MCP tools work without the skill; it only adds guidance on when to delegate. The session workflow (open → send → status/result → reuse → close) and the safety rules below are identical to the Codex workflow.
 
 ## Safety Notes
 
