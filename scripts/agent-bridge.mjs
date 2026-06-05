@@ -755,8 +755,10 @@ class OpenCodeServerSession {
     this.sseBuffer = "";
     this.sseReconnectTimer = null;
     this.sseAttempts = 0;
+    this.sseConnected = false;
     this.sseDead = false;
     this.drainTerminal = 0;
+    this.finalizing = false;
     this.turn = null;
     this.partText = new Map();
     this.assistantMsgIds = new Set();
@@ -828,7 +830,7 @@ class OpenCodeServerSession {
     if (this.status === "closed") throw new Error(`OpenCode session ${this.id} is closed.`);
     if (this.sseDead) throw new Error(`OpenCode session ${this.id} lost its event stream; recreate the session.`);
     if (!this.server || this.server.exitCode !== null) throw new Error(`OpenCode server for ${this.id} is not running.`);
-    if (this.turn) throw new Error(`OpenCode session ${this.id} already has a running turn.`);
+    if (this.turn || this.finalizing) throw new Error(`OpenCode session ${this.id} already has a running turn.`);
 
     this.partText = new Map();
     this.assistantMsgIds = new Set();
@@ -840,10 +842,15 @@ class OpenCodeServerSession {
     if (this.effort) body.variant = this.effort;
     if (!this.write) body.tools = { bash: false, edit: false, write: false, apply_patch: false, task: false };
 
+    // Ensure the event stream is connected before prompting, so a fast turn cannot
+    // finish (emit session.idle) before any observer is attached.
+    await this.#waitForSse();
+
     setSessionStatus(this, "running", true, { source: "send" });
     const done = new Promise((resolve, reject) => {
       this.turn = { resolve, reject };
     });
+    const myTurn = this.turn;
     // Attach a handler now so a turn that rejects before a waiter is attached
     // (SSE drop / session.error during the POST) cannot trip the process-level
     // unhandledRejection handler and take down the whole daemon.
@@ -854,16 +861,24 @@ class OpenCodeServerSession {
     try {
       resp = await this.#http("POST", `/session/${this.openCodeSessionId}/prompt_async`, body);
     } catch (err) {
-      this.turn = null;
-      this.lastError = err instanceof Error ? err.message : String(err);
-      setSessionStatus(this, "idle", false, { source: "prompt_error" });
+      // Only mutate state if this is still our turn; abort()/close() may have run
+      // during the POST and already settled it (don't flip a closed session to idle).
+      if (this.turn === myTurn) {
+        this.turn = null;
+        this.lastError = err instanceof Error ? err.message : String(err);
+        if (this.status !== "closed") setSessionStatus(this, "idle", false, { source: "prompt_error" });
+      }
       throw err instanceof Error ? err : new Error(this.lastError);
+    }
+    if (this.turn !== myTurn) {
+      // Aborted/closed while the prompt POST was in flight; the turn is already settled.
+      return { accepted: false, session_id: this.id, status: this.status, server_url: this.serverUrl };
     }
     if (resp.status >= 400) {
       this.turn = null;
       const err = new Error(`opencode prompt failed: ${resp.status} ${String(resp.body).slice(0, 300)}`);
       this.lastError = err.message;
-      setSessionStatus(this, "failed", false, { source: "prompt_error", code: resp.status });
+      if (this.status !== "closed") setSessionStatus(this, "failed", false, { source: "prompt_error", code: resp.status });
       throw err;
     }
 
@@ -931,6 +946,7 @@ class OpenCodeServerSession {
           let d = "";
           res.setEncoding("utf8");
           res.on("data", c => (d += c));
+          res.on("error", reject);
           res.on("end", () => {
             let json = null;
             try {
@@ -957,7 +973,12 @@ class OpenCodeServerSession {
       }
       res.setEncoding("utf8");
       this.sseAttempts = 0;
+      this.sseConnected = true;
       res.on("data", chunk => this.#consumeSse(chunk));
+      res.on("error", err => {
+        appendLog(this.logFile, `[agent-bridge] event stream response error: ${err.message}\n`);
+        this.#onEventStreamGone(err);
+      });
       res.on("end", () => {
         appendLog(this.logFile, "[agent-bridge] opencode event stream ended\n");
         this.#onEventStreamGone(new Error("event stream ended"));
@@ -981,11 +1002,27 @@ class OpenCodeServerSession {
     timer.unref?.();
   }
 
+  async #waitForSse(timeoutMs = 10000) {
+    // The SSE stream is how we observe turn completion. Don't send a prompt until it
+    // is actually connected, or a fast turn could finish before any observer attaches
+    // and its session.idle would be missed.
+    if (this.sseConnected) return;
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+      if (this.sseConnected) return;
+      if (this.sseDead || this.status === "closed") throw new Error("opencode event stream is not available");
+      if (!this.server || this.server.exitCode !== null) throw new Error("opencode server is not running");
+      await sleep(50);
+    }
+    throw new Error("timed out waiting for opencode event stream to connect");
+  }
+
   #onEventStreamGone(err) {
     // The event stream is how we observe turn completion. If it drops while the
     // server is still up and a turn is active, settle the turn instead of hanging.
     if (this.status === "closed") return;
     this.sse = null;
+    this.sseConnected = false;
     // Drop any partial frame; its bytes must not be prepended to the next stream.
     this.sseBuffer = "";
     if (this.turn) {
@@ -1124,16 +1161,23 @@ class OpenCodeServerSession {
 
   #settleTurn(err) {
     const turn = this.turn;
-    if (!turn) return;
-    this.turn = null;
+    if (!turn || this.finalizing) return;
     this.turnCount += 1;
     this.updatedAt = nowIso();
     if (err) {
+      this.turn = null;
       setSessionStatus(this, "failed", false, { source: "turn_error", error: err.message });
       turn.reject(err);
       return;
     }
+    // Keep this.turn occupied through finalization so a concurrent (non-wait) send
+    // cannot start and have its text/status clobbered by this turn's late finalizer.
+    this.finalizing = true;
     this.#finalizeText().finally(() => {
+      this.finalizing = false;
+      // close()/abort() may have run during finalization; don't resurrect a closed session.
+      if (this.status === "closed") return;
+      this.turn = null;
       setSessionStatus(this, "idle", false, { source: "idle" });
       turn.resolve();
     });
@@ -1547,6 +1591,7 @@ class CodexAppServerSession {
     const done = new Promise((resolve, reject) => {
       this.turn = { resolve, reject };
     });
+    const myTurn = this.turn;
     // Guard against unhandledRejection taking down the daemon if the turn rejects
     // (process crash / error notification) before a waiter is attached below.
     done.catch(() => {});
@@ -1565,12 +1610,26 @@ class CodexAppServerSession {
         "Timed out starting Codex turn.",
       );
     } catch (err) {
-      this.turn = null;
-      this.lastError = err instanceof Error ? err.message : String(err);
-      setSessionStatus(this, "idle", false, { source: "turn_start_error" });
+      if (this.turn === myTurn) {
+        this.turn = null;
+        this.lastError = err instanceof Error ? err.message : String(err);
+        if (this.status !== "closed") setSessionStatus(this, "idle", false, { source: "turn_start_error" });
+      }
       throw err instanceof Error ? err : new Error(this.lastError);
     }
-    this.currentTurnId = turnResp?.turn?.id || this.currentTurnId;
+    const startedTurnId = turnResp?.turn?.id || null;
+    if (this.turn !== myTurn) {
+      // abort()/close() ran while turn/start was in flight, so it couldn't interrupt a
+      // turn whose id was still unknown. Interrupt it now and ignore its trailing events.
+      if (startedTurnId) {
+        this.#ignoreTurn(startedTurnId);
+        if (this.threadId && this.proc && this.proc.exitCode === null) {
+          this.#request("turn/interrupt", { threadId: this.threadId, turnId: startedTurnId }).catch(() => {});
+        }
+      }
+      return { accepted: false, session_id: this.id, status: this.status };
+    }
+    this.currentTurnId = startedTurnId || this.currentTurnId;
     const initialStatus = turnResp?.turn?.status;
     // Only a known-terminal status from the start response settles synchronously;
     // queued/pending/inProgress/unknown stay in flight and are driven by notifications.
@@ -1670,9 +1729,9 @@ class CodexAppServerSession {
     try {
       this.proc?.stdin?.end();
     } catch {}
-    const turn = this.turn;
-    this.turn = null;
-    turn?.reject?.(new Error("session closed"));
+    // Reject the active turn AND every in-flight RPC (turn/start, turn/interrupt, ...)
+    // so nothing is left pending; the proc "close" handler early-returns once closed.
+    this.#rejectAll(new Error("session closed"));
     const pid = this.proc?.pid;
     terminateProcessTree(pid);
     scheduleForceKill(pid);
