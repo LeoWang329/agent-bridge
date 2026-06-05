@@ -36,6 +36,11 @@ const AGENTS = {
     env: "OPENCODE_BIN",
     bin: "opencode",
   },
+  codex: {
+    label: "Codex",
+    env: "CODEX_BIN",
+    bin: "codex",
+  },
 };
 
 const sessions = new Map();
@@ -50,11 +55,11 @@ const TOOLS = [
   {
     name: "agent_bridge_open_session",
     description:
-      "Open a persistent delegated-agent session. OMP uses its JSONL RPC mode; OpenCode starts a persistent opencode serve backend. Use this before sending messages.",
+      "Open a persistent delegated-agent session. OMP uses its JSONL RPC mode; OpenCode drives a persistent opencode serve backend over its HTTP/SSE API; Codex drives a persistent codex app-server over JSON-RPC. Use this before sending messages.",
     inputSchema: {
       type: "object",
       properties: {
-        agent: { type: "string", enum: ["omp", "opencode"], description: "Agent backend to open." },
+        agent: { type: "string", enum: ["omp", "opencode", "codex"], description: "Agent backend to open: omp, opencode, or codex." },
         cwd: { type: "string", description: "Absolute workspace directory for the delegated agent." },
         write: {
           type: "boolean",
@@ -65,7 +70,7 @@ const TOOLS = [
         effort: {
           type: "string",
           description:
-            "Optional reasoning effort. OMP accepts minimal|low|medium|high|xhigh. OpenCode receives this as --variant.",
+            "Optional reasoning effort. OMP maps it to --thinking (minimal|low|medium|high|xhigh). OpenCode sends it as the prompt variant. Codex sends it as the turn effort (none|minimal|low|medium|high|xhigh).",
         },
         initial_prompt: { type: "string", description: "Optional first message to send after opening." },
         wait: {
@@ -160,7 +165,7 @@ function usage() {
     "  agent-bridge stop [--json]",
     "  agent-bridge ui [--port PORT] [--no-open] [--json]",
     "  agent-bridge sessions [--json]",
-    "  agent-bridge open --agent omp|opencode [--cwd DIR] [--write] [--json]",
+    "  agent-bridge open --agent omp|opencode|codex [--cwd DIR] [--write] [--model M] [--effort E] [--json]",
     "  agent-bridge send <session_id> <message...> [--wait] [--json]",
     "  agent-bridge status [session_id] [--json]",
     "  agent-bridge result <session_id> [--json]",
@@ -186,7 +191,7 @@ function makeId(prefix) {
 }
 
 function assertAgent(agent) {
-  if (!AGENTS[agent]) throw new Error(`Unsupported agent "${agent}". Use omp or opencode.`);
+  if (!AGENTS[agent]) throw new Error(`Unsupported agent "${agent}". Use omp, opencode, or codex.`);
 }
 
 function assertCwd(cwd) {
@@ -359,6 +364,7 @@ function roleMatchesCommand(role, command) {
   if (role === "opencode-run") {
     return /\bopencode\b/.test(command) && /\brun\b/.test(command) && /--attach\b/.test(command);
   }
+  if (role === "codex-app-server") return /\bcodex\b/.test(command) && /\bapp-server\b/.test(command);
   return false;
 }
 
@@ -713,19 +719,19 @@ class OpenCodeServerSession {
     this.isStreaming = false;
     this.server = null;
     this.serverUrl = null;
-    this.currentClient = null;
     this.openCodeSessionId = null;
     this.turnCount = 0;
     this.lastAssistantText = "";
-    this.lastRawOutput = "";
-    this.stdoutBuffer = "";
     this.lastError = null;
     this.events = [];
     this.logFile = path.join(LOG_DIR, `${this.id}.log`);
     this.pidFile = pidRecordPath(this.id);
     this.serverArgs = null;
-    this.currentClientArgs = null;
-    this.expectedClientExit = false;
+    this.sse = null;
+    this.sseBuffer = "";
+    this.turn = null;
+    this.partText = new Map();
+    this.assistantMsgIds = new Set();
   }
 
   async start() {
@@ -748,17 +754,24 @@ class OpenCodeServerSession {
       this.lastError = clampText(stripAnsi(text), 4000);
     });
     this.server.on("close", code => {
-      if (!this.currentClient) removePidRecord(this.pidFile);
-      else this.#writePidRecord();
+      removePidRecord(this.pidFile);
       if (this.status === "closed") return;
-      if (this.status !== "closed") {
-        this.lastError = `opencode serve exited with code ${code}`;
-        setSessionStatus(this, "failed", false, { source: "server_close", code });
-      }
+      this.lastError = `opencode serve exited with code ${code}`;
+      setSessionStatus(this, "failed", false, { source: "server_close", code });
+      const turn = this.turn;
+      this.turn = null;
+      turn?.reject?.(new Error(this.lastError));
     });
 
     try {
       await waitForHttp(this.serverUrl, 20000, () => this.server?.exitCode !== null);
+      const created = await this.#http("POST", "/session", {});
+      if (created.status >= 400 || !created.json?.id) {
+        throw new Error(`opencode create session failed: ${created.status} ${String(created.body).slice(0, 200)}`);
+      }
+      this.openCodeSessionId = created.json.id;
+      appendLog(this.logFile, `[agent-bridge] opencode session ${this.openCodeSessionId}\n`);
+      this.#openEventStream();
       setSessionStatus(this, "idle", false, { source: "ready" });
       this.#writePidRecord();
       return this;
@@ -771,91 +784,39 @@ class OpenCodeServerSession {
 
   async send(message, options = {}) {
     if (!message || !String(message).trim()) throw new Error("message is required.");
-    if (this.currentClient) throw new Error(`OpenCode session ${this.id} already has a running turn.`);
+    if (this.turn) throw new Error(`OpenCode session ${this.id} already has a running turn.`);
 
-    const args = [
-      "run",
-      "--attach",
-      this.serverUrl,
-      "--dir",
-      this.cwd,
-      "--format",
-      "json",
-    ];
-    if (this.openCodeSessionId) args.push("--session", this.openCodeSessionId);
-    else if (this.turnCount > 0) args.push("--continue");
-    if (this.model) args.push("--model", this.model);
-    if (this.effort) args.push("--variant", this.effort);
-    if (this.write) args.push("--dangerously-skip-permissions");
-    args.push(String(message));
-
-    appendLog(this.logFile, `$ ${[agentBin("opencode"), ...args.map(shellQuote)].join(" ")}\n`);
+    this.partText = new Map();
+    this.assistantMsgIds = new Set();
     this.lastAssistantText = "";
-    this.lastRawOutput = "";
-    this.stdoutBuffer = "";
+
+    const body = { parts: [{ type: "text", text: String(message) }] };
+    const model = this.#modelObject();
+    if (model) body.model = model;
+    if (this.effort) body.variant = this.effort;
+    if (!this.write) body.tools = { bash: false, edit: false, write: false, apply_patch: false, task: false };
+
     setSessionStatus(this, "running", true, { source: "send" });
-
     const done = new Promise((resolve, reject) => {
-      const child = spawn(agentBin("opencode"), args, {
-        cwd: this.cwd,
-        env: process.env,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-      this.currentClient = child;
-      this.currentClientArgs = args;
-      this.#writePidRecord();
-
-      child.stdout.on("data", chunk => {
-        const text = chunk.toString("utf8");
-        this.lastRawOutput = clampText(this.lastRawOutput + text);
-        appendLog(this.logFile, text);
-        this.#consumeJsonLines(text);
-      });
-      child.stderr.on("data", chunk => {
-        const text = chunk.toString("utf8");
-        appendLog(this.logFile, text);
-        this.lastError = clampText(stripAnsi(text), 4000);
-      });
-      child.on("error", err => {
-        this.currentClient = null;
-        this.currentClientArgs = null;
-        this.#writePidRecord();
-        this.lastError = err.message;
-        setSessionStatus(this, "failed", false, { source: "client_error", error: err.message });
-        reject(err);
-      });
-      child.on("close", code => {
-        const expectedExit = this.expectedClientExit || this.status === "closed";
-        this.expectedClientExit = false;
-        this.currentClient = null;
-        this.currentClientArgs = null;
-        if (this.server && this.server.exitCode === null) this.#writePidRecord();
-        else removePidRecord(this.pidFile);
-        this.updatedAt = nowIso();
-        this.turnCount += 1;
-        this.#flushJsonBuffer();
-        if (expectedExit) {
-          setSessionStatus(this, this.status === "closed" ? "closed" : "idle", false, { source: "client_close", code });
-          resolve(this.result());
-          return;
-        }
-        if (code === 0) {
-          if (!this.lastAssistantText) this.lastAssistantText = extractLikelyText(this.lastRawOutput);
-          if (!this.lastAssistantText && this.openCodeSessionId) {
-            this.lastAssistantText = readOpenCodeAssistantTextFromDb(this.openCodeSessionId);
-          }
-          setSessionStatus(this, "idle", false, { source: "client_close", code });
-          resolve(this.result());
-        } else {
-          const err = new Error(this.lastError || `opencode run --attach exited with code ${code}`);
-          setSessionStatus(this, "failed", false, { source: "client_close", code, error: err.message });
-          reject(err);
-        }
-      });
+      this.turn = { resolve, reject };
     });
 
+    appendLog(this.logFile, `$ POST /session/${this.openCodeSessionId}/prompt_async write=${this.write}\n`);
+    const resp = await this.#http("POST", `/session/${this.openCodeSessionId}/prompt_async`, body);
+    if (resp.status >= 400) {
+      this.turn = null;
+      const err = new Error(`opencode prompt failed: ${resp.status} ${String(resp.body).slice(0, 300)}`);
+      this.lastError = err.message;
+      setSessionStatus(this, "failed", false, { source: "prompt_error", code: resp.status });
+      throw err;
+    }
+
     if (options.wait) {
-      return await withTimeout(done, options.timeout_ms || DEFAULT_WAIT_TIMEOUT_MS, "Timed out waiting for OpenCode turn.");
+      return await withTimeout(
+        done.then(() => this.result()),
+        options.timeout_ms || DEFAULT_WAIT_TIMEOUT_MS,
+        "Timed out waiting for OpenCode turn.",
+      );
     }
     done.catch(err => {
       this.lastError = err.message;
@@ -872,14 +833,6 @@ class OpenCodeServerSession {
         command: [agentBin("opencode"), ...(this.serverArgs || [])],
       });
     }
-    if (this.currentClient?.pid) {
-      processes.push({
-        role: "opencode-run",
-        pid: this.currentClient.pid,
-        command: [agentBin("opencode"), ...(this.currentClientArgs || [])],
-      });
-    }
-
     if (!processes.length) {
       removePidRecord(this.pidFile);
       return;
@@ -895,60 +848,526 @@ class OpenCodeServerSession {
     });
   }
 
-  #consumeJsonLines(text) {
-    this.stdoutBuffer += text;
-    const lines = this.stdoutBuffer.split(/\r?\n/);
-    this.stdoutBuffer = lines.pop() || "";
-    for (const rawLine of lines) {
-      const line = rawLine.trim();
-      if (!line.startsWith("{") && !line.startsWith("[")) continue;
+  #http(method, pathName, body) {
+    return new Promise((resolve, reject) => {
+      const u = new URL(this.serverUrl + pathName);
+      const data = body == null ? null : Buffer.from(JSON.stringify(body));
+      const req = http.request(
+        {
+          method,
+          hostname: u.hostname,
+          port: u.port,
+          path: u.pathname + u.search,
+          headers: { "content-type": "application/json", ...(data ? { "content-length": data.length } : {}) },
+        },
+        res => {
+          let d = "";
+          res.setEncoding("utf8");
+          res.on("data", c => (d += c));
+          res.on("end", () => {
+            let json = null;
+            try {
+              json = d ? JSON.parse(d) : null;
+            } catch {}
+            resolve({ status: res.statusCode, json, body: d });
+          });
+        },
+      );
+      req.on("error", reject);
+      if (data) req.write(data);
+      req.end();
+    });
+  }
+
+  #openEventStream() {
+    const req = http.get(this.serverUrl + "/event", res => {
+      res.setEncoding("utf8");
+      res.on("data", chunk => this.#consumeSse(chunk));
+      res.on("end", () => appendLog(this.logFile, "[agent-bridge] opencode event stream ended\n"));
+    });
+    req.on("error", err => appendLog(this.logFile, `[agent-bridge] event stream error: ${err.message}\n`));
+    this.sse = req;
+  }
+
+  #consumeSse(chunk) {
+    this.sseBuffer += chunk;
+    let idx;
+    while ((idx = this.sseBuffer.indexOf("\n\n")) >= 0) {
+      const frame = this.sseBuffer.slice(0, idx);
+      this.sseBuffer = this.sseBuffer.slice(idx + 2);
+      const dataStr = frame
+        .split("\n")
+        .filter(line => line.startsWith("data:"))
+        .map(line => line.slice(5).trim())
+        .join("");
+      if (!dataStr) continue;
+      let obj;
       try {
-        const parsed = JSON.parse(line);
-        const sessionId = findFirstKey(parsed, ["sessionID", "sessionId", "session_id"]);
-        if (typeof sessionId === "string") this.openCodeSessionId = sessionId;
-        const assistantText = extractAssistantText(parsed);
-        if (assistantText) this.lastAssistantText = clampText(this.lastAssistantText + assistantText);
-        pushEvent(this, compactEvent(parsed));
+        obj = JSON.parse(dataStr);
       } catch {
-        // OpenCode may emit non-JSON framing even in json mode; keep raw log.
+        continue;
       }
+      this.#onEvent(obj);
     }
   }
 
-  #flushJsonBuffer() {
-    const tail = this.stdoutBuffer.trim();
-    this.stdoutBuffer = "";
-    if (!tail || (!tail.startsWith("{") && !tail.startsWith("["))) return;
-    try {
-      const parsed = JSON.parse(tail);
-      const sessionId = findFirstKey(parsed, ["sessionID", "sessionId", "session_id"]);
-      if (typeof sessionId === "string") this.openCodeSessionId = sessionId;
-      const assistantText = extractAssistantText(parsed);
-      if (assistantText) this.lastAssistantText = clampText(this.lastAssistantText + assistantText);
-      pushEvent(this, compactEvent(parsed));
-    } catch {
-      // Keep the raw tail in the log when OpenCode closes after a partial JSON frame.
+  #onEvent(obj) {
+    const type = String(obj?.type || "");
+    const props = obj?.properties || {};
+    const sid = props.sessionID || props.part?.sessionID || props.info?.sessionID || null;
+    if (sid && this.openCodeSessionId && sid !== this.openCodeSessionId) return;
+
+    if (type === "message.part.delta") {
+      if (props.field === "text" && typeof props.delta === "string") {
+        this.lastAssistantText = clampText(this.lastAssistantText + props.delta);
+      }
+      pushEvent(this, compactEvent(obj));
+      return;
     }
+    if (type === "message.updated") {
+      const info = props.info;
+      if (info && info.role === "assistant" && info.id) this.assistantMsgIds.add(info.id);
+      pushEvent(this, compactEvent(obj));
+      return;
+    }
+    if (type === "message.part.updated") {
+      const part = props.part;
+      if (part && part.type === "text" && typeof part.text === "string" && this.assistantMsgIds.has(part.messageID)) {
+        this.partText.set(part.id, part.text);
+      }
+      // Snapshot marker only — omit cumulative text so the UI does not double-append.
+      pushEvent(this, { type, partID: part?.id, partType: part?.type });
+      return;
+    }
+    if (type === "permission.asked") {
+      const permID = props.id;
+      const decision = this.write ? "always" : "reject";
+      if (permID) {
+        this.#http("POST", `/session/${this.openCodeSessionId}/permissions/${permID}`, { response: decision }).catch(() => {});
+      }
+      pushEvent(this, compactEvent(obj));
+      return;
+    }
+    if (type === "question.asked") {
+      const qid = props.id;
+      if (qid) this.#http("POST", `/question/${qid}/reject`, null).catch(() => {});
+      pushEvent(this, compactEvent(obj));
+      return;
+    }
+    if (type === "session.error") {
+      this.lastError = clampText(JSON.stringify(props), 4000);
+      pushEvent(this, compactEvent(obj));
+      this.#settleTurn(new Error(this.lastError));
+      return;
+    }
+    if (type === "session.idle") {
+      pushEvent(this, compactEvent(obj));
+      this.#settleTurn(null);
+      return;
+    }
+    pushEvent(this, compactEvent(obj));
+  }
+
+  #settleTurn(err) {
+    const turn = this.turn;
+    if (!turn) return;
+    this.turn = null;
+    this.turnCount += 1;
+    this.updatedAt = nowIso();
+    if (err) {
+      setSessionStatus(this, "failed", false, { source: "turn_error", error: err.message });
+      turn.reject(err);
+      return;
+    }
+    this.#finalizeText().finally(() => {
+      setSessionStatus(this, "idle", false, { source: "idle" });
+      turn.resolve();
+    });
+  }
+
+  async #finalizeText() {
+    let text = "";
+    // Primary: ask the server for the persisted messages and take the last assistant message's text parts.
+    try {
+      const r = await this.#http("GET", `/session/${this.openCodeSessionId}/message`, null);
+      if (Array.isArray(r.json)) {
+        let lastAssistant = null;
+        for (const m of r.json) {
+          const info = m.info || m;
+          if (info.role === "assistant") lastAssistant = m;
+        }
+        if (lastAssistant) {
+          text = (lastAssistant.parts || [])
+            .filter(p => p.type === "text" && typeof p.text === "string")
+            .map(p => p.text)
+            .join("")
+            .trim();
+        }
+      }
+    } catch {}
+    // Fallback: assistant text parts assembled from the live event stream.
+    if (!text) {
+      let assembled = "";
+      for (const value of this.partText.values()) assembled += value;
+      text = assembled.trim();
+    }
+    if (!text) text = readOpenCodeAssistantTextFromDb(this.openCodeSessionId) || this.lastAssistantText || "";
+    if (text) this.lastAssistantText = clampText(text);
+  }
+
+  #modelObject() {
+    if (!this.model) return null;
+    const s = String(this.model);
+    const i = s.indexOf("/");
+    if (i > 0) return { providerID: s.slice(0, i), modelID: s.slice(i + 1) };
+    appendLog(this.logFile, `[agent-bridge] model "${s}" lacks a provider/ prefix; using opencode default.\n`);
+    return null;
   }
 
   result() {
-    if (!this.lastAssistantText && this.openCodeSessionId) {
-      this.lastAssistantText = readOpenCodeAssistantTextFromDb(this.openCodeSessionId);
-    }
     return {
       session: this.summary(),
-      text: this.lastAssistantText || extractLikelyText(this.lastRawOutput) || null,
-      raw_output_tail: clampText(stripAnsi(this.lastRawOutput), 20000),
+      text: this.lastAssistantText || null,
       recent_events: this.events.slice(-20),
       log_file: this.logFile,
     };
   }
 
   async abort() {
-    if (this.currentClient) {
-      this.expectedClientExit = true;
-      terminateProcessTree(this.currentClient.pid);
-      this.currentClient = null;
+    if (this.openCodeSessionId) {
+      try {
+        await this.#http("POST", `/session/${this.openCodeSessionId}/abort`, null);
+      } catch {}
+    }
+    const turn = this.turn;
+    this.turn = null;
+    setSessionStatus(this, "idle", false, { source: "abort" });
+    turn?.resolve?.();
+    return { aborted: true, session_id: this.id };
+  }
+
+  summary() {
+    return {
+      id: this.id,
+      agent: this.agent,
+      cwd: this.cwd,
+      write: this.write,
+      model: this.model,
+      effort: this.effort,
+      status: this.status,
+      isStreaming: this.isStreaming,
+      serverPid: this.server?.pid || null,
+      serverUrl: this.serverUrl,
+      openCodeSessionId: this.openCodeSessionId,
+      turnCount: this.turnCount,
+      createdAt: this.createdAt,
+      updatedAt: this.updatedAt,
+      lastError: this.lastError,
+      logFile: this.logFile,
+    };
+  }
+
+  close(options = {}) {
+    setSessionStatus(this, "closed", false, { source: "close" });
+    try {
+      this.sse?.destroy();
+    } catch {}
+    this.sse = null;
+    const turn = this.turn;
+    this.turn = null;
+    turn?.reject?.(new Error("session closed"));
+    terminateProcessTree(this.server?.pid);
+    if (options.removePidRecord !== false) removePidRecord(this.pidFile);
+    return { closed: true, session_id: this.id };
+  }
+}
+
+class CodexAppServerSession {
+  constructor(options) {
+    this.id = makeId("codex");
+    this.agent = "codex";
+    this.cwd = assertCwd(options.cwd);
+    this.write = Boolean(options.write);
+    this.model = options.model || null;
+    this.effort = options.effort || null;
+    this.createdAt = nowIso();
+    this.updatedAt = this.createdAt;
+    this.status = "starting";
+    this.isStreaming = false;
+    this.lastAssistantText = "";
+    this.lastError = null;
+    this.events = [];
+    this.proc = null;
+    this.pending = new Map();
+    this.nextId = 1;
+    this.threadId = null;
+    this.currentTurnId = null;
+    this.turn = null;
+    this.turnCount = 0;
+    this.finalAnswer = "";
+    this.lastAgentMessage = "";
+    this.tokenUsage = null;
+    this.logFile = path.join(LOG_DIR, `${this.id}.log`);
+    this.pidFile = pidRecordPath(this.id);
+  }
+
+  async start() {
+    const args = ["app-server"];
+    appendLog(this.logFile, `$ ${[agentBin("codex"), ...args].join(" ")}\n`);
+    this.proc = spawn(agentBin("codex"), args, {
+      cwd: this.cwd,
+      env: process.env,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    appendLog(this.logFile, `[agent-bridge] spawned codex app-server pid=${this.proc.pid}\n`);
+    this.#writePidRecord();
+
+    this.proc.stderr.setEncoding("utf8");
+    this.proc.stderr.on("data", text => {
+      appendLog(this.logFile, text);
+      this.lastError = clampText(stripAnsi(text), 4000);
+    });
+    this.proc.stdout.setEncoding("utf8");
+    const rl = readline.createInterface({ input: this.proc.stdout, crlfDelay: Infinity });
+    rl.on("line", line => this.#handleLine(line));
+
+    this.proc.on("error", err => {
+      this.lastError = err.message;
+      setSessionStatus(this, "failed", false, { source: "process_error", error: err.message });
+      this.#rejectAll(err);
+    });
+    this.proc.on("close", (code, signal) => {
+      appendLog(this.logFile, `[agent-bridge] codex app-server exited code=${code} signal=${signal || ""}\n`);
+      removePidRecord(this.pidFile);
+      if (this.status === "closed") {
+        setSessionStatus(this, "closed", false, { source: "process_close", code, signal });
+        return;
+      }
+      this.lastError = code === 0 ? this.lastError : `codex app-server exited with code ${code}`;
+      setSessionStatus(this, code === 0 && this.status !== "failed" ? "closed" : "failed", false, {
+        source: "process_close",
+        code,
+        signal,
+      });
+      this.#rejectAll(new Error(this.lastError || "codex app-server exited."));
+    });
+
+    await withTimeout(
+      this.#request("initialize", {
+        clientInfo: { title: "Agent Bridge", name: "agent-bridge", version: BRIDGE_VERSION },
+        capabilities: { experimentalApi: false, optOutNotificationMethods: [] },
+      }),
+      20000,
+      "Timed out on codex initialize.",
+    );
+    this.#notify("initialized", {});
+
+    const started = await withTimeout(
+      this.#request("thread/start", {
+        cwd: this.cwd,
+        model: this.model,
+        approvalPolicy: "never",
+        sandbox: this.write ? "workspace-write" : "read-only",
+        serviceName: "agent_bridge",
+        ephemeral: true,
+        experimentalRawEvents: false,
+      }),
+      20000,
+      "Timed out on codex thread/start.",
+    );
+    this.threadId = started?.thread?.id || started?.threadId || null;
+    if (!this.threadId) throw new Error("codex thread/start returned no thread id");
+    appendLog(this.logFile, `[agent-bridge] codex thread ${this.threadId}\n`);
+    setSessionStatus(this, "idle", false, { source: "ready" });
+    return this;
+  }
+
+  #writePidRecord() {
+    writePidRecord(this.pidFile, {
+      id: this.id,
+      agent: this.agent,
+      ownerPid: process.pid,
+      cwd: this.cwd,
+      createdAt: this.createdAt,
+      processes: [{ role: "codex-app-server", pid: this.proc?.pid || null, command: [agentBin("codex"), "app-server"] }].filter(
+        item => item.pid,
+      ),
+    });
+  }
+
+  #write(msg) {
+    appendLog(this.logFile, `> ${JSON.stringify(msg).slice(0, 600)}\n`);
+    this.proc.stdin.write(`${JSON.stringify(msg)}\n`);
+  }
+
+  #request(method, params) {
+    const id = this.nextId++;
+    const promise = new Promise((resolve, reject) => this.pending.set(id, { resolve, reject }));
+    this.#write({ id, method, params });
+    return promise;
+  }
+
+  #notify(method, params = {}) {
+    this.#write({ method, params });
+  }
+
+  #rejectAll(err) {
+    for (const pending of this.pending.values()) pending.reject(err);
+    this.pending.clear();
+    const turn = this.turn;
+    this.turn = null;
+    turn?.reject?.(err);
+  }
+
+  #handleLine(line) {
+    appendLog(this.logFile, `${line}\n`);
+    if (!line.trim()) return;
+    let msg;
+    try {
+      msg = JSON.parse(line);
+    } catch {
+      pushEvent(this, { type: "raw", line });
+      return;
+    }
+    this.updatedAt = nowIso();
+    if (msg.id !== undefined && msg.method) {
+      // Server-initiated request: we do not implement any, so reject.
+      this.#write({ id: msg.id, error: { code: -32601, message: "unsupported server request" } });
+      return;
+    }
+    if (msg.id !== undefined) {
+      const pending = this.pending.get(msg.id);
+      if (pending) {
+        this.pending.delete(msg.id);
+        if (msg.error) pending.reject(Object.assign(new Error(msg.error.message || "codex error"), { rpc: msg.error }));
+        else pending.resolve(msg.result ?? {});
+      }
+      return;
+    }
+    if (msg.method) this.#onNotification(msg);
+  }
+
+  #onNotification(msg) {
+    const method = msg.method;
+    const params = msg.params || {};
+    const threadId = params.threadId ?? params.thread?.id ?? null;
+    if (threadId && this.threadId && threadId !== this.threadId) {
+      // Subagent / unrelated thread: keep for debug, do not drive our turn.
+      pushEvent(this, compactEvent(msg));
+      return;
+    }
+
+    switch (method) {
+      case "turn/started":
+        this.currentTurnId = params.turn?.id || this.currentTurnId;
+        setSessionStatus(this, "running", true, { source: "turn/started" });
+        pushEvent(this, compactEvent(msg));
+        return;
+      case "item/agentMessage/delta":
+        if (typeof params.delta === "string") this.lastAssistantText = clampText(this.lastAssistantText + params.delta);
+        pushEvent(this, compactEvent(msg));
+        return;
+      case "item/completed": {
+        const item = params.item || {};
+        if (item.type === "agentMessage" && typeof item.text === "string" && item.text) {
+          this.lastAgentMessage = item.text;
+          if (item.phase === "final_answer") this.finalAnswer = item.text;
+        }
+        // Strip large text payloads from the pushed event to avoid double-appending in the UI.
+        pushEvent(this, { type: "item.completed", itemType: item.type, phase: item.phase ?? null, id: item.id });
+        return;
+      }
+      case "turn/completed": {
+        const status = params.turn?.status;
+        pushEvent(this, compactEvent(msg));
+        this.#settleTurn(status === "completed" || status === "interrupted" ? null : new Error(`codex turn ${status}`), status);
+        return;
+      }
+      case "error":
+        this.lastError = clampText(JSON.stringify(params.error || params), 4000);
+        pushEvent(this, compactEvent(msg));
+        this.#settleTurn(new Error(this.lastError));
+        return;
+      case "thread/tokenUsage/updated":
+        this.tokenUsage = params.tokenUsage || this.tokenUsage;
+        return;
+      default:
+        pushEvent(this, compactEvent(msg));
+    }
+  }
+
+  #settleTurn(err, status) {
+    const turn = this.turn;
+    if (!turn) return;
+    this.turn = null;
+    this.currentTurnId = null;
+    this.turnCount += 1;
+    this.updatedAt = nowIso();
+    if (err) {
+      this.lastError = err.message;
+      setSessionStatus(this, "failed", false, { source: "turn_error", error: err.message });
+      turn.reject(err);
+      return;
+    }
+    this.lastAssistantText = clampText(this.finalAnswer || this.lastAgentMessage || this.lastAssistantText || "");
+    setSessionStatus(this, "idle", false, { source: "turn/completed", status });
+    turn.resolve();
+  }
+
+  async send(message, options = {}) {
+    if (!message || !String(message).trim()) throw new Error("message is required.");
+    if (this.turn) throw new Error(`Codex session ${this.id} already has a running turn.`);
+    if (!this.threadId) throw new Error("Codex session is not started.");
+
+    this.finalAnswer = "";
+    this.lastAgentMessage = "";
+    this.lastAssistantText = "";
+    setSessionStatus(this, "running", true, { source: "send" });
+
+    const done = new Promise((resolve, reject) => {
+      this.turn = { resolve, reject };
+    });
+
+    const turnResp = await this.#request("turn/start", {
+      threadId: this.threadId,
+      input: [{ type: "text", text: String(message), text_elements: [] }],
+      model: this.model,
+      effort: this.effort,
+      outputSchema: null,
+    });
+    this.currentTurnId = turnResp?.turn?.id || this.currentTurnId;
+    const initialStatus = turnResp?.turn?.status;
+    if (initialStatus && initialStatus !== "inProgress") {
+      this.#settleTurn(initialStatus === "completed" ? null : new Error(`codex turn ${initialStatus}`), initialStatus);
+    }
+
+    if (options.wait) {
+      return await withTimeout(
+        done.then(() => this.result()),
+        options.timeout_ms || DEFAULT_WAIT_TIMEOUT_MS,
+        "Timed out waiting for Codex turn.",
+      );
+    }
+    done.catch(err => {
+      this.lastError = err.message;
+    });
+    return { accepted: true, session_id: this.id, status: this.status };
+  }
+
+  result() {
+    return {
+      session: this.summary(),
+      text: this.lastAssistantText || null,
+      recent_events: this.events.slice(-20),
+      log_file: this.logFile,
+    };
+  }
+
+  async abort() {
+    if (this.threadId && this.currentTurnId) {
+      try {
+        await this.#request("turn/interrupt", { threadId: this.threadId, turnId: this.currentTurnId });
+      } catch {}
     }
     setSessionStatus(this, "idle", false, { source: "abort" });
     return { aborted: true, session_id: this.id };
@@ -964,10 +1383,8 @@ class OpenCodeServerSession {
       effort: this.effort,
       status: this.status,
       isStreaming: this.isStreaming,
-      serverPid: this.server?.pid || null,
-      currentClientPid: this.currentClient?.pid || null,
-      serverUrl: this.serverUrl,
-      openCodeSessionId: this.openCodeSessionId,
+      pid: this.proc?.pid || null,
+      threadId: this.threadId,
       turnCount: this.turnCount,
       createdAt: this.createdAt,
       updatedAt: this.updatedAt,
@@ -978,9 +1395,13 @@ class OpenCodeServerSession {
 
   close(options = {}) {
     setSessionStatus(this, "closed", false, { source: "close" });
-    if (this.currentClient) this.expectedClientExit = true;
-    terminateProcessTree(this.currentClient?.pid);
-    terminateProcessTree(this.server?.pid);
+    try {
+      this.proc?.stdin?.end();
+    } catch {}
+    const turn = this.turn;
+    this.turn = null;
+    turn?.reject?.(new Error("session closed"));
+    terminateProcessTree(this.proc?.pid);
     if (options.removePidRecord !== false) removePidRecord(this.pidFile);
     return { closed: true, session_id: this.id };
   }
@@ -1101,7 +1522,12 @@ function findFirstKey(value, keys) {
 async function openSession(params) {
   ensureDirs();
   assertAgent(params.agent);
-  const session = params.agent === "omp" ? new OmpRpcSession(params) : new OpenCodeServerSession(params);
+  const session =
+    params.agent === "omp"
+      ? new OmpRpcSession(params)
+      : params.agent === "opencode"
+        ? new OpenCodeServerSession(params)
+        : new CodexAppServerSession(params);
   sessions.set(session.id, session);
   try {
     await session.start();
@@ -2387,7 +2813,7 @@ async function handleDaemonRequest(request) {
 
 function cliOpenParams(args) {
   const agent = args.agent || args._[0];
-  if (!agent) throw new Error("open requires --agent omp|opencode.");
+  if (!agent) throw new Error("open requires --agent omp|opencode|codex.");
   return {
     agent,
     cwd: args.cwd || process.cwd(),

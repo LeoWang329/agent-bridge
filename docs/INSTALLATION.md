@@ -55,8 +55,9 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | nod
 
 ```text
 Agent Bridge 0.3.0
-omp: ok (...) omp/15.9.0
+omp: ok (...) omp/15.9.1
 opencode: ok (...) 1.15.13
+codex: ok (...) codex-cli 0.137.0
 ```
 
 ## 3. 安装到 Codex
@@ -219,6 +220,8 @@ Codex 使用 Agent Bridge 时应该遵循这个流程：
   "write": false
 }
 ```
+
+需要 Codex 时，把 `agent` 换成 `codex`（会启动 `codex app-server`，逐 token 流式返回；只读用 `sandbox: read-only`，写用 `sandbox: workspace-write`，均为非交互）。
 
 可以在**打开会话时**指定模型与推理强度。模型是会话级参数：在 `agent_bridge_open_session` 时用 `model` 指定，整个会话内固定，`agent_bridge_send_message` 不能逐条切换；想换模型就新开一个 session。`model` 会原样传给后端的 `--model`，取值格式由后端决定。可选的 `effort` 在 OMP 映射为 `--thinking`（`minimal|low|medium|high|xhigh`），在 OpenCode 映射为 `--variant`。不传 `model` / `effort` 时使用后端默认值。
 

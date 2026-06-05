@@ -9,9 +9,10 @@ MCP tools, the CLI facade, and the local web monitor all share the same daemon-b
 ## Backends
 
 - `omp`: starts a persistent `omp --mode rpc` process and communicates through JSONL stdio RPC.
-- `opencode`: starts a persistent `opencode serve` backend and sends messages through `opencode run --attach`.
+- `opencode`: starts a persistent `opencode serve` backend and drives it over its HTTP API. It creates a session, subscribes to the `GET /event` SSE stream for live `message.part.delta` updates, and submits each turn with `prompt_async`. Read-only sessions disable the write-capable tools (`bash`, `edit`, `write`, `apply_patch`, `task`); write sessions auto-approve permission prompts. If the event stream yields no assistant text, Agent Bridge falls back to `GET /session/:id/message` and then to a read-only lookup in OpenCode's local SQLite database.
+- `codex`: starts a persistent `codex app-server` process and communicates through newline-delimited JSON-RPC (`initialize` → `thread/start` → `turn/start`), streaming `item/agentMessage/delta` events. Read-only uses `sandbox: read-only`; write uses `sandbox: workspace-write`; both run non-interactively (`approvalPolicy: never`).
 
-OpenCode 1.15.13 does not expose the same stdio JSONL RPC mode that OMP does. Agent Bridge therefore treats OpenCode as a persistent server/attach backend. When OpenCode's JSON stdout does not include final assistant text, Agent Bridge falls back to a read-only lookup in OpenCode's local SQLite database.
+OpenCode does not expose OMP's stdio JSONL RPC mode, so Agent Bridge talks to its local HTTP/SSE server directly — this yields real incremental streaming instead of parsing one-shot CLI stdout.
 
 ## MCP Tools
 
@@ -187,7 +188,8 @@ The MCP tools work without the skill; it only adds guidance on when to delegate.
 
 - Agent Bridge defaults to read-oriented sessions.
 - OMP write mode adds `--auto-approve --approval-mode yolo`.
-- OpenCode write mode adds `--dangerously-skip-permissions`.
+- OpenCode read-only mode disables the write-capable tools; write mode auto-approves permission requests.
+- Codex read-only mode uses `sandbox: read-only`; write mode uses `sandbox: workspace-write`. Both run with `approvalPolicy: never`.
 - Always close sessions after use so no backend process remains running.
 - On normal daemon shutdown, Agent Bridge closes all active daemon-owned OMP/OpenCode child processes.
 - `agent-bridge stop` closes daemon-owned sessions and their OMP/OpenCode child processes.
