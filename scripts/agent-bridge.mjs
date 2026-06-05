@@ -387,6 +387,19 @@ function terminateProcessTree(pid, signal = "SIGTERM") {
   }
 }
 
+function scheduleForceKill(pid, graceMs = 3000) {
+  if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) return;
+  const timer = setTimeout(() => {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return; // already exited
+    }
+    terminateProcessTree(pid, "SIGKILL");
+  }, graceMs);
+  timer.unref?.();
+}
+
 function cleanupStalePidRecords() {
   ensureDirs();
   const summary = {
@@ -613,7 +626,16 @@ class OmpRpcSession {
     setSessionStatus(this, "running", true, { source: "send" });
     await this.request("prompt", { message: String(message) });
     if (options.wait) {
-      await this.waitIdle(options.timeout_ms || DEFAULT_WAIT_TIMEOUT_MS);
+      try {
+        await this.waitIdle(options.timeout_ms || DEFAULT_WAIT_TIMEOUT_MS);
+      } catch (err) {
+        // On wait timeout the OMP turn is still streaming; abort it so the session is
+        // immediately reusable instead of rejecting the next send as "already processing".
+        try {
+          await this.abort();
+        } catch {}
+        throw err;
+      }
       return await this.result();
     }
     return { accepted: true, session_id: this.id, status: this.status };
@@ -729,6 +751,9 @@ class OpenCodeServerSession {
     this.serverArgs = null;
     this.sse = null;
     this.sseBuffer = "";
+    this.sseReconnectTimer = null;
+    this.sseAttempts = 0;
+    this.drainTerminal = 0;
     this.turn = null;
     this.partText = new Map();
     this.assistantMsgIds = new Set();
@@ -752,6 +777,16 @@ class OpenCodeServerSession {
       const text = chunk.toString("utf8");
       appendLog(this.logFile, text);
       this.lastError = clampText(stripAnsi(text), 4000);
+    });
+    this.server.on("error", err => {
+      const msg = err instanceof Error ? err.message : String(err);
+      appendLog(this.logFile, `[agent-bridge] opencode serve error: ${msg}\n`);
+      this.lastError = msg;
+      removePidRecord(this.pidFile);
+      if (this.status !== "closed") setSessionStatus(this, "failed", false, { source: "server_error" });
+      const turn = this.turn;
+      this.turn = null;
+      turn?.reject?.(err instanceof Error ? err : new Error(msg));
     });
     this.server.on("close", code => {
       removePidRecord(this.pidFile);
@@ -800,6 +835,10 @@ class OpenCodeServerSession {
     const done = new Promise((resolve, reject) => {
       this.turn = { resolve, reject };
     });
+    // Attach a handler now so a turn that rejects before a waiter is attached
+    // (SSE drop / session.error during the POST) cannot trip the process-level
+    // unhandledRejection handler and take down the whole daemon.
+    done.catch(() => {});
 
     appendLog(this.logFile, `$ POST /session/${this.openCodeSessionId}/prompt_async write=${this.write}\n`);
     let resp;
@@ -820,11 +859,22 @@ class OpenCodeServerSession {
     }
 
     if (options.wait) {
-      return await withTimeout(
-        done.then(() => this.result()),
-        options.timeout_ms || DEFAULT_WAIT_TIMEOUT_MS,
-        "Timed out waiting for OpenCode turn.",
-      );
+      try {
+        return await withTimeout(
+          done.then(() => this.result()),
+          options.timeout_ms || DEFAULT_WAIT_TIMEOUT_MS,
+          "Timed out waiting for OpenCode turn.",
+        );
+      } catch (err) {
+        // On a wait timeout the turn is still pending; abort the backend turn and
+        // clear it so the session stays reusable instead of wedged at status=running.
+        if (this.turn) {
+          try {
+            await this.abort();
+          } catch {}
+        }
+        throw err;
+      }
     }
     done.catch(err => {
       this.lastError = err.message;
@@ -897,6 +947,7 @@ class OpenCodeServerSession {
         return;
       }
       res.setEncoding("utf8");
+      this.sseAttempts = 0;
       res.on("data", chunk => this.#consumeSse(chunk));
       res.on("end", () => {
         appendLog(this.logFile, "[agent-bridge] opencode event stream ended\n");
@@ -914,7 +965,29 @@ class OpenCodeServerSession {
     // The event stream is how we observe turn completion. If it drops while the
     // server is still up and a turn is active, settle the turn instead of hanging.
     if (this.status === "closed") return;
+    this.sse = null;
     if (this.turn) this.#settleTurn(err instanceof Error ? err : new Error(String(err)));
+    // Reconnect so future turns can still observe events; a transient drop would
+    // otherwise leave the session healthy-looking but permanently unobservable.
+    this.#scheduleSseReconnect();
+  }
+
+  #scheduleSseReconnect() {
+    if (this.status === "closed" || this.sseReconnectTimer) return;
+    if (!this.server || this.server.exitCode !== null) return; // server gone; nothing to reconnect to
+    const attempt = (this.sseAttempts += 1);
+    if (attempt > 10) {
+      appendLog(this.logFile, `[agent-bridge] gave up reconnecting opencode event stream after ${attempt - 1} attempts\n`);
+      return;
+    }
+    const delay = Math.min(2000, 100 * attempt);
+    this.sseReconnectTimer = setTimeout(() => {
+      this.sseReconnectTimer = null;
+      if (this.status === "closed") return;
+      appendLog(this.logFile, `[agent-bridge] reconnecting opencode event stream (attempt ${attempt})\n`);
+      this.#openEventStream();
+    }, delay);
+    this.sseReconnectTimer.unref?.();
   }
 
   #consumeSse(chunk) {
@@ -970,26 +1043,44 @@ class OpenCodeServerSession {
     if (type === "permission.asked") {
       const permID = props.id;
       const decision = this.write ? "always" : "reject";
+      appendLog(this.logFile, `[agent-bridge] permission.asked -> ${decision}\n`);
       if (permID) {
-        this.#http("POST", `/session/${this.openCodeSessionId}/permissions/${permID}`, { response: decision }).catch(() => {});
+        this.#http("POST", `/session/${this.openCodeSessionId}/permissions/${permID}`, { response: decision }).catch(err =>
+          appendLog(this.logFile, `[agent-bridge] permission reply failed: ${err.message}\n`),
+        );
       }
       pushEvent(this, compactEvent(obj));
       return;
     }
     if (type === "question.asked") {
       const qid = props.id;
-      if (qid) this.#http("POST", `/question/${qid}/reject`, null).catch(() => {});
+      appendLog(this.logFile, `[agent-bridge] question.asked -> reject\n`);
+      if (qid)
+        this.#http("POST", `/question/${qid}/reject`, null).catch(err =>
+          appendLog(this.logFile, `[agent-bridge] question reject failed: ${err.message}\n`),
+        );
       pushEvent(this, compactEvent(obj));
       return;
     }
     if (type === "session.error") {
       this.lastError = clampText(JSON.stringify(props), 4000);
+      appendLog(this.logFile, `[agent-bridge] session.error\n`);
       pushEvent(this, compactEvent(obj));
+      // Swallow a terminal event left over from an aborted turn so it cannot settle a new one.
+      if (this.drainTerminal > 0) {
+        this.drainTerminal -= 1;
+        return;
+      }
       this.#settleTurn(new Error(this.lastError));
       return;
     }
     if (type === "session.idle") {
+      appendLog(this.logFile, `[agent-bridge] session.idle\n`);
       pushEvent(this, compactEvent(obj));
+      if (this.drainTerminal > 0) {
+        this.drainTerminal -= 1;
+        return;
+      }
       this.#settleTurn(null);
       return;
     }
@@ -1069,6 +1160,16 @@ class OpenCodeServerSession {
     }
     const turn = this.turn;
     this.turn = null;
+    if (turn) {
+      // The aborted turn will still emit a trailing session.idle/error on the shared
+      // event stream; swallow exactly one so it cannot settle a brand-new turn. Bound
+      // it with a timer so a missing terminal event never eats a later turn's idle.
+      this.drainTerminal += 1;
+      const drainTimer = setTimeout(() => {
+        if (this.drainTerminal > 0) this.drainTerminal -= 1;
+      }, 3000);
+      drainTimer.unref?.();
+    }
     setSessionStatus(this, "idle", false, { source: "abort" });
     turn?.resolve?.();
     return { aborted: true, session_id: this.id };
@@ -1097,6 +1198,10 @@ class OpenCodeServerSession {
 
   close(options = {}) {
     setSessionStatus(this, "closed", false, { source: "close" });
+    if (this.sseReconnectTimer) {
+      clearTimeout(this.sseReconnectTimer);
+      this.sseReconnectTimer = null;
+    }
     try {
       this.sse?.destroy();
     } catch {}
@@ -1104,7 +1209,9 @@ class OpenCodeServerSession {
     const turn = this.turn;
     this.turn = null;
     turn?.reject?.(new Error("session closed"));
-    terminateProcessTree(this.server?.pid);
+    const pid = this.server?.pid;
+    terminateProcessTree(pid);
+    scheduleForceKill(pid);
     if (options.removePidRecord !== false) removePidRecord(this.pidFile);
     return { closed: true, session_id: this.id };
   }
@@ -1156,6 +1263,10 @@ class CodexAppServerSession {
       this.lastError = clampText(stripAnsi(text), 4000);
     });
     this.proc.stdout.setEncoding("utf8");
+    this.proc.stdin.on("error", err => {
+      appendLog(this.logFile, `[agent-bridge] codex stdin error: ${err.message}\n`);
+      this.lastError = err.message;
+    });
     const rl = readline.createInterface({ input: this.proc.stdout, crlfDelay: Infinity });
     rl.on("line", line => this.#handleLine(line));
 
@@ -1225,18 +1336,32 @@ class CodexAppServerSession {
 
   #write(msg) {
     appendLog(this.logFile, `> ${JSON.stringify(msg).slice(0, 600)}\n`);
-    this.proc.stdin.write(`${JSON.stringify(msg)}\n`);
+    const stdin = this.proc?.stdin;
+    if (!stdin || stdin.destroyed || this.proc.exitCode !== null) {
+      throw new Error("codex app-server stdin is not writable");
+    }
+    stdin.write(`${JSON.stringify(msg)}\n`);
   }
 
   #request(method, params) {
     const id = this.nextId++;
     const promise = new Promise((resolve, reject) => this.pending.set(id, { resolve, reject }));
-    this.#write({ id, method, params });
+    try {
+      this.#write({ id, method, params });
+    } catch (err) {
+      const pending = this.pending.get(id);
+      this.pending.delete(id);
+      pending?.reject(err);
+    }
     return promise;
   }
 
   #notify(method, params = {}) {
-    this.#write({ method, params });
+    try {
+      this.#write({ method, params });
+    } catch (err) {
+      appendLog(this.logFile, `[agent-bridge] codex notify failed: ${err.message}\n`);
+    }
   }
 
   #rejectAll(err) {
@@ -1284,6 +1409,11 @@ class CodexAppServerSession {
       pushEvent(this, compactEvent(msg));
       return;
     }
+    // Events carry the turn they belong to; ignore ones from a turn that is no
+    // longer current (an aborted/interrupted turn emitting trailing deltas or a
+    // late turn/completed) so they cannot corrupt or prematurely settle a new turn.
+    const evTurnId = params.turn?.id ?? params.turnId ?? null;
+    const staleTurn = Boolean(evTurnId && this.currentTurnId && evTurnId !== this.currentTurnId);
 
     switch (method) {
       case "turn/started":
@@ -1292,10 +1422,18 @@ class CodexAppServerSession {
         pushEvent(this, compactEvent(msg));
         return;
       case "item/agentMessage/delta":
+        if (staleTurn) {
+          pushEvent(this, compactEvent(msg));
+          return;
+        }
         if (typeof params.delta === "string") this.lastAssistantText = clampText(this.lastAssistantText + params.delta);
         pushEvent(this, compactEvent(msg));
         return;
       case "item/completed": {
+        if (staleTurn) {
+          pushEvent(this, { type: "item.completed", stale: true });
+          return;
+        }
         const item = params.item || {};
         if (item.type === "agentMessage" && typeof item.text === "string" && item.text) {
           this.lastAgentMessage = item.text;
@@ -1306,12 +1444,20 @@ class CodexAppServerSession {
         return;
       }
       case "turn/completed": {
+        if (staleTurn) {
+          pushEvent(this, compactEvent(msg));
+          return;
+        }
         const status = params.turn?.status;
         pushEvent(this, compactEvent(msg));
         this.#settleTurn(status === "completed" || status === "interrupted" ? null : new Error(`codex turn ${status}`), status);
         return;
       }
       case "error":
+        if (staleTurn) {
+          pushEvent(this, compactEvent(msg));
+          return;
+        }
         this.lastError = clampText(JSON.stringify(params.error || params), 4000);
         pushEvent(this, compactEvent(msg));
         this.#settleTurn(new Error(this.lastError));
@@ -1355,6 +1501,9 @@ class CodexAppServerSession {
     const done = new Promise((resolve, reject) => {
       this.turn = { resolve, reject };
     });
+    // Guard against unhandledRejection taking down the daemon if the turn rejects
+    // (process crash / error notification) before a waiter is attached below.
+    done.catch(() => {});
 
     let turnResp;
     try {
@@ -1384,11 +1533,22 @@ class CodexAppServerSession {
     }
 
     if (options.wait) {
-      return await withTimeout(
-        done.then(() => this.result()),
-        options.timeout_ms || DEFAULT_WAIT_TIMEOUT_MS,
-        "Timed out waiting for Codex turn.",
-      );
+      try {
+        return await withTimeout(
+          done.then(() => this.result()),
+          options.timeout_ms || DEFAULT_WAIT_TIMEOUT_MS,
+          "Timed out waiting for Codex turn.",
+        );
+      } catch (err) {
+        // On a wait timeout the turn is still pending; interrupt the backend turn
+        // and clear it so the session stays reusable instead of wedged at running.
+        if (this.turn) {
+          try {
+            await this.abort();
+          } catch {}
+        }
+        throw err;
+      }
     }
     done.catch(err => {
       this.lastError = err.message;
@@ -1451,7 +1611,9 @@ class CodexAppServerSession {
     const turn = this.turn;
     this.turn = null;
     turn?.reject?.(new Error("session closed"));
-    terminateProcessTree(this.proc?.pid);
+    const pid = this.proc?.pid;
+    terminateProcessTree(pid);
+    scheduleForceKill(pid);
     if (options.removePidRecord !== false) removePidRecord(this.pidFile);
     return { closed: true, session_id: this.id };
   }
