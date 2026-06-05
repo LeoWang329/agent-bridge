@@ -802,7 +802,15 @@ class OpenCodeServerSession {
     });
 
     appendLog(this.logFile, `$ POST /session/${this.openCodeSessionId}/prompt_async write=${this.write}\n`);
-    const resp = await this.#http("POST", `/session/${this.openCodeSessionId}/prompt_async`, body);
+    let resp;
+    try {
+      resp = await this.#http("POST", `/session/${this.openCodeSessionId}/prompt_async`, body);
+    } catch (err) {
+      this.turn = null;
+      this.lastError = err instanceof Error ? err.message : String(err);
+      setSessionStatus(this, "idle", false, { source: "prompt_error" });
+      throw err instanceof Error ? err : new Error(this.lastError);
+    }
     if (resp.status >= 400) {
       this.turn = null;
       const err = new Error(`opencode prompt failed: ${resp.status} ${String(resp.body).slice(0, 300)}`);
@@ -874,6 +882,7 @@ class OpenCodeServerSession {
         },
       );
       req.on("error", reject);
+      req.setTimeout(30000, () => req.destroy(new Error(`opencode request timed out: ${method} ${pathName}`)));
       if (data) req.write(data);
       req.end();
     });
@@ -881,12 +890,31 @@ class OpenCodeServerSession {
 
   #openEventStream() {
     const req = http.get(this.serverUrl + "/event", res => {
+      if (res.statusCode !== 200) {
+        appendLog(this.logFile, `[agent-bridge] event stream bad status ${res.statusCode}\n`);
+        res.resume();
+        this.#onEventStreamGone(new Error(`event stream HTTP ${res.statusCode}`));
+        return;
+      }
       res.setEncoding("utf8");
       res.on("data", chunk => this.#consumeSse(chunk));
-      res.on("end", () => appendLog(this.logFile, "[agent-bridge] opencode event stream ended\n"));
+      res.on("end", () => {
+        appendLog(this.logFile, "[agent-bridge] opencode event stream ended\n");
+        this.#onEventStreamGone(new Error("event stream ended"));
+      });
     });
-    req.on("error", err => appendLog(this.logFile, `[agent-bridge] event stream error: ${err.message}\n`));
+    req.on("error", err => {
+      appendLog(this.logFile, `[agent-bridge] event stream error: ${err.message}\n`);
+      this.#onEventStreamGone(err);
+    });
     this.sse = req;
+  }
+
+  #onEventStreamGone(err) {
+    // The event stream is how we observe turn completion. If it drops while the
+    // server is still up and a turn is active, settle the turn instead of hanging.
+    if (this.status === "closed") return;
+    if (this.turn) this.#settleTurn(err instanceof Error ? err : new Error(String(err)));
   }
 
   #consumeSse(chunk) {
@@ -1328,17 +1356,31 @@ class CodexAppServerSession {
       this.turn = { resolve, reject };
     });
 
-    const turnResp = await this.#request("turn/start", {
-      threadId: this.threadId,
-      input: [{ type: "text", text: String(message), text_elements: [] }],
-      model: this.model,
-      effort: this.effort,
-      outputSchema: null,
-    });
+    let turnResp;
+    try {
+      turnResp = await withTimeout(
+        this.#request("turn/start", {
+          threadId: this.threadId,
+          input: [{ type: "text", text: String(message), text_elements: [] }],
+          model: this.model,
+          effort: this.effort,
+          outputSchema: null,
+        }),
+        30000,
+        "Timed out starting Codex turn.",
+      );
+    } catch (err) {
+      this.turn = null;
+      this.lastError = err instanceof Error ? err.message : String(err);
+      setSessionStatus(this, "idle", false, { source: "turn_start_error" });
+      throw err instanceof Error ? err : new Error(this.lastError);
+    }
     this.currentTurnId = turnResp?.turn?.id || this.currentTurnId;
     const initialStatus = turnResp?.turn?.status;
     if (initialStatus && initialStatus !== "inProgress") {
-      this.#settleTurn(initialStatus === "completed" ? null : new Error(`codex turn ${initialStatus}`), initialStatus);
+      const failed = initialStatus !== "completed";
+      this.#settleTurn(failed ? new Error(`codex turn ${initialStatus}`) : null, initialStatus);
+      if (failed) throw new Error(`codex turn ${initialStatus}`);
     }
 
     if (options.wait) {
@@ -1366,10 +1408,18 @@ class CodexAppServerSession {
   async abort() {
     if (this.threadId && this.currentTurnId) {
       try {
-        await this.#request("turn/interrupt", { threadId: this.threadId, turnId: this.currentTurnId });
+        await withTimeout(
+          this.#request("turn/interrupt", { threadId: this.threadId, turnId: this.currentTurnId }),
+          5000,
+          "codex interrupt timeout",
+        );
       } catch {}
     }
+    const turn = this.turn;
+    this.turn = null;
+    this.currentTurnId = null;
     setSessionStatus(this, "idle", false, { source: "abort" });
+    turn?.resolve?.();
     return { aborted: true, session_id: this.id };
   }
 
