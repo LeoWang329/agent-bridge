@@ -1,6 +1,6 @@
 # Agent Bridge
 
-Agent Bridge is a session-first MCP bridge that lets MCP clients such as Codex and Claude Code delegate work to local OMP and OpenCode agents.
+Agent Bridge is a session-first MCP bridge that lets MCP clients such as Codex and Claude Code delegate work to local OMP, OpenCode, and Codex agents.
 
 It is intentionally not a one-shot command wrapper. Codex opens a delegated-agent session, sends one or more messages into that same session, checks status/result, can abort the active turn, and closes the session when the work is done.
 
