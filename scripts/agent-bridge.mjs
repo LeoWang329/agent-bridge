@@ -842,10 +842,8 @@ class OpenCodeServerSession {
     if (this.effort) body.variant = this.effort;
     if (!this.write) body.tools = { bash: false, edit: false, write: false, apply_patch: false, task: false };
 
-    // Ensure the event stream is connected before prompting, so a fast turn cannot
-    // finish (emit session.idle) before any observer is attached.
-    await this.#waitForSse();
-
+    // Reserve the turn synchronously, before any await, so two concurrent sends can't
+    // both pass the single-flight guard while the SSE stream is (re)connecting.
     setSessionStatus(this, "running", true, { source: "send" });
     const done = new Promise((resolve, reject) => {
       this.turn = { resolve, reject };
@@ -855,6 +853,19 @@ class OpenCodeServerSession {
     // (SSE drop / session.error during the POST) cannot trip the process-level
     // unhandledRejection handler and take down the whole daemon.
     done.catch(() => {});
+
+    // Ensure the event stream is connected before prompting, so a fast turn cannot
+    // finish (emit session.idle) before any observer is attached.
+    try {
+      await this.#waitForSse();
+    } catch (err) {
+      if (this.turn === myTurn) {
+        this.turn = null;
+        this.lastError = err instanceof Error ? err.message : String(err);
+        if (this.status !== "closed") setSessionStatus(this, "idle", false, { source: "sse_wait_error" });
+      }
+      throw err instanceof Error ? err : new Error(this.lastError);
+    }
 
     appendLog(this.logFile, `$ POST /session/${this.openCodeSessionId}/prompt_async write=${this.write}\n`);
     let resp;
@@ -866,6 +877,13 @@ class OpenCodeServerSession {
       if (this.turn === myTurn) {
         this.turn = null;
         this.lastError = err instanceof Error ? err.message : String(err);
+        // The prompt may have been accepted before the POST errored (e.g. response
+        // timeout); abort the backend turn and arm the drain so a late session.idle
+        // can't settle a later turn.
+        if (this.server && this.server.exitCode === null && this.openCodeSessionId) {
+          this.#armDrain();
+          this.#http("POST", `/session/${this.openCodeSessionId}/abort`, null).catch(() => {});
+        }
         if (this.status !== "closed") setSessionStatus(this, "idle", false, { source: "prompt_error" });
       }
       throw err instanceof Error ? err : new Error(this.lastError);
@@ -1232,7 +1250,11 @@ class OpenCodeServerSession {
   }
 
   async abort() {
-    if (this.openCodeSessionId) {
+    // If the turn already completed and is finalizing, its terminal event was already
+    // consumed: don't POST another abort or arm a drain (that would swallow a future
+    // turn's terminal). Just let finalization finish.
+    if (this.finalizing) return { aborted: true, session_id: this.id, finalizing: true };
+    if (this.openCodeSessionId && this.server && this.server.exitCode === null) {
       try {
         await this.#http("POST", `/session/${this.openCodeSessionId}/abort`, null);
       } catch {}
@@ -1242,7 +1264,11 @@ class OpenCodeServerSession {
     // The aborted turn still emits a trailing session.idle/error on the shared event
     // stream; swallow exactly one so it cannot settle a brand-new turn.
     if (turn) this.#armDrain();
-    setSessionStatus(this, "idle", false, { source: "abort" });
+    // Only return to idle if the backend is actually healthy; otherwise leave the
+    // failed/closed status in place instead of masking it as reusable.
+    if (this.status !== "closed" && this.server && this.server.exitCode === null && !this.sseDead) {
+      setSessionStatus(this, "idle", false, { source: "abort" });
+    }
     turn?.resolve?.();
     return { aborted: true, session_id: this.id };
   }
@@ -1597,6 +1623,9 @@ class CodexAppServerSession {
     done.catch(() => {});
 
     let turnResp;
+    // Capture the request id so a turn/start that times out can still handle a late
+    // response: the app-server may yet return a turn id and run that turn untracked.
+    const startReqId = this.nextId;
     try {
       turnResp = await withTimeout(
         this.#request("turn/start", {
@@ -1610,6 +1639,22 @@ class CodexAppServerSession {
         "Timed out starting Codex turn.",
       );
     } catch (err) {
+      // Replace the pending handler so a late turn/start response interrupts and
+      // ignores the orphaned turn instead of letting its events drive a later turn.
+      if (this.pending.has(startReqId)) {
+        this.pending.set(startReqId, {
+          resolve: result => {
+            const lateId = result?.turn?.id;
+            if (lateId) {
+              this.#ignoreTurn(lateId);
+              if (this.threadId && this.proc && this.proc.exitCode === null) {
+                this.#request("turn/interrupt", { threadId: this.threadId, turnId: lateId }).catch(() => {});
+              }
+            }
+          },
+          reject: () => {},
+        });
+      }
       if (this.turn === myTurn) {
         this.turn = null;
         this.lastError = err instanceof Error ? err.message : String(err);
@@ -1690,7 +1735,11 @@ class CodexAppServerSession {
     // Reject any trailing notifications from the interrupted turn so a late
     // turn/completed or delta cannot settle/contaminate a subsequent turn.
     if (interruptedTurnId) this.#ignoreTurn(interruptedTurnId);
-    setSessionStatus(this, "idle", false, { source: "abort" });
+    // Only return to idle if the app-server is still alive; otherwise leave the
+    // failed/closed status instead of masking a dead backend as reusable.
+    if (this.status !== "closed" && this.proc && this.proc.exitCode === null) {
+      setSessionStatus(this, "idle", false, { source: "abort" });
+    }
     turn?.resolve?.();
     return { aborted: true, session_id: this.id };
   }
