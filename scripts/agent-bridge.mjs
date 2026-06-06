@@ -689,6 +689,10 @@ class OmpRpcSession {
     const started = Date.now();
     while (Date.now() - started < timeoutMs) {
       await sleep(750);
+      // If the process died, fail now instead of polling a dead pipe until timeout.
+      if (!this.proc || this.proc.exitCode !== null) {
+        throw new Error(`OMP process for ${this.id} exited (code ${this.proc?.exitCode ?? "?"}) before the turn completed.`);
+      }
       try {
         const state = await this.state();
         const idle = !state?.isStreaming && !state?.queuedMessageCount;
@@ -733,6 +737,12 @@ class OmpRpcSession {
 
   close(options = {}) {
     setSessionStatus(this, "closed", false, { source: "close" });
+    // Reject any in-flight RPCs (send/state/result waiters) now: once status is "closed"
+    // the proc "close" handler early-returns and won't reject them, so they'd hang forever.
+    const err = new Error(`OMP session ${this.id} closed.`);
+    this.readyReject?.(err);
+    for (const pending of this.pending.values()) pending.reject(err);
+    this.pending.clear();
     try {
       this.proc?.stdin?.end();
     } catch {}
@@ -774,13 +784,19 @@ class OpenCodeServerSession {
     this.turn = null;
     this.partText = new Map();
     this.assistantMsgIds = new Set();
-    // OpenCode's event stream is session-level, not turn-level: an aborted turn emits a
-    // burst of trailing deltas + session.idle|error that can't be attributed to a turn.
-    // turnStarted gates settling — a session.idle|error can't end a turn until that turn
-    // is confirmed started, detected by a brand-new assistant message id (allAssistantIds
-    // holds every id ever seen, so an aborted turn's repeated message.updated is not new).
+    // OpenCode's event stream is session-level (events carry no turn id), so an aborted
+    // turn's trailing deltas + session.idle|error must not settle/contaminate a new turn.
+    // We anchor each turn to its USER message, which opencode creates synchronously when
+    // it accepts our prompt (before any generation or abort) and emits first on the stream:
+    //  - turnStarted (gate for settling terminals + deltas) flips true on a brand-new user
+    //    message, so it is set for EVERY accepted prompt — even an empty/error turn — which
+    //    prevents a terminal from being dropped forever (no wedge), and it can't be set by a
+    //    prior aborted turn (whose user message id was already seen pre-abort).
+    //  - the current turn's assistant message is identified by parentID === currentUserMsgId,
+    //    so deltas/finalize attribute only this turn's text.
     this.turnStarted = false;
-    this.allAssistantIds = new Set();
+    this.currentUserMsgId = null;
+    this.seenUserMsgIds = new Set();
   }
 
   async start() {
@@ -858,6 +874,7 @@ class OpenCodeServerSession {
     this.assistantMsgIds = new Set();
     this.lastAssistantText = "";
     this.turnStarted = false;
+    this.currentUserMsgId = null;
 
     const body = { parts: [{ type: "text", text: String(message) }] };
     const model = this.#modelObject();
@@ -1046,6 +1063,20 @@ class OpenCodeServerSession {
     throw new Error("timed out waiting for opencode event stream to connect");
   }
 
+  #rememberUserMsg(id) {
+    // Bounded record of user message ids ever seen, so a brand-new one can be detected as
+    // a turn boundary. Capped so a long-lived session can't grow this set without bound.
+    this.seenUserMsgIds.add(id);
+    if (this.seenUserMsgIds.size > 4096) {
+      const drop = this.seenUserMsgIds.size - 3072;
+      let i = 0;
+      for (const v of this.seenUserMsgIds) {
+        if (i++ >= drop) break;
+        this.seenUserMsgIds.delete(v);
+      }
+    }
+  }
+
   #onEventStreamGone(err) {
     // The event stream is how we observe turn completion. If it drops while the
     // server is still up and a turn is active, settle the turn instead of hanging.
@@ -1119,10 +1150,10 @@ class OpenCodeServerSession {
     if (sid && this.openCodeSessionId && sid !== this.openCodeSessionId) return;
 
     if (type === "message.part.delta") {
-      // Only accumulate once this turn is confirmed started; deltas arriving before that
-      // belong to an aborted/prior turn (the stream is shared) and would contaminate the
-      // text. #finalizeText reads the persisted message, so dropping pre-start deltas is safe.
-      if (this.turnStarted && props.field === "text" && typeof props.delta === "string") {
+      // Accumulate only THIS turn's deltas, attributed by messageID (assistantMsgIds holds
+      // the current turn's assistant message, linked via parentID). An aborted turn's late
+      // deltas carry a different messageID and are dropped, so they can't contaminate text.
+      if (props.field === "text" && typeof props.delta === "string" && this.assistantMsgIds.has(props.messageID)) {
         this.lastAssistantText = clampText(this.lastAssistantText + props.delta);
       }
       pushEvent(this, compactEvent(obj));
@@ -1130,13 +1161,21 @@ class OpenCodeServerSession {
     }
     if (type === "message.updated") {
       const info = props.info;
-      if (info && info.role === "assistant" && info.id && !this.allAssistantIds.has(info.id)) {
-        // A brand-new assistant message: it belongs to the current turn (an aborted/prior
-        // turn's id was already recorded). Mark the turn started so a stale leftover
-        // session.idle/error can't settle it before it has produced anything.
-        this.allAssistantIds.add(info.id);
-        this.assistantMsgIds.add(info.id);
-        if (this.turn) this.turnStarted = true;
+      if (info && info.id) {
+        if (info.role === "user" && !this.seenUserMsgIds.has(info.id)) {
+          // Brand-new user message = the start of the current turn. opencode creates it
+          // synchronously when accepting our prompt (before generation/abort), so this
+          // fires for every accepted prompt and reliably marks the turn started — and a
+          // prior aborted turn's user id was already seen, so it can't trigger here.
+          this.#rememberUserMsg(info.id);
+          if (this.turn) {
+            this.currentUserMsgId = info.id;
+            this.turnStarted = true;
+          }
+        } else if (info.role === "assistant" && info.parentID && info.parentID === this.currentUserMsgId) {
+          // The assistant message for the current turn (parent-linked to its user message).
+          this.assistantMsgIds.add(info.id);
+        }
       }
       pushEvent(this, compactEvent(obj));
       return;
@@ -1206,14 +1245,18 @@ class OpenCodeServerSession {
     // Keep this.turn occupied through finalization so a concurrent (non-wait) send
     // cannot start and have its text/status clobbered by this turn's late finalizer.
     this.finalizing = true;
-    this.#finalizeText().finally(() => {
-      this.finalizing = false;
-      // close()/abort() may have run during finalization; don't resurrect a closed session.
-      if (this.status === "closed") return;
-      this.turn = null;
-      setSessionStatus(this, "idle", false, { source: "idle" });
-      turn.resolve();
-    });
+    // .catch keeps a #finalizeText rejection (e.g. a throwing DB fallback) from reaching
+    // the process-level unhandledRejection handler, which would kill the shared daemon.
+    this.#finalizeText()
+      .catch(() => {})
+      .finally(() => {
+        this.finalizing = false;
+        // close()/abort() may have run during finalization; don't resurrect a closed session.
+        if (this.status === "closed") return;
+        this.turn = null;
+        setSessionStatus(this, "idle", false, { source: "idle" });
+        turn.resolve();
+      });
   }
 
   async #finalizeText() {
@@ -1222,18 +1265,25 @@ class OpenCodeServerSession {
     try {
       const r = await this.#http("GET", `/session/${this.openCodeSessionId}/message`, null);
       if (Array.isArray(r.json)) {
-        // Prefer the CURRENT turn's assistant message (its id is tracked via
-        // message.updated and reset each send), not the global last assistant message —
-        // after an abort/reuse the global last could be a previous turn's reply.
+        // Select the CURRENT turn's assistant message — the one parent-linked to this
+        // turn's user message (or whose id we tracked) — never the global last assistant,
+        // which after an abort/reuse could be a previous turn's reply.
         let lastAssistant = null;
         let lastTurnAssistant = null;
         for (const m of r.json) {
           const info = m.info || m;
           if (info.role !== "assistant") continue;
           lastAssistant = m;
-          if (info.id && this.assistantMsgIds.has(info.id)) lastTurnAssistant = m;
+          if (
+            (info.id && this.assistantMsgIds.has(info.id)) ||
+            (this.currentUserMsgId && info.parentID === this.currentUserMsgId)
+          ) {
+            lastTurnAssistant = m;
+          }
         }
-        const chosen = lastTurnAssistant || lastAssistant;
+        // Once the current turn is known, never fall back to a different turn's message:
+        // an empty current turn must finalize as empty, not as the previous reply.
+        const chosen = lastTurnAssistant || (this.currentUserMsgId ? null : lastAssistant);
         if (chosen) {
           text = (chosen.parts || [])
             .filter(p => p.type === "text" && typeof p.text === "string")
@@ -1243,13 +1293,17 @@ class OpenCodeServerSession {
         }
       }
     } catch {}
-    // Fallback: assistant text parts assembled from the live event stream.
+    // Fallback: text parts assembled from the live event stream (current turn only —
+    // partText is keyed by parts whose messageID is in assistantMsgIds).
     if (!text) {
       let assembled = "";
       for (const value of this.partText.values()) assembled += value;
       text = assembled.trim();
     }
-    if (!text) text = readOpenCodeAssistantTextFromDb(this.openCodeSessionId) || this.lastAssistantText || "";
+    // The SQLite fallback is session-global, so only use it when we don't know the current
+    // turn's message (it could otherwise return a previous turn's text).
+    if (!text && !this.currentUserMsgId) text = readOpenCodeAssistantTextFromDb(this.openCodeSessionId) || "";
+    if (!text) text = this.lastAssistantText || "";
     if (text) this.lastAssistantText = clampText(text);
   }
 
@@ -1277,6 +1331,10 @@ class OpenCodeServerSession {
     if (this.finalizing) return { aborted: true, session_id: this.id, finalizing: true };
     const turn = this.turn;
     this.turn = null;
+    // No current turn now: clear the turn-start state so a stale terminal from the aborted
+    // turn can't be treated as the (non-existent) current turn's. send() also resets these.
+    this.turnStarted = false;
+    this.currentUserMsgId = null;
     // The aborted turn keeps emitting trailing deltas + a final session.idle/error on the
     // shared stream; those can't settle the next turn because the turnStarted gate ignores
     // terminals (and pre-start deltas) until that turn is confirmed started.
