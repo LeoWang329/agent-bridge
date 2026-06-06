@@ -8,7 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 
-const BRIDGE_VERSION = "0.5.3";
+const BRIDGE_VERSION = "0.5.4";
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const DEFAULT_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_EVENTS = 300;
@@ -19,6 +19,8 @@ const SSE_HEARTBEAT_MS = 15_000;
 const STATE_ROOT = process.env.AGENT_BRIDGE_STATE_DIR || path.join(os.homedir(), ".agent-bridge");
 const LOG_DIR = path.join(STATE_ROOT, "logs");
 const PID_DIR = path.join(STATE_ROOT, "pids");
+const LOG_RETENTION_DAYS = Number(process.env.AGENT_BRIDGE_LOG_RETENTION_DAYS ?? 7);
+const LOG_MAX_BYTES = Number(process.env.AGENT_BRIDGE_LOG_MAX_MB ?? 500) * 1024 * 1024;
 const DAEMON_SOCKET = process.env.AGENT_BRIDGE_SOCKET || path.join(STATE_ROOT, "agent-bridge.sock");
 const DAEMON_PID_FILE = path.join(STATE_ROOT, "agent-bridge-daemon.pid");
 
@@ -298,6 +300,23 @@ function slimEvents(events, limit = 12) {
   });
 }
 
+// Remove model thinking/reasoning content before logging an event (keeps the answer, tool calls,
+// and structure; drops the chain-of-thought from disk).
+function stripThinking(value, depth = 0) {
+  if (!value || typeof value !== "object" || depth >= 10) return value;
+  if (Array.isArray(value)) {
+    return value
+      .filter(item => !(item && typeof item === "object" && item.type === "thinking"))
+      .map(item => stripThinking(item, depth + 1));
+  }
+  const out = {};
+  for (const [key, child] of Object.entries(value)) {
+    if (key === "thinking" || key === "reasoning_content" || key === "thinkingSignature") continue;
+    out[key] = stripThinking(child, depth + 1);
+  }
+  return out;
+}
+
 function sanitizeEventForUi(value, depth = 0) {
   if (typeof value === "string") return value.length > 1000 ? `${value.slice(0, 1000)}...` : value;
   if (!value || typeof value !== "object") return value;
@@ -431,6 +450,51 @@ function scheduleForceKill(pid, graceMs = 3000) {
     terminateProcessTree(pid, "SIGKILL");
   }, graceMs);
   timer.unref?.();
+}
+
+// Bound on-disk logs: drop session logs older than the retention window, then trim oldest-first
+// until under the total-size cap. Runs at daemon start (no active sessions exist yet, so nothing
+// in use is removed); daemon.log is always kept. Configure via AGENT_BRIDGE_LOG_RETENTION_DAYS /
+// AGENT_BRIDGE_LOG_MAX_MB (set either to 0 to disable that limit).
+function pruneLogs() {
+  let names;
+  try {
+    names = fs.readdirSync(LOG_DIR).filter(n => n.endsWith(".log") && n !== "daemon.log");
+  } catch {
+    return { removed: 0, freedBytes: 0 };
+  }
+  const maxAgeMs = LOG_RETENTION_DAYS > 0 ? LOG_RETENTION_DAYS * 86_400_000 : Infinity;
+  const maxBytes = LOG_MAX_BYTES > 0 ? LOG_MAX_BYTES : Infinity;
+  const now = Date.now();
+  const entries = [];
+  for (const name of names) {
+    const file = path.join(LOG_DIR, name);
+    try {
+      const st = fs.statSync(file);
+      entries.push({ file, mtime: st.mtimeMs, size: st.size, removed: false });
+    } catch {}
+  }
+  let removed = 0;
+  let freedBytes = 0;
+  const remove = entry => {
+    try {
+      fs.rmSync(entry.file, { force: true });
+      entry.removed = true;
+      removed += 1;
+      freedBytes += entry.size;
+    } catch {}
+  };
+  for (const entry of entries) {
+    if (now - entry.mtime > maxAgeMs) remove(entry);
+  }
+  const live = entries.filter(e => !e.removed).sort((a, b) => a.mtime - b.mtime);
+  let total = live.reduce((n, e) => n + e.size, 0);
+  for (const entry of live) {
+    if (total <= maxBytes) break;
+    remove(entry);
+    total -= entry.size;
+  }
+  return { removed, freedBytes };
 }
 
 function cleanupStalePidRecords() {
@@ -608,7 +672,7 @@ class OmpRpcSession {
     // Don't log message_update lines verbatim: OMP re-serializes the entire growing message
     // on every delta, so logging each one is O(n^2) and produces multi-GB logs. Non-streaming
     // events are logged in full; the final assembled message still lands via turn_end/agent_end.
-    if (message.type !== "message_update") appendLog(this.logFile, `${line}\n`);
+    if (message.type !== "message_update") appendLog(this.logFile, `${JSON.stringify(stripThinking(message))}\n`);
 
     this.updatedAt = nowIso();
     if (message.type === "ready") {
@@ -971,7 +1035,7 @@ class CodexAppServerSession {
     }
     // Skip logging the high-frequency streaming delta notifications verbatim; the final
     // item/turn events (logged below) still capture the assembled output.
-    if (msg.method !== "item/agentMessage/delta") appendLog(this.logFile, `${line}\n`);
+    if (msg.method !== "item/agentMessage/delta") appendLog(this.logFile, `${JSON.stringify(stripThinking(msg))}\n`);
     this.updatedAt = nowIso();
     if (msg.id !== undefined && msg.method) {
       // Server-initiated request: we do not implement any, so reject.
@@ -2546,6 +2610,13 @@ function cleanupStaleDaemons() {
 async function serveDaemon() {
   ensureDirs();
   cleanupStalePidRecords();
+  const pruned = pruneLogs();
+  if (pruned.removed) {
+    appendLog(
+      path.join(LOG_DIR, "daemon.log"),
+      `[${nowIso()}] pruned ${pruned.removed} session log(s), freed ~${Math.round(pruned.freedBytes / 1048576)}MB\n`,
+    );
+  }
   installProcessHandlers();
 
   const existing = await tryDaemonPing();
