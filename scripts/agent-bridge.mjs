@@ -456,6 +456,10 @@ class OmpRpcSession {
     this.isStreaming = false;
     this.lastAssistantText = "";
     this.lastError = null;
+    // Set true once the current turn is observed actually streaming (agent_start /
+    // stream deltas / a live isStreaming reading); waitIdle won't accept the idle
+    // window that exists *before* a freshly-sent prompt starts.
+    this.turnStarted = false;
     this.sessionState = null;
     this.events = [];
     this.pending = new Map();
@@ -590,6 +594,7 @@ class OmpRpcSession {
   #applyEvent(message) {
     if (message.type === "agent_start" || message.type === "turn_start") {
       this.lastAssistantText = "";
+      this.turnStarted = true;
       setSessionStatus(this, "running", true, { source: message.type });
       return;
     }
@@ -625,6 +630,9 @@ class OmpRpcSession {
     if (!message || !String(message).trim()) throw new Error("message is required.");
     if (this.status === "closed") throw new Error(`OMP session ${this.id} is closed.`);
     if (!this.proc || this.proc.exitCode !== null) throw new Error(`OMP process for ${this.id} is not running.`);
+    // Reset before prompting so waitIdle below ignores the pre-streaming idle window
+    // (a stale idle reading from before this turn actually starts).
+    this.turnStarted = false;
     setSessionStatus(this, "running", true, { source: "send" });
     await this.request("prompt", { message: String(message) });
     if (options.wait) {
@@ -683,9 +691,14 @@ class OmpRpcSession {
       await sleep(750);
       try {
         const state = await this.state();
-        if (!state?.isStreaming && !state?.queuedMessageCount) return;
+        const idle = !state?.isStreaming && !state?.queuedMessageCount;
+        // Only accept idle once THIS turn has actually started, observed via the
+        // agent_start event (turnStarted, reset at send). A live isStreaming reading is
+        // not used to set turnStarted: it can reflect a prior aborted/queued turn still
+        // streaming, which would let waitIdle return the previous turn's text early.
+        if (idle && this.turnStarted) return;
       } catch {
-        if (!this.isStreaming) return;
+        if (this.turnStarted && !this.isStreaming) return;
       }
     }
     throw new Error(`Timed out waiting for ${this.id} to become idle.`);
@@ -757,11 +770,17 @@ class OpenCodeServerSession {
     this.sseAttempts = 0;
     this.sseConnected = false;
     this.sseDead = false;
-    this.drainTerminal = 0;
     this.finalizing = false;
     this.turn = null;
     this.partText = new Map();
     this.assistantMsgIds = new Set();
+    // OpenCode's event stream is session-level, not turn-level: an aborted turn emits a
+    // burst of trailing deltas + session.idle|error that can't be attributed to a turn.
+    // turnStarted gates settling — a session.idle|error can't end a turn until that turn
+    // is confirmed started, detected by a brand-new assistant message id (allAssistantIds
+    // holds every id ever seen, so an aborted turn's repeated message.updated is not new).
+    this.turnStarted = false;
+    this.allAssistantIds = new Set();
   }
 
   async start() {
@@ -832,9 +851,13 @@ class OpenCodeServerSession {
     if (!this.server || this.server.exitCode !== null) throw new Error(`OpenCode server for ${this.id} is not running.`);
     if (this.turn || this.finalizing) throw new Error(`OpenCode session ${this.id} already has a running turn.`);
 
+    // Reset accumulators and the turn-start gate synchronously with reserving the turn
+    // (no await in between), so a leftover terminal from an aborted turn arriving right
+    // now can't settle this turn before it has actually started.
     this.partText = new Map();
     this.assistantMsgIds = new Set();
     this.lastAssistantText = "";
+    this.turnStarted = false;
 
     const body = { parts: [{ type: "text", text: String(message) }] };
     const model = this.#modelObject();
@@ -878,10 +901,9 @@ class OpenCodeServerSession {
         this.turn = null;
         this.lastError = err instanceof Error ? err.message : String(err);
         // The prompt may have been accepted before the POST errored (e.g. response
-        // timeout); abort the backend turn and arm the drain so a late session.idle
-        // can't settle a later turn.
+        // timeout); abort the backend turn. A late session.idle can't settle a later
+        // turn because the turnStarted gate ignores terminals until the next turn starts.
         if (this.server && this.server.exitCode === null && this.openCodeSessionId) {
-          this.#armDrain();
           this.#http("POST", `/session/${this.openCodeSessionId}/abort`, null).catch(() => {});
         }
         if (this.status !== "closed") setSessionStatus(this, "idle", false, { source: "prompt_error" });
@@ -1009,17 +1031,6 @@ class OpenCodeServerSession {
     this.sse = req;
   }
 
-  #armDrain() {
-    // Swallow one trailing terminal event from a turn we stopped observing, so it
-    // cannot settle a new turn. Bounded by a timer so a missing terminal never eats
-    // a later turn's idle.
-    this.drainTerminal += 1;
-    const timer = setTimeout(() => {
-      if (this.drainTerminal > 0) this.drainTerminal -= 1;
-    }, 3000);
-    timer.unref?.();
-  }
-
   async #waitForSse(timeoutMs = 10000) {
     // The SSE stream is how we observe turn completion. Don't send a prompt until it
     // is actually connected, or a fast turn could finish before any observer attaches
@@ -1044,10 +1055,9 @@ class OpenCodeServerSession {
     // Drop any partial frame; its bytes must not be prepended to the next stream.
     this.sseBuffer = "";
     if (this.turn) {
-      // We can no longer observe this turn. Stop it on the backend and arrange to
-      // swallow its trailing terminal event if the stream reconnects, so a stale
-      // session.idle/error cannot settle a later turn.
-      this.#armDrain();
+      // We can no longer observe this turn. Stop it on the backend; a stale
+      // session.idle/error after reconnect can't settle a later turn because the
+      // turnStarted gate ignores terminals until the next turn is confirmed started.
       if (this.openCodeSessionId && this.server && this.server.exitCode === null) {
         this.#http("POST", `/session/${this.openCodeSessionId}/abort`, null).catch(() => {});
       }
@@ -1109,7 +1119,10 @@ class OpenCodeServerSession {
     if (sid && this.openCodeSessionId && sid !== this.openCodeSessionId) return;
 
     if (type === "message.part.delta") {
-      if (props.field === "text" && typeof props.delta === "string") {
+      // Only accumulate once this turn is confirmed started; deltas arriving before that
+      // belong to an aborted/prior turn (the stream is shared) and would contaminate the
+      // text. #finalizeText reads the persisted message, so dropping pre-start deltas is safe.
+      if (this.turnStarted && props.field === "text" && typeof props.delta === "string") {
         this.lastAssistantText = clampText(this.lastAssistantText + props.delta);
       }
       pushEvent(this, compactEvent(obj));
@@ -1117,7 +1130,14 @@ class OpenCodeServerSession {
     }
     if (type === "message.updated") {
       const info = props.info;
-      if (info && info.role === "assistant" && info.id) this.assistantMsgIds.add(info.id);
+      if (info && info.role === "assistant" && info.id && !this.allAssistantIds.has(info.id)) {
+        // A brand-new assistant message: it belongs to the current turn (an aborted/prior
+        // turn's id was already recorded). Mark the turn started so a stale leftover
+        // session.idle/error can't settle it before it has produced anything.
+        this.allAssistantIds.add(info.id);
+        this.assistantMsgIds.add(info.id);
+        if (this.turn) this.turnStarted = true;
+      }
       pushEvent(this, compactEvent(obj));
       return;
     }
@@ -1156,21 +1176,16 @@ class OpenCodeServerSession {
       this.lastError = clampText(JSON.stringify(props), 4000);
       appendLog(this.logFile, `[agent-bridge] session.error\n`);
       pushEvent(this, compactEvent(obj));
-      // Swallow a terminal event left over from an aborted turn so it cannot settle a new one.
-      if (this.drainTerminal > 0) {
-        this.drainTerminal -= 1;
-        return;
-      }
+      // Ignore a terminal until the current turn is confirmed started — otherwise a
+      // leftover session.error from an aborted turn would settle a fresh turn early.
+      if (!this.turnStarted) return;
       this.#settleTurn(new Error(this.lastError));
       return;
     }
     if (type === "session.idle") {
       appendLog(this.logFile, `[agent-bridge] session.idle\n`);
       pushEvent(this, compactEvent(obj));
-      if (this.drainTerminal > 0) {
-        this.drainTerminal -= 1;
-        return;
-      }
+      if (!this.turnStarted) return;
       this.#settleTurn(null);
       return;
     }
@@ -1207,13 +1222,20 @@ class OpenCodeServerSession {
     try {
       const r = await this.#http("GET", `/session/${this.openCodeSessionId}/message`, null);
       if (Array.isArray(r.json)) {
+        // Prefer the CURRENT turn's assistant message (its id is tracked via
+        // message.updated and reset each send), not the global last assistant message —
+        // after an abort/reuse the global last could be a previous turn's reply.
         let lastAssistant = null;
+        let lastTurnAssistant = null;
         for (const m of r.json) {
           const info = m.info || m;
-          if (info.role === "assistant") lastAssistant = m;
+          if (info.role !== "assistant") continue;
+          lastAssistant = m;
+          if (info.id && this.assistantMsgIds.has(info.id)) lastTurnAssistant = m;
         }
-        if (lastAssistant) {
-          text = (lastAssistant.parts || [])
+        const chosen = lastTurnAssistant || lastAssistant;
+        if (chosen) {
+          text = (chosen.parts || [])
             .filter(p => p.type === "text" && typeof p.text === "string")
             .map(p => p.text)
             .join("")
@@ -1251,19 +1273,18 @@ class OpenCodeServerSession {
 
   async abort() {
     // If the turn already completed and is finalizing, its terminal event was already
-    // consumed: don't POST another abort or arm a drain (that would swallow a future
-    // turn's terminal). Just let finalization finish.
+    // consumed: don't POST another abort. Just let finalization finish.
     if (this.finalizing) return { aborted: true, session_id: this.id, finalizing: true };
+    const turn = this.turn;
+    this.turn = null;
+    // The aborted turn keeps emitting trailing deltas + a final session.idle/error on the
+    // shared stream; those can't settle the next turn because the turnStarted gate ignores
+    // terminals (and pre-start deltas) until that turn is confirmed started.
     if (this.openCodeSessionId && this.server && this.server.exitCode === null) {
       try {
         await this.#http("POST", `/session/${this.openCodeSessionId}/abort`, null);
       } catch {}
     }
-    const turn = this.turn;
-    this.turn = null;
-    // The aborted turn still emits a trailing session.idle/error on the shared event
-    // stream; swallow exactly one so it cannot settle a brand-new turn.
-    if (turn) this.#armDrain();
     // Only return to idle if the backend is actually healthy; otherwise leave the
     // failed/closed status in place instead of masking it as reusable.
     if (this.status !== "closed" && this.server && this.server.exitCode === null && !this.sseDead) {
