@@ -8,7 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 
-const BRIDGE_VERSION = "0.5.5";
+const BRIDGE_VERSION = "0.5.6";
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const DEFAULT_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_EVENTS = 300;
@@ -101,11 +101,12 @@ const TOOLS = [
   },
   {
     name: "agent_bridge_status",
-    description: "Inspect a persistent delegated-agent session, including streaming state and recent events.",
+    description: "Inspect a persistent delegated-agent session, including streaming state and recent events. Omit session_id to list sessions; the daemon is shared, so the unfiltered list includes sessions opened by other hosts/clients — pass mine:true to see only the ones this client opened.",
     inputSchema: {
       type: "object",
       properties: {
-        session_id: { type: "string", description: "Optional session id. If omitted, lists all sessions." },
+        session_id: { type: "string", description: "Optional session id. If omitted, lists sessions." },
+        mine: { type: "boolean", description: "When listing (no session_id), return only sessions opened by this client. Default false (all sessions in the shared daemon)." },
       },
       additionalProperties: false,
     },
@@ -547,6 +548,7 @@ class OmpRpcSession {
     this.write = Boolean(options.write);
     this.model = options.model || null;
     this.effort = options.effort || null;
+    this.owner = options.owner || null;
     this.createdAt = nowIso();
     this.updatedAt = this.createdAt;
     this.status = "starting";
@@ -820,6 +822,7 @@ class OmpRpcSession {
     return {
       id: this.id,
       agent: this.agent,
+      owner: this.owner,
       cwd: this.cwd,
       write: this.write,
       model: this.model,
@@ -868,6 +871,7 @@ class CodexAppServerSession {
     this.write = Boolean(options.write);
     this.model = options.model || null;
     this.effort = options.effort || null;
+    this.owner = options.owner || null;
     this.createdAt = nowIso();
     this.updatedAt = this.createdAt;
     this.status = "starting";
@@ -1305,6 +1309,7 @@ class CodexAppServerSession {
     return {
       id: this.id,
       agent: this.agent,
+      owner: this.owner,
       cwd: this.cwd,
       write: this.write,
       model: this.model,
@@ -1402,8 +1407,12 @@ function getSession(sessionId) {
   return session;
 }
 
-async function status(sessionId) {
-  if (!sessionId) return { sessions: [...sessions.values()].map(session => session.summary()) };
+async function status(sessionId, ownerFilter) {
+  if (!sessionId) {
+    let list = [...sessions.values()];
+    if (ownerFilter) list = list.filter(session => session.owner === ownerFilter);
+    return { sessions: list.map(session => session.summary()) };
+  }
   const session = getSession(sessionId);
   if (session instanceof OmpRpcSession && session.status !== "closed" && session.status !== "failed") {
     await session.state().catch(() => null);
@@ -2701,7 +2710,7 @@ async function handleDaemonRequest(request) {
     case "sessions":
       return await status(undefined);
     case "status":
-      return await status(params.session_id);
+      return await status(params.session_id, params.owner);
     case "result":
       return await result(params.session_id);
     case "wait":
@@ -2862,7 +2871,9 @@ function mcpText(value, isError = false) {
 async function callTool(name, args) {
   switch (name) {
     case "agent_bridge_open_session":
-      return mcpText(await requestDaemon("open", args || {}, { timeoutMs: 30000 }));
+      // Stamp this client's id so the daemon can attribute the session without the agent
+      // passing anything. The agent still tracks ids it opened; owner adds origin on top.
+      return mcpText(await requestDaemon("open", { ...(args || {}), owner: mcpClientId() }, { timeoutMs: 30000 }));
     case "agent_bridge_send_message":
       return mcpText(
         // Default to blocking: an omitted wait means true (sequential delegation is the common
@@ -2872,7 +2883,13 @@ async function callTool(name, args) {
         }),
       );
     case "agent_bridge_status":
-      return mcpText(await requestDaemon("status", { session_id: args?.session_id }, { timeoutMs: 10000 }));
+      return mcpText(
+        await requestDaemon(
+          "status",
+          { session_id: args?.session_id, owner: args?.mine ? mcpClientId() : undefined },
+          { timeoutMs: 10000 },
+        ),
+      );
     case "agent_bridge_result":
       return mcpText(await requestDaemon("result", { session_id: args?.session_id }, { timeoutMs: 10000 }));
     case "agent_bridge_wait":
@@ -2926,9 +2943,21 @@ function serveMcp() {
   });
 }
 
+// A stable owner id for sessions opened through THIS MCP process. The MCP process is a
+// per-host boundary (one long-lived process per client connection), so its pid plus the
+// client name from initialize identifies "this host/agent" — letting the daemon attribute
+// sessions without the calling agent passing anything. Other clients sharing the daemon get
+// their own ids; mine:true on status filters to this one.
+let mcpClientInfo = null;
+function mcpClientId() {
+  const name = mcpClientInfo?.name ? String(mcpClientInfo.name).replace(/\s+/g, "-") : "mcp";
+  return `${name}:${process.pid}`;
+}
+
 async function handleMcp(message) {
   switch (message.method) {
     case "initialize":
+      mcpClientInfo = message.params?.clientInfo || null;
       rpcResult(message.id, {
         protocolVersion: message.params?.protocolVersion || MCP_PROTOCOL_VERSION,
         capabilities: { tools: {} },
