@@ -134,8 +134,8 @@ Your personal marketplace must contain an entry that points `agent-bridge` at `.
 Codex should use the bridge like this:
 
 1. Call `agent_bridge_open_session` with `agent: "omp"` or `agent: "codex"`.
-2. Call `agent_bridge_send_message` with the returned `session_id`.
-3. Poll `agent_bridge_status` or call `agent_bridge_result`.
+2. Call `agent_bridge_send_message` with the returned `session_id` — it blocks and returns the turn's result by default (pass `wait: false` to return immediately for parallel work).
+3. Poll `agent_bridge_status` or call `agent_bridge_result` (only needed for non-blocking sends).
 4. Reuse the same `session_id` for follow-up messages.
 5. Call `agent_bridge_close_session` when finished.
 

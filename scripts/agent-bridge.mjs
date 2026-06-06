@@ -8,7 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 
-const BRIDGE_VERSION = "0.5.0";
+const BRIDGE_VERSION = "0.5.1";
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const DEFAULT_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_EVENTS = 300;
@@ -79,13 +79,18 @@ const TOOLS = [
   {
     name: "agent_bridge_send_message",
     description:
-      "Send a message to an existing persistent delegated-agent session. Returns immediately unless wait=true.",
+      "Send a message to an existing persistent delegated-agent session. Blocks until the turn completes and returns its result by default; pass wait=false to return immediately with an ack (e.g. to dispatch several sessions in parallel, then collect with agent_bridge_wait).",
     inputSchema: {
       type: "object",
       properties: {
         session_id: { type: "string", description: "Session id returned by agent_bridge_open_session." },
         message: { type: "string", description: "Message to send into the delegated agent session." },
-        wait: { type: "boolean", default: false, description: "Wait for the turn to complete." },
+        wait: {
+          type: "boolean",
+          default: true,
+          description:
+            "Block until the turn completes and return its result (default). Pass false to return immediately with an ack, for parallel fan-out.",
+        },
         timeout_ms: { type: "number", description: "Optional wait timeout in milliseconds." },
       },
       required: ["session_id", "message"],
@@ -2765,7 +2770,9 @@ async function callTool(name, args) {
       return mcpText(await requestDaemon("open", args || {}, { timeoutMs: 30000 }));
     case "agent_bridge_send_message":
       return mcpText(
-        await requestDaemon("send", args || {}, {
+        // Default to blocking: an omitted wait means true (sequential delegation is the common
+        // case). Pass wait:false explicitly for parallel fan-out, then collect with agent_bridge_wait.
+        await requestDaemon("send", { ...(args || {}), wait: args?.wait ?? true }, {
           timeoutMs: parseNumber(args?.timeout_ms, DEFAULT_WAIT_TIMEOUT_MS) + 30000,
         }),
       );

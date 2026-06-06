@@ -198,7 +198,7 @@ Codex 正式调用 Agent Bridge 时，应该优先使用 MCP 工具。CLI facade
 Codex 使用 Agent Bridge 时应该遵循这个流程：
 
 1. `agent_bridge_open_session`
-2. `agent_bridge_send_message`
+2. `agent_bridge_send_message`（**默认阻塞**，直接返回本轮结果；并行时显式传 `wait:false`）
 3. `agent_bridge_status`
 4. `agent_bridge_result`
 5. `agent_bridge_close_session`
