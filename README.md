@@ -140,7 +140,7 @@ Codex should use the bridge like this:
 
 Keep `write: false` for review, diagnosis, planning, or research. Set `write: true` only when the user explicitly wants the delegated agent to edit files.
 
-You can also pin a model and reasoning effort when opening a session. These are per-session — they are set on `agent_bridge_open_session` and cannot be changed per message, so open a new session to switch models. Pass `model` (forwarded verbatim to the backend's `--model`) and optional `effort`, which maps to OMP's `--thinking` (`minimal|low|medium|high|xhigh`) and Codex's turn effort (`none|minimal|low|medium|high|xhigh`). Omit both to use each backend's default. OMP in particular reaches many models via `omp --model <name>` (e.g. `deepseek-v4-pro`, `claude`, `gpt`).
+You can also pin a model and reasoning effort when opening a session. These are per-session — they are set on `agent_bridge_open_session` and cannot be changed per message, so open a new session to switch models. Pass `model` (forwarded verbatim to the backend's `--model`) and optional `effort`, which maps to OMP's `--thinking` (`minimal|low|medium|high|xhigh`) and Codex's turn effort (`none|minimal|low|medium|high|xhigh`). Omit both to use each backend's default. OMP in particular reaches many models via `omp --model <name>` (e.g. `deepseek-v4-pro`, `minimax-m3`, `claude`, `gpt`).
 
 ## Use With Claude Code
 
