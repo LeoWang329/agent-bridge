@@ -8,7 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 
-const BRIDGE_VERSION = "0.5.1";
+const BRIDGE_VERSION = "0.5.2";
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const DEFAULT_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_EVENTS = 300;
@@ -284,6 +284,18 @@ function compactValue(value, depth = 0) {
     copy[key] = compactValue(child, depth + 1);
   }
   return copy;
+}
+
+// Compact projection of recent events for tool results: just the type/status, not the
+// full message/usage/thinking snapshots (those bloat the caller's context — see result()).
+function slimEvents(events, limit = 12) {
+  return events.slice(-limit).map(record => {
+    const ev = record.event || {};
+    const out = { at: record.at, type: ev.type || ev.method || ev.kind || "event" };
+    if (ev.status) out.status = ev.status;
+    if (ev.source) out.source = ev.source;
+    return out;
+  });
 }
 
 function sanitizeEventForUi(value, depth = 0) {
@@ -695,7 +707,7 @@ class OmpRpcSession {
     return {
       session: this.summary(),
       text: this.lastAssistantText || null,
-      recent_events: this.events.slice(-20),
+      recent_events: slimEvents(this.events),
       log_file: this.logFile,
     };
   }
@@ -756,7 +768,7 @@ class OmpRpcSession {
             sessionFile: this.sessionState.sessionFile,
             messageCount: this.sessionState.messageCount,
             queuedMessageCount: this.sessionState.queuedMessageCount,
-            model: this.sessionState.model,
+            model: this.sessionState.model?.id || this.sessionState.model?.name || (typeof this.sessionState.model === "string" ? this.sessionState.model : null),
           }
         : null,
     };
@@ -1177,7 +1189,7 @@ class CodexAppServerSession {
     return {
       session: this.summary(),
       text: this.lastAssistantText || null,
-      recent_events: this.events.slice(-20),
+      recent_events: slimEvents(this.events),
       log_file: this.logFile,
     };
   }
