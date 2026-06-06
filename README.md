@@ -1,6 +1,6 @@
 # Agent Bridge
 
-Agent Bridge is a session-first MCP bridge that lets MCP clients such as Codex and Claude Code delegate work to local OMP, OpenCode, and Codex agents.
+Agent Bridge is a session-first MCP bridge that lets MCP clients such as Codex and Claude Code delegate work to local OMP and Codex agents.
 
 It is intentionally not a one-shot command wrapper. Codex opens a delegated-agent session, sends one or more messages into that same session, checks status/result, can abort the active turn, and closes the session when the work is done.
 
@@ -9,10 +9,7 @@ MCP tools, the CLI facade, and the local web monitor all share the same daemon-b
 ## Backends
 
 - `omp`: starts a persistent `omp --mode rpc` process and communicates through JSONL stdio RPC.
-- `opencode`: starts a persistent `opencode serve` backend and drives it over its HTTP API. It creates a session, subscribes to the `GET /event` SSE stream for live `message.part.delta` updates, and submits each turn with `prompt_async`. Read-only sessions disable the write-capable tools (`bash`, `edit`, `write`, `apply_patch`, `task`); write sessions auto-approve permission prompts. If the event stream yields no assistant text, Agent Bridge falls back to `GET /session/:id/message` and then to a read-only lookup in OpenCode's local SQLite database.
 - `codex`: starts a persistent `codex app-server` process and communicates through newline-delimited JSON-RPC (`initialize` → `thread/start` → `turn/start`), streaming `item/agentMessage/delta` events. Read-only uses `sandbox: read-only`; write uses `sandbox: workspace-write`; both run non-interactively (`approvalPolicy: never`).
-
-OpenCode does not expose OMP's stdio JSONL RPC mode, so Agent Bridge talks to its local HTTP/SSE server directly — this yields real incremental streaming instead of parsing one-shot CLI stdout.
 
 ## MCP Tools
 
@@ -75,10 +72,9 @@ node scripts/agent-bridge.mjs stop
 - Node.js 20 or newer
 - An MCP client: Codex (CLI or app with MCP/plugin support) or Claude Code
 - OMP installed and available as `omp` (if you delegate to OMP)
-- OpenCode installed and available as `opencode` (if you delegate to OpenCode)
-- `sqlite3` on PATH for the OpenCode result fallback
+- Codex installed and available as `codex` (if you delegate to Codex)
 
-**Install the delegated coding agents first.** Agent Bridge only bridges to OMP and OpenCode; it does not bundle or install them. If the backend you want to delegate to is not installed, the session cannot start. Install at least the backend(s) you plan to use before opening a session, then confirm each one is detected:
+**Install the delegated coding agents first.** Agent Bridge only bridges to OMP and Codex; it does not bundle or install them. If the backend you want to delegate to is not installed, the session cannot start. Install at least the backend(s) you plan to use before opening a session, then confirm each one is detected:
 
 ```sh
 node scripts/agent-bridge.mjs doctor
@@ -90,8 +86,7 @@ You can override binary paths with environment variables:
 
 ```sh
 export OMP_BIN="$HOME/.local/bin/omp"
-export OPENCODE_BIN="$(command -v opencode)"
-export OPENCODE_DB_PATH="$HOME/.local/share/opencode/opencode.db"
+export CODEX_BIN="$(command -v codex)"
 ```
 
 ## Quick Start
@@ -137,7 +132,7 @@ Your personal marketplace must contain an entry that points `agent-bridge` at `.
 
 Codex should use the bridge like this:
 
-1. Call `agent_bridge_open_session` with `agent: "omp"` or `agent: "opencode"`.
+1. Call `agent_bridge_open_session` with `agent: "omp"` or `agent: "codex"`.
 2. Call `agent_bridge_send_message` with the returned `session_id`.
 3. Poll `agent_bridge_status` or call `agent_bridge_result`.
 4. Reuse the same `session_id` for follow-up messages.
@@ -145,7 +140,7 @@ Codex should use the bridge like this:
 
 Keep `write: false` for review, diagnosis, planning, or research. Set `write: true` only when the user explicitly wants the delegated agent to edit files.
 
-You can also pin a model and reasoning effort when opening a session. These are per-session — they are set on `agent_bridge_open_session` and cannot be changed per message, so open a new session to switch models. Pass `model` (forwarded verbatim to the backend's `--model`) and optional `effort`, which maps to OMP's `--thinking` (`minimal|low|medium|high|xhigh`) and OpenCode's `--variant`. Omit both to use each backend's default.
+You can also pin a model and reasoning effort when opening a session. These are per-session — they are set on `agent_bridge_open_session` and cannot be changed per message, so open a new session to switch models. Pass `model` (forwarded verbatim to the backend's `--model`) and optional `effort`, which maps to OMP's `--thinking` (`minimal|low|medium|high|xhigh`) and Codex's turn effort (`none|minimal|low|medium|high|xhigh`). Omit both to use each backend's default. OMP in particular reaches many models via `omp --model <name>` (e.g. `deepseek-v4-pro`, `claude`, `gpt`).
 
 ## Use With Claude Code
 
@@ -188,11 +183,10 @@ The MCP tools work without the skill; it only adds guidance on when to delegate.
 
 - Agent Bridge defaults to read-oriented sessions.
 - OMP write mode adds `--auto-approve --approval-mode yolo`.
-- OpenCode read-only mode disables the write-capable tools; write mode auto-approves permission requests.
 - Codex read-only mode uses `sandbox: read-only`; write mode uses `sandbox: workspace-write`. Both run with `approvalPolicy: never`.
 - Always close sessions after use so no backend process remains running.
-- On normal daemon shutdown, Agent Bridge closes all active daemon-owned OMP/OpenCode child processes.
-- `agent-bridge stop` closes daemon-owned sessions and their OMP/OpenCode child processes.
+- On normal daemon shutdown, Agent Bridge closes all active daemon-owned OMP/Codex child processes.
+- `agent-bridge stop` closes daemon-owned sessions and their OMP/Codex child processes.
 - `agent-bridge ui` listens only on `127.0.0.1` by default.
 - Agent Bridge records its child process ids under `~/.agent-bridge/pids/`, skips records whose MCP/daemon owner is still running, and removes stale recorded children on the next startup or `cleanup`.
 - Do not commit personal access tokens, local secrets, or machine-specific absolute paths.

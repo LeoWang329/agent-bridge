@@ -21,20 +21,12 @@ const LOG_DIR = path.join(STATE_ROOT, "logs");
 const PID_DIR = path.join(STATE_ROOT, "pids");
 const DAEMON_SOCKET = process.env.AGENT_BRIDGE_SOCKET || path.join(STATE_ROOT, "agent-bridge.sock");
 const DAEMON_PID_FILE = path.join(STATE_ROOT, "agent-bridge-daemon.pid");
-const OPENCODE_DB_PATH =
-  process.env.OPENCODE_DB_PATH ||
-  path.join(process.env.XDG_DATA_HOME || path.join(os.homedir(), ".local", "share"), "opencode", "opencode.db");
 
 const AGENTS = {
   omp: {
     label: "Oh My Pi",
     env: "OMP_BIN",
     bin: "omp",
-  },
-  opencode: {
-    label: "OpenCode",
-    env: "OPENCODE_BIN",
-    bin: "opencode",
   },
   codex: {
     label: "Codex",
@@ -55,11 +47,11 @@ const TOOLS = [
   {
     name: "agent_bridge_open_session",
     description:
-      "Open a persistent delegated-agent session. OMP uses its JSONL RPC mode; OpenCode drives a persistent opencode serve backend over its HTTP/SSE API; Codex drives a persistent codex app-server over JSON-RPC. Use this before sending messages.",
+      "Open a persistent delegated-agent session. OMP uses its JSONL RPC mode; Codex drives a persistent codex app-server over JSON-RPC. Use this before sending messages.",
     inputSchema: {
       type: "object",
       properties: {
-        agent: { type: "string", enum: ["omp", "opencode", "codex"], description: "Agent backend to open: omp, opencode, or codex." },
+        agent: { type: "string", enum: ["omp", "codex"], description: "Agent backend to open: omp or codex." },
         cwd: { type: "string", description: "Absolute workspace directory for the delegated agent." },
         write: {
           type: "boolean",
@@ -70,7 +62,7 @@ const TOOLS = [
         effort: {
           type: "string",
           description:
-            "Optional reasoning effort. OMP maps it to --thinking (minimal|low|medium|high|xhigh). OpenCode sends it as the prompt variant. Codex sends it as the turn effort (none|minimal|low|medium|high|xhigh).",
+            "Optional reasoning effort. OMP maps it to --thinking (minimal|low|medium|high|xhigh). Codex sends it as the turn effort (none|minimal|low|medium|high|xhigh).",
         },
         initial_prompt: { type: "string", description: "Optional first message to send after opening." },
         wait: {
@@ -149,7 +141,7 @@ const TOOLS = [
   },
   {
     name: "agent_bridge_doctor",
-    description: "Check whether OMP, OpenCode, and Node are available for Agent Bridge.",
+    description: "Check whether OMP, Codex, and Node are available for Agent Bridge.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
 ];
@@ -165,7 +157,7 @@ function usage() {
     "  agent-bridge stop [--json]",
     "  agent-bridge ui [--port PORT] [--no-open] [--json]",
     "  agent-bridge sessions [--json]",
-    "  agent-bridge open --agent omp|opencode|codex [--cwd DIR] [--write] [--model M] [--effort E] [--json]",
+    "  agent-bridge open --agent omp|codex [--cwd DIR] [--write] [--model M] [--effort E] [--json]",
     "  agent-bridge send <session_id> <message...> [--wait] [--json]",
     "  agent-bridge status [session_id] [--json]",
     "  agent-bridge result <session_id> [--json]",
@@ -191,7 +183,7 @@ function makeId(prefix) {
 }
 
 function assertAgent(agent) {
-  if (!AGENTS[agent]) throw new Error(`Unsupported agent "${agent}". Use omp, opencode, or codex.`);
+  if (!AGENTS[agent]) throw new Error(`Unsupported agent "${agent}". Use omp or codex.`);
 }
 
 function assertCwd(cwd) {
@@ -360,10 +352,6 @@ function processCommand(pid) {
 function roleMatchesCommand(role, command) {
   if (!command) return false;
   if (role === "omp-rpc") return /\bomp\b/.test(command) && /--mode\s+rpc|--mode.*\brpc\b/.test(command);
-  if (role === "opencode-serve") return /\bopencode\b/.test(command) && /\bserve\b/.test(command);
-  if (role === "opencode-run") {
-    return /\bopencode\b/.test(command) && /\brun\b/.test(command) && /--attach\b/.test(command);
-  }
   if (role === "codex-app-server") return /\bcodex\b/.test(command) && /\bapp-server\b/.test(command);
   return false;
 }
@@ -702,6 +690,12 @@ class OmpRpcSession {
         // streaming, which would let waitIdle return the previous turn's text early.
         if (idle && this.turnStarted) return;
       } catch {
+        // state() failed. If the process died or the session failed/closed mid-poll, that
+        // is a real error — don't let "turnStarted && !isStreaming" report it as a clean idle
+        // (the close handler clears isStreaming on exit), which would return a half-done turn.
+        if (!this.proc || this.proc.exitCode !== null || this.status === "failed" || this.status === "closed") {
+          throw new Error(`OMP process for ${this.id} exited before the turn completed.`);
+        }
         if (this.turnStarted && !this.isStreaming) return;
       }
     }
@@ -747,648 +741,6 @@ class OmpRpcSession {
       this.proc?.stdin?.end();
     } catch {}
     terminateProcessTree(this.proc?.pid);
-    if (options.removePidRecord !== false) removePidRecord(this.pidFile);
-    return { closed: true, session_id: this.id };
-  }
-}
-
-class OpenCodeServerSession {
-  constructor(options) {
-    this.id = makeId("opencode");
-    this.agent = "opencode";
-    this.cwd = assertCwd(options.cwd);
-    this.write = Boolean(options.write);
-    this.model = options.model || null;
-    this.effort = options.effort || null;
-    this.createdAt = nowIso();
-    this.updatedAt = this.createdAt;
-    this.status = "starting";
-    this.isStreaming = false;
-    this.server = null;
-    this.serverUrl = null;
-    this.openCodeSessionId = null;
-    this.turnCount = 0;
-    this.lastAssistantText = "";
-    this.lastError = null;
-    this.events = [];
-    this.logFile = path.join(LOG_DIR, `${this.id}.log`);
-    this.pidFile = pidRecordPath(this.id);
-    this.serverArgs = null;
-    this.sse = null;
-    this.sseBuffer = "";
-    this.sseReconnectTimer = null;
-    this.sseAttempts = 0;
-    this.sseConnected = false;
-    this.sseDead = false;
-    this.finalizing = false;
-    this.turn = null;
-    this.partText = new Map();
-    this.assistantMsgIds = new Set();
-    // OpenCode's event stream is session-level (events carry no turn id), so an aborted
-    // turn's trailing deltas + session.idle|error must not settle/contaminate a new turn.
-    // We anchor each turn to its USER message, which opencode creates synchronously when
-    // it accepts our prompt (before any generation or abort) and emits first on the stream:
-    //  - turnStarted (gate for settling terminals + deltas) flips true on a brand-new user
-    //    message, so it is set for EVERY accepted prompt — even an empty/error turn — which
-    //    prevents a terminal from being dropped forever (no wedge), and it can't be set by a
-    //    prior aborted turn (whose user message id was already seen pre-abort).
-    //  - the current turn's assistant message is identified by parentID === currentUserMsgId,
-    //    so deltas/finalize attribute only this turn's text.
-    this.turnStarted = false;
-    this.currentUserMsgId = null;
-    this.seenUserMsgIds = new Set();
-  }
-
-  async start() {
-    const port = await getFreePort();
-    this.serverUrl = `http://127.0.0.1:${port}`;
-    const args = ["serve", "--hostname", "127.0.0.1", "--port", String(port)];
-    this.serverArgs = args;
-    appendLog(this.logFile, `$ ${[agentBin("opencode"), ...args.map(shellQuote)].join(" ")}\n`);
-    this.server = spawn(agentBin("opencode"), args, {
-      cwd: this.cwd,
-      env: process.env,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    this.#writePidRecord();
-
-    this.server.stdout.on("data", chunk => appendLog(this.logFile, chunk.toString("utf8")));
-    this.server.stderr.on("data", chunk => {
-      const text = chunk.toString("utf8");
-      appendLog(this.logFile, text);
-      this.lastError = clampText(stripAnsi(text), 4000);
-    });
-    this.server.on("error", err => {
-      const msg = err instanceof Error ? err.message : String(err);
-      appendLog(this.logFile, `[agent-bridge] opencode serve error: ${msg}\n`);
-      this.lastError = msg;
-      removePidRecord(this.pidFile);
-      if (this.status !== "closed") setSessionStatus(this, "failed", false, { source: "server_error" });
-      const turn = this.turn;
-      this.turn = null;
-      turn?.reject?.(err instanceof Error ? err : new Error(msg));
-    });
-    this.server.on("close", code => {
-      removePidRecord(this.pidFile);
-      if (this.status === "closed") return;
-      this.lastError = `opencode serve exited with code ${code}`;
-      setSessionStatus(this, "failed", false, { source: "server_close", code });
-      const turn = this.turn;
-      this.turn = null;
-      turn?.reject?.(new Error(this.lastError));
-    });
-
-    try {
-      await waitForHttp(this.serverUrl, 20000, () => this.server?.exitCode !== null);
-      const created = await this.#http("POST", "/session", {});
-      if (created.status >= 400 || !created.json?.id) {
-        throw new Error(`opencode create session failed: ${created.status} ${String(created.body).slice(0, 200)}`);
-      }
-      if (!this.server || this.server.exitCode !== null) {
-        throw new Error("opencode serve exited during startup");
-      }
-      this.openCodeSessionId = created.json.id;
-      appendLog(this.logFile, `[agent-bridge] opencode session ${this.openCodeSessionId}\n`);
-      this.#openEventStream();
-      setSessionStatus(this, "idle", false, { source: "ready" });
-      this.#writePidRecord();
-      return this;
-    } catch (err) {
-      this.lastError = err instanceof Error ? err.message : String(err);
-      this.close();
-      throw err;
-    }
-  }
-
-  async send(message, options = {}) {
-    if (!message || !String(message).trim()) throw new Error("message is required.");
-    if (this.status === "closed") throw new Error(`OpenCode session ${this.id} is closed.`);
-    if (this.sseDead) throw new Error(`OpenCode session ${this.id} lost its event stream; recreate the session.`);
-    if (!this.server || this.server.exitCode !== null) throw new Error(`OpenCode server for ${this.id} is not running.`);
-    if (this.turn || this.finalizing) throw new Error(`OpenCode session ${this.id} already has a running turn.`);
-
-    // Reset accumulators and the turn-start gate synchronously with reserving the turn
-    // (no await in between), so a leftover terminal from an aborted turn arriving right
-    // now can't settle this turn before it has actually started.
-    this.partText = new Map();
-    this.assistantMsgIds = new Set();
-    this.lastAssistantText = "";
-    this.turnStarted = false;
-    this.currentUserMsgId = null;
-
-    const body = { parts: [{ type: "text", text: String(message) }] };
-    const model = this.#modelObject();
-    if (model) body.model = model;
-    if (this.effort) body.variant = this.effort;
-    if (!this.write) body.tools = { bash: false, edit: false, write: false, apply_patch: false, task: false };
-
-    // Reserve the turn synchronously, before any await, so two concurrent sends can't
-    // both pass the single-flight guard while the SSE stream is (re)connecting.
-    setSessionStatus(this, "running", true, { source: "send" });
-    const done = new Promise((resolve, reject) => {
-      this.turn = { resolve, reject };
-    });
-    const myTurn = this.turn;
-    // Attach a handler now so a turn that rejects before a waiter is attached
-    // (SSE drop / session.error during the POST) cannot trip the process-level
-    // unhandledRejection handler and take down the whole daemon.
-    done.catch(() => {});
-
-    // Ensure the event stream is connected before prompting, so a fast turn cannot
-    // finish (emit session.idle) before any observer is attached.
-    try {
-      await this.#waitForSse();
-    } catch (err) {
-      if (this.turn === myTurn) {
-        this.turn = null;
-        this.lastError = err instanceof Error ? err.message : String(err);
-        if (this.status !== "closed") setSessionStatus(this, "idle", false, { source: "sse_wait_error" });
-      }
-      throw err instanceof Error ? err : new Error(this.lastError);
-    }
-
-    appendLog(this.logFile, `$ POST /session/${this.openCodeSessionId}/prompt_async write=${this.write}\n`);
-    let resp;
-    try {
-      resp = await this.#http("POST", `/session/${this.openCodeSessionId}/prompt_async`, body);
-    } catch (err) {
-      // Only mutate state if this is still our turn; abort()/close() may have run
-      // during the POST and already settled it (don't flip a closed session to idle).
-      if (this.turn === myTurn) {
-        this.turn = null;
-        this.lastError = err instanceof Error ? err.message : String(err);
-        // The prompt may have been accepted before the POST errored (e.g. response
-        // timeout); abort the backend turn. A late session.idle can't settle a later
-        // turn because the turnStarted gate ignores terminals until the next turn starts.
-        if (this.server && this.server.exitCode === null && this.openCodeSessionId) {
-          this.#http("POST", `/session/${this.openCodeSessionId}/abort`, null).catch(() => {});
-        }
-        if (this.status !== "closed") setSessionStatus(this, "idle", false, { source: "prompt_error" });
-      }
-      throw err instanceof Error ? err : new Error(this.lastError);
-    }
-    if (this.turn !== myTurn) {
-      // Aborted/closed while the prompt POST was in flight; the turn is already settled.
-      return { accepted: false, session_id: this.id, status: this.status, server_url: this.serverUrl };
-    }
-    if (resp.status >= 400) {
-      this.turn = null;
-      const err = new Error(`opencode prompt failed: ${resp.status} ${String(resp.body).slice(0, 300)}`);
-      this.lastError = err.message;
-      if (this.status !== "closed") setSessionStatus(this, "failed", false, { source: "prompt_error", code: resp.status });
-      throw err;
-    }
-
-    if (options.wait) {
-      try {
-        return await withTimeout(
-          done.then(() => this.result()),
-          options.timeout_ms || DEFAULT_WAIT_TIMEOUT_MS,
-          "Timed out waiting for OpenCode turn.",
-        );
-      } catch (err) {
-        // On a wait timeout the turn is still pending; abort the backend turn and
-        // clear it so the session stays reusable instead of wedged at status=running.
-        if (this.turn) {
-          try {
-            await this.abort();
-          } catch {}
-        }
-        throw err;
-      }
-    }
-    done.catch(err => {
-      this.lastError = err.message;
-    });
-    return { accepted: true, session_id: this.id, status: this.status, server_url: this.serverUrl };
-  }
-
-  #writePidRecord() {
-    const processes = [];
-    if (this.server?.pid && this.server.exitCode === null) {
-      processes.push({
-        role: "opencode-serve",
-        pid: this.server.pid,
-        command: [agentBin("opencode"), ...(this.serverArgs || [])],
-      });
-    }
-    if (!processes.length) {
-      removePidRecord(this.pidFile);
-      return;
-    }
-    writePidRecord(this.pidFile, {
-      id: this.id,
-      agent: this.agent,
-      ownerPid: process.pid,
-      cwd: this.cwd,
-      serverUrl: this.serverUrl,
-      createdAt: this.createdAt,
-      processes,
-    });
-  }
-
-  #http(method, pathName, body) {
-    return new Promise((resolve, reject) => {
-      const u = new URL(this.serverUrl + pathName);
-      const data = body == null ? null : Buffer.from(JSON.stringify(body));
-      const req = http.request(
-        {
-          method,
-          hostname: u.hostname,
-          port: u.port,
-          path: u.pathname + u.search,
-          headers: { "content-type": "application/json", ...(data ? { "content-length": data.length } : {}) },
-        },
-        res => {
-          let d = "";
-          res.setEncoding("utf8");
-          res.on("data", c => (d += c));
-          res.on("error", reject);
-          res.on("end", () => {
-            let json = null;
-            try {
-              json = d ? JSON.parse(d) : null;
-            } catch {}
-            resolve({ status: res.statusCode, json, body: d });
-          });
-        },
-      );
-      req.on("error", reject);
-      req.setTimeout(30000, () => req.destroy(new Error(`opencode request timed out: ${method} ${pathName}`)));
-      if (data) req.write(data);
-      req.end();
-    });
-  }
-
-  #openEventStream() {
-    const req = http.get(this.serverUrl + "/event", res => {
-      if (res.statusCode !== 200) {
-        appendLog(this.logFile, `[agent-bridge] event stream bad status ${res.statusCode}\n`);
-        res.resume();
-        this.#onEventStreamGone(new Error(`event stream HTTP ${res.statusCode}`));
-        return;
-      }
-      res.setEncoding("utf8");
-      this.sseAttempts = 0;
-      this.sseConnected = true;
-      res.on("data", chunk => this.#consumeSse(chunk));
-      res.on("error", err => {
-        appendLog(this.logFile, `[agent-bridge] event stream response error: ${err.message}\n`);
-        this.#onEventStreamGone(err);
-      });
-      res.on("end", () => {
-        appendLog(this.logFile, "[agent-bridge] opencode event stream ended\n");
-        this.#onEventStreamGone(new Error("event stream ended"));
-      });
-    });
-    req.on("error", err => {
-      appendLog(this.logFile, `[agent-bridge] event stream error: ${err.message}\n`);
-      this.#onEventStreamGone(err);
-    });
-    this.sse = req;
-  }
-
-  async #waitForSse(timeoutMs = 10000) {
-    // The SSE stream is how we observe turn completion. Don't send a prompt until it
-    // is actually connected, or a fast turn could finish before any observer attaches
-    // and its session.idle would be missed.
-    if (this.sseConnected) return;
-    const started = Date.now();
-    while (Date.now() - started < timeoutMs) {
-      if (this.sseConnected) return;
-      if (this.sseDead || this.status === "closed") throw new Error("opencode event stream is not available");
-      if (!this.server || this.server.exitCode !== null) throw new Error("opencode server is not running");
-      await sleep(50);
-    }
-    throw new Error("timed out waiting for opencode event stream to connect");
-  }
-
-  #rememberUserMsg(id) {
-    // Bounded record of user message ids ever seen, so a brand-new one can be detected as
-    // a turn boundary. Capped so a long-lived session can't grow this set without bound.
-    this.seenUserMsgIds.add(id);
-    if (this.seenUserMsgIds.size > 4096) {
-      const drop = this.seenUserMsgIds.size - 3072;
-      let i = 0;
-      for (const v of this.seenUserMsgIds) {
-        if (i++ >= drop) break;
-        this.seenUserMsgIds.delete(v);
-      }
-    }
-  }
-
-  #onEventStreamGone(err) {
-    // The event stream is how we observe turn completion. If it drops while the
-    // server is still up and a turn is active, settle the turn instead of hanging.
-    if (this.status === "closed") return;
-    this.sse = null;
-    this.sseConnected = false;
-    // Drop any partial frame; its bytes must not be prepended to the next stream.
-    this.sseBuffer = "";
-    if (this.turn) {
-      // We can no longer observe this turn. Stop it on the backend; a stale
-      // session.idle/error after reconnect can't settle a later turn because the
-      // turnStarted gate ignores terminals until the next turn is confirmed started.
-      if (this.openCodeSessionId && this.server && this.server.exitCode === null) {
-        this.#http("POST", `/session/${this.openCodeSessionId}/abort`, null).catch(() => {});
-      }
-      this.#settleTurn(err instanceof Error ? err : new Error(String(err)));
-    }
-    // Reconnect so future turns can still observe events; a transient drop would
-    // otherwise leave the session healthy-looking but permanently unobservable.
-    this.#scheduleSseReconnect();
-  }
-
-  #scheduleSseReconnect() {
-    if (this.status === "closed" || this.sseReconnectTimer) return;
-    if (!this.server || this.server.exitCode !== null) return; // server gone; nothing to reconnect to
-    const attempt = (this.sseAttempts += 1);
-    if (attempt > 10) {
-      appendLog(this.logFile, `[agent-bridge] gave up reconnecting opencode event stream after ${attempt - 1} attempts\n`);
-      // Completion can no longer be observed; refuse future sends instead of hanging.
-      this.sseDead = true;
-      if (this.status !== "closed") setSessionStatus(this, "failed", false, { source: "sse_dead" });
-      if (this.turn) this.#settleTurn(new Error("opencode event stream lost"));
-      return;
-    }
-    const delay = Math.min(2000, 100 * attempt);
-    this.sseReconnectTimer = setTimeout(() => {
-      this.sseReconnectTimer = null;
-      if (this.status === "closed") return;
-      appendLog(this.logFile, `[agent-bridge] reconnecting opencode event stream (attempt ${attempt})\n`);
-      this.#openEventStream();
-    }, delay);
-    this.sseReconnectTimer.unref?.();
-  }
-
-  #consumeSse(chunk) {
-    this.sseBuffer += chunk;
-    let idx;
-    while ((idx = this.sseBuffer.indexOf("\n\n")) >= 0) {
-      const frame = this.sseBuffer.slice(0, idx);
-      this.sseBuffer = this.sseBuffer.slice(idx + 2);
-      const dataStr = frame
-        .split("\n")
-        .filter(line => line.startsWith("data:"))
-        .map(line => line.slice(5).trim())
-        .join("");
-      if (!dataStr) continue;
-      let obj;
-      try {
-        obj = JSON.parse(dataStr);
-      } catch {
-        continue;
-      }
-      this.#onEvent(obj);
-    }
-  }
-
-  #onEvent(obj) {
-    const type = String(obj?.type || "");
-    const props = obj?.properties || {};
-    const sid = props.sessionID || props.part?.sessionID || props.info?.sessionID || null;
-    if (sid && this.openCodeSessionId && sid !== this.openCodeSessionId) return;
-
-    if (type === "message.part.delta") {
-      // Accumulate only THIS turn's deltas, attributed by messageID (assistantMsgIds holds
-      // the current turn's assistant message, linked via parentID). An aborted turn's late
-      // deltas carry a different messageID and are dropped, so they can't contaminate text.
-      if (props.field === "text" && typeof props.delta === "string" && this.assistantMsgIds.has(props.messageID)) {
-        this.lastAssistantText = clampText(this.lastAssistantText + props.delta);
-      }
-      pushEvent(this, compactEvent(obj));
-      return;
-    }
-    if (type === "message.updated") {
-      const info = props.info;
-      if (info && info.id) {
-        if (info.role === "user" && !this.seenUserMsgIds.has(info.id)) {
-          // Brand-new user message = the start of the current turn. opencode creates it
-          // synchronously when accepting our prompt (before generation/abort), so this
-          // fires for every accepted prompt and reliably marks the turn started — and a
-          // prior aborted turn's user id was already seen, so it can't trigger here.
-          this.#rememberUserMsg(info.id);
-          if (this.turn) {
-            this.currentUserMsgId = info.id;
-            this.turnStarted = true;
-          }
-        } else if (info.role === "assistant" && info.parentID && info.parentID === this.currentUserMsgId) {
-          // The assistant message for the current turn (parent-linked to its user message).
-          this.assistantMsgIds.add(info.id);
-        }
-      }
-      pushEvent(this, compactEvent(obj));
-      return;
-    }
-    if (type === "message.part.updated") {
-      const part = props.part;
-      if (part && part.type === "text" && typeof part.text === "string" && this.assistantMsgIds.has(part.messageID)) {
-        this.partText.set(part.id, part.text);
-      }
-      // Snapshot marker only — omit cumulative text so the UI does not double-append.
-      pushEvent(this, { type, partID: part?.id, partType: part?.type });
-      return;
-    }
-    if (type === "permission.asked") {
-      const permID = props.id;
-      const decision = this.write ? "always" : "reject";
-      appendLog(this.logFile, `[agent-bridge] permission.asked -> ${decision}\n`);
-      if (permID) {
-        this.#http("POST", `/session/${this.openCodeSessionId}/permissions/${permID}`, { response: decision }).catch(err =>
-          appendLog(this.logFile, `[agent-bridge] permission reply failed: ${err.message}\n`),
-        );
-      }
-      pushEvent(this, compactEvent(obj));
-      return;
-    }
-    if (type === "question.asked") {
-      const qid = props.id;
-      appendLog(this.logFile, `[agent-bridge] question.asked -> reject\n`);
-      if (qid)
-        this.#http("POST", `/question/${qid}/reject`, null).catch(err =>
-          appendLog(this.logFile, `[agent-bridge] question reject failed: ${err.message}\n`),
-        );
-      pushEvent(this, compactEvent(obj));
-      return;
-    }
-    if (type === "session.error") {
-      this.lastError = clampText(JSON.stringify(props), 4000);
-      appendLog(this.logFile, `[agent-bridge] session.error\n`);
-      pushEvent(this, compactEvent(obj));
-      // Ignore a terminal until the current turn is confirmed started — otherwise a
-      // leftover session.error from an aborted turn would settle a fresh turn early.
-      if (!this.turnStarted) return;
-      this.#settleTurn(new Error(this.lastError));
-      return;
-    }
-    if (type === "session.idle") {
-      appendLog(this.logFile, `[agent-bridge] session.idle\n`);
-      pushEvent(this, compactEvent(obj));
-      if (!this.turnStarted) return;
-      this.#settleTurn(null);
-      return;
-    }
-    pushEvent(this, compactEvent(obj));
-  }
-
-  #settleTurn(err) {
-    const turn = this.turn;
-    if (!turn || this.finalizing) return;
-    this.turnCount += 1;
-    this.updatedAt = nowIso();
-    if (err) {
-      this.turn = null;
-      setSessionStatus(this, "failed", false, { source: "turn_error", error: err.message });
-      turn.reject(err);
-      return;
-    }
-    // Keep this.turn occupied through finalization so a concurrent (non-wait) send
-    // cannot start and have its text/status clobbered by this turn's late finalizer.
-    this.finalizing = true;
-    // .catch keeps a #finalizeText rejection (e.g. a throwing DB fallback) from reaching
-    // the process-level unhandledRejection handler, which would kill the shared daemon.
-    this.#finalizeText()
-      .catch(() => {})
-      .finally(() => {
-        this.finalizing = false;
-        // close()/abort() may have run during finalization; don't resurrect a closed session.
-        if (this.status === "closed") return;
-        this.turn = null;
-        setSessionStatus(this, "idle", false, { source: "idle" });
-        turn.resolve();
-      });
-  }
-
-  async #finalizeText() {
-    let text = "";
-    // Primary: ask the server for the persisted messages and take the last assistant message's text parts.
-    try {
-      const r = await this.#http("GET", `/session/${this.openCodeSessionId}/message`, null);
-      if (Array.isArray(r.json)) {
-        // Select the CURRENT turn's assistant message — the one parent-linked to this
-        // turn's user message (or whose id we tracked) — never the global last assistant,
-        // which after an abort/reuse could be a previous turn's reply.
-        let lastAssistant = null;
-        let lastTurnAssistant = null;
-        for (const m of r.json) {
-          const info = m.info || m;
-          if (info.role !== "assistant") continue;
-          lastAssistant = m;
-          if (
-            (info.id && this.assistantMsgIds.has(info.id)) ||
-            (this.currentUserMsgId && info.parentID === this.currentUserMsgId)
-          ) {
-            lastTurnAssistant = m;
-          }
-        }
-        // Once the current turn is known, never fall back to a different turn's message:
-        // an empty current turn must finalize as empty, not as the previous reply.
-        const chosen = lastTurnAssistant || (this.currentUserMsgId ? null : lastAssistant);
-        if (chosen) {
-          text = (chosen.parts || [])
-            .filter(p => p.type === "text" && typeof p.text === "string")
-            .map(p => p.text)
-            .join("")
-            .trim();
-        }
-      }
-    } catch {}
-    // Fallback: text parts assembled from the live event stream (current turn only —
-    // partText is keyed by parts whose messageID is in assistantMsgIds).
-    if (!text) {
-      let assembled = "";
-      for (const value of this.partText.values()) assembled += value;
-      text = assembled.trim();
-    }
-    // The SQLite fallback is session-global, so only use it when we don't know the current
-    // turn's message (it could otherwise return a previous turn's text).
-    if (!text && !this.currentUserMsgId) text = readOpenCodeAssistantTextFromDb(this.openCodeSessionId) || "";
-    if (!text) text = this.lastAssistantText || "";
-    if (text) this.lastAssistantText = clampText(text);
-  }
-
-  #modelObject() {
-    if (!this.model) return null;
-    const s = String(this.model);
-    const i = s.indexOf("/");
-    if (i > 0) return { providerID: s.slice(0, i), modelID: s.slice(i + 1) };
-    appendLog(this.logFile, `[agent-bridge] model "${s}" lacks a provider/ prefix; using opencode default.\n`);
-    return null;
-  }
-
-  result() {
-    return {
-      session: this.summary(),
-      text: this.lastAssistantText || null,
-      recent_events: this.events.slice(-20),
-      log_file: this.logFile,
-    };
-  }
-
-  async abort() {
-    // If the turn already completed and is finalizing, its terminal event was already
-    // consumed: don't POST another abort. Just let finalization finish.
-    if (this.finalizing) return { aborted: true, session_id: this.id, finalizing: true };
-    const turn = this.turn;
-    this.turn = null;
-    // No current turn now: clear the turn-start state so a stale terminal from the aborted
-    // turn can't be treated as the (non-existent) current turn's. send() also resets these.
-    this.turnStarted = false;
-    this.currentUserMsgId = null;
-    // The aborted turn keeps emitting trailing deltas + a final session.idle/error on the
-    // shared stream; those can't settle the next turn because the turnStarted gate ignores
-    // terminals (and pre-start deltas) until that turn is confirmed started.
-    if (this.openCodeSessionId && this.server && this.server.exitCode === null) {
-      try {
-        await this.#http("POST", `/session/${this.openCodeSessionId}/abort`, null);
-      } catch {}
-    }
-    // Only return to idle if the backend is actually healthy; otherwise leave the
-    // failed/closed status in place instead of masking it as reusable.
-    if (this.status !== "closed" && this.server && this.server.exitCode === null && !this.sseDead) {
-      setSessionStatus(this, "idle", false, { source: "abort" });
-    }
-    turn?.resolve?.();
-    return { aborted: true, session_id: this.id };
-  }
-
-  summary() {
-    return {
-      id: this.id,
-      agent: this.agent,
-      cwd: this.cwd,
-      write: this.write,
-      model: this.model,
-      effort: this.effort,
-      status: this.status,
-      isStreaming: this.isStreaming,
-      serverPid: this.server?.pid || null,
-      serverUrl: this.serverUrl,
-      openCodeSessionId: this.openCodeSessionId,
-      turnCount: this.turnCount,
-      createdAt: this.createdAt,
-      updatedAt: this.updatedAt,
-      lastError: this.lastError,
-      logFile: this.logFile,
-    };
-  }
-
-  close(options = {}) {
-    setSessionStatus(this, "closed", false, { source: "close" });
-    if (this.sseReconnectTimer) {
-      clearTimeout(this.sseReconnectTimer);
-      this.sseReconnectTimer = null;
-    }
-    try {
-      this.sse?.destroy();
-    } catch {}
-    this.sse = null;
-    const turn = this.turn;
-    this.turn = null;
-    turn?.reject?.(new Error("session closed"));
-    const pid = this.server?.pid;
-    terminateProcessTree(pid);
-    scheduleForceKill(pid);
     if (options.removePidRecord !== false) removePidRecord(this.pidFile);
     return { closed: true, session_id: this.id };
   }
@@ -1902,93 +1254,10 @@ function extractLikelyText(raw) {
   return "";
 }
 
-function sqlString(value) {
-  return `'${String(value).replace(/'/g, "''")}'`;
-}
-
-function readOpenCodeAssistantTextFromDb(sessionId) {
-  if (!sessionId || !fs.existsSync(OPENCODE_DB_PATH)) return "";
-  const sql = [
-    "select",
-    "  m.id as message_id,",
-    "  m.time_created as message_time,",
-    "  m.data as message_data,",
-    "  p.id as part_id,",
-    "  p.time_created as part_time,",
-    "  p.data as part_data",
-    "from message m",
-    "join part p on p.message_id = m.id",
-    `where m.session_id = ${sqlString(sessionId)}`,
-    "order by m.time_created asc, p.time_created asc, p.id asc;",
-  ].join("\n");
-  const result = spawnSync("sqlite3", ["-json", OPENCODE_DB_PATH, sql], {
-    encoding: "utf8",
-    maxBuffer: 20 * 1024 * 1024,
-  });
-  if (result.status !== 0 || !result.stdout) return "";
-
-  let rows;
-  try {
-    rows = JSON.parse(result.stdout);
-  } catch {
-    return "";
-  }
-
-  const assistantMessages = new Map();
-  for (const row of rows) {
-    let messageData;
-    let partData;
-    try {
-      messageData = JSON.parse(row.message_data);
-      partData = JSON.parse(row.part_data);
-    } catch {
-      continue;
-    }
-    if (messageData?.role !== "assistant") continue;
-    if (partData?.type !== "text" || typeof partData.text !== "string") continue;
-    const existing = assistantMessages.get(row.message_id) || {
-      time: Number(row.message_time) || 0,
-      parts: [],
-    };
-    existing.parts.push(partData.text);
-    assistantMessages.set(row.message_id, existing);
-  }
-
-  let latest = "";
-  let latestTime = -1;
-  for (const value of assistantMessages.values()) {
-    const text = value.parts.join("");
-    if (text && value.time >= latestTime) {
-      latest = text;
-      latestTime = value.time;
-    }
-  }
-  return clampText(latest);
-}
-
-function findFirstKey(value, keys) {
-  if (!value || typeof value !== "object") return null;
-  for (const key of keys) {
-    if (typeof value[key] === "string") return value[key];
-  }
-  for (const child of Object.values(value)) {
-    if (child && typeof child === "object") {
-      const found = findFirstKey(child, keys);
-      if (found) return found;
-    }
-  }
-  return null;
-}
-
 async function openSession(params) {
   ensureDirs();
   assertAgent(params.agent);
-  const session =
-    params.agent === "omp"
-      ? new OmpRpcSession(params)
-      : params.agent === "opencode"
-        ? new OpenCodeServerSession(params)
-        : new CodexAppServerSession(params);
+  const session = params.agent === "omp" ? new OmpRpcSession(params) : new CodexAppServerSession(params);
   sessions.set(session.id, session);
   try {
     await session.start();
@@ -2711,7 +1980,7 @@ function renderUiHtml() {
           <label>Agent
             <select id="agent">
               <option value="omp">OMP</option>
-              <option value="opencode">OpenCode</option>
+              <option value="codex">Codex</option>
             </select>
           </label>
           <label class="checkbox">
@@ -3274,7 +2543,7 @@ async function handleDaemonRequest(request) {
 
 function cliOpenParams(args) {
   const agent = args.agent || args._[0];
-  if (!agent) throw new Error("open requires --agent omp|opencode|codex.");
+  if (!agent) throw new Error("open requires --agent omp|codex.");
   return {
     agent,
     cwd: args.cwd || process.cwd(),
@@ -3566,31 +2835,6 @@ async function withTimeout(promise, timeoutMs, message) {
   } finally {
     clearTimeout(timer);
   }
-}
-
-function getFreePort() {
-  return new Promise((resolve, reject) => {
-    const server = net.createServer();
-    server.unref();
-    server.on("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      server.close(() => resolve(address.port));
-    });
-  });
-}
-
-async function waitForHttp(url, timeoutMs, exited) {
-  const started = Date.now();
-  while (Date.now() - started < timeoutMs) {
-    if (exited?.()) throw new Error("OpenCode server exited before becoming ready.");
-    try {
-      const response = await fetch(url);
-      if (response.status < 500) return;
-    } catch {}
-    await sleep(250);
-  }
-  throw new Error(`Timed out waiting for ${url}.`);
 }
 
 runCli(process.argv.slice(2)).catch(err => {

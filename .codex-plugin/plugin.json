@@ -1,7 +1,7 @@
 {
   "name": "agent-bridge",
   "version": "0.3.0+codex.20260604164532",
-  "description": "Persistent session bridge from MCP clients to local OMP, OpenCode, and Codex agents.",
+  "description": "Persistent session bridge from MCP clients to local OMP and Codex agents.",
   "author": {
     "name": "LeoWang329"
   },
@@ -11,7 +11,6 @@
     "agent",
     "bridge",
     "omp",
-    "opencode",
     "codex",
     "mcp",
     "rpc"
@@ -20,8 +19,8 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Agent Bridge",
-    "shortDescription": "Use persistent OMP, OpenCode, and Codex sessions from Codex",
-    "longDescription": "Agent Bridge gives MCP clients a persistent session bridge to local OMP, OpenCode, and Codex agents. The client opens a delegated-agent session, sends messages into it, polls status/result, can abort active turns, closes the session when finished, and can observe daemon sessions through a localhost-only UI monitor.",
+    "shortDescription": "Use persistent OMP and Codex sessions from Codex",
+    "longDescription": "Agent Bridge gives MCP clients a persistent session bridge to local OMP and Codex agents. The client opens a delegated-agent session, sends messages into it, polls status/result, can abort active turns, closes the session when finished, and can observe daemon sessions through a localhost-only UI monitor.",
     "developerName": "LeoWang329",
     "category": "Productivity",
     "capabilities": [
@@ -31,7 +30,7 @@
     ],
     "defaultPrompt": [
       "Open an OMP session and ask for a second pass",
-      "Use OpenCode to investigate this repository",
+      "Use Codex to investigate this repository",
       "Delegate a task to a local Codex session",
       "Delegate a write-capable fix to OMP"
     ],

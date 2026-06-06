@@ -19,8 +19,7 @@ agent-bridge/
 There are no npm dependencies. The runtime uses Node built-ins plus external CLIs:
 
 - `omp`
-- `opencode`
-- `sqlite3`
+- `codex`
 
 ## Architecture
 
@@ -33,12 +32,9 @@ flowchart LR
   Bridge --> Daemon
   Daemon --> BridgeCore["session manager"]
   BridgeCore --> OMP["OMP RPC process"]
-  BridgeCore --> OCS["OpenCode server"]
-  BridgeCore --> OCR["OpenCode run attach client"]
+  BridgeCore --> CDX["Codex app-server"]
   OMP --> OMPIO["JSONL stdio"]
-  OCS --> OCDB["OpenCode SQLite DB"]
-  OCR --> OCS
-  BridgeCore -. "fallback read" .-> OCDB
+  CDX --> CDXIO["JSON-RPC stdio"]
 ```
 
 Agent Bridge exposes a small MCP tool surface:
@@ -87,9 +83,9 @@ Agent Bridge owns every child process it starts and records those process ids in
 
 The daemon cleans up active sessions when it receives `SIGTERM`, `SIGINT`, or `SIGHUP`, when stdout closes with `EPIPE`, or when an uncaught exception/unhandled rejection reaches the process boundary. The MCP server no longer owns delegated sessions directly; it proxies to the daemon, then waits for pending async MCP responses before exiting on stdin close.
 
-Normal `agent_bridge_close_session` calls remove the pid record immediately. `agent-bridge stop` closes daemon-owned sessions and their OMP/OpenCode child processes. Process-level shutdown leaves pid records in place after sending `SIGTERM`; this is intentional. If a child ignores termination or Agent Bridge is killed abruptly, the next MCP startup reads those records, verifies that the process command still matches an Agent Bridge backend such as `omp --mode rpc`, `opencode serve`, or `opencode run --attach`, and terminates the recorded process tree. Stale records for already-exited processes are removed.
+Normal `agent_bridge_close_session` calls remove the pid record immediately. `agent-bridge stop` closes daemon-owned sessions and their OMP/Codex child processes. Process-level shutdown leaves pid records in place after sending `SIGTERM`; this is intentional. If a child ignores termination or Agent Bridge is killed abruptly, the next MCP startup reads those records, verifies that the process command still matches an Agent Bridge backend such as `omp --mode rpc` or `codex app-server`, and terminates the recorded process tree. Stale records for already-exited processes are removed.
 
-Pid-record cleanup must treat both `agent-bridge mcp` and `agent-bridge daemon` as live owners. A short-lived MCP process may start while the daemon owns sessions, and cleanup must skip those daemon-owned children instead of terminating active OMP/OpenCode processes.
+Pid-record cleanup must treat both `agent-bridge mcp` and `agent-bridge daemon` as live owners. A short-lived MCP process may start while the daemon owns sessions, and cleanup must skip those daemon-owned children instead of terminating active OMP/Codex processes.
 
 This cleanup cannot run after `SIGKILL` (`kill -9`) because no Node.js code can execute in that case, but the pid-record sweep on the next startup is designed to catch leftovers from that kind of hard exit.
 
@@ -114,29 +110,6 @@ In write mode it adds:
 ```
 
 The adapter sends JSONL requests over stdin and reads JSONL responses/events from stdout. It uses OMP RPC commands such as `prompt`, `get_state`, `get_last_assistant_text`, and `abort`.
-
-## OpenCode Backend
-
-OpenCode does not currently provide an OMP-style `--mode rpc` stdio protocol. The backend starts:
-
-```sh
-opencode serve --hostname 127.0.0.1 --port <free-port>
-```
-
-Each turn sends a message with:
-
-```sh
-opencode run --attach http://127.0.0.1:<port> --dir <cwd> --format json <message>
-```
-
-When OpenCode stdout includes only partial JSON events, the adapter reads the final assistant text from OpenCode's local SQLite database:
-
-```text
-$OPENCODE_DB_PATH
-~/.local/share/opencode/opencode.db
-```
-
-This fallback is read-only. It queries `message` and `part`, finds the latest assistant message for the OpenCode session id, and joins text parts.
 
 ## Local Checks
 
@@ -168,14 +141,14 @@ Minimal non-mutating session test:
 
 ```sh
 codex -a never -s danger-full-access -C "$PWD" exec --json --skip-git-repo-check \
-  'Use only the agent_bridge MCP tools. Call agent_bridge_doctor. Open an opencode session with write=false, call status, close it, and report the session id.'
+  'Use only the agent_bridge MCP tools. Call agent_bridge_doctor. Open a codex session with write=false, call status, close it, and report the session id.'
 ```
 
 Real message exchange test:
 
 ```sh
 codex -a never -s danger-full-access -C "$PWD" exec --json --skip-git-repo-check \
-  'Use only agent_bridge MCP tools. Open an opencode session with write=false. Send: "Only reply EXACT_OPENCODE_BRIDGE_OK." with wait=true. Close the session and report whether the exact text was returned.'
+  'Use only agent_bridge MCP tools. Open a codex session with write=false. Send: "Only reply EXACT_CODEX_BRIDGE_OK." with wait=true. Close the session and report whether the exact text was returned.'
 ```
 
 ## Agent Bridge CLI Facade Tests
@@ -198,8 +171,8 @@ node scripts/agent-bridge.mjs stop --json
 For a real message exchange test, send a bounded prompt and close the session afterward:
 
 ```sh
-node scripts/agent-bridge.mjs open --agent opencode --cwd "$PWD" --json
-node scripts/agent-bridge.mjs send <session_id> "Only reply EXACT_OPENCODE_BRIDGE_OK. Do not read or write files." --wait --json
+node scripts/agent-bridge.mjs open --agent codex --cwd "$PWD" --json
+node scripts/agent-bridge.mjs send <session_id> "Only reply EXACT_CODEX_BRIDGE_OK. Do not read or write files." --wait --json
 node scripts/agent-bridge.mjs close <session_id> --json
 ```
 
@@ -277,7 +250,7 @@ codex plugin add agent-bridge@personal
 8. Confirm no delegated backend processes are left running:
 
 ```sh
-ps -axo pid,ppid,command | rg 'agent-bridge|omp --mode rpc|opencode serve' || true
+ps -axo pid,ppid,command | rg 'agent-bridge|omp --mode rpc|codex app-server' || true
 ```
 
 ## Security Notes
@@ -285,14 +258,12 @@ ps -axo pid,ppid,command | rg 'agent-bridge|omp --mode rpc|opencode serve' || tr
 - Never commit GitHub tokens, API keys, `.env` files, logs, or local auth files.
 - Keep public repository config portable. Avoid committing machine-specific paths such as `/Users/<name>/...`.
 - Keep `write: false` unless the user explicitly requested delegated edits.
-- Treat `write: true` as high privilege. OMP and OpenCode both receive auto-approval style flags in write mode.
+- Treat `write: true` as high privilege. OMP and Codex both receive auto-approval style settings in write mode.
 - Close sessions when finished.
 
 ## Troubleshooting
 
-If `agent_bridge_doctor` cannot find a backend, set `OMP_BIN` or `OPENCODE_BIN`.
-
-If OpenCode returns `text: null`, check that `sqlite3` is available and that `OPENCODE_DB_PATH` points to the active OpenCode database.
+If `agent_bridge_doctor` cannot find a backend, set `OMP_BIN` or `CODEX_BIN`.
 
 If Codex cannot see the MCP server, reinstall the plugin and check:
 
