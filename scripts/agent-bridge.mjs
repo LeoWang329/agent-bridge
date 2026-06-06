@@ -8,7 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 
-const BRIDGE_VERSION = "0.5.2";
+const BRIDGE_VERSION = "0.5.3";
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const DEFAULT_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_EVENTS = 300;
@@ -594,16 +594,21 @@ class OmpRpcSession {
   }
 
   #handleLine(line) {
-    appendLog(this.logFile, `${line}\n`);
     if (!line.trim()) return;
 
     let message;
     try {
       message = JSON.parse(line);
     } catch {
+      appendLog(this.logFile, `${line}\n`);
       pushEvent(this, { type: "raw", line });
       return;
     }
+
+    // Don't log message_update lines verbatim: OMP re-serializes the entire growing message
+    // on every delta, so logging each one is O(n^2) and produces multi-GB logs. Non-streaming
+    // events are logged in full; the final assembled message still lands via turn_end/agent_end.
+    if (message.type !== "message_update") appendLog(this.logFile, `${line}\n`);
 
     this.updatedAt = nowIso();
     if (message.type === "ready") {
@@ -955,15 +960,18 @@ class CodexAppServerSession {
   }
 
   #handleLine(line) {
-    appendLog(this.logFile, `${line}\n`);
     if (!line.trim()) return;
     let msg;
     try {
       msg = JSON.parse(line);
     } catch {
+      appendLog(this.logFile, `${line}\n`);
       pushEvent(this, { type: "raw", line });
       return;
     }
+    // Skip logging the high-frequency streaming delta notifications verbatim; the final
+    // item/turn events (logged below) still capture the assembled output.
+    if (msg.method !== "item/agentMessage/delta") appendLog(this.logFile, `${line}\n`);
     this.updatedAt = nowIso();
     if (msg.id !== undefined && msg.method) {
       // Server-initiated request: we do not implement any, so reject.
