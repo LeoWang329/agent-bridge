@@ -8,7 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 
-const BRIDGE_VERSION = "0.5.4";
+const BRIDGE_VERSION = "0.5.5";
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const DEFAULT_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_EVENTS = 300;
@@ -2502,30 +2502,34 @@ async function requestDaemon(method, params = {}, options = {}) {
   const request = { id: makeId("cli"), method, params };
   return await new Promise((resolve, reject) => {
     const timeoutMs = options.timeoutMs || DEFAULT_WAIT_TIMEOUT_MS + 30000;
+    let settled = false;
+    const succeed = value => { if (settled) return; settled = true; clearTimeout(timer); resolve(value); };
+    const fail = err => { if (settled) return; settled = true; clearTimeout(timer); reject(err); };
     const timer = setTimeout(() => {
       socket.destroy();
-      reject(new Error(`Timed out waiting for daemon response to ${method}.`));
+      fail(new Error(`Timed out waiting for daemon response to ${method}.`));
     }, timeoutMs);
     timer.unref?.();
 
     const rl = readline.createInterface({ input: socket, crlfDelay: Infinity });
     rl.once("line", line => {
-      clearTimeout(timer);
       socket.end();
       let response;
       try {
         response = JSON.parse(line);
       } catch (err) {
-        reject(new Error(`Invalid daemon response: ${err instanceof Error ? err.message : String(err)}`));
+        fail(new Error(`Invalid daemon response: ${err instanceof Error ? err.message : String(err)}`));
         return;
       }
-      if (response.ok === false) reject(new Error(response.error || "Daemon request failed."));
-      else resolve(response.result);
+      if (response.ok === false) fail(new Error(response.error || "Daemon request failed."));
+      else succeed(response.result);
     });
-    socket.once("error", err => {
-      clearTimeout(timer);
-      reject(err);
-    });
+    socket.once("error", err => fail(err));
+    // If the daemon goes away (restart / graceful shutdown / crash) before sending a
+    // response line, the socket closes via EOF with no "error" event. Without this the
+    // call would block until timeoutMs; instead surface the disconnect promptly. Harmless
+    // after a real response — succeed/fail already ran, so `settled` makes this a no-op.
+    socket.once("close", () => fail(new Error(`Agent Bridge daemon closed the connection before responding to ${method}.`)));
     socket.write(`${JSON.stringify(request)}\n`);
   });
 }
