@@ -17,6 +17,7 @@ MCP tools, the CLI facade, and the local web monitor all share the same daemon-b
 - `agent_bridge_send_message`
 - `agent_bridge_status`
 - `agent_bridge_result`
+- `agent_bridge_wait` — block until sessions finish (`all`/`any`); for parallel fan-out
 - `agent_bridge_abort`
 - `agent_bridge_close_session`
 - `agent_bridge_doctor`
@@ -137,6 +138,8 @@ Codex should use the bridge like this:
 3. Poll `agent_bridge_status` or call `agent_bridge_result`.
 4. Reuse the same `session_id` for follow-up messages.
 5. Call `agent_bridge_close_session` when finished.
+
+For parallel work, send with `wait: false` to multiple sessions, then make a single `agent_bridge_wait` call: `mode: "all"` blocks until every session finishes; `mode: "any"` returns as soon as the first does (call again with the remaining ids to handle each as it completes). This replaces polling `agent_bridge_status` in a loop.
 
 Keep `write: false` for review, diagnosis, planning, or research. Set `write: true` only when the user explicitly wants the delegated agent to edit files.
 

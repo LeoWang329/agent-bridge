@@ -203,6 +203,8 @@ Codex 使用 Agent Bridge 时应该遵循这个流程：
 4. `agent_bridge_result`
 5. `agent_bridge_close_session`
 
+并行多个 session 时：对每个 session `agent_bridge_send_message` 传 `wait:false`，再调**一次** `agent_bridge_wait` 阻塞等结果——`mode:"all"` 等全部完成，`mode:"any"` 第一个完成即返回（用 `pending` 里剩下的 id 再调一次，即可按完成顺序逐个处理），省去循环轮询 `agent_bridge_status`。
+
 典型只读委托：
 
 ```json

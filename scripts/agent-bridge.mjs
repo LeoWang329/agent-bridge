@@ -8,7 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 
-const BRIDGE_VERSION = "0.4.0";
+const BRIDGE_VERSION = "0.5.0";
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const DEFAULT_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_EVENTS = 300;
@@ -116,6 +116,33 @@ const TOOLS = [
     },
   },
   {
+    name: "agent_bridge_wait",
+    description:
+      "Block until delegated-agent sessions finish their current turn, then return their results. Use after " +
+      'sending with wait=false to several sessions. mode "all" returns once every listed session is done; mode ' +
+      '"any" returns as soon as the first finishes (call again with the remaining ids to handle each as it ' +
+      "completes). One blocking call replaces polling agent_bridge_status in a loop.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_ids: {
+          type: "array",
+          items: { type: "string" },
+          description: 'Session ids to wait on. For mode "any", pass only the still-running ids on each call.',
+        },
+        mode: {
+          type: "string",
+          enum: ["all", "any"],
+          default: "all",
+          description: '"all": return when every session is done. "any": return when the first one is done.',
+        },
+        timeout_ms: { type: "number", description: "Optional overall wait timeout in milliseconds." },
+      },
+      required: ["session_ids"],
+      additionalProperties: false,
+    },
+  },
+  {
     name: "agent_bridge_abort",
     description: "Abort the active turn in a persistent delegated-agent session without closing the session.",
     inputSchema: {
@@ -161,6 +188,7 @@ function usage() {
     "  agent-bridge send <session_id> <message...> [--wait] [--json]",
     "  agent-bridge status [session_id] [--json]",
     "  agent-bridge result <session_id> [--json]",
+    "  agent-bridge wait <session_id...> [--mode all|any] [--timeout-ms N] [--json]",
     "  agent-bridge abort <session_id> [--json]",
     "  agent-bridge close <session_id> [--json]",
     "",
@@ -1305,6 +1333,53 @@ async function sendMessage(params) {
 async function result(sessionId) {
   const session = getSession(sessionId);
   return await session.result();
+}
+
+// A session has finished the turn we are waiting on once it leaves the running/starting
+// state. OMP also gates on turnStarted (mirroring waitIdle) so a pre-stream idle window is
+// never mistaken for a completed turn; Codex completion is driven by its turn promise.
+function sessionSettled(session) {
+  if (!session) return true;
+  if (session.status === "failed" || session.status === "closed") return true;
+  if (session instanceof OmpRpcSession) return session.status === "idle" && session.turnStarted;
+  return session.status === "idle" && !session.turn;
+}
+
+async function waitSessions(params) {
+  const ids = Array.isArray(params.session_ids) ? params.session_ids.filter(Boolean) : [];
+  if (!ids.length) throw new Error("session_ids is required (a non-empty array of session ids).");
+  const mode = params.mode === "any" ? "any" : "all";
+  const timeoutMs = parseNumber(params.timeout_ms, DEFAULT_WAIT_TIMEOUT_MS);
+  // Validate up front so an unknown id is a clear error rather than a silent timeout.
+  for (const id of ids) getSession(id);
+
+  const summarize = async id => {
+    const session = sessions.get(id);
+    if (!session) return { session_id: id, status: "closed", text: null, gone: true };
+    const r = await result(id).catch(() => null);
+    return { session_id: id, status: session.status, text: r?.text ?? null, log_file: session.logFile };
+  };
+  const pendingIds = () => ids.filter(id => !sessionSettled(sessions.get(id)));
+
+  const started = Date.now();
+  for (;;) {
+    // Refresh running OMP sessions via state() (most authoritative); Codex is event-driven.
+    for (const id of ids) {
+      const session = sessions.get(id);
+      if (session instanceof OmpRpcSession && !sessionSettled(session)) await session.state().catch(() => {});
+    }
+    const settledIds = ids.filter(id => sessionSettled(sessions.get(id)));
+    if (mode === "any" && settledIds.length) {
+      return { mode, completed: await summarize(settledIds[0]), pending: pendingIds() };
+    }
+    if (mode === "all" && settledIds.length === ids.length) {
+      return { mode, results: await Promise.all(ids.map(summarize)) };
+    }
+    if (Date.now() - started >= timeoutMs) {
+      return { mode, timed_out: true, settled: await Promise.all(settledIds.map(summarize)), pending: pendingIds() };
+    }
+    await sleep(250);
+  }
 }
 
 async function abortSession(sessionId) {
@@ -2529,6 +2604,8 @@ async function handleDaemonRequest(request) {
       return await status(params.session_id);
     case "result":
       return await result(params.session_id);
+    case "wait":
+      return await waitSessions(params);
     case "abort":
       return await abortSession(params.session_id);
     case "close":
@@ -2647,6 +2724,19 @@ async function runCli(argv) {
     case "result":
       printCliResult(await requestDaemon("result", { session_id: cliSessionId(args, "result") }, { timeoutMs: 10000 }), args);
       return;
+    case "wait": {
+      const ids = args._.filter(Boolean);
+      if (!ids.length) throw new Error("wait requires one or more session_ids.");
+      printCliResult(
+        await requestDaemon(
+          "wait",
+          { session_ids: ids, mode: args.mode, timeout_ms: parseNumber(args.timeoutMs, undefined) },
+          { timeoutMs: parseNumber(args.timeoutMs, DEFAULT_WAIT_TIMEOUT_MS) + 30000 },
+        ),
+        args,
+      );
+      return;
+    }
     case "abort":
       printCliResult(await requestDaemon("abort", { session_id: cliSessionId(args, "abort") }, { timeoutMs: 10000 }), args);
       return;
@@ -2683,6 +2773,12 @@ async function callTool(name, args) {
       return mcpText(await requestDaemon("status", { session_id: args?.session_id }, { timeoutMs: 10000 }));
     case "agent_bridge_result":
       return mcpText(await requestDaemon("result", { session_id: args?.session_id }, { timeoutMs: 10000 }));
+    case "agent_bridge_wait":
+      return mcpText(
+        await requestDaemon("wait", args || {}, {
+          timeoutMs: parseNumber(args?.timeout_ms, DEFAULT_WAIT_TIMEOUT_MS) + 30000,
+        }),
+      );
     case "agent_bridge_abort":
       return mcpText(await requestDaemon("abort", { session_id: args?.session_id }, { timeoutMs: 10000 }));
     case "agent_bridge_close_session":
