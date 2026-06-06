@@ -1,0 +1,22 @@
+{
+  "name": "agent-bridge",
+  "owner": {
+    "name": "LeoWang329",
+    "email": "ai-ops@innocellence.com"
+  },
+  "description": "Agent Bridge — persistent OMP/Codex delegated-agent sessions for Claude Code over MCP.",
+  "plugins": [
+    {
+      "name": "agent-bridge",
+      "source": "./",
+      "description": "Open persistent OMP/Codex sessions, stream their output, and delegate review or implementation to a second local coding agent.",
+      "version": "0.4.0",
+      "author": {
+        "name": "LeoWang329"
+      },
+      "homepage": "https://github.com/LeoWang329/agent-bridge",
+      "license": "MIT",
+      "keywords": ["agent", "bridge", "omp", "codex", "mcp"]
+    }
+  ]
+}

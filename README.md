@@ -148,6 +148,25 @@ Agent Bridge is a standard stdio MCP server, so Claude Code can use it with no c
 
 In Claude Code the tools appear namespaced, for example `mcp__agent-bridge__agent_bridge_open_session` and `mcp__agent-bridge__agent_bridge_send_message`.
 
+### Plugin (recommended)
+
+This repository is also a Claude Code plugin and a self-hosting plugin marketplace, so a single install registers the MCP server **and** the skill — no path juggling. From inside Claude Code:
+
+```text
+/plugin marketplace add LeoWang329/agent-bridge
+/plugin install agent-bridge@agent-bridge
+```
+
+The plugin manifest (`.claude-plugin/plugin.json`) launches the server via `${CLAUDE_PLUGIN_ROOT}/scripts/agent-bridge.mjs`, so it resolves wherever the plugin is installed. For local development, point Claude Code at a working copy instead:
+
+```sh
+claude --plugin-dir "$PWD"
+```
+
+Manage it later with `/plugin` (enable/disable/uninstall). The backend agents (`omp`, `codex`) must still be installed (see [Requirements](#requirements)).
+
+If you would rather register only the MCP server (no plugin, no skill), use one of the scopes below.
+
 ### Project scope (this repository)
 
 Claude Code automatically detects the project `.mcp.json` at the repository root. Launch `claude` from the repository root and approve the `agent-bridge` server when prompted, then confirm with:

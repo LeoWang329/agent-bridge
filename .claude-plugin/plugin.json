@@ -1,0 +1,20 @@
+{
+  "name": "agent-bridge",
+  "displayName": "Agent Bridge",
+  "version": "0.4.0",
+  "description": "Persistent session bridge from Claude Code to local OMP and Codex agents over MCP. Open a delegated-agent session, stream its output, and have a second coding agent review or implement.",
+  "author": {
+    "name": "LeoWang329",
+    "email": "ai-ops@innocellence.com"
+  },
+  "homepage": "https://github.com/LeoWang329/agent-bridge",
+  "repository": "https://github.com/LeoWang329/agent-bridge",
+  "license": "MIT",
+  "keywords": ["agent", "bridge", "omp", "codex", "mcp", "rpc", "delegation"],
+  "mcpServers": {
+    "agent-bridge": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/agent-bridge.mjs", "mcp"]
+    }
+  }
+}
