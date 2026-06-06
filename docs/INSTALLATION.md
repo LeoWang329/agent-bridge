@@ -198,12 +198,12 @@ Codex 正式调用 Agent Bridge 时，应该优先使用 MCP 工具。CLI facade
 Codex 使用 Agent Bridge 时应该遵循这个流程：
 
 1. `agent_bridge_open_session`
-2. `agent_bridge_send_message`（**默认阻塞**，直接返回本轮结果；并行时显式传 `wait:false`）
-3. `agent_bridge_status`
-4. `agent_bridge_result`
+2. `agent_bridge_send_message`（**默认非阻塞**，立刻返回 ack；快任务可显式传 `wait:true` 内联阻塞）
+3. `agent_bridge_wait`（收结果主力，建议设短 `timeout_ms`，如 5~10 分钟：没完会返回当前状态，可看进展后再等）
+4. `agent_bridge_status` / `agent_bridge_result`（随时查进度；`status` 传 `mine:true` 只看本客户端开的会话）
 5. `agent_bridge_close_session`
 
-并行多个 session 时：对每个 session `agent_bridge_send_message` 传 `wait:false`，再调**一次** `agent_bridge_wait` 阻塞等结果——`mode:"all"` 等全部完成，`mode:"any"` 第一个完成即返回（用 `pending` 里剩下的 id 再调一次，即可按完成顺序逐个处理），省去循环轮询 `agent_bridge_status`。
+并行多个 session 时：对每个 session `agent_bridge_send_message`（默认非阻塞），再调**一次** `agent_bridge_wait` 收口——`mode:"all"` 等全部完成，`mode:"any"` 第一个完成即返回（用 `pending` 里剩下的 id 再调一次，即可按完成顺序逐个处理），省去循环轮询 `agent_bridge_status`。
 
 典型只读委托：
 

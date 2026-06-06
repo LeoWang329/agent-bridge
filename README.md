@@ -134,12 +134,12 @@ Your personal marketplace must contain an entry that points `agent-bridge` at `.
 Codex should use the bridge like this:
 
 1. Call `agent_bridge_open_session` with `agent: "omp"` or `agent: "codex"`.
-2. Call `agent_bridge_send_message` with the returned `session_id` — it blocks and returns the turn's result by default (pass `wait: false` to return immediately for parallel work).
-3. Poll `agent_bridge_status` or call `agent_bridge_result` (only needed for non-blocking sends).
+2. Call `agent_bridge_send_message` with the returned `session_id` — non-blocking by default, it returns an ack immediately (pass `wait: true` to block inline for a quick turn).
+3. Join the result with `agent_bridge_wait`, ideally with a short `timeout_ms` (e.g. 5–10 min): it returns the result when the turn finishes, or `{ timed_out, settled, pending }` if not — so you can check `agent_bridge_status` / `agent_bridge_result`, do other work, then wait again instead of dead-waiting.
 4. Reuse the same `session_id` for follow-up messages.
 5. Call `agent_bridge_close_session` when finished.
 
-For parallel work, send with `wait: false` to multiple sessions, then make a single `agent_bridge_wait` call: `mode: "all"` blocks until every session finishes; `mode: "any"` returns as soon as the first does (call again with the remaining ids to handle each as it completes). This replaces polling `agent_bridge_status` in a loop.
+For parallel work, send to multiple sessions (non-blocking), then make a single `agent_bridge_wait` call: `mode: "all"` blocks until every session finishes; `mode: "any"` returns as soon as the first does (call again with the remaining ids to handle each as it completes). This replaces polling `agent_bridge_status` in a loop. Pass `mine: true` to `agent_bridge_status` (no `session_id`) to list only the sessions this client opened.
 
 Keep `write: false` for review, diagnosis, planning, or research. Set `write: true` only when the user explicitly wants the delegated agent to edit files.
 

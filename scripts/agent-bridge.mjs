@@ -8,7 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 
-const BRIDGE_VERSION = "0.5.6";
+const BRIDGE_VERSION = "0.5.7";
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const DEFAULT_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_EVENTS = 300;
@@ -81,7 +81,7 @@ const TOOLS = [
   {
     name: "agent_bridge_send_message",
     description:
-      "Send a message to an existing persistent delegated-agent session. Blocks until the turn completes and returns its result by default; pass wait=false to return immediately with an ack (e.g. to dispatch several sessions in parallel, then collect with agent_bridge_wait).",
+      "Send a message to an existing persistent delegated-agent session. Returns immediately with an ack by default (non-blocking) so you stay responsive; join the result with agent_bridge_wait, using a short timeout_ms (e.g. 5-10 min) to check progress without dead-waiting. Pass wait=true to block inline until the turn completes and return its result.",
     inputSchema: {
       type: "object",
       properties: {
@@ -89,9 +89,9 @@ const TOOLS = [
         message: { type: "string", description: "Message to send into the delegated agent session." },
         wait: {
           type: "boolean",
-          default: true,
+          default: false,
           description:
-            "Block until the turn completes and return its result (default). Pass false to return immediately with an ack, for parallel fan-out.",
+            "Default false: return immediately with an ack, then join via agent_bridge_wait (recommended with a short timeout_ms so you can poll progress instead of dead-waiting). Pass true to block until the turn completes and return its result inline.",
         },
         timeout_ms: { type: "number", description: "Optional wait timeout in milliseconds." },
       },
@@ -2876,9 +2876,11 @@ async function callTool(name, args) {
       return mcpText(await requestDaemon("open", { ...(args || {}), owner: mcpClientId() }, { timeoutMs: 30000 }));
     case "agent_bridge_send_message":
       return mcpText(
-        // Default to blocking: an omitted wait means true (sequential delegation is the common
-        // case). Pass wait:false explicitly for parallel fan-out, then collect with agent_bridge_wait.
-        await requestDaemon("send", { ...(args || {}), wait: args?.wait ?? true }, {
+        // Default to non-blocking: an omitted wait means false, returning an ack immediately so
+        // the agent stays responsive instead of dead-waiting (up to 30 min) on one turn. Join the
+        // result via agent_bridge_wait with a short timeout_ms to poll progress. Pass wait:true
+        // here for a simple inline blocking send.
+        await requestDaemon("send", { ...(args || {}), wait: args?.wait ?? false }, {
           timeoutMs: parseNumber(args?.timeout_ms, DEFAULT_WAIT_TIMEOUT_MS) + 30000,
         }),
       );
