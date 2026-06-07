@@ -8,7 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 
-const BRIDGE_VERSION = "0.6.0";
+const BRIDGE_VERSION = "0.6.1";
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const DEFAULT_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_EVENTS = 300;
@@ -21,6 +21,8 @@ const LOG_DIR = path.join(STATE_ROOT, "logs");
 const PID_DIR = path.join(STATE_ROOT, "pids");
 const LOG_RETENTION_DAYS = Number(process.env.AGENT_BRIDGE_LOG_RETENTION_DAYS ?? 7);
 const LOG_MAX_BYTES = Number(process.env.AGENT_BRIDGE_LOG_MAX_MB ?? 500) * 1024 * 1024;
+const LOG_FILE_MAX_BYTES = Number(process.env.AGENT_BRIDGE_LOG_FILE_MAX_MB ?? 200) * 1024 * 1024;
+const LOG_PRUNE_INTERVAL_MS = Number(process.env.AGENT_BRIDGE_LOG_PRUNE_INTERVAL_MIN ?? 30) * 60_000;
 const DAEMON_SOCKET = process.env.AGENT_BRIDGE_SOCKET || path.join(STATE_ROOT, "agent-bridge.sock");
 const DAEMON_PID_FILE = path.join(STATE_ROOT, "agent-bridge-daemon.pid");
 
@@ -537,11 +539,30 @@ function scheduleForceKill(pid, graceMs = 3000) {
   timer.unref?.();
 }
 
-// Bound on-disk logs: drop session logs older than the retention window, then trim oldest-first
-// until under the total-size cap. Runs at daemon start (no active sessions exist yet, so nothing
-// in use is removed); daemon.log is always kept. Configure via AGENT_BRIDGE_LOG_RETENTION_DAYS /
-// AGENT_BRIDGE_LOG_MAX_MB (set either to 0 to disable that limit).
-function pruneLogs() {
+// Log/answer files belonging to live sessions. pruneLogs must never remove a file that may still
+// be appended to. A file is safe to prune only when its backend process is truly gone: the
+// session was explicitly closed, or the child has exited. Status alone is NOT enough — Codex
+// sets status="failed" on a turn error WITHOUT killing the app-server, and send() will happily
+// reuse that session (writing more to the same log), so a failed-but-alive session must stay
+// protected. A session in "starting" has no proc yet (proc undefined) → treated as alive.
+function activeLogPaths() {
+  const set = new Set();
+  for (const session of sessions.values()) {
+    const procExited = session.proc && session.proc.exitCode !== null;
+    if (session.status === "closed" || procExited) continue;
+    if (session.logFile) set.add(session.logFile);
+    if (session.answerFile) set.add(session.answerFile);
+  }
+  return set;
+}
+
+// Bound on-disk logs in three passes: (1) drop files older than the retention window, (2) drop
+// any single file over the per-file cap, (3) trim oldest-first until under the total-size cap.
+// Files belonging to live sessions (activePaths) are never touched. Runs at daemon start AND
+// periodically (see serveDaemon); daemon.log is always kept. Configure via
+// AGENT_BRIDGE_LOG_RETENTION_DAYS / AGENT_BRIDGE_LOG_FILE_MAX_MB / AGENT_BRIDGE_LOG_MAX_MB
+// (set any to 0 to disable that limit).
+function pruneLogs(activePaths = new Set()) {
   let names;
   try {
     names = fs.readdirSync(LOG_DIR).filter(n => (n.endsWith(".log") || n.endsWith(".answer.txt")) && n !== "daemon.log");
@@ -550,10 +571,12 @@ function pruneLogs() {
   }
   const maxAgeMs = LOG_RETENTION_DAYS > 0 ? LOG_RETENTION_DAYS * 86_400_000 : Infinity;
   const maxBytes = LOG_MAX_BYTES > 0 ? LOG_MAX_BYTES : Infinity;
+  const maxFileBytes = LOG_FILE_MAX_BYTES > 0 ? LOG_FILE_MAX_BYTES : Infinity;
   const now = Date.now();
   const entries = [];
   for (const name of names) {
     const file = path.join(LOG_DIR, name);
+    if (activePaths.has(file)) continue; // in use by a live session — leave it alone
     try {
       const st = fs.statSync(file);
       entries.push({ file, mtime: st.mtimeMs, size: st.size, removed: false });
@@ -571,6 +594,9 @@ function pruneLogs() {
   };
   for (const entry of entries) {
     if (now - entry.mtime > maxAgeMs) remove(entry);
+  }
+  for (const entry of entries) {
+    if (!entry.removed && entry.size > maxFileBytes) remove(entry);
   }
   const live = entries.filter(e => !e.removed).sort((a, b) => a.mtime - b.mtime);
   let total = live.reduce((n, e) => n + e.size, 0);
@@ -762,10 +788,20 @@ class OmpRpcSession {
       return;
     }
 
-    // Don't log message_update lines verbatim: OMP re-serializes the entire growing message
-    // on every delta, so logging each one is O(n^2) and produces multi-GB logs. Non-streaming
-    // events are logged in full; the final assembled message still lands via turn_end/agent_end.
-    if (message.type !== "message_update") appendLog(this.logFile, `${JSON.stringify(stripThinking(message))}\n`);
+    // Don't log noisy lines verbatim:
+    // - message_update: OMP re-serializes the entire growing message on every delta, so logging
+    //   each one is O(n^2) and produces multi-GB logs.
+    // - get_state responses: waitIdle polls get_state every 750ms and each response is a ~112KB
+    //   blob that is ~99% static (dumpTools + systemPrompt, identical across calls); logging it
+    //   verbatim was the dominant OMP log-bloat source (single logs reaching ~1GB; see issue #1).
+    // - get_last_assistant_text responses: result() fetches the full answer (up to MAX_TEXT) on
+    //   every call; the answer already lands via turn_end/agent_end and in answerFile, so logging
+    //   the response too is redundant and re-bloats on repeated result() polling.
+    // Live state is still available via the get_state response object itself.
+    const isMessageUpdate = message.type === "message_update";
+    const isBulkResponse =
+      message.type === "response" && (message.command === "get_state" || message.command === "get_last_assistant_text");
+    if (!isMessageUpdate && !isBulkResponse) appendLog(this.logFile, `${JSON.stringify(stripThinking(message))}\n`);
 
     this.updatedAt = nowIso();
     if (message.type === "ready") {
@@ -2770,6 +2806,14 @@ function cleanupStaleDaemons() {
 async function serveDaemon() {
   ensureDirs();
   cleanupStalePidRecords();
+  installProcessHandlers();
+
+  const existing = await tryDaemonPing();
+  if (existing) throw new Error(`Agent Bridge daemon is already running at ${DAEMON_SOCKET}.`);
+  cleanupStaleDaemons();
+  // Prune only AFTER confirming we are the sole daemon: a racing second start has an empty
+  // session registry, so pruning before the ping check could delete logs the existing daemon is
+  // actively writing (its active files aren't known to us) right before we bail out.
   const pruned = pruneLogs();
   if (pruned.removed) {
     appendLog(
@@ -2777,11 +2821,6 @@ async function serveDaemon() {
       `[${nowIso()}] pruned ${pruned.removed} session log(s), freed ~${Math.round(pruned.freedBytes / 1048576)}MB\n`,
     );
   }
-  installProcessHandlers();
-
-  const existing = await tryDaemonPing();
-  if (existing) throw new Error(`Agent Bridge daemon is already running at ${DAEMON_SOCKET}.`);
-  cleanupStaleDaemons();
   try {
     fs.rmSync(DAEMON_SOCKET, { force: true });
   } catch {}
@@ -2825,10 +2864,29 @@ async function serveDaemon() {
 
   appendLog(path.join(LOG_DIR, "daemon.log"), `[${nowIso()}] Agent Bridge daemon ${BRIDGE_VERSION} listening at ${DAEMON_SOCKET}\n`);
   const keepAlive = setInterval(() => {}, 60_000);
+  // Periodic prune while the daemon is long-lived: the start-time prune alone never reclaims
+  // anything until the next restart, so a long-running daemon's logs grow unbounded. Skips files
+  // belonging to live sessions. unref so it never holds the process open on its own.
+  let pruneTimer = null;
+  if (LOG_PRUNE_INTERVAL_MS > 0) {
+    pruneTimer = setInterval(() => {
+      try {
+        const res = pruneLogs(activeLogPaths());
+        if (res.removed) {
+          appendLog(
+            path.join(LOG_DIR, "daemon.log"),
+            `[${nowIso()}] periodic prune removed ${res.removed} log(s), freed ~${Math.round(res.freedBytes / 1048576)}MB\n`,
+          );
+        }
+      } catch {}
+    }, LOG_PRUNE_INTERVAL_MS);
+    pruneTimer.unref?.();
+  }
   try {
     await new Promise(resolve => daemonServer.once("close", resolve));
   } finally {
     clearInterval(keepAlive);
+    if (pruneTimer) clearInterval(pruneTimer);
   }
 }
 

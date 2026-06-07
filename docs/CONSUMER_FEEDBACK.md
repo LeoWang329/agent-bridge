@@ -100,3 +100,32 @@
 **有意保留(拒绝过度精简)**:`pid`/`cwd`/`owner`(运维/UI/多宿主有用)、`byteCount`(中文等多字节答案与 `charCount` 差很多,判断体积要用)、`textRef`(P1 的「全文永远可取回」保证)、null 值的 `model`/`effort`/`lastError`(保持顶层 schema 稳定,不做 omit-when-null——那正是 P3 反对的形状漂移)。
 
 复测:逐命令重抓确认四项删除生效;端到端 omp+codex **17/17 通过**。
+
+---
+
+## v0.6.1 · 运维修复:OMP 日志膨胀([issue #1](https://github.com/LeoWang329/agent-bridge/issues/1))
+
+排查时发现 `~/.agent-bridge/logs/` 累计 **2.2GB**,单个 OMP 日志可达 **~1GB**(codex 日志全部加起来才 5.5MB)。根因:`waitIdle` 每 750ms 轮询一次 `get_state`,而 OMP 的 `get_state` 响应里 ~112KB **96–99% 是静态内容**(`dumpTools` 全量工具 schema + `systemPrompt`,每次都一样),却被 `#handleLine` 原样落盘;长会话累积即接近 1GB。这是之前 `message_update` 降噪之外的**另一个独立落盘泄漏点**。
+
+| # | 修复 |
+|---|---|
+| **治本** | `#handleLine` 落盘分支跳过 `type==="response" && command==="get_state"` 的消息——get_state 响应不落盘(其动态状态仍可从响应对象实时读取)。直接消掉 96–99% 的 OMP 日志体积。 |
+| **兜底** | `pruneLogs` 改为三段式(按年龄 → **单文件上限** → 总量上限,oldest-first),并在 daemon 运行期间**周期性执行**(此前只在启动时跑一次,daemon 长跑就永不清理);prune 跳过活跃会话(非 `closed`/`failed`)的 log/answer 文件,绝不删在用文件。 |
+| **清理** | daemon 重启时启动期 prune 自动清掉超过单文件上限的**死会话**巨型日志(那两个孤儿会话的 omp 子进程已自行退出,日志由此被回收)。 |
+
+新增环境变量(均可设 0 关闭该项):
+- `AGENT_BRIDGE_LOG_FILE_MAX_MB`(默认 **200**):单个日志文件上限。
+- `AGENT_BRIDGE_LOG_PRUNE_INTERVAL_MIN`(默认 **30**):daemon 运行期间周期性 prune 的间隔(分钟)。
+
+> 顺带确认:OMP 的 `get_state.data` 本就带 `contextUsage:{tokens,contextWindow,percent}`、codex 的 `thread/tokenUsage/updated` 带 `tokenUsage`+`modelContextWindow`——两后端均可算上下文用量百分比,后续可低成本接入统一字段(本次未做)。
+
+### 交叉审核(codex + deepseek-v4-pro)+ 实测
+
+用 Agent Bridge 自身拉起 codex 与 deepseek 各做一遍独立审核。两方一致确认三项修复**正确、无回归**;deepseek 未发现新问题,codex 额外揪出 2 个真实边界缺陷,均已修复:
+
+1. **`failed` 会话不一定是死会话**:Codex 在 turn 出错时把 `status="failed"` 但**不杀 app-server**,且 `send()` 不拒绝 `failed`——会话仍可复用继续写日志。原 `activeLogPaths` 以 `failed` 判死会误删在用日志。改为以**进程是否退出**判定(`status==="closed"` 或 `proc.exitCode!==null` 才算死;`starting`(proc 未生成)及 `failed`-但-进程活 均受保护)。
+2. **启动期 prune 早于 daemon 探活**:并发启动第二个 daemon 时,新进程 sessions 为空,会按年龄/单文件上限删掉旧 daemon 正在用的日志后才退出。把启动期 `pruneLogs()` 移到 `tryDaemonPing()` 确认无其他 daemon **之后**。
+
+两方都提的 💡:`get_last_assistant_text` 响应也全量落盘(全文已在 `answerFile` + `turn_end`),已一并归入跳过列表。
+
+复测(0.6.1 daemon 实跑):omp+deepseek 与 codex 端到端各一轮,答案正确;OMP 日志 `get_state` 响应 **0 条**、`get_last_assistant_text` 响应 **0 条**,`prompt` ack 仍保留、最终答案仍随 `turn_end` 落盘;启动期 prune 自动清掉 2 个 >200MB 死会话巨型日志(~1.9GB),目录 2.4G→531M。
