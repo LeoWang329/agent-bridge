@@ -8,7 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 
-const BRIDGE_VERSION = "0.5.7";
+const BRIDGE_VERSION = "0.6.0";
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const DEFAULT_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_EVENTS = 300;
@@ -94,6 +94,11 @@ const TOOLS = [
             "Default false: return immediately with an ack, then join via agent_bridge_wait (recommended with a short timeout_ms so you can poll progress instead of dead-waiting). Pass true to block until the turn completes and return its result inline.",
         },
         timeout_ms: { type: "number", description: "Optional wait timeout in milliseconds." },
+        max_chars: {
+          type: "number",
+          description:
+            "Optional cap (characters) on the inline result text when wait=true. If the answer is longer, text is truncated, truncated:true is set, and the full answer stays retrievable via textRef. charCount/byteCount are always reported.",
+        },
       },
       required: ["session_id", "message"],
       additionalProperties: false,
@@ -113,11 +118,17 @@ const TOOLS = [
   },
   {
     name: "agent_bridge_result",
-    description: "Read the latest assistant result and recent raw events/logs from a persistent delegated-agent session.",
+    description:
+      "Read the latest assistant result and recent raw events/logs from a persistent delegated-agent session. The result always reports charCount/byteCount; the full untruncated answer is written to textRef. Pass max_chars to cap the inline text (sets truncated:true) while keeping the full answer retrievable via textRef.",
     inputSchema: {
       type: "object",
       properties: {
         session_id: { type: "string", description: "Session id returned by agent_bridge_open_session." },
+        max_chars: {
+          type: "number",
+          description:
+            "Optional cap (characters) on the inline result text. If the answer is longer, text is truncated, truncated:true is set, and the full answer stays retrievable via textRef.",
+        },
       },
       required: ["session_id"],
       additionalProperties: false,
@@ -145,6 +156,11 @@ const TOOLS = [
           description: '"all": return when every session is done. "any": return when the first one is done.',
         },
         timeout_ms: { type: "number", description: "Optional overall wait timeout in milliseconds." },
+        max_chars: {
+          type: "number",
+          description:
+            "Optional cap (characters) on each returned result's text. Longer answers are truncated with truncated:true and stay retrievable via textRef. charCount/byteCount are always reported.",
+        },
       },
       required: ["session_ids"],
       additionalProperties: false,
@@ -193,10 +209,10 @@ function usage() {
     "  agent-bridge ui [--port PORT] [--no-open] [--json]",
     "  agent-bridge sessions [--json]",
     "  agent-bridge open --agent omp|codex [--cwd DIR] [--write] [--model M] [--effort E] [--json]",
-    "  agent-bridge send <session_id> <message...> [--wait] [--json]",
+    "  agent-bridge send <session_id> <message...> [--wait] [--max-chars N] [--json]",
     "  agent-bridge status [session_id] [--json]",
-    "  agent-bridge result <session_id> [--json]",
-    "  agent-bridge wait <session_id...> [--mode all|any] [--timeout-ms N] [--json]",
+    "  agent-bridge result <session_id> [--max-chars N] [--json]",
+    "  agent-bridge wait <session_id...> [--mode all|any] [--timeout-ms N] [--max-chars N] [--json]",
     "  agent-bridge abort <session_id> [--json]",
     "  agent-bridge close <session_id> [--json]",
     "",
@@ -289,16 +305,84 @@ function compactValue(value, depth = 0) {
   return copy;
 }
 
-// Compact projection of recent events for tool results: just the type/status, not the
-// full message/usage/thinking snapshots (those bloat the caller's context — see result()).
+// Per-token / heartbeat event types that carry no actionable signal for the orchestrating
+// model — only "tokens streamed", which the session's isStreaming/status already convey.
+// Dropping them keeps recentEvents a meaningful lifecycle trail instead of a wall of deltas.
+const NOISE_EVENT_TYPES = new Set([
+  "message_update", // OMP re-serializes the whole assistant message on every token
+  "item/agentMessage/delta", // Codex per-token delta
+  "message_start", // OMP message decode boundary — turn_start/turn_end already frame the turn
+  "message_end",
+  "extension_ui_request", // OMP extension UI plumbing — irrelevant when driven over RPC
+  "account/rateLimits/updated",
+  "thread/tokenUsage/updated",
+]);
+
+// Compact projection of recent events for tool results: just the type/status, not the full
+// message/usage/thinking snapshots (those bloat the caller's context — see result()). Drops
+// high-frequency streaming noise and collapses consecutive same-type events into a count, so
+// the orchestrator sees turn/tool/error lifecycle, not hundreds of identical delta lines.
 function slimEvents(events, limit = 12) {
-  return events.slice(-limit).map(record => {
+  const out = [];
+  for (const record of events) {
     const ev = record.event || {};
-    const out = { at: record.at, type: ev.type || ev.method || ev.kind || "event" };
-    if (ev.status) out.status = ev.status;
-    if (ev.source) out.source = ev.source;
-    return out;
-  });
+    const type = ev.type || ev.method || ev.kind || "event";
+    if (NOISE_EVENT_TYPES.has(type)) continue;
+    const prev = out[out.length - 1];
+    if (prev && prev.type === type && !ev.status && !ev.source) {
+      prev.count = (prev.count || 1) + 1;
+      prev.at = record.at;
+      continue;
+    }
+    const item = { at: record.at, type };
+    if (ev.status) item.status = ev.status;
+    if (ev.source) item.source = ev.source;
+    out.push(item);
+  }
+  return out.slice(-limit);
+}
+
+// Turn-level timing/id, surfaced uniformly across backends (omp mints a bridge-side turn id;
+// codex reuses the app-server's). Null until a turn has been sent. Lets consumers profile a
+// turn and confirm *which* turn a result belongs to without backend-specific plumbing.
+function lastTurnOf(session) {
+  if (!session.lastTurnId && !session.turnStartedAt) return null;
+  const startedAt = session.turnStartedAt || null;
+  const endedAt = session.turnEndedAt || null;
+  const durationMs = startedAt && endedAt ? new Date(endedAt) - new Date(startedAt) : null;
+  return { id: session.lastTurnId || null, startedAt, endedAt, durationMs };
+}
+
+// Build the result payload shared by result()/wait()/send(wait). The assistant `text` is
+// must-read content, so it is never silently dropped: charCount/byteCount are always reported
+// (the "compass needle"), and the full untruncated answer is persisted to an artifact that
+// `textRef` points at — so a caller who caps inline size with `max_chars` can always retrieve
+// the whole thing. Without max_chars the full text comes back inline (current behavior).
+function buildSessionResult(session, fullText, options = {}) {
+  const text = String(fullText ?? "");
+  const charCount = text.length;
+  const byteCount = Buffer.byteLength(text, "utf8");
+  let textRef = null;
+  if (text) {
+    try {
+      fs.writeFileSync(session.answerFile, text, "utf8");
+      textRef = session.answerFile;
+    } catch {}
+  }
+  const max = parseNumber(options.maxChars, undefined);
+  // Only truncate when the full answer is actually retrievable (artifact written). If the
+  // write failed, return the full text inline rather than silently dropping must-read content.
+  const truncated = Boolean(max && max > 0 && charCount > max && textRef);
+  return {
+    session: session.summary(),
+    text: (truncated ? text.slice(0, max) : text) || null,
+    charCount,
+    byteCount,
+    truncated,
+    textRef,
+    recentEvents: slimEvents(session.events),
+    // logFile is intentionally NOT repeated here — it already lives in session.logFile above.
+  };
 }
 
 // Remove model thinking/reasoning content before logging an event (keeps the answer, tool calls,
@@ -352,10 +436,10 @@ function sessionEventPayload(session, record) {
     kind: uiEventKind(record.event),
     status: session.status,
     isStreaming: session.isStreaming,
-    text_delta: extractVisibleTextDelta(record.event) || null,
+    textDelta: extractVisibleTextDelta(record.event) || null,
     session: sanitizeEventForUi(session.summary()),
     event: sanitizeEventForUi(record.event),
-    log_file: session.logFile,
+    logFile: session.logFile,
   };
 }
 
@@ -460,7 +544,7 @@ function scheduleForceKill(pid, graceMs = 3000) {
 function pruneLogs() {
   let names;
   try {
-    names = fs.readdirSync(LOG_DIR).filter(n => n.endsWith(".log") && n !== "daemon.log");
+    names = fs.readdirSync(LOG_DIR).filter(n => (n.endsWith(".log") || n.endsWith(".answer.txt")) && n !== "daemon.log");
   } catch {
     return { removed: 0, freedBytes: 0 };
   }
@@ -560,10 +644,15 @@ class OmpRpcSession {
     // window that exists *before* a freshly-sent prompt starts.
     this.turnStarted = false;
     this.sessionState = null;
+    this.currentTurnId = null;
+    this.lastTurnId = null;
+    this.turnStartedAt = null;
+    this.turnEndedAt = null;
     this.events = [];
     this.pending = new Map();
     this.requestCounter = 0;
     this.logFile = path.join(LOG_DIR, `${this.id}.log`);
+    this.answerFile = path.join(LOG_DIR, `${this.id}.answer.txt`);
     this.pidFile = pidRecordPath(this.id);
     this.proc = null;
     this.readyPromise = null;
@@ -614,6 +703,7 @@ class OmpRpcSession {
 
     this.proc.on("error", err => {
       this.lastError = err.message;
+      if (this.turnStartedAt && !this.turnEndedAt) this.turnEndedAt = nowIso();
       setSessionStatus(this, "failed", false, { source: "process_error", error: err.message });
       this.readyReject?.(err);
       for (const pending of this.pending.values()) pending.reject(err);
@@ -627,6 +717,7 @@ class OmpRpcSession {
         setSessionStatus(this, "closed", false, { source: "process_close", code, signal });
         return;
       }
+      if (this.turnStartedAt && !this.turnEndedAt) this.turnEndedAt = nowIso();
       this.lastError = code === 0 ? this.lastError : `OMP RPC exited with code ${code}`;
       setSessionStatus(this, code === 0 && this.status !== "failed" ? "closed" : "failed", false, {
         source: "process_close",
@@ -703,6 +794,7 @@ class OmpRpcSession {
       return;
     }
     if (message.type === "agent_end" || message.type === "turn_end") {
+      this.turnEndedAt = nowIso();
       setSessionStatus(this, "idle", false, { source: message.type });
       return;
     }
@@ -738,7 +830,23 @@ class OmpRpcSession {
     // (a stale idle reading from before this turn actually starts).
     this.turnStarted = false;
     setSessionStatus(this, "running", true, { source: "send" });
-    await this.request("prompt", { message: String(message) });
+    try {
+      await this.request("prompt", { message: String(message) });
+    } catch (err) {
+      // Prompt was rejected; don't leave the session stuck at "running". If the backend is
+      // still alive, return it to idle (a dead proc is handled by the close/error handlers).
+      if (this.status !== "closed" && this.proc && this.proc.exitCode === null) {
+        setSessionStatus(this, "idle", false, { source: "prompt_error" });
+      }
+      throw err;
+    }
+    // Prompt accepted — stamp the turn now. Doing this AFTER the ack means a failed prompt
+    // leaves the previous turn's lastTurn coherent instead of half-overwriting it. OMP RPC
+    // has no native turn id, so mint a bridge-side one (P6) and start the clock (P5).
+    this.currentTurnId = makeId("turn");
+    this.lastTurnId = this.currentTurnId;
+    this.turnStartedAt = nowIso();
+    this.turnEndedAt = null;
     if (options.wait) {
       try {
         await this.waitIdle(options.timeout_ms || DEFAULT_WAIT_TIMEOUT_MS);
@@ -750,9 +858,9 @@ class OmpRpcSession {
         } catch {}
         throw err;
       }
-      return await this.result();
+      return await this.result({ maxChars: options.maxChars });
     }
-    return { accepted: true, session_id: this.id, status: this.status };
+    return { accepted: true, sessionId: this.id, status: this.status, turnId: this.currentTurnId };
   }
 
   async state() {
@@ -766,7 +874,7 @@ class OmpRpcSession {
     return this.sessionState;
   }
 
-  async result() {
+  async result(options = {}) {
     let text = this.lastAssistantText;
     try {
       const response = await this.request("get_last_assistant_text");
@@ -774,19 +882,20 @@ class OmpRpcSession {
     } catch {
       // Keep accumulated stream text when the helper command is unavailable.
     }
-    this.lastAssistantText = clampText(text || this.lastAssistantText || "");
-    return {
-      session: this.summary(),
-      text: this.lastAssistantText || null,
-      recent_events: slimEvents(this.events),
-      log_file: this.logFile,
-    };
+    const full = text || this.lastAssistantText || "";
+    this.lastAssistantText = clampText(full);
+    // Hand buildSessionResult the UNCLAMPED text so the artifact/charCount reflect the true
+    // full answer even past the internal MAX_TEXT clamp — must-read content is never lost.
+    return buildSessionResult(this, full, options);
   }
 
   async abort() {
     await this.request("abort");
+    // Only close the clock if a turn is actually in flight; aborting an idle session must
+    // not stretch the previous turn's duration to now.
+    if (this.turnStartedAt && !this.turnEndedAt) this.turnEndedAt = nowIso();
     setSessionStatus(this, "idle", false, { source: "abort" });
-    return { aborted: true, session_id: this.id };
+    return { aborted: true, sessionId: this.id };
   }
 
   async waitIdle(timeoutMs) {
@@ -828,25 +937,28 @@ class OmpRpcSession {
       model: this.model,
       effort: this.effort,
       status: this.status,
-      isStreaming: this.isStreaming,
       pid: this.proc?.pid || null,
       createdAt: this.createdAt,
       updatedAt: this.updatedAt,
       lastError: this.lastError,
       logFile: this.logFile,
-      sessionState: this.sessionState
+      lastTurn: lastTurnOf(this),
+      // Backend-specific fields live here so the top-level shape is identical across agents
+      // (P3). Empty until OMP reports state (after the first status poll / turn), so the old
+      // always-null `sessionState` dead field is gone (P4).
+      agentSpecific: this.sessionState
         ? {
             sessionId: this.sessionState.sessionId,
-            sessionFile: this.sessionState.sessionFile,
             messageCount: this.sessionState.messageCount,
             queuedMessageCount: this.sessionState.queuedMessageCount,
             model: this.sessionState.model?.id || this.sessionState.model?.name || (typeof this.sessionState.model === "string" ? this.sessionState.model : null),
           }
-        : null,
+        : {},
     };
   }
 
   close(options = {}) {
+    if (this.turnStartedAt && !this.turnEndedAt) this.turnEndedAt = nowIso();
     setSessionStatus(this, "closed", false, { source: "close" });
     // Reject any in-flight RPCs (send/state/result waiters) now: once status is "closed"
     // the proc "close" handler early-returns and won't reject them, so they'd hang forever.
@@ -859,7 +971,10 @@ class OmpRpcSession {
     } catch {}
     terminateProcessTree(this.proc?.pid);
     if (options.removePidRecord !== false) removePidRecord(this.pidFile);
-    return { closed: true, session_id: this.id };
+    try {
+      fs.rmSync(this.answerFile, { force: true });
+    } catch {}
+    return { closed: true, sessionId: this.id };
   }
 }
 
@@ -884,6 +999,9 @@ class CodexAppServerSession {
     this.nextId = 1;
     this.threadId = null;
     this.currentTurnId = null;
+    this.lastTurnId = null;
+    this.turnStartedAt = null;
+    this.turnEndedAt = null;
     this.ignoredTurnIds = new Set();
     this.turn = null;
     this.turnCount = 0;
@@ -891,6 +1009,7 @@ class CodexAppServerSession {
     this.lastAgentMessage = "";
     this.tokenUsage = null;
     this.logFile = path.join(LOG_DIR, `${this.id}.log`);
+    this.answerFile = path.join(LOG_DIR, `${this.id}.answer.txt`);
     this.pidFile = pidRecordPath(this.id);
   }
 
@@ -1020,6 +1139,9 @@ class CodexAppServerSession {
   }
 
   #rejectAll(err) {
+    // Close the turn clock if a turn was in flight (process crash / stdin EPIPE / close),
+    // so durationMs reflects the failed turn instead of staying null.
+    if (this.turnStartedAt && !this.turnEndedAt) this.turnEndedAt = nowIso();
     for (const pending of this.pending.values()) pending.reject(err);
     this.pending.clear();
     const turn = this.turn;
@@ -1142,6 +1264,7 @@ class CodexAppServerSession {
     this.turn = null;
     this.currentTurnId = null;
     this.turnCount += 1;
+    this.turnEndedAt = nowIso();
     this.updatedAt = nowIso();
     if (err) {
       this.lastError = err.message;
@@ -1161,9 +1284,6 @@ class CodexAppServerSession {
     if (this.turn) throw new Error(`Codex session ${this.id} already has a running turn.`);
     if (!this.threadId) throw new Error("Codex session is not started.");
 
-    this.finalAnswer = "";
-    this.lastAgentMessage = "";
-    this.lastAssistantText = "";
     setSessionStatus(this, "running", true, { source: "send" });
 
     const done = new Promise((resolve, reject) => {
@@ -1224,9 +1344,19 @@ class CodexAppServerSession {
           this.#request("turn/interrupt", { threadId: this.threadId, turnId: startedTurnId }).catch(() => {});
         }
       }
-      return { accepted: false, session_id: this.id, status: this.status };
+      return { accepted: false, sessionId: this.id, status: this.status, turnId: startedTurnId };
     }
     this.currentTurnId = startedTurnId || this.currentTurnId;
+    this.lastTurnId = startedTurnId || this.lastTurnId;
+    // Stamp timing AND reset accumulated text only now that the turn is accepted: a failed/
+    // timed-out turn/start (the catch above) then leaves the previous turn's lastTurn AND its
+    // result text intact instead of a stale-id mismatch / wiped answer. Runs synchronously
+    // before any turn notification tick, so the new turn's deltas accumulate from empty.
+    this.turnStartedAt = nowIso();
+    this.turnEndedAt = null;
+    this.finalAnswer = "";
+    this.lastAgentMessage = "";
+    this.lastAssistantText = "";
     const initialStatus = turnResp?.turn?.status;
     // Only a known-terminal status from the start response settles synchronously;
     // queued/pending/inProgress/unknown stay in flight and are driven by notifications.
@@ -1240,7 +1370,7 @@ class CodexAppServerSession {
     if (options.wait) {
       try {
         return await withTimeout(
-          done.then(() => this.result()),
+          done.then(() => this.result({ maxChars: options.maxChars })),
           options.timeout_ms || DEFAULT_WAIT_TIMEOUT_MS,
           "Timed out waiting for Codex turn.",
         );
@@ -1258,16 +1388,14 @@ class CodexAppServerSession {
     done.catch(err => {
       this.lastError = err.message;
     });
-    return { accepted: true, session_id: this.id, status: this.status };
+    return { accepted: true, sessionId: this.id, status: this.status, turnId: startedTurnId };
   }
 
-  result() {
-    return {
-      session: this.summary(),
-      text: this.lastAssistantText || null,
-      recent_events: slimEvents(this.events),
-      log_file: this.logFile,
-    };
+  result(options = {}) {
+    // finalAnswer/lastAgentMessage hold the UNCLAMPED final text (set on item.completed);
+    // prefer them over the clamped lastAssistantText so the artifact/charCount are accurate.
+    const full = this.finalAnswer || this.lastAgentMessage || this.lastAssistantText || "";
+    return buildSessionResult(this, full, options);
   }
 
   async abort() {
@@ -1292,8 +1420,10 @@ class CodexAppServerSession {
     if (this.status !== "closed" && this.proc && this.proc.exitCode === null) {
       setSessionStatus(this, "idle", false, { source: "abort" });
     }
+    // Only close the clock if a turn is actually in flight (don't stretch a finished turn).
+    if (this.turnStartedAt && !this.turnEndedAt) this.turnEndedAt = nowIso();
     turn?.resolve?.();
-    return { aborted: true, session_id: this.id };
+    return { aborted: true, sessionId: this.id };
   }
 
   #ignoreTurn(turnId) {
@@ -1315,14 +1445,14 @@ class CodexAppServerSession {
       model: this.model,
       effort: this.effort,
       status: this.status,
-      isStreaming: this.isStreaming,
       pid: this.proc?.pid || null,
-      threadId: this.threadId,
-      turnCount: this.turnCount,
       createdAt: this.createdAt,
       updatedAt: this.updatedAt,
       lastError: this.lastError,
       logFile: this.logFile,
+      lastTurn: lastTurnOf(this),
+      // Backend-specific fields kept off the top level so the shape matches omp (P3).
+      agentSpecific: { threadId: this.threadId, turnCount: this.turnCount },
     };
   }
 
@@ -1338,7 +1468,10 @@ class CodexAppServerSession {
     terminateProcessTree(pid);
     scheduleForceKill(pid);
     if (options.removePidRecord !== false) removePidRecord(this.pidFile);
-    return { closed: true, session_id: this.id };
+    try {
+      fs.rmSync(this.answerFile, { force: true });
+    } catch {}
+    return { closed: true, sessionId: this.id };
   }
 }
 
@@ -1417,7 +1550,10 @@ async function status(sessionId, ownerFilter) {
   if (session instanceof OmpRpcSession && session.status !== "closed" && session.status !== "failed") {
     await session.state().catch(() => null);
   }
-  return { session: session.summary(), recent_events: session.events.slice(-20) };
+  // Slim projection (type/status/source only), same as result(): the raw events carry full
+  // message/usage trees and bloat the caller's context into "a blob". Use the UI SSE stream
+  // for full raw events.
+  return { session: session.summary(), recentEvents: slimEvents(session.events, 20) };
 }
 
 async function sendMessage(params) {
@@ -1425,12 +1561,13 @@ async function sendMessage(params) {
   return await session.send(params.message, {
     wait: Boolean(params.wait),
     timeout_ms: params.timeout_ms,
+    maxChars: params.max_chars,
   });
 }
 
-async function result(sessionId) {
+async function result(sessionId, options = {}) {
   const session = getSession(sessionId);
-  return await session.result();
+  return await session.result(options);
 }
 
 // A session has finished the turn we are waiting on once it leaves the running/starting
@@ -1453,9 +1590,18 @@ async function waitSessions(params) {
 
   const summarize = async id => {
     const session = sessions.get(id);
-    if (!session) return { session_id: id, status: "closed", text: null, gone: true };
-    const r = await result(id).catch(() => null);
-    return { session_id: id, status: session.status, text: r?.text ?? null, log_file: session.logFile };
+    if (!session) return { sessionId: id, status: "closed", text: null, gone: true };
+    const r = await result(id, { maxChars: params.max_chars }).catch(() => null);
+    return {
+      sessionId: id,
+      status: session.status,
+      text: r?.text ?? null,
+      charCount: r?.charCount ?? null,
+      byteCount: r?.byteCount ?? null,
+      truncated: r?.truncated ?? false,
+      textRef: r?.textRef ?? null,
+      lastTurn: lastTurnOf(session),
+    };
   };
   const pendingIds = () => ids.filter(id => !sessionSettled(sessions.get(id)));
 
@@ -1474,7 +1620,7 @@ async function waitSessions(params) {
       return { mode, results: await Promise.all(ids.map(summarize)) };
     }
     if (Date.now() - started >= timeoutMs) {
-      return { mode, timed_out: true, settled: await Promise.all(settledIds.map(summarize)), pending: pendingIds() };
+      return { mode, timedOut: true, settled: await Promise.all(settledIds.map(summarize)), pending: pendingIds() };
     }
     await sleep(250);
   }
@@ -1756,13 +1902,14 @@ async function handleSessionHttp(req, res, parts, url) {
         message: params.message,
         wait: Boolean(params.wait),
         timeout_ms: params.timeout_ms,
+        max_chars: params.max_chars,
       }),
     );
     return;
   }
 
   if (parts.length === 3 && parts[2] === "result" && req.method === "GET") {
-    sendJson(res, 200, await result(sessionId));
+    sendJson(res, 200, await result(sessionId, { maxChars: parseNumber(url.searchParams.get("max_chars"), undefined) }));
     return;
   }
 
@@ -1794,8 +1941,8 @@ function handleSessionEvents(req, res, sessionId, includeRaw = false) {
   sendSse(client, "session", {
     at: nowIso(),
     session: sanitizeEventForUi(session.summary()),
-    recent_events: session.events.slice(-50).map(record => sessionEventPayload(session, record)),
-    log_file: session.logFile,
+    recentEvents: session.events.slice(-50).map(record => sessionEventPayload(session, record)),
+    logFile: session.logFile,
   });
 
   const heartbeat = setInterval(() => {
@@ -1838,7 +1985,7 @@ function stopDaemonSoon() {
     } catch {}
     process.exit(0);
   }, 100).unref?.();
-  return { stopping: true, sessions_closed: sessionCount, ui: uiServerUrl, socket: DAEMON_SOCKET };
+  return { stopping: true, sessionsClosed: sessionCount, ui: uiServerUrl, socket: DAEMON_SOCKET };
 }
 
 function openLocalUrl(url) {
@@ -2340,7 +2487,7 @@ function renderUiHtml() {
       try {
         const data = await api("/sessions/" + encodeURIComponent(id) + "/result");
         el.output.textContent = data.text || "";
-        el.logPath.textContent = data.log_file || "";
+        el.logPath.textContent = data.session?.logFile || "";
       } catch (err) {
         setStatus(err.message);
       }
@@ -2361,7 +2508,7 @@ function renderUiHtml() {
       events.addEventListener("session-event", event => {
         const payload = JSON.parse(event.data);
         upsertSession(payload.session);
-        if (payload.text_delta) appendOutput(payload.text_delta);
+        if (payload.textDelta) appendOutput(payload.textDelta);
         appendRaw(payload);
         renderSessions();
         renderActive();
@@ -2712,7 +2859,7 @@ async function handleDaemonRequest(request) {
     case "status":
       return await status(params.session_id, params.owner);
     case "result":
-      return await result(params.session_id);
+      return await result(params.session_id, { maxChars: params.max_chars });
     case "wait":
       return await waitSessions(params);
     case "abort":
@@ -2770,7 +2917,7 @@ async function runCli(argv) {
       printCliResult(
         {
           daemon: ping ? { running: true, pid: ping.pid, socket: ping.socket } : { running: false, ...cleanupStaleDaemons() },
-          child_processes: cleanupStalePidRecords(),
+          childProcesses: cleanupStalePidRecords(),
         },
         args,
       );
@@ -2817,6 +2964,7 @@ async function runCli(argv) {
             message,
             wait: Boolean(args.wait),
             timeout_ms: parseNumber(args.timeoutMs, undefined),
+            max_chars: parseNumber(args.maxChars, undefined),
           },
           { timeoutMs: parseNumber(args.timeoutMs, DEFAULT_WAIT_TIMEOUT_MS) + 30000 },
         ),
@@ -2831,7 +2979,14 @@ async function runCli(argv) {
       );
       return;
     case "result":
-      printCliResult(await requestDaemon("result", { session_id: cliSessionId(args, "result") }, { timeoutMs: 10000 }), args);
+      printCliResult(
+        await requestDaemon(
+          "result",
+          { session_id: cliSessionId(args, "result"), max_chars: parseNumber(args.maxChars, undefined) },
+          { timeoutMs: 10000 },
+        ),
+        args,
+      );
       return;
     case "wait": {
       const ids = args._.filter(Boolean);
@@ -2839,7 +2994,7 @@ async function runCli(argv) {
       printCliResult(
         await requestDaemon(
           "wait",
-          { session_ids: ids, mode: args.mode, timeout_ms: parseNumber(args.timeoutMs, undefined) },
+          { session_ids: ids, mode: args.mode, timeout_ms: parseNumber(args.timeoutMs, undefined), max_chars: parseNumber(args.maxChars, undefined) },
           { timeoutMs: parseNumber(args.timeoutMs, DEFAULT_WAIT_TIMEOUT_MS) + 30000 },
         ),
         args,
@@ -2893,7 +3048,9 @@ async function callTool(name, args) {
         ),
       );
     case "agent_bridge_result":
-      return mcpText(await requestDaemon("result", { session_id: args?.session_id }, { timeoutMs: 10000 }));
+      return mcpText(
+        await requestDaemon("result", { session_id: args?.session_id, max_chars: args?.max_chars }, { timeoutMs: 10000 }),
+      );
     case "agent_bridge_wait":
       return mcpText(
         await requestDaemon("wait", args || {}, {

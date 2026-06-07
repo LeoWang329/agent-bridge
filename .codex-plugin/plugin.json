@@ -1,6 +1,6 @@
 {
   "name": "agent-bridge",
-  "version": "0.5.7+codex.20260606234914",
+  "version": "0.6.0+codex.20260607",
   "description": "Persistent session bridge from MCP clients to local OMP and Codex agents.",
   "author": {
     "name": "LeoWang329"
