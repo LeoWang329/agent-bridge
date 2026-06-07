@@ -1,6 +1,6 @@
 {
   "name": "agent-bridge",
-  "version": "0.6.1+codex.20260607",
+  "version": "0.7.0+codex.20260607",
   "description": "Persistent session bridge from MCP clients to local OMP and Codex agents.",
   "author": {
     "name": "LeoWang329"
@@ -20,7 +20,7 @@
   "interface": {
     "displayName": "Agent Bridge",
     "shortDescription": "Use persistent OMP and Codex sessions from Codex",
-    "longDescription": "Agent Bridge gives MCP clients a persistent session bridge to local OMP and Codex agents. The client opens a delegated-agent session, sends messages into it, polls status/result, can abort active turns, closes the session when finished, and can observe daemon sessions through a localhost-only UI monitor.",
+    "longDescription": "Agent Bridge gives MCP clients a persistent session bridge to local OMP and Codex agents. The client opens a delegated-agent session, sends messages into it, polls status/result, can abort active turns, and closes the session when finished. Sessions live inside the MCP server process and are cleaned up when it exits.",
     "developerName": "LeoWang329",
     "category": "Productivity",
     "capabilities": [

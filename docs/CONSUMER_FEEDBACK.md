@@ -129,3 +129,55 @@
 两方都提的 💡:`get_last_assistant_text` 响应也全量落盘(全文已在 `answerFile` + `turn_end`),已一并归入跳过列表。
 
 复测(0.6.1 daemon 实跑):omp+deepseek 与 codex 端到端各一轮,答案正确;OMP 日志 `get_state` 响应 **0 条**、`get_last_assistant_text` 响应 **0 条**,`prompt` ack 仍保留、最终答案仍随 `turn_end` 落盘;启动期 prune 自动清掉 2 个 >200MB 死会话巨型日志(~1.9GB),目录 2.4G→531M。
+
+---
+
+## v0.7.0 · 架构塌缩:daemon 收进 MCP 进程 + 移除 UI(2026-06-07)
+
+> 完整动机与演进脉络见 [docs/ARCHITECTURE.md](ARCHITECTURE.md) 的 v0.7.0 节;这里只记消费方视角与验证过程。
+
+**消费方视角的核心收益:** 编排者真正的诉求是「**一个主 agent 通过 MCP 拉起 N 个外部 agent,管好自己这批就够了**」。旧的"共享 daemon + UI"反而带来非需求的复杂度:会话跨客户端混在一个 daemon 里(才需要 `owner`/`mine` 来区分)、客户端退出留下孤儿会话、UI/HTTP 永驻。塌缩为「一个客户端 = 一个 MCP 进程 = 自管自己的后端」后:
+
+- `agent_bridge_status`(无 `session_id`)列出的就是「**你自己拉起的全部**」,不再混入别的客户端——这正是「看当前主 agent 拉起了哪些 agent」的需求,且**不再需要 `mine`/`owner` 参数**(已移除)。
+- 生命周期天然绑定主 agent:客户端退出 → MCP 进程退出 → 它 spawn 的 omp/codex 子进程**全部被清**(优雅退出等在途完成;SIGTERM 强制清;另有 SIGKILL force-kill 兜底)。**不再有孤儿会话堆积。**
+- 不再监听任何端口(纯 stdio MCP),无 socket、无 UI;每进程独立 `logs/<runId>/`,优雅退出即删除,并发多开互不删日志。
+
+**对消费方接口的影响:** MCP 8 个工具的入参/出参形状**不变**(v0.6.0 schema 全部保留),唯一去除的是 `session` 里的 `owner` 字段与 `status` 的 `mine` 入参——它们随"共享"概念一起消失。是破坏性变更(删字段 + 删全部 CLI 会话命令 + 删 daemon/UI),按 minor 标记 **0.6.1 → 0.7.0**。
+
+### 分阶段实施 + 每阶段 sub-agent 测试
+
+按 [改造计划 v3] 分 3 个代码阶段推进,**每阶段结束用独立 sub-agent 实测**后才进下一阶段:
+
+| 阶段 | 改动 | sub-agent 实测结果 |
+|---|---|---|
+| **1** | `callTool` 7 个 `requestDaemon` → 进程内直调;删 `owner`/`mine`/`mcpClientId` | 全链路 open→send→wait→result→close 通过;**无 sock/无 daemon 进程**;omp 是 MCP 进程的直接子进程;`status`/`summary` 不含 `owner`。PASS |
+| **2** | 移除整个 UI/HTTP/SSE 栈(~1000 行)、`http` import、UI 常量/状态 | 20 个 UI 符号全部不存在;运行中 `lsof` 确认**未监听任何 TCP 端口**;`recentEvents` 仍正常(events 缓冲保留)。PASS |
+| **3** | 彻底删 daemon 全部符号/`net`、CLI 瘦身、per-run 日志、force-kill、周期 prune | 18 个 daemon 符号全无;CLI 仅剩 mcp/doctor/cleanup;SIGTERM 清子进程;per-run 目录优雅退出后删除;双进程日志目录隔离;`cleanup` 正确回收孤儿、跳过活 owner。PASS(8/8) |
+
+### 全量 e2e
+
+独立 sub-agent 对 **omp + codex 各跑一遍完整生命周期**(initialize→doctor→open→send(非阻塞)→wait→status→result(max_chars 截断+textRef)→复用同会话再 send→idle abort→close),外加架构不变量:**verdict PASS**(45/47;两个 red 是测试假设/产物问题,非缺陷)。要点:
+
+- `serverInfo.version` = **0.7.0**;`tools/list` = 8;`session` 无 `owner`;`recentEvents` 正常。
+- **运行中:无 sock、无 daemon pid、`lsof` 0 个 LISTEN(零网络监听)**;`logs/mcp-*` 含会话日志;后端是 MCP 进程的直接子进程。
+- **优雅退出(stdin close):exit 0,`logs/mcp-*` run 目录被删除,后端子进程清掉,pid 记录清空。**
+- 截断:`max_chars:5` 对 13 字符答案 → `truncated:true` + inline 5 字符 + `textRef` 全文落盘可取回(P1 保证仍成立)。
+
+> **生命周期边界(设计如此,非缺陷):** 优雅退出的等待守卫看的是**在途 MCP 请求**(`activeRequests`),不是后台 turn。所以:推荐用法(非阻塞 send + `agent_bridge_wait`)期间 `wait` 是在途请求,stdin 关闭会**等它结算完**(实测阻塞调用等了 3579ms、turn 完成后 49ms 才退);而「光发一条非阻塞 send 就立刻退客户端」会**连同未收口的 turn 一起清掉**——这正是「客户端退出→子进程全清、不留孤儿」的预期语义。
+
+> 实施期一个有价值的实测发现:omp 与 codex 的 stdin 都是 MCP 父进程持有的 pipe,**父进程一旦死亡,子进程因 stdin EOF 会自行退出**(~50ms)——所以「父进程被 kill 后留下长命孤儿」在实践中很难发生;`cleanup` 的孤儿回收逻辑作为兜底仍经构造场景验证正确。
+
+### dogfood 交叉复审发现的运维缺陷,已修复(A–D)
+
+上面那轮 DeepSeek + Codex 复审又揪出 4 个运维侧缺陷,均已修复并重测:
+
+| # | 缺陷 | 修复 |
+|---|---|---|
+| **A** | `pruneLogs` 只管当前 `RUN_LOG_DIR`,崩溃/SIGKILL 退出的 server 留下的 `logs/<runId>/` 没人回收 → 目录无限累积(实测真实环境已躺着 538MB 旧日志 + 1 个孤儿目录)。 | 每个 run 写 `logs/<runId>/owner`(pid);新增 `reclaimStaleLogs()`,在**启动 / 周期 / `cleanup`** 扫掉 owner 已死的遗留 run 目录(跳过活 owner、自身、<60s 的新目录)。 |
+| **B** | `cleanupAndExit` 误用 `removePidRecord:true`:`close()` 只 SIGTERM、SIGKILL 兜底是异步定时器、`process.exit()` 同步执行 → 抗信号后端活下来且记录已删,下次无法回收。**且与 `DEVELOPMENT.md` 矛盾。** | 回退为 `removePidRecord:false`,保留记录给下次启动 `cleanupStalePidRecords` 回收。 |
+| **C** | `cleanupStalePidRecords` 只 SIGTERM 后即删记录,无 SIGKILL 兜底。 | 补 `scheduleForceKill`(server 启动后存活,3s 兜底能触发)。 |
+| **D** | `activeLogPaths` 用 `exitCode!==null` 判死,漏判信号杀死(`signalCode`)。 | 增加 `signalCode!==null` 判定。 |
+
+并清理一次性迁移残留:真实 `~/.agent-bridge/logs/` 的 538MB 旧扁平日志(1321 文件)+ 孤儿 run 目录全部清空。
+
+复测(独立 sub-agent,omp + codex 全生命周期 + A–D 回归 + 运维不变量):**9/9 PASS**——版本 0.7.0、`status` 无 `mine`、会话无 `owner`;启动扫掉 dead-owner 目录且保留新目录;`cleanup` 回收遗留目录;SIGTERM 后 pid 记录留存且被 `cleanup` 回收;无 socket/端口/daemon;omp 日志 `get_state`/`get_last_assistant_text` 仍 0 条;优雅退出删自身 run 目录、子进程清。

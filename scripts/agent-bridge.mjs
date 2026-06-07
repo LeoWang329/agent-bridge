@@ -2,20 +2,15 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
-import http from "node:http";
-import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 
-const BRIDGE_VERSION = "0.6.1";
+const BRIDGE_VERSION = "0.7.0";
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const DEFAULT_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_EVENTS = 300;
 const MAX_TEXT = 400_000;
-const MAX_HTTP_BODY = 1024 * 1024;
-const DEFAULT_UI_HOST = "127.0.0.1";
-const SSE_HEARTBEAT_MS = 15_000;
 const STATE_ROOT = process.env.AGENT_BRIDGE_STATE_DIR || path.join(os.homedir(), ".agent-bridge");
 const LOG_DIR = path.join(STATE_ROOT, "logs");
 const PID_DIR = path.join(STATE_ROOT, "pids");
@@ -23,8 +18,6 @@ const LOG_RETENTION_DAYS = Number(process.env.AGENT_BRIDGE_LOG_RETENTION_DAYS ??
 const LOG_MAX_BYTES = Number(process.env.AGENT_BRIDGE_LOG_MAX_MB ?? 500) * 1024 * 1024;
 const LOG_FILE_MAX_BYTES = Number(process.env.AGENT_BRIDGE_LOG_FILE_MAX_MB ?? 200) * 1024 * 1024;
 const LOG_PRUNE_INTERVAL_MS = Number(process.env.AGENT_BRIDGE_LOG_PRUNE_INTERVAL_MIN ?? 30) * 60_000;
-const DAEMON_SOCKET = process.env.AGENT_BRIDGE_SOCKET || path.join(STATE_ROOT, "agent-bridge.sock");
-const DAEMON_PID_FILE = path.join(STATE_ROOT, "agent-bridge-daemon.pid");
 
 const AGENTS = {
   omp: {
@@ -42,10 +35,10 @@ const AGENTS = {
 const sessions = new Map();
 let processHandlersInstalled = false;
 let shuttingDown = false;
-let daemonServer = null;
-let uiServer = null;
-let uiServerUrl = null;
-const sseClients = new Set();
+// Per-process log directory: each MCP server gets logs/<runId>/ so concurrent servers never
+// prune each other's files. Set in serveMcp(); defaults to the base LOG_DIR for one-shot CLI
+// commands (doctor/cleanup) that never open sessions.
+let RUN_LOG_DIR = LOG_DIR;
 
 const TOOLS = [
   {
@@ -108,12 +101,11 @@ const TOOLS = [
   },
   {
     name: "agent_bridge_status",
-    description: "Inspect a persistent delegated-agent session, including streaming state and recent events. Omit session_id to list sessions; the daemon is shared, so the unfiltered list includes sessions opened by other hosts/clients — pass mine:true to see only the ones this client opened.",
+    description: "Inspect a persistent delegated-agent session, including streaming state and recent events. Omit session_id to list all sessions this server is managing.",
     inputSchema: {
       type: "object",
       properties: {
         session_id: { type: "string", description: "Optional session id. If omitted, lists sessions." },
-        mine: { type: "boolean", description: "When listing (no session_id), return only sessions opened by this client. Default false (all sessions in the shared daemon)." },
       },
       additionalProperties: false,
     },
@@ -202,29 +194,17 @@ const TOOLS = [
 function usage() {
   return [
     "Usage:",
-    "  agent-bridge mcp",
-    "  agent-bridge daemon",
-    "  agent-bridge doctor [--json]",
-    "  agent-bridge cleanup [--json]",
-    "  agent-bridge start [--json]",
-    "  agent-bridge stop [--json]",
-    "  agent-bridge ui [--port PORT] [--no-open] [--json]",
-    "  agent-bridge sessions [--json]",
-    "  agent-bridge open --agent omp|codex [--cwd DIR] [--write] [--model M] [--effort E] [--json]",
-    "  agent-bridge send <session_id> <message...> [--wait] [--max-chars N] [--json]",
-    "  agent-bridge status [session_id] [--json]",
-    "  agent-bridge result <session_id> [--max-chars N] [--json]",
-    "  agent-bridge wait <session_id...> [--mode all|any] [--timeout-ms N] [--max-chars N] [--json]",
-    "  agent-bridge abort <session_id> [--json]",
-    "  agent-bridge close <session_id> [--json]",
+    "  agent-bridge mcp                 Run the MCP server (stdio). Sessions live in this process.",
+    "  agent-bridge doctor [--json]     Report environment / backend availability.",
+    "  agent-bridge cleanup [--json]    Reap orphaned omp/codex children from dead MCP servers.",
     "",
-    "Codex should use the MCP server as the primary interface. The CLI facade is for",
-    "human debugging, smoke tests, cleanup, and operational control.",
+    "Sessions are managed exclusively through the MCP server's tools (open/send/status/result/",
+    "wait/abort/close). The CLI exposes only the server entrypoint plus doctor/cleanup helpers.",
   ].join("\n");
 }
 
 function ensureDirs() {
-  fs.mkdirSync(LOG_DIR, { recursive: true });
+  fs.mkdirSync(RUN_LOG_DIR, { recursive: true });
   fs.mkdirSync(PID_DIR, { recursive: true });
 }
 
@@ -274,7 +254,6 @@ function pushEvent(session, event) {
   session.updatedAt = record.at;
   session.events.push(record);
   while (session.events.length > MAX_EVENTS) session.events.shift();
-  broadcastSessionEvent(session, record);
 }
 
 function setSessionStatus(session, status, isStreaming = session.isStreaming, extra = {}) {
@@ -404,65 +383,6 @@ function stripThinking(value, depth = 0) {
   return out;
 }
 
-function sanitizeEventForUi(value, depth = 0) {
-  if (typeof value === "string") return value.length > 1000 ? `${value.slice(0, 1000)}...` : value;
-  if (!value || typeof value !== "object") return value;
-  if (depth >= 6) return Array.isArray(value) ? `[${value.length} items]` : "[object]";
-  if (Array.isArray(value)) return value.map(item => sanitizeEventForUi(item, depth + 1));
-
-  const copy = {};
-  for (const [key, child] of Object.entries(value)) {
-    if (/thinking|reasoning|thought|analysis/i.test(key)) continue;
-    copy[key] = sanitizeEventForUi(child, depth + 1);
-  }
-  return copy;
-}
-
-function uiEventKind(event) {
-  const type = String(event?.type || event?.event || event?.kind || "");
-  if (type === "status" || /start|end|ready|closed|failed|abort/i.test(type)) return "status";
-  if (extractVisibleTextDelta(event)) return "text";
-  if (/error|fail/i.test(type)) return "error";
-  return "event";
-}
-
-function extractVisibleTextDelta(event) {
-  if (!event || typeof event !== "object") return "";
-  if (event.type === "status") return "";
-  return clampText(extractAssistantText(event), 4000);
-}
-
-function sessionEventPayload(session, record) {
-  return {
-    at: record.at,
-    kind: uiEventKind(record.event),
-    status: session.status,
-    isStreaming: session.isStreaming,
-    textDelta: extractVisibleTextDelta(record.event) || null,
-    session: sanitizeEventForUi(session.summary()),
-    event: sanitizeEventForUi(record.event),
-    logFile: session.logFile,
-  };
-}
-
-function sendSse(client, eventName, payload) {
-  try {
-    client.res.write(`event: ${eventName}\n`);
-    client.res.write(`data: ${JSON.stringify(payload)}\n\n`);
-  } catch {
-    sseClients.delete(client);
-  }
-}
-
-function broadcastSessionEvent(session, record) {
-  if (!sseClients.size) return;
-  const payload = sessionEventPayload(session, record);
-  for (const client of [...sseClients]) {
-    if (client.sessionId && client.sessionId !== session.id) continue;
-    sendSse(client, "session-event", payload);
-  }
-}
-
 function shellQuote(value) {
   const s = String(value);
   if (/^[a-zA-Z0-9_./:=,+-]+$/.test(s)) return s;
@@ -512,7 +432,7 @@ function ownerStillRunning(record) {
   if (!Number.isInteger(ownerPid) || ownerPid <= 1 || ownerPid === process.pid) return false;
   const command = processCommand(ownerPid);
   const argv0LooksLikeNode = /^(?:\S*\/)?node(?:\s|$)/.test(command);
-  return argv0LooksLikeNode && /agent-bridge\.mjs/.test(command) && /\b(?:mcp|daemon)\b/.test(command);
+  return argv0LooksLikeNode && /agent-bridge\.mjs/.test(command) && /\bmcp\b/.test(command);
 }
 
 function terminateProcessTree(pid, signal = "SIGTERM") {
@@ -545,10 +465,11 @@ function scheduleForceKill(pid, graceMs = 3000) {
 // sets status="failed" on a turn error WITHOUT killing the app-server, and send() will happily
 // reuse that session (writing more to the same log), so a failed-but-alive session must stay
 // protected. A session in "starting" has no proc yet (proc undefined) → treated as alive.
+// "Exited" must cover signal death too: a SIGKILLed child has exitCode === null but signalCode set.
 function activeLogPaths() {
   const set = new Set();
   for (const session of sessions.values()) {
-    const procExited = session.proc && session.proc.exitCode !== null;
+    const procExited = session.proc && (session.proc.exitCode !== null || session.proc.signalCode !== null);
     if (session.status === "closed" || procExited) continue;
     if (session.logFile) set.add(session.logFile);
     if (session.answerFile) set.add(session.answerFile);
@@ -558,14 +479,15 @@ function activeLogPaths() {
 
 // Bound on-disk logs in three passes: (1) drop files older than the retention window, (2) drop
 // any single file over the per-file cap, (3) trim oldest-first until under the total-size cap.
-// Files belonging to live sessions (activePaths) are never touched. Runs at daemon start AND
-// periodically (see serveDaemon); daemon.log is always kept. Configure via
+// Files belonging to live sessions (activePaths) are never touched. Scoped to THIS process's
+// run dir (RUN_LOG_DIR), so concurrent MCP servers never prune each other's files; bridge.log
+// is always kept. Runs periodically while the server is alive (see serveMcp). Configure via
 // AGENT_BRIDGE_LOG_RETENTION_DAYS / AGENT_BRIDGE_LOG_FILE_MAX_MB / AGENT_BRIDGE_LOG_MAX_MB
 // (set any to 0 to disable that limit).
 function pruneLogs(activePaths = new Set()) {
   let names;
   try {
-    names = fs.readdirSync(LOG_DIR).filter(n => (n.endsWith(".log") || n.endsWith(".answer.txt")) && n !== "daemon.log");
+    names = fs.readdirSync(RUN_LOG_DIR).filter(n => (n.endsWith(".log") || n.endsWith(".answer.txt")) && n !== "bridge.log");
   } catch {
     return { removed: 0, freedBytes: 0 };
   }
@@ -575,7 +497,7 @@ function pruneLogs(activePaths = new Set()) {
   const now = Date.now();
   const entries = [];
   for (const name of names) {
-    const file = path.join(LOG_DIR, name);
+    const file = path.join(RUN_LOG_DIR, name);
     if (activePaths.has(file)) continue; // in use by a live session — leave it alone
     try {
       const st = fs.statSync(file);
@@ -606,6 +528,53 @@ function pruneLogs(activePaths = new Set()) {
     total -= entry.size;
   }
   return { removed, freedBytes };
+}
+
+// Reclaim leftover run dirs from servers that did not exit cleanly. A clean exit removes its own
+// logs/<runId>/, but a hard exit (uncaughtException, SIGKILL, OOM, power loss) leaves it behind,
+// and the periodic prune only scopes to the CURRENT run — so without this, logs/mcp-*/ dirs pile
+// up forever. Each run dir carries an "owner" file with the server's pid; remove any whose owner
+// is gone. Never touch a dir a live MCP still owns, our own run, or an owner-less brand-new dir
+// (a server that may still be writing its owner file).
+function reclaimStaleLogs() {
+  let entries;
+  try {
+    entries = fs.readdirSync(LOG_DIR, { withFileTypes: true });
+  } catch {
+    return { runDirsRemoved: 0, freedBytes: 0 };
+  }
+  let runDirsRemoved = 0;
+  let freedBytes = 0;
+  for (const ent of entries) {
+    if (!ent.isDirectory() || !ent.name.startsWith("mcp-")) continue;
+    const dir = path.join(LOG_DIR, ent.name);
+    if (dir === RUN_LOG_DIR) continue; // our own run
+    let ownerPid = null;
+    try {
+      ownerPid = Number(fs.readFileSync(path.join(dir, "owner"), "utf8").trim()) || null;
+    } catch {}
+    if (ownerPid && ownerStillRunning({ ownerPid })) continue; // a live MCP still owns it
+    if (!ownerPid) {
+      // No owner tag — could be a server still starting up. Only reclaim once it's clearly old.
+      let mtimeMs = 0;
+      try {
+        mtimeMs = fs.statSync(dir).mtimeMs;
+      } catch {}
+      if (Date.now() - mtimeMs < 60_000) continue;
+    }
+    try {
+      for (const f of fs.readdirSync(dir)) {
+        try {
+          freedBytes += fs.statSync(path.join(dir, f)).size;
+        } catch {}
+      }
+    } catch {}
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+      runDirsRemoved += 1;
+    } catch {}
+  }
+  return { runDirsRemoved, freedBytes };
 }
 
 function cleanupStalePidRecords() {
@@ -640,6 +609,9 @@ function cleanupStalePidRecords() {
       const command = processCommand(pid);
       if (roleMatchesCommand(child.role, command)) {
         if (terminateProcessTree(pid)) {
+          // SIGTERM may not stick; schedule a SIGKILL backstop. On the MCP-startup path the server
+          // stays alive long enough (3s, unref'd) for it to fire on a TERM-resistant orphan.
+          scheduleForceKill(pid);
           summary.terminated.push({ pid, role: child.role, command });
         }
       }
@@ -658,7 +630,6 @@ class OmpRpcSession {
     this.write = Boolean(options.write);
     this.model = options.model || null;
     this.effort = options.effort || null;
-    this.owner = options.owner || null;
     this.createdAt = nowIso();
     this.updatedAt = this.createdAt;
     this.status = "starting";
@@ -677,8 +648,8 @@ class OmpRpcSession {
     this.events = [];
     this.pending = new Map();
     this.requestCounter = 0;
-    this.logFile = path.join(LOG_DIR, `${this.id}.log`);
-    this.answerFile = path.join(LOG_DIR, `${this.id}.answer.txt`);
+    this.logFile = path.join(RUN_LOG_DIR, `${this.id}.log`);
+    this.answerFile = path.join(RUN_LOG_DIR, `${this.id}.answer.txt`);
     this.pidFile = pidRecordPath(this.id);
     this.proc = null;
     this.readyPromise = null;
@@ -967,7 +938,6 @@ class OmpRpcSession {
     return {
       id: this.id,
       agent: this.agent,
-      owner: this.owner,
       cwd: this.cwd,
       write: this.write,
       model: this.model,
@@ -1005,7 +975,9 @@ class OmpRpcSession {
     try {
       this.proc?.stdin?.end();
     } catch {}
-    terminateProcessTree(this.proc?.pid);
+    const pid = this.proc?.pid;
+    terminateProcessTree(pid);
+    scheduleForceKill(pid);
     if (options.removePidRecord !== false) removePidRecord(this.pidFile);
     try {
       fs.rmSync(this.answerFile, { force: true });
@@ -1022,7 +994,6 @@ class CodexAppServerSession {
     this.write = Boolean(options.write);
     this.model = options.model || null;
     this.effort = options.effort || null;
-    this.owner = options.owner || null;
     this.createdAt = nowIso();
     this.updatedAt = this.createdAt;
     this.status = "starting";
@@ -1044,8 +1015,8 @@ class CodexAppServerSession {
     this.finalAnswer = "";
     this.lastAgentMessage = "";
     this.tokenUsage = null;
-    this.logFile = path.join(LOG_DIR, `${this.id}.log`);
-    this.answerFile = path.join(LOG_DIR, `${this.id}.answer.txt`);
+    this.logFile = path.join(RUN_LOG_DIR, `${this.id}.log`);
+    this.answerFile = path.join(RUN_LOG_DIR, `${this.id}.answer.txt`);
     this.pidFile = pidRecordPath(this.id);
   }
 
@@ -1263,7 +1234,7 @@ class CodexAppServerSession {
           this.lastAgentMessage = item.text;
           if (item.phase === "final_answer") this.finalAnswer = item.text;
         }
-        // Strip large text payloads from the pushed event to avoid double-appending in the UI.
+        // Strip large text payloads from the pushed event; recentEvents only needs the lifecycle.
         pushEvent(this, { type: "item.completed", itemType: item.type, phase: item.phase ?? null, id: item.id });
         return;
       }
@@ -1326,7 +1297,7 @@ class CodexAppServerSession {
       this.turn = { resolve, reject };
     });
     const myTurn = this.turn;
-    // Guard against unhandledRejection taking down the daemon if the turn rejects
+    // Guard against unhandledRejection taking down the server if the turn rejects
     // (process crash / error notification) before a waiter is attached below.
     done.catch(() => {});
 
@@ -1475,7 +1446,6 @@ class CodexAppServerSession {
     return {
       id: this.id,
       agent: this.agent,
-      owner: this.owner,
       cwd: this.cwd,
       write: this.write,
       model: this.model,
@@ -1576,19 +1546,17 @@ function getSession(sessionId) {
   return session;
 }
 
-async function status(sessionId, ownerFilter) {
+async function status(sessionId) {
   if (!sessionId) {
-    let list = [...sessions.values()];
-    if (ownerFilter) list = list.filter(session => session.owner === ownerFilter);
-    return { sessions: list.map(session => session.summary()) };
+    return { sessions: [...sessions.values()].map(session => session.summary()) };
   }
   const session = getSession(sessionId);
   if (session instanceof OmpRpcSession && session.status !== "closed" && session.status !== "failed") {
     await session.state().catch(() => null);
   }
   // Slim projection (type/status/source only), same as result(): the raw events carry full
-  // message/usage trees and bloat the caller's context into "a blob". Use the UI SSE stream
-  // for full raw events.
+  // message/usage trees and bloat the caller's context into "a blob". Full raw events stay in
+  // the per-session log file (session.logFile).
   return { session: session.summary(), recentEvents: slimEvents(session.events, 20) };
 }
 
@@ -1678,7 +1646,7 @@ function doctor() {
     bridgeVersion: BRIDGE_VERSION,
     node: process.version,
     stateRoot: STATE_ROOT,
-    logDir: LOG_DIR,
+    logDir: RUN_LOG_DIR,
     agents: Object.entries(AGENTS).map(([agent, config]) => {
       const bin = agentBin(agent);
       const probe = spawnSync(bin, ["--version"], { encoding: "utf8" });
@@ -1749,1210 +1717,6 @@ function printCliResult(value, args = {}) {
   }
 }
 
-function jsonHeaders(extra = {}) {
-  return {
-    "content-type": "application/json; charset=utf-8",
-    "cache-control": "no-store",
-    "x-content-type-options": "nosniff",
-    ...extra,
-  };
-}
-
-function sendJson(res, statusCode, value) {
-  res.writeHead(statusCode, jsonHeaders());
-  res.end(`${JSON.stringify(value, null, 2)}\n`);
-}
-
-function sendHttpError(res, statusCode, err) {
-  sendJson(res, statusCode, { error: err instanceof Error ? err.message : String(err) });
-}
-
-function httpStatusForError(err) {
-  const message = err instanceof Error ? err.message : String(err);
-  if (/^Unknown session:/.test(message)) return 404;
-  if (/Request body is too large/.test(message)) return 413;
-  if (err instanceof SyntaxError) return 400;
-  return 500;
-}
-
-async function readJsonBody(req) {
-  const chunks = [];
-  let size = 0;
-  for await (const chunk of req) {
-    size += chunk.length;
-    if (size > MAX_HTTP_BODY) throw new Error("Request body is too large.");
-    chunks.push(chunk);
-  }
-  if (!chunks.length) return {};
-  const text = Buffer.concat(chunks).toString("utf8").trim();
-  if (!text) return {};
-  return JSON.parse(text);
-}
-
-function routeParts(urlPath) {
-  return urlPath
-    .split("/")
-    .filter(Boolean)
-    .map(part => decodeURIComponent(part));
-}
-
-function noCacheHtmlHeaders() {
-  return {
-    "content-type": "text/html; charset=utf-8",
-    "cache-control": "no-store",
-    "x-content-type-options": "nosniff",
-    "referrer-policy": "no-referrer",
-  };
-}
-
-async function startUiServer(params = {}) {
-  ensureDirs();
-  if (uiServer && uiServerUrl) {
-    return {
-      running: true,
-      reused: true,
-      url: uiServerUrl,
-      host: DEFAULT_UI_HOST,
-      port: Number(new URL(uiServerUrl).port),
-      daemonPid: process.pid,
-      socket: DAEMON_SOCKET,
-    };
-  }
-
-  const requestedPort = parseNumber(params.port, 0);
-  if (!Number.isInteger(requestedPort) || requestedPort < 0 || requestedPort > 65535) {
-    throw new Error(`Invalid UI port: ${params.port}`);
-  }
-
-  uiServer = http.createServer((req, res) => {
-    handleUiRequest(req, res).catch(err => {
-      if (!res.headersSent) sendHttpError(res, httpStatusForError(err), err);
-      else {
-        try {
-          res.end();
-        } catch {}
-      }
-    });
-  });
-
-  await new Promise((resolve, reject) => {
-    uiServer.once("error", reject);
-    uiServer.listen(requestedPort, DEFAULT_UI_HOST, () => {
-      uiServer.off("error", reject);
-      const address = uiServer.address();
-      uiServerUrl = `http://${DEFAULT_UI_HOST}:${address.port}`;
-      uiServer.on("error", err => cleanupAndExit(1, "ui server error", err));
-      resolve();
-    });
-  });
-
-  appendLog(path.join(LOG_DIR, "daemon.log"), `[${nowIso()}] Agent Bridge UI listening at ${uiServerUrl}\n`);
-  return {
-    running: true,
-    reused: false,
-    url: uiServerUrl,
-    host: DEFAULT_UI_HOST,
-    port: Number(new URL(uiServerUrl).port),
-    daemonPid: process.pid,
-    socket: DAEMON_SOCKET,
-  };
-}
-
-async function handleUiRequest(req, res) {
-  const url = new URL(req.url || "/", "http://127.0.0.1");
-  const parts = routeParts(url.pathname);
-
-  if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
-    res.writeHead(200, noCacheHtmlHeaders());
-    res.end(renderUiHtml());
-    return;
-  }
-
-  if (req.method === "GET" && url.pathname === "/health") {
-    sendJson(res, 200, { ok: true, bridgeVersion: BRIDGE_VERSION, daemonPid: process.pid });
-    return;
-  }
-
-  if (req.method === "GET" && url.pathname === "/config") {
-    sendJson(res, 200, {
-      bridgeVersion: BRIDGE_VERSION,
-      daemonPid: process.pid,
-      socket: DAEMON_SOCKET,
-      stateRoot: STATE_ROOT,
-      logDir: LOG_DIR,
-      cwd: process.cwd(),
-      ui: { url: uiServerUrl, host: DEFAULT_UI_HOST },
-    });
-    return;
-  }
-
-  if (parts[0] === "sessions") {
-    await handleSessionHttp(req, res, parts, url);
-    return;
-  }
-
-  if (parts[0] === "daemon" && parts[1] === "stop" && req.method === "POST") {
-    sendJson(res, 200, stopDaemonSoon());
-    return;
-  }
-
-  sendJson(res, 404, { error: "Not found." });
-}
-
-async function handleSessionHttp(req, res, parts, url) {
-  if (parts.length === 1 && req.method === "GET") {
-    sendJson(res, 200, await status(undefined));
-    return;
-  }
-
-  if (parts.length === 1 && req.method === "POST") {
-    const params = await readJsonBody(req);
-    if (!params.cwd) params.cwd = process.cwd();
-    sendJson(res, 201, await openSession(params));
-    return;
-  }
-
-  const sessionId = parts[1];
-  if (!sessionId) {
-    sendJson(res, 404, { error: "Session id is required." });
-    return;
-  }
-
-  if (parts.length === 2 && req.method === "GET") {
-    sendJson(res, 200, await status(sessionId));
-    return;
-  }
-
-  if (parts.length === 2 && req.method === "DELETE") {
-    sendJson(res, 200, closeSession(sessionId));
-    return;
-  }
-
-  if (parts.length === 3 && parts[2] === "messages" && req.method === "POST") {
-    const params = await readJsonBody(req);
-    sendJson(
-      res,
-      202,
-      await sendMessage({
-        session_id: sessionId,
-        message: params.message,
-        wait: Boolean(params.wait),
-        timeout_ms: params.timeout_ms,
-        max_chars: params.max_chars,
-      }),
-    );
-    return;
-  }
-
-  if (parts.length === 3 && parts[2] === "result" && req.method === "GET") {
-    sendJson(res, 200, await result(sessionId, { maxChars: parseNumber(url.searchParams.get("max_chars"), undefined) }));
-    return;
-  }
-
-  if (parts.length === 3 && parts[2] === "events" && req.method === "GET") {
-    handleSessionEvents(req, res, sessionId, url.searchParams.get("raw") === "1");
-    return;
-  }
-
-  if (parts.length === 3 && parts[2] === "abort" && req.method === "POST") {
-    sendJson(res, 200, await abortSession(sessionId));
-    return;
-  }
-
-  sendJson(res, 404, { error: "Not found." });
-}
-
-function handleSessionEvents(req, res, sessionId, includeRaw = false) {
-  const session = getSession(sessionId);
-  res.writeHead(200, {
-    "content-type": "text/event-stream; charset=utf-8",
-    "cache-control": "no-store, no-transform",
-    connection: "keep-alive",
-    "x-accel-buffering": "no",
-  });
-  res.write(": connected\n\n");
-
-  const client = { id: makeId("sse"), sessionId, res, includeRaw };
-  sseClients.add(client);
-  sendSse(client, "session", {
-    at: nowIso(),
-    session: sanitizeEventForUi(session.summary()),
-    recentEvents: session.events.slice(-50).map(record => sessionEventPayload(session, record)),
-    logFile: session.logFile,
-  });
-
-  const heartbeat = setInterval(() => {
-    try {
-      res.write(`: ${nowIso()}\n\n`);
-    } catch {
-      clearInterval(heartbeat);
-      sseClients.delete(client);
-    }
-  }, SSE_HEARTBEAT_MS);
-  heartbeat.unref?.();
-
-  req.on("close", () => {
-    clearInterval(heartbeat);
-    sseClients.delete(client);
-  });
-}
-
-function stopDaemonSoon() {
-  const sessionCount = sessions.size;
-  cleanupSessions({ removePidRecord: false });
-  setTimeout(() => {
-    for (const client of [...sseClients]) {
-      try {
-        client.res.end();
-      } catch {}
-    }
-    sseClients.clear();
-    try {
-      uiServer?.close();
-    } catch {}
-    try {
-      daemonServer?.close();
-    } catch {}
-    try {
-      fs.rmSync(DAEMON_SOCKET, { force: true });
-    } catch {}
-    try {
-      fs.rmSync(DAEMON_PID_FILE, { force: true });
-    } catch {}
-    process.exit(0);
-  }, 100).unref?.();
-  return { stopping: true, sessionsClosed: sessionCount, ui: uiServerUrl, socket: DAEMON_SOCKET };
-}
-
-function openLocalUrl(url) {
-  let command = null;
-  let args = [];
-  if (process.platform === "darwin") {
-    command = "open";
-    args = [url];
-  } else if (process.platform === "win32") {
-    command = "cmd";
-    args = ["/c", "start", "", url];
-  } else {
-    command = "xdg-open";
-    args = [url];
-  }
-  try {
-    const child = spawn(command, args, { detached: true, stdio: "ignore" });
-    child.unref();
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function renderUiHtml() {
-  return `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Agent Bridge Monitor</title>
-  <style>
-    :root {
-      color-scheme: light;
-      --bg: #f7f8fa;
-      --surface: #ffffff;
-      --surface-2: #f0f3f6;
-      --border: #d7dde5;
-      --text: #18202a;
-      --muted: #657386;
-      --accent: #2563eb;
-      --danger: #b42318;
-      --warning: #a15c07;
-      --ok: #0f7a42;
-      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-      --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      min-height: 100vh;
-      background: var(--bg);
-      color: var(--text);
-      font-family: var(--sans);
-      font-size: 14px;
-      letter-spacing: 0;
-    }
-    button, input, select, textarea {
-      font: inherit;
-    }
-    button {
-      border: 1px solid var(--border);
-      background: var(--surface);
-      color: var(--text);
-      min-height: 34px;
-      border-radius: 6px;
-      padding: 6px 10px;
-      cursor: pointer;
-    }
-    button:hover { border-color: #9eabbc; }
-    button.primary {
-      background: var(--accent);
-      border-color: var(--accent);
-      color: #fff;
-    }
-    button.danger {
-      border-color: #f0b8b2;
-      color: var(--danger);
-    }
-    button:disabled {
-      opacity: .52;
-      cursor: not-allowed;
-    }
-    .app {
-      display: grid;
-      grid-template-columns: 320px minmax(0, 1fr);
-      min-height: 100vh;
-    }
-    header {
-      grid-column: 1 / -1;
-      height: 56px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 16px;
-      padding: 0 18px;
-      border-bottom: 1px solid var(--border);
-      background: var(--surface);
-    }
-    .brand {
-      display: flex;
-      align-items: baseline;
-      gap: 10px;
-      min-width: 0;
-    }
-    h1 {
-      margin: 0;
-      font-size: 17px;
-      font-weight: 700;
-    }
-    .version, .meta, .muted {
-      color: var(--muted);
-      font-size: 12px;
-    }
-    aside {
-      border-right: 1px solid var(--border);
-      background: var(--surface);
-      min-width: 0;
-      display: flex;
-      flex-direction: column;
-    }
-    main {
-      min-width: 0;
-      display: grid;
-      grid-template-rows: auto minmax(220px, 1fr) auto;
-    }
-    .section {
-      padding: 14px;
-      border-bottom: 1px solid var(--border);
-    }
-    .section-title {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 10px;
-      margin-bottom: 10px;
-      font-weight: 700;
-    }
-    .session-list {
-      overflow: auto;
-      padding: 8px;
-      display: grid;
-      gap: 8px;
-    }
-    .session-row {
-      width: 100%;
-      text-align: left;
-      display: grid;
-      gap: 5px;
-      padding: 10px;
-      border-radius: 7px;
-      background: var(--surface);
-    }
-    .session-row.active {
-      border-color: var(--accent);
-      box-shadow: inset 3px 0 0 var(--accent);
-    }
-    .session-head {
-      display: flex;
-      justify-content: space-between;
-      gap: 8px;
-      min-width: 0;
-    }
-    .session-id {
-      font-family: var(--mono);
-      font-size: 12px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 5px;
-      min-height: 22px;
-      border-radius: 999px;
-      padding: 2px 8px;
-      border: 1px solid var(--border);
-      font-size: 12px;
-      white-space: nowrap;
-    }
-    .badge.running { color: var(--accent); border-color: #b8cdfc; background: #edf3ff; }
-    .badge.idle { color: var(--ok); border-color: #bae5cc; background: #eefaf3; }
-    .badge.failed, .badge.closed { color: var(--danger); border-color: #f0b8b2; background: #fff1f0; }
-    .badge.write { color: var(--warning); border-color: #f4c889; background: #fff7e8; }
-    .form-grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 8px;
-    }
-    .form-grid .wide { grid-column: 1 / -1; }
-    label {
-      display: grid;
-      gap: 5px;
-      color: var(--muted);
-      font-size: 12px;
-      min-width: 0;
-    }
-    input, select, textarea {
-      width: 100%;
-      border: 1px solid var(--border);
-      background: var(--surface);
-      color: var(--text);
-      border-radius: 6px;
-      padding: 7px 9px;
-      min-height: 34px;
-    }
-    textarea {
-      min-height: 88px;
-      resize: vertical;
-      line-height: 1.45;
-    }
-    .checkbox {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      color: var(--text);
-      min-height: 34px;
-    }
-    .checkbox input {
-      width: 16px;
-      height: 16px;
-      min-height: 16px;
-    }
-    .toolbar {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      gap: 8px;
-    }
-    .summary {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      gap: 8px;
-    }
-    .output {
-      margin: 0;
-      padding: 14px;
-      overflow: auto;
-      background: #111827;
-      color: #ecfdf5;
-      font-family: var(--mono);
-      font-size: 13px;
-      line-height: 1.55;
-      white-space: pre-wrap;
-      word-break: break-word;
-    }
-    .details {
-      background: var(--surface);
-      border-top: 1px solid var(--border);
-      max-height: 280px;
-      overflow: auto;
-    }
-    details {
-      padding: 12px 14px;
-    }
-    summary {
-      cursor: pointer;
-      font-weight: 700;
-    }
-    .raw {
-      margin: 10px 0 0;
-      padding: 10px;
-      border-radius: 6px;
-      background: var(--surface-2);
-      color: #263241;
-      font-family: var(--mono);
-      font-size: 12px;
-      line-height: 1.45;
-      white-space: pre-wrap;
-      word-break: break-word;
-      max-height: 210px;
-      overflow: auto;
-    }
-    .status-line {
-      min-height: 20px;
-      color: var(--muted);
-      font-size: 12px;
-    }
-    .empty {
-      color: var(--muted);
-      padding: 18px 10px;
-      text-align: center;
-    }
-    @media (max-width: 820px) {
-      .app { grid-template-columns: 1fr; }
-      aside { border-right: 0; border-bottom: 1px solid var(--border); max-height: 48vh; }
-      main { min-height: 52vh; }
-    }
-  </style>
-</head>
-<body>
-  <div class="app" data-version="${BRIDGE_VERSION}">
-    <header>
-      <div class="brand">
-        <h1>Agent Bridge Monitor</h1>
-        <span class="version">v${BRIDGE_VERSION}</span>
-      </div>
-      <div class="toolbar">
-        <button id="refresh" type="button">Refresh</button>
-        <button id="stopDaemon" class="danger" type="button">Stop Daemon</button>
-      </div>
-    </header>
-    <aside>
-      <section class="section">
-        <div class="section-title">
-          <span>Sessions</span>
-          <span id="sessionCount" class="meta">0</span>
-        </div>
-        <form id="openForm" class="form-grid">
-          <label>Agent
-            <select id="agent">
-              <option value="omp">OMP</option>
-              <option value="codex">Codex</option>
-            </select>
-          </label>
-          <label class="checkbox">
-            <input id="write" type="checkbox">
-            <span>Write</span>
-          </label>
-          <label class="wide">cwd
-            <input id="cwd" autocomplete="off">
-          </label>
-          <button class="primary wide" type="submit">Open Session</button>
-        </form>
-      </section>
-      <div id="sessions" class="session-list"></div>
-    </aside>
-    <main>
-      <section class="section">
-        <div class="summary">
-          <strong id="activeTitle">No session</strong>
-          <span id="activeStatus" class="badge">none</span>
-          <span id="writeBadge" class="badge write" hidden>write enabled</span>
-          <span id="pidInfo" class="meta"></span>
-        </div>
-      </section>
-      <pre id="output" class="output"></pre>
-      <section class="section">
-        <form id="sendForm">
-          <label>Message
-            <textarea id="message" placeholder="Send a message to the selected session"></textarea>
-          </label>
-          <div class="toolbar" style="margin-top:8px">
-            <button class="primary" type="submit">Send</button>
-            <button id="abort" type="button">Abort</button>
-            <button id="close" class="danger" type="button">Close Session</button>
-          </div>
-        </form>
-        <div id="statusLine" class="status-line"></div>
-      </section>
-      <div class="details">
-        <details>
-          <summary>Debug</summary>
-          <div id="logPath" class="meta"></div>
-          <pre id="raw" class="raw"></pre>
-        </details>
-      </div>
-    </main>
-  </div>
-  <script>
-    const state = { sessions: [], activeId: null, events: null, config: null };
-    const el = {};
-
-    function byId(id) { return document.getElementById(id); }
-
-    function setStatus(text) {
-      el.statusLine.textContent = text || "";
-    }
-
-    async function api(path, options) {
-      const response = await fetch(path, Object.assign({
-        headers: { "content-type": "application/json" }
-      }, options || {}));
-      const text = await response.text();
-      const data = text ? JSON.parse(text) : {};
-      if (!response.ok) throw new Error(data.error || response.statusText);
-      return data;
-    }
-
-    function upsertSession(session) {
-      if (!session || !session.id) return;
-      const index = state.sessions.findIndex(item => item.id === session.id);
-      if (index === -1) state.sessions.push(session);
-      else state.sessions[index] = session;
-    }
-
-    function activeSession() {
-      return state.sessions.find(session => session.id === state.activeId) || null;
-    }
-
-    function pidText(session) {
-      if (!session) return "";
-      const pids = [];
-      if (session.pid) pids.push("pid " + session.pid);
-      if (session.serverPid) pids.push("server " + session.serverPid);
-      if (session.currentClientPid) pids.push("client " + session.currentClientPid);
-      return pids.join(" | ");
-    }
-
-    function shortTime(value) {
-      if (!value) return "";
-      const date = new Date(value);
-      if (Number.isNaN(date.getTime())) return "";
-      return date.toLocaleString();
-    }
-
-    function statusClass(status) {
-      return "badge " + (status || "none");
-    }
-
-    function renderSessions() {
-      el.sessionCount.textContent = String(state.sessions.length);
-      el.sessions.innerHTML = "";
-      if (!state.sessions.length) {
-        const empty = document.createElement("div");
-        empty.className = "empty";
-        empty.textContent = "No sessions";
-        el.sessions.appendChild(empty);
-        return;
-      }
-      for (const session of state.sessions) {
-        const button = document.createElement("button");
-        button.type = "button";
-        button.className = "session-row" + (session.id === state.activeId ? " active" : "");
-        button.dataset.testid = "session-row";
-        button.dataset.sessionId = session.id;
-        button.addEventListener("click", () => selectSession(session.id));
-
-        const head = document.createElement("div");
-        head.className = "session-head";
-        const id = document.createElement("span");
-        id.className = "session-id";
-        id.textContent = session.id;
-        const badge = document.createElement("span");
-        badge.className = statusClass(session.status);
-        badge.textContent = session.status || "unknown";
-        head.append(id, badge);
-
-        const meta = document.createElement("div");
-        meta.className = "meta";
-        meta.textContent = session.agent + " | " + pidText(session) + " | " + shortTime(session.createdAt);
-
-        const cwd = document.createElement("div");
-        cwd.className = "meta";
-        cwd.textContent = session.cwd || "";
-
-        button.append(head, meta, cwd);
-        el.sessions.appendChild(button);
-      }
-    }
-
-    function renderActive() {
-      const session = activeSession();
-      el.activeTitle.textContent = session ? session.id : "No session";
-      el.activeStatus.className = statusClass(session ? session.status : "none");
-      el.activeStatus.textContent = session ? session.status : "none";
-      el.writeBadge.hidden = !session || !session.write;
-      el.pidInfo.textContent = pidText(session);
-      el.abort.disabled = !session;
-      el.close.disabled = !session;
-      el.sendForm.querySelector("button[type=submit]").disabled = !session;
-      el.logPath.textContent = session && session.logFile ? session.logFile : "";
-    }
-
-    function appendOutput(text) {
-      if (!text) return;
-      el.output.textContent += text;
-      el.output.scrollTop = el.output.scrollHeight;
-    }
-
-    function appendRaw(payload) {
-      const line = JSON.stringify(payload, null, 2);
-      el.raw.textContent += (el.raw.textContent ? "\\n" : "") + line;
-      const lines = el.raw.textContent.split("\\n");
-      if (lines.length > 900) el.raw.textContent = lines.slice(lines.length - 900).join("\\n");
-      el.raw.scrollTop = el.raw.scrollHeight;
-    }
-
-    async function refreshSessions() {
-      const data = await api("/sessions");
-      state.sessions = data.sessions || [];
-      if (state.activeId && !state.sessions.some(session => session.id === state.activeId)) {
-        disconnectEvents();
-        state.activeId = null;
-      }
-      if (!state.activeId && state.sessions.length) selectSession(state.sessions[0].id);
-      renderSessions();
-      renderActive();
-    }
-
-    function disconnectEvents() {
-      if (state.events) state.events.close();
-      state.events = null;
-    }
-
-    async function loadResult(id) {
-      try {
-        const data = await api("/sessions/" + encodeURIComponent(id) + "/result");
-        el.output.textContent = data.text || "";
-        el.logPath.textContent = data.session?.logFile || "";
-      } catch (err) {
-        setStatus(err.message);
-      }
-    }
-
-    function connectEvents(id) {
-      disconnectEvents();
-      el.raw.textContent = "";
-      const events = new EventSource("/sessions/" + encodeURIComponent(id) + "/events");
-      state.events = events;
-      events.addEventListener("session", event => {
-        const payload = JSON.parse(event.data);
-        upsertSession(payload.session);
-        appendRaw(payload);
-        renderSessions();
-        renderActive();
-      });
-      events.addEventListener("session-event", event => {
-        const payload = JSON.parse(event.data);
-        upsertSession(payload.session);
-        if (payload.textDelta) appendOutput(payload.textDelta);
-        appendRaw(payload);
-        renderSessions();
-        renderActive();
-      });
-      events.onerror = () => setStatus("event stream disconnected");
-    }
-
-    async function selectSession(id) {
-      if (state.activeId === id) return;
-      state.activeId = id;
-      el.output.textContent = "";
-      renderSessions();
-      renderActive();
-      connectEvents(id);
-      await loadResult(id);
-    }
-
-    async function openSession(event) {
-      event.preventDefault();
-      setStatus("opening");
-      const data = await api("/sessions", {
-        method: "POST",
-        body: JSON.stringify({
-          agent: el.agent.value,
-          cwd: el.cwd.value || (state.config && state.config.cwd) || "",
-          write: el.write.checked
-        })
-      });
-      upsertSession(data.session);
-      renderSessions();
-      await selectSession(data.session.id);
-      setStatus("opened");
-    }
-
-    async function sendMessage(event) {
-      event.preventDefault();
-      const session = activeSession();
-      if (!session) return;
-      const message = el.message.value.trim();
-      if (!message) return;
-      setStatus("sending");
-      await api("/sessions/" + encodeURIComponent(session.id) + "/messages", {
-        method: "POST",
-        body: JSON.stringify({ message })
-      });
-      el.message.value = "";
-      setStatus("sent");
-      await refreshSessions();
-    }
-
-    async function abortSession() {
-      const session = activeSession();
-      if (!session) return;
-      await api("/sessions/" + encodeURIComponent(session.id) + "/abort", { method: "POST" });
-      setStatus("aborted");
-      await refreshSessions();
-    }
-
-    async function closeSession() {
-      const session = activeSession();
-      if (!session) return;
-      await api("/sessions/" + encodeURIComponent(session.id), { method: "DELETE" });
-      state.sessions = state.sessions.filter(item => item.id !== session.id);
-      disconnectEvents();
-      state.activeId = null;
-      el.output.textContent = "";
-      renderSessions();
-      renderActive();
-      setStatus("closed");
-    }
-
-    async function stopDaemon() {
-      await api("/daemon/stop", { method: "POST" });
-      setStatus("daemon stopping");
-    }
-
-    async function init() {
-      el.refresh = byId("refresh");
-      el.stopDaemon = byId("stopDaemon");
-      el.sessions = byId("sessions");
-      el.sessionCount = byId("sessionCount");
-      el.openForm = byId("openForm");
-      el.agent = byId("agent");
-      el.cwd = byId("cwd");
-      el.write = byId("write");
-      el.activeTitle = byId("activeTitle");
-      el.activeStatus = byId("activeStatus");
-      el.writeBadge = byId("writeBadge");
-      el.pidInfo = byId("pidInfo");
-      el.output = byId("output");
-      el.raw = byId("raw");
-      el.logPath = byId("logPath");
-      el.sendForm = byId("sendForm");
-      el.message = byId("message");
-      el.abort = byId("abort");
-      el.close = byId("close");
-      el.statusLine = byId("statusLine");
-
-      state.config = await api("/config");
-      el.cwd.value = state.config.cwd || "";
-      el.openForm.addEventListener("submit", event => openSession(event).catch(err => setStatus(err.message)));
-      el.sendForm.addEventListener("submit", event => sendMessage(event).catch(err => setStatus(err.message)));
-      el.refresh.addEventListener("click", () => refreshSessions().catch(err => setStatus(err.message)));
-      el.abort.addEventListener("click", () => abortSession().catch(err => setStatus(err.message)));
-      el.close.addEventListener("click", () => closeSession().catch(err => setStatus(err.message)));
-      el.stopDaemon.addEventListener("click", () => stopDaemon().catch(err => setStatus(err.message)));
-      renderActive();
-      await refreshSessions();
-      setInterval(() => refreshSessions().catch(() => {}), 2500);
-    }
-
-    init().catch(err => setStatus(err.message));
-  </script>
-</body>
-</html>`;
-}
-
-function connectDaemon(timeoutMs = 2000) {
-  return new Promise((resolve, reject) => {
-    const socket = net.createConnection(DAEMON_SOCKET);
-    let done = false;
-    const timer = setTimeout(() => {
-      if (done) return;
-      done = true;
-      socket.destroy();
-      reject(new Error(`Timed out connecting to Agent Bridge daemon at ${DAEMON_SOCKET}.`));
-    }, timeoutMs);
-    timer.unref?.();
-    socket.once("connect", () => {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      resolve(socket);
-    });
-    socket.once("error", err => {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      reject(err);
-    });
-  });
-}
-
-async function requestDaemon(method, params = {}, options = {}) {
-  if (options.autoStart !== false) await ensureDaemon();
-  const socket = await connectDaemon(options.connectTimeoutMs || 2000);
-  const request = { id: makeId("cli"), method, params };
-  return await new Promise((resolve, reject) => {
-    const timeoutMs = options.timeoutMs || DEFAULT_WAIT_TIMEOUT_MS + 30000;
-    let settled = false;
-    const succeed = value => { if (settled) return; settled = true; clearTimeout(timer); resolve(value); };
-    const fail = err => { if (settled) return; settled = true; clearTimeout(timer); reject(err); };
-    const timer = setTimeout(() => {
-      socket.destroy();
-      fail(new Error(`Timed out waiting for daemon response to ${method}.`));
-    }, timeoutMs);
-    timer.unref?.();
-
-    const rl = readline.createInterface({ input: socket, crlfDelay: Infinity });
-    rl.once("line", line => {
-      socket.end();
-      let response;
-      try {
-        response = JSON.parse(line);
-      } catch (err) {
-        fail(new Error(`Invalid daemon response: ${err instanceof Error ? err.message : String(err)}`));
-        return;
-      }
-      if (response.ok === false) fail(new Error(response.error || "Daemon request failed."));
-      else succeed(response.result);
-    });
-    socket.once("error", err => fail(err));
-    // If the daemon goes away (restart / graceful shutdown / crash) before sending a
-    // response line, the socket closes via EOF with no "error" event. Without this the
-    // call would block until timeoutMs; instead surface the disconnect promptly. Harmless
-    // after a real response — succeed/fail already ran, so `settled` makes this a no-op.
-    socket.once("close", () => fail(new Error(`Agent Bridge daemon closed the connection before responding to ${method}.`)));
-    socket.write(`${JSON.stringify(request)}\n`);
-  });
-}
-
-async function tryDaemonPing() {
-  try {
-    return await requestDaemon("ping", {}, { autoStart: false, timeoutMs: 2000, connectTimeoutMs: 1000 });
-  } catch {
-    return null;
-  }
-}
-
-async function ensureDaemon() {
-  const existing = await tryDaemonPing();
-  if (existing) return existing;
-  cleanupStaleDaemons();
-  try {
-    fs.rmSync(DAEMON_SOCKET, { force: true });
-  } catch {}
-
-  ensureDirs();
-  const logFile = path.join(LOG_DIR, "daemon.log");
-  const logFd = fs.openSync(logFile, "a");
-  const child = spawn(process.execPath, [process.argv[1], "daemon"], {
-    cwd: process.cwd(),
-    env: process.env,
-    detached: true,
-    stdio: ["ignore", logFd, logFd],
-  });
-  child.unref();
-
-  const started = Date.now();
-  while (Date.now() - started < 20000) {
-    await sleep(250);
-    const ping = await tryDaemonPing();
-    if (ping) return ping;
-  }
-  throw new Error(`Timed out starting Agent Bridge daemon. See ${logFile}.`);
-}
-
-function daemonPid() {
-  try {
-    return Number(fs.readFileSync(DAEMON_PID_FILE, "utf8").trim()) || null;
-  } catch {
-    return null;
-  }
-}
-
-function listDaemonPids() {
-  const result = spawnSync("ps", ["-axo", "pid=,command="], { encoding: "utf8" });
-  if (result.status !== 0 || !result.stdout) return [];
-  return result.stdout
-    .split(/\r?\n/)
-    .map(line => line.trim())
-    .filter(Boolean)
-    .map(line => {
-      const match = line.match(/^(\d+)\s+(.+)$/);
-      if (!match) return null;
-      return { pid: Number(match[1]), command: match[2] };
-    })
-    .filter(row => {
-      if (!row || row.pid === process.pid) return false;
-      const argv0LooksLikeNode = /^(?:\S*\/)?node(?:\s|$)/.test(row.command);
-      return argv0LooksLikeNode && /agent-bridge\.mjs/.test(row.command) && /\bdaemon\b/.test(row.command);
-    });
-}
-
-function cleanupStaleDaemons() {
-  const terminated = [];
-  for (const row of listDaemonPids()) {
-    if (terminateProcessTree(row.pid)) terminated.push(row);
-  }
-  try {
-    fs.rmSync(DAEMON_SOCKET, { force: true });
-  } catch {}
-  try {
-    fs.rmSync(DAEMON_PID_FILE, { force: true });
-  } catch {}
-  return { terminated };
-}
-
-async function serveDaemon() {
-  ensureDirs();
-  cleanupStalePidRecords();
-  installProcessHandlers();
-
-  const existing = await tryDaemonPing();
-  if (existing) throw new Error(`Agent Bridge daemon is already running at ${DAEMON_SOCKET}.`);
-  cleanupStaleDaemons();
-  // Prune only AFTER confirming we are the sole daemon: a racing second start has an empty
-  // session registry, so pruning before the ping check could delete logs the existing daemon is
-  // actively writing (its active files aren't known to us) right before we bail out.
-  const pruned = pruneLogs();
-  if (pruned.removed) {
-    appendLog(
-      path.join(LOG_DIR, "daemon.log"),
-      `[${nowIso()}] pruned ${pruned.removed} session log(s), freed ~${Math.round(pruned.freedBytes / 1048576)}MB\n`,
-    );
-  }
-  try {
-    fs.rmSync(DAEMON_SOCKET, { force: true });
-  } catch {}
-
-  daemonServer = net.createServer(socket => {
-    const rl = readline.createInterface({ input: socket, crlfDelay: Infinity });
-    rl.on("line", line => {
-      if (!line.trim()) return;
-      let request;
-      try {
-        request = JSON.parse(line);
-      } catch (err) {
-        socket.write(`${JSON.stringify({ id: null, ok: false, error: `Invalid JSON: ${err instanceof Error ? err.message : String(err)}` })}\n`);
-        return;
-      }
-      handleDaemonRequest(request)
-        .then(result => socket.write(`${JSON.stringify({ id: request.id, ok: true, result })}\n`))
-        .catch(err =>
-          socket.write(
-            `${JSON.stringify({
-              id: request.id,
-              ok: false,
-              error: err instanceof Error ? err.message : String(err),
-            })}\n`,
-          ),
-        );
-    });
-  });
-
-  daemonServer.on("error", err => cleanupAndExit(1, "daemon server error", err));
-
-  await new Promise((resolve, reject) => {
-    daemonServer.once("error", reject);
-    daemonServer.listen(DAEMON_SOCKET, () => {
-      daemonServer.off("error", reject);
-      fs.chmodSync(DAEMON_SOCKET, 0o600);
-      fs.writeFileSync(DAEMON_PID_FILE, `${process.pid}\n`, "utf8");
-      resolve();
-    });
-  });
-
-  appendLog(path.join(LOG_DIR, "daemon.log"), `[${nowIso()}] Agent Bridge daemon ${BRIDGE_VERSION} listening at ${DAEMON_SOCKET}\n`);
-  const keepAlive = setInterval(() => {}, 60_000);
-  // Periodic prune while the daemon is long-lived: the start-time prune alone never reclaims
-  // anything until the next restart, so a long-running daemon's logs grow unbounded. Skips files
-  // belonging to live sessions. unref so it never holds the process open on its own.
-  let pruneTimer = null;
-  if (LOG_PRUNE_INTERVAL_MS > 0) {
-    pruneTimer = setInterval(() => {
-      try {
-        const res = pruneLogs(activeLogPaths());
-        if (res.removed) {
-          appendLog(
-            path.join(LOG_DIR, "daemon.log"),
-            `[${nowIso()}] periodic prune removed ${res.removed} log(s), freed ~${Math.round(res.freedBytes / 1048576)}MB\n`,
-          );
-        }
-      } catch {}
-    }, LOG_PRUNE_INTERVAL_MS);
-    pruneTimer.unref?.();
-  }
-  try {
-    await new Promise(resolve => daemonServer.once("close", resolve));
-  } finally {
-    clearInterval(keepAlive);
-    if (pruneTimer) clearInterval(pruneTimer);
-  }
-}
-
-async function handleDaemonRequest(request) {
-  const params = request.params || {};
-  switch (request.method) {
-    case "ping":
-      return {
-        ok: true,
-        bridgeVersion: BRIDGE_VERSION,
-        pid: process.pid,
-        socket: DAEMON_SOCKET,
-        ui: uiServerUrl ? { running: true, url: uiServerUrl, host: DEFAULT_UI_HOST } : { running: false },
-        sessions: [...sessions.values()].map(session => session.summary()),
-      };
-    case "doctor":
-      return doctor();
-    case "cleanup":
-      return cleanupStalePidRecords();
-    case "ui_start":
-      return await startUiServer(params);
-    case "open":
-      return await openSession(params);
-    case "send":
-      return await sendMessage(params);
-    case "sessions":
-      return await status(undefined);
-    case "status":
-      return await status(params.session_id, params.owner);
-    case "result":
-      return await result(params.session_id, { maxChars: params.max_chars });
-    case "wait":
-      return await waitSessions(params);
-    case "abort":
-      return await abortSession(params.session_id);
-    case "close":
-      return closeSession(params.session_id);
-    case "stop": {
-      return stopDaemonSoon();
-    }
-    default:
-      throw new Error(`Unknown daemon method: ${request.method}`);
-  }
-}
-
-function cliOpenParams(args) {
-  const agent = args.agent || args._[0];
-  if (!agent) throw new Error("open requires --agent omp|codex.");
-  return {
-    agent,
-    cwd: args.cwd || process.cwd(),
-    write: Boolean(args.write),
-    model: args.model,
-    effort: args.effort,
-    initial_prompt: args.initialPrompt,
-    wait: Boolean(args.wait),
-    timeout_ms: parseNumber(args.timeoutMs, undefined),
-  };
-}
-
-function cliSessionId(args, command) {
-  const sessionId = args.sessionId || args._[0];
-  if (!sessionId) throw new Error(`${command} requires a session_id.`);
-  return sessionId;
-}
-
 async function runCli(argv) {
   const [cmd, ...rest] = argv;
   const args = parseArgs(rest);
@@ -2961,109 +1725,16 @@ async function runCli(argv) {
     case "serve-mcp":
       serveMcp();
       return;
-    case "daemon":
-    case "serve-daemon":
-      await serveDaemon();
-      return;
     case "doctor": {
       const value = doctor();
       process.stdout.write(args.json ? `${JSON.stringify(value, null, 2)}\n` : renderDoctor(value));
       return;
     }
-    case "cleanup": {
-      const ping = await tryDaemonPing();
-      printCliResult(
-        {
-          daemon: ping ? { running: true, pid: ping.pid, socket: ping.socket } : { running: false, ...cleanupStaleDaemons() },
-          childProcesses: cleanupStalePidRecords(),
-        },
-        args,
-      );
-      return;
-    }
-    case "start":
-      printCliResult(await ensureDaemon(), args);
-      return;
-    case "stop": {
-      const ping = await tryDaemonPing();
-      if (!ping) {
-        cleanupStaleDaemons();
-        printCliResult({ stopping: false, running: false, socket: DAEMON_SOCKET, pid: daemonPid() }, args);
-        return;
-      }
-      printCliResult(await requestDaemon("stop", {}, { autoStart: false, timeoutMs: 5000 }), args);
-      return;
-    }
-    case "ui": {
-      const value = await requestDaemon(
-        "ui_start",
-        { port: parseNumber(args.port, 0) },
-        { timeoutMs: 10000 },
-      );
-      if (args.open !== false && !args.json) openLocalUrl(value.url);
-      printCliResult(args.json ? value : `Agent Bridge UI: ${value.url}\n`, args);
-      return;
-    }
-    case "sessions":
-      printCliResult(await requestDaemon("sessions", {}, { timeoutMs: 10000 }), args);
-      return;
-    case "open":
-      printCliResult(await requestDaemon("open", cliOpenParams(args), { timeoutMs: 30000 }), args);
-      return;
-    case "send": {
-      const sessionId = cliSessionId(args, "send");
-      const message = args.message || args._.slice(1).join(" ");
-      if (!message.trim()) throw new Error("send requires a message.");
-      printCliResult(
-        await requestDaemon(
-          "send",
-          {
-            session_id: sessionId,
-            message,
-            wait: Boolean(args.wait),
-            timeout_ms: parseNumber(args.timeoutMs, undefined),
-            max_chars: parseNumber(args.maxChars, undefined),
-          },
-          { timeoutMs: parseNumber(args.timeoutMs, DEFAULT_WAIT_TIMEOUT_MS) + 30000 },
-        ),
-        args,
-      );
-      return;
-    }
-    case "status":
-      printCliResult(
-        await requestDaemon("status", { session_id: args.sessionId || args._[0] }, { timeoutMs: 10000 }),
-        args,
-      );
-      return;
-    case "result":
-      printCliResult(
-        await requestDaemon(
-          "result",
-          { session_id: cliSessionId(args, "result"), max_chars: parseNumber(args.maxChars, undefined) },
-          { timeoutMs: 10000 },
-        ),
-        args,
-      );
-      return;
-    case "wait": {
-      const ids = args._.filter(Boolean);
-      if (!ids.length) throw new Error("wait requires one or more session_ids.");
-      printCliResult(
-        await requestDaemon(
-          "wait",
-          { session_ids: ids, mode: args.mode, timeout_ms: parseNumber(args.timeoutMs, undefined), max_chars: parseNumber(args.maxChars, undefined) },
-          { timeoutMs: parseNumber(args.timeoutMs, DEFAULT_WAIT_TIMEOUT_MS) + 30000 },
-        ),
-        args,
-      );
-      return;
-    }
-    case "abort":
-      printCliResult(await requestDaemon("abort", { session_id: cliSessionId(args, "abort") }, { timeoutMs: 10000 }), args);
-      return;
-    case "close":
-      printCliResult(await requestDaemon("close", { session_id: cliSessionId(args, "close") }, { timeoutMs: 10000 }), args);
+    case "cleanup":
+      // Reap orphaned backend child processes (omp/codex) left behind by an MCP server that
+      // was SIGKILLed before it could clean up its own sessions (matched by pid records whose
+      // owner MCP is gone), and remove abandoned logs/<runId>/ dirs from those dead servers.
+      printCliResult({ childProcesses: cleanupStalePidRecords(), staleLogs: reclaimStaleLogs() }, args);
       return;
     case undefined:
     case "help":
@@ -3084,41 +1755,23 @@ function mcpText(value, isError = false) {
 async function callTool(name, args) {
   switch (name) {
     case "agent_bridge_open_session":
-      // Stamp this client's id so the daemon can attribute the session without the agent
-      // passing anything. The agent still tracks ids it opened; owner adds origin on top.
-      return mcpText(await requestDaemon("open", { ...(args || {}), owner: mcpClientId() }, { timeoutMs: 30000 }));
+      return mcpText(await openSession(args || {}));
     case "agent_bridge_send_message":
-      return mcpText(
-        // Default to non-blocking: an omitted wait means false, returning an ack immediately so
-        // the agent stays responsive instead of dead-waiting (up to 30 min) on one turn. Join the
-        // result via agent_bridge_wait with a short timeout_ms to poll progress. Pass wait:true
-        // here for a simple inline blocking send.
-        await requestDaemon("send", { ...(args || {}), wait: args?.wait ?? false }, {
-          timeoutMs: parseNumber(args?.timeout_ms, DEFAULT_WAIT_TIMEOUT_MS) + 30000,
-        }),
-      );
+      // Default to non-blocking: an omitted wait means false, returning an ack immediately so
+      // the agent stays responsive instead of dead-waiting (up to 30 min) on one turn. Join the
+      // result via agent_bridge_wait with a short timeout_ms to poll progress. Pass wait:true
+      // here for a simple inline blocking send.
+      return mcpText(await sendMessage({ ...(args || {}), wait: args?.wait ?? false }));
     case "agent_bridge_status":
-      return mcpText(
-        await requestDaemon(
-          "status",
-          { session_id: args?.session_id, owner: args?.mine ? mcpClientId() : undefined },
-          { timeoutMs: 10000 },
-        ),
-      );
+      return mcpText(await status(args?.session_id));
     case "agent_bridge_result":
-      return mcpText(
-        await requestDaemon("result", { session_id: args?.session_id, max_chars: args?.max_chars }, { timeoutMs: 10000 }),
-      );
+      return mcpText(await result(args?.session_id, { maxChars: args?.max_chars }));
     case "agent_bridge_wait":
-      return mcpText(
-        await requestDaemon("wait", args || {}, {
-          timeoutMs: parseNumber(args?.timeout_ms, DEFAULT_WAIT_TIMEOUT_MS) + 30000,
-        }),
-      );
+      return mcpText(await waitSessions(args || {}));
     case "agent_bridge_abort":
-      return mcpText(await requestDaemon("abort", { session_id: args?.session_id }, { timeoutMs: 10000 }));
+      return mcpText(await abortSession(args?.session_id));
     case "agent_bridge_close_session":
-      return mcpText(await requestDaemon("close", { session_id: args?.session_id }, { timeoutMs: 10000 }));
+      return mcpText(closeSession(args?.session_id));
     case "agent_bridge_doctor":
       return mcpText(renderDoctor(doctor()));
     default:
@@ -3127,9 +1780,30 @@ async function callTool(name, args) {
 }
 
 function serveMcp() {
+  // This MCP server process is the sole owner of its sessions; give it a private log dir so
+  // concurrent servers never prune each other's files.
+  RUN_LOG_DIR = path.join(LOG_DIR, makeId("mcp"));
   ensureDirs();
+  // Tag the run dir with our pid so a later startup/cleanup can tell whether a leftover
+  // logs/mcp-*/ belongs to a still-living server before reclaiming it.
+  try {
+    fs.writeFileSync(path.join(RUN_LOG_DIR, "owner"), `${process.pid}\n`, "utf8");
+  } catch {}
   cleanupStalePidRecords();
+  reclaimStaleLogs(); // sweep run dirs left by servers that did not exit cleanly
   installProcessHandlers();
+  // Periodic prune of THIS run's logs while the server is long-lived (the per-file/total caps
+  // matter most for chatty OMP sessions), plus a sweep of other servers' abandoned run dirs.
+  // Scoped work only; unref so it never holds the process open on its own.
+  if (LOG_PRUNE_INTERVAL_MS > 0) {
+    const pruneTimer = setInterval(() => {
+      try {
+        pruneLogs(activeLogPaths());
+        reclaimStaleLogs();
+      } catch {}
+    }, LOG_PRUNE_INTERVAL_MS);
+    pruneTimer.unref?.();
+  }
   const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
   let activeRequests = 0;
   let inputClosed = false;
@@ -3160,21 +1834,9 @@ function serveMcp() {
   });
 }
 
-// A stable owner id for sessions opened through THIS MCP process. The MCP process is a
-// per-host boundary (one long-lived process per client connection), so its pid plus the
-// client name from initialize identifies "this host/agent" — letting the daemon attribute
-// sessions without the calling agent passing anything. Other clients sharing the daemon get
-// their own ids; mine:true on status filters to this one.
-let mcpClientInfo = null;
-function mcpClientId() {
-  const name = mcpClientInfo?.name ? String(mcpClientInfo.name).replace(/\s+/g, "-") : "mcp";
-  return `${name}:${process.pid}`;
-}
-
 async function handleMcp(message) {
   switch (message.method) {
     case "initialize":
-      mcpClientInfo = message.params?.clientInfo || null;
       rpcResult(message.id, {
         protocolVersion: message.params?.protocolVersion || MCP_PROTOCOL_VERSION,
         capabilities: { tools: {} },
@@ -3217,30 +1879,23 @@ function cleanupSessions(options = {}) {
 function cleanupAndExit(code = 0, reason = "shutdown", error = null) {
   if (shuttingDown) return;
   shuttingDown = true;
-  appendLog(path.join(LOG_DIR, "daemon.log"), `[${nowIso()}] Agent Bridge shutdown code=${code} reason=${reason}\n`);
+  appendLog(path.join(RUN_LOG_DIR, "bridge.log"), `[${nowIso()}] Agent Bridge shutdown code=${code} reason=${reason}\n`);
   if (error) {
     process.stderr.write(`${reason}: ${error instanceof Error ? error.stack || error.message : String(error)}\n`);
   }
+  // KEEP pid records on process shutdown (removePidRecord:false). close() only SIGTERMs the
+  // children; its SIGKILL backstop is an async timer that cannot fire before process.exit() below.
+  // So a TERM-resistant backend may briefly outlive us — leaving its pid record lets the next MCP
+  // startup's cleanupStalePidRecords reap it (see docs/DEVELOPMENT.md). A child that does die
+  // removes its own record via its proc "exit" handler.
   cleanupSessions({ removePidRecord: false });
-  for (const client of [...sseClients]) {
+  // Clean exit (stdin close / signal) removes this run's ephemeral log dir; a crash (code !== 0)
+  // keeps it for debugging. Never touch the base LOG_DIR (one-shot CLI mode never sets a run dir).
+  if (code === 0 && RUN_LOG_DIR !== LOG_DIR) {
     try {
-      client.res.end();
+      fs.rmSync(RUN_LOG_DIR, { recursive: true, force: true });
     } catch {}
   }
-  sseClients.clear();
-  try {
-    uiServer?.close();
-  } catch {}
-  try {
-    daemonServer?.close();
-  } catch {}
-  const ownsDaemonState = Boolean(daemonServer) || daemonPid() === process.pid;
-  try {
-    if (ownsDaemonState && fs.existsSync(DAEMON_SOCKET)) fs.rmSync(DAEMON_SOCKET, { force: true });
-  } catch {}
-  try {
-    if (ownsDaemonState && fs.existsSync(DAEMON_PID_FILE) && daemonPid() === process.pid) fs.rmSync(DAEMON_PID_FILE, { force: true });
-  } catch {}
   process.exit(code);
 }
 
@@ -3256,7 +1911,7 @@ function installProcessHandlers() {
     if (!shuttingDown) cleanupSessions({ removePidRecord: false });
   });
   process.once("beforeExit", code => {
-    appendLog(path.join(LOG_DIR, "daemon.log"), `[${nowIso()}] Agent Bridge beforeExit code=${code}\n`);
+    appendLog(path.join(RUN_LOG_DIR, "bridge.log"), `[${nowIso()}] Agent Bridge beforeExit code=${code}\n`);
   });
   process.stdout.on("error", err => {
     if (err?.code === "EPIPE") cleanupAndExit(0, "stdout closed");

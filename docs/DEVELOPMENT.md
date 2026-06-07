@@ -25,14 +25,10 @@ There are no npm dependencies. The runtime uses Node built-ins plus external CLI
 
 ```mermaid
 flowchart LR
-  Codex["Codex MCP client"] --> Bridge["agent-bridge MCP server"]
-  CLI["agent-bridge CLI facade"] --> Daemon["agent-bridge daemon"]
-  Browser["Local browser"] --> UI["HTTP/SSE UI facade"]
-  UI --> Daemon
-  Bridge --> Daemon
-  Daemon --> BridgeCore["session manager"]
-  BridgeCore --> OMP["OMP RPC process"]
-  BridgeCore --> CDX["Codex app-server"]
+  Client["MCP client (Codex / Claude Code)"] --> Bridge["agent-bridge MCP server (stdio)"]
+  Bridge --> Sessions["in-memory session map"]
+  Sessions --> OMP["OMP RPC process"]
+  Sessions --> CDX["Codex app-server"]
   OMP --> OMPIO["JSONL stdio"]
   CDX --> CDXIO["JSON-RPC stdio"]
 ```
@@ -47,31 +43,11 @@ Agent Bridge exposes a small MCP tool surface:
 - `agent_bridge_close_session`
 - `agent_bridge_doctor`
 
-The daemon keeps in-memory session objects for its own lifetime. A session is not persisted by Agent Bridge itself.
+Each `agent-bridge mcp` process keeps its own in-memory session map for its own lifetime; one MCP client equals one MCP process equals one session map. A session is not persisted by Agent Bridge itself, and sessions are never shared across clients.
 
-The MCP server proxies session tools to the local daemon over `~/.agent-bridge/agent-bridge.sock`. The CLI facade uses the same socket. The web UI is an HTTP/SSE server running inside that daemon, so MCP, CLI, and UI all operate on the same session map.
+The MCP server owns its sessions directly: `callTool` invokes `openSession`/`sendMessage`/… in-process and spawns the OMP/Codex backends as children of the MCP process. There is no background daemon, no Unix socket, and no `requestDaemon` proxy. The bridge speaks MCP over stdio only and opens no network listener of any kind. As of v0.7.0 the entire HTTP/SSE Web UI stack was removed (see [ARCHITECTURE.md](ARCHITECTURE.md)); `session.events` is still buffered to back `recentEvents` in `status`/`result`, but it is no longer broadcast anywhere.
 
-Codex should still use MCP as the primary interface. CLI commands are for humans, CI smoke tests, process cleanup, and debugging.
-
-## Web UI Monitor
-
-`node scripts/agent-bridge.mjs ui` ensures the daemon is running, requests `ui_start`, and prints or opens a localhost URL. The HTTP server listens on `127.0.0.1` only.
-
-The daemon exposes:
-
-```text
-GET    /sessions
-POST   /sessions
-GET    /sessions/:id
-POST   /sessions/:id/messages
-GET    /sessions/:id/result
-GET    /sessions/:id/events
-POST   /sessions/:id/abort
-DELETE /sessions/:id
-POST   /daemon/stop
-```
-
-`/sessions/:id/events` is a Server-Sent Events stream. `pushEvent()` stores a compact event on the session and broadcasts a sanitized payload to connected SSE clients. The main output path emits assistant-visible text and status transitions; the Debug panel receives compact JSON with thinking/reasoning-like keys removed.
+Sessions are managed exclusively through the MCP tools. The CLI exposes only `mcp` (the server entrypoint) plus `doctor` and `cleanup` helpers.
 
 ## Process Lifecycle
 
@@ -81,11 +57,11 @@ Agent Bridge owns every child process it starts and records those process ids in
 ~/.agent-bridge/pids/
 ```
 
-The daemon cleans up active sessions when it receives `SIGTERM`, `SIGINT`, or `SIGHUP`, when stdout closes with `EPIPE`, or when an uncaught exception/unhandled rejection reaches the process boundary. The MCP server no longer owns delegated sessions directly; it proxies to the daemon, then waits for pending async MCP responses before exiting on stdin close.
+The MCP server owns its sessions directly and cleans up every active session when it receives `SIGTERM`, `SIGINT`, or `SIGHUP`, when stdin closes (the client exited), when stdout closes with `EPIPE`, or when an uncaught exception/unhandled rejection reaches the process boundary. On stdin close it waits for pending async MCP responses before exiting. A clean exit (code 0) also removes that run's log directory `~/.agent-bridge/logs/<runId>/`; a crash (code !== 0) keeps it for debugging. Each run dir carries an `owner` file holding the server's pid, so the next server's startup sweep (and `cleanup`) can reclaim `logs/<runId>/` dirs whose owning server is gone — abandoned crash dirs do not accumulate.
 
-Normal `agent_bridge_close_session` calls remove the pid record immediately. `agent-bridge stop` closes daemon-owned sessions and their OMP/Codex child processes. Process-level shutdown leaves pid records in place after sending `SIGTERM`; this is intentional. If a child ignores termination or Agent Bridge is killed abruptly, the next MCP startup reads those records, verifies that the process command still matches an Agent Bridge backend such as `omp --mode rpc` or `codex app-server`, and terminates the recorded process tree. Stale records for already-exited processes are removed.
+Normal `agent_bridge_close_session` calls remove the pid record immediately. Process-level shutdown leaves pid records in place after sending `SIGTERM`; this is intentional. If a child ignores termination or Agent Bridge is killed abruptly, the next MCP startup reads those records, verifies that the process command still matches an Agent Bridge backend such as `omp --mode rpc` or `codex app-server`, and terminates the recorded process tree. Stale records for already-exited processes are removed.
 
-Pid-record cleanup must treat both `agent-bridge mcp` and `agent-bridge daemon` as live owners. A short-lived MCP process may start while the daemon owns sessions, and cleanup must skip those daemon-owned children instead of terminating active OMP/Codex processes.
+Pid-record cleanup treats only `agent-bridge mcp` as a live owner (the owner-alive check matches `\bmcp\b` in the owning process command). A record whose owning MCP process is still running is skipped so its active OMP/Codex children are never terminated; `cleanup` only reaps orphans whose owning MCP server is gone (SIGTERM followed by a SIGKILL backstop), and also deletes abandoned `logs/<runId>/` dirs from those dead servers.
 
 This cleanup cannot run after `SIGKILL` (`kill -9`) because no Node.js code can execute in that case, but the pid-record sweep on the next startup is designed to catch leftovers from that kind of hard exit.
 
@@ -151,57 +127,54 @@ codex -a never -s danger-full-access -C "$PWD" exec --json --skip-git-repo-check
   'Use only agent_bridge MCP tools. Open a codex session with write=false. Send: "Only reply EXACT_CODEX_BRIDGE_OK." with wait=true. Close the session and report whether the exact text was returned.'
 ```
 
-## Agent Bridge CLI Facade Tests
+## MCP Stdio Verification
 
-The facade auto-starts a daemon when a session command needs it:
-
-```sh
-node scripts/agent-bridge.mjs cleanup --json
-node scripts/agent-bridge.mjs start --json
-node scripts/agent-bridge.mjs ui --no-open --json
-curl -fsS <ui-url>/health
-curl -fsS <ui-url>/sessions
-node scripts/agent-bridge.mjs sessions --json
-node scripts/agent-bridge.mjs open --agent omp --cwd "$PWD" --json
-node scripts/agent-bridge.mjs status <session_id> --json
-node scripts/agent-bridge.mjs close <session_id> --json
-node scripts/agent-bridge.mjs stop --json
-```
-
-For a real message exchange test, send a bounded prompt and close the session afterward:
+Sessions are driven only through the MCP tools over stdio. Open and close a session in one MCP process by piping JSON-RPC frames:
 
 ```sh
-node scripts/agent-bridge.mjs open --agent codex --cwd "$PWD" --json
-node scripts/agent-bridge.mjs send <session_id> "Only reply EXACT_CODEX_BRIDGE_OK. Do not read or write files." --wait --json
-node scripts/agent-bridge.mjs close <session_id> --json
-```
-
-UI/API sharing checks:
-
-```sh
-# CLI-opened sessions must appear through HTTP.
-node scripts/agent-bridge.mjs open --agent omp --cwd "$PWD" --json
-curl -fsS <ui-url>/sessions
-
-# UI-opened sessions must appear through CLI.
-curl -fsS -X POST <ui-url>/sessions \
-  -H 'content-type: application/json' \
-  --data '{"agent":"omp","cwd":"'"$PWD"'","write":false}'
-node scripts/agent-bridge.mjs sessions --json
-
-# MCP-opened sessions must appear through HTTP because MCP proxies to the daemon.
 printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"agent_bridge_open_session","arguments":{"agent":"omp","cwd":"'"$PWD"'","write":false}}}' \
+  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"agent_bridge_status","arguments":{}}}' \
   | node scripts/agent-bridge.mjs mcp
-curl -fsS <ui-url>/sessions
 ```
 
-SSE realtime checks should subscribe to `/sessions/:id/events`, send a short bounded prompt, and assert that the stream receives:
+For a real message exchange, add a `agent_bridge_send_message` (with `wait: true` for a quick turn) and an `agent_bridge_close_session` frame after the open frame.
 
-- a `running` status
-- assistant-visible text
-- an `idle` status
+### No listening port
+
+The bridge speaks MCP over stdio only and must never open a network listener. With a server running, confirm it holds no socket:
+
+```sh
+node scripts/agent-bridge.mjs mcp &   # or run it under a client
+lsof -p $! -a -i 2>/dev/null || echo "no network sockets (expected)"
+```
+
+### Per-run log dir removed on clean exit
+
+Each MCP server gets `~/.agent-bridge/logs/<runId>/`. After a clean exit (stdin close / signal) that run dir should be gone; only a crash (exit code != 0) leaves it for debugging:
+
+```sh
+ls "$HOME/.agent-bridge/logs/"   # before: a <runId> dir exists while the server runs
+# after a clean shutdown, that <runId> dir is removed
+```
+
+### Signal kills backend children
+
+Send `SIGTERM` (or close stdin) to a running server that has an open session and confirm its `omp --mode rpc` / `codex app-server` children exit too:
+
+```sh
+ps -axo pid,ppid,command | rg 'omp --mode rpc|codex app-server' || true
+```
+
+### cleanup reaps orphans
+
+Hard-kill a server (`kill -9`) with an open session so the in-process cleanup cannot run, then confirm `cleanup` reaps the orphaned children whose owning MCP server is gone:
+
+```sh
+node scripts/agent-bridge.mjs cleanup --json
+ps -axo pid,ppid,command | rg 'omp --mode rpc|codex app-server' || true
+```
 
 ## Personal Marketplace Example
 
@@ -243,8 +216,8 @@ codex plugin add agent-bridge@personal
 1. Update `BRIDGE_VERSION` in `scripts/agent-bridge.mjs`.
 2. Update `.codex-plugin/plugin.json`.
 3. Run syntax and plugin validation.
-4. Run the CLI facade and UI/SSE smoke tests if CLI, daemon, MCP proxy, or UI code changed.
-5. Run the process-cleanup smoke test if lifecycle code changed.
+4. Run the MCP stdio verification (including the no-listening-port check) if MCP or session code changed.
+5. Run the process-cleanup / per-run-log-dir checks if lifecycle code changed.
 6. Reinstall the plugin through Codex.
 7. Run the Codex CLI smoke tests.
 8. Confirm no delegated backend processes are left running:
