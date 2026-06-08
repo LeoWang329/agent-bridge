@@ -6,6 +6,8 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 
+const IS_WINDOWS = process.platform === "win32";
+
 const BRIDGE_VERSION = "0.7.0";
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const DEFAULT_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
@@ -233,6 +235,58 @@ function agentBin(agent) {
   return process.env[config.env] || config.bin;
 }
 
+// Resolve `bin` to a concrete file by searching PATH and trying each PATHEXT extension in order (so a
+// native .exe wins over a .cmd in the same directory, under the default PATHEXT). PATH only — we do
+// not resolve against the current directory. Returns the resolved path, or null if nothing matched.
+function resolveWindowsExecutable(bin) {
+  const exts = (process.env.PATHEXT || ".COM;.EXE;.BAT;.CMD").split(";").map(e => e.trim()).filter(Boolean);
+  const lower = bin.toLowerCase();
+  const hasKnownExt = exts.some(e => lower.endsWith(e.toLowerCase()));
+  const asFile = p => {
+    try { return fs.statSync(p).isFile() ? p : null; } catch { return null; }
+  };
+  if (path.isAbsolute(bin) || bin.includes("\\") || bin.includes("/")) {
+    if (hasKnownExt) return asFile(bin);
+    for (const e of exts) { const f = asFile(bin + e); if (f) return f; }
+    return null;
+  }
+  for (const dir of (process.env.PATH || "").split(path.delimiter).filter(Boolean)) {
+    if (hasKnownExt) { const f = asFile(path.join(dir, bin)); if (f) return f; }
+    else { for (const e of exts) { const f = asFile(path.join(dir, bin + e)); if (f) return f; } }
+  }
+  return null;
+}
+
+// Decide how to spawn `bin args`. POSIX spawns directly. On Windows, Node cannot launch a .cmd/.bat
+// without a shell — but routing a real .exe through cmd.exe is unnecessary and unsafe (cmd.exe
+// re-parses every argument, so a metacharacter in a value like --model becomes command injection).
+// So resolve the real target: spawn native executables DIRECTLY (clean argv array, no shell, no
+// injection) and only run genuine .cmd/.bat through cmd.exe. Callers must NOT pass shell:true.
+function spawnPlan(bin, args) {
+  if (!IS_WINDOWS) return { command: bin, args };
+  const resolved = resolveWindowsExecutable(bin);
+  if (resolved && /\.(cmd|bat)$/i.test(resolved)) {
+    // Batch shim: must go through cmd.exe. Node MSVCRT-quotes argv entries with spaces; a resolved
+    // path with cmd metacharacters (& | ^ etc.) is unsupported, but real install paths never use them.
+    return { command: process.env.ComSpec || "cmd.exe", args: ["/d", "/s", "/c", resolved, ...args] };
+  }
+  // Native executable, or an unresolved bare name (fall through so the OS reports ENOENT cleanly).
+  return { command: resolved || bin, args };
+}
+
+// Reject shell/CLI-hostile characters in pass-through agent arguments (OMP --model / --thinking).
+// Defense in depth: the default backends resolve to executables we spawn without a shell, but a
+// .cmd-based OMP_BIN would route these through cmd.exe, and a metacharacter must never reach a
+// command line. Real model/effort names only use this character set.
+function sanitizeAgentArg(value, label) {
+  if (value == null) return null;
+  const str = String(value);
+  if (!/^[A-Za-z0-9._:\/@+-]+$/.test(str)) {
+    throw new Error(`Invalid ${label} "${str}": only letters, digits, and . _ : / @ + - are allowed.`);
+  }
+  return str;
+}
+
 function appendLog(file, text) {
   if (!file || !text) return;
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -405,6 +459,7 @@ function removePidRecord(file) {
   } catch {}
 }
 
+// POSIX-only helper for terminateProcessTree's recursive kill; on Windows that path uses taskkill /T.
 function listChildPids(pid) {
   const result = spawnSync("pgrep", ["-P", String(pid)], { encoding: "utf8" });
   if (result.status !== 0 || !result.stdout) return [];
@@ -414,9 +469,50 @@ function listChildPids(pid) {
     .filter(value => Number.isInteger(value) && value > 1);
 }
 
+// Windows has no `ps`. Snapshot every process's command line via one CIM query, cached for the
+// duration of a SINGLE cleanup/reclaim sweep. Callers reset it (resetWinProcessSnapshot) at the
+// start of each sweep so the periodic reclaim timer never reuses a stale snapshot — stale data would
+// otherwise mislead PID-reuse checks. winSnapshotValid records whether the query actually succeeded,
+// so a probe failure is not mistaken for "process gone".
+let winCommandSnapshot = null;
+let winSnapshotValid = false;
+function resetWinProcessSnapshot() {
+  winCommandSnapshot = null;
+  winSnapshotValid = false;
+}
+function winProcessSnapshot() {
+  if (winCommandSnapshot) return winCommandSnapshot;
+  winCommandSnapshot = new Map();
+  const script = 'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId)`t$($_.CommandLine)" }';
+  const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+    encoding: "utf8",
+    windowsHide: true,
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  if (result.status === 0 && result.stdout) {
+    winSnapshotValid = true;
+    for (const line of result.stdout.split(/\r?\n/)) {
+      const tab = line.indexOf("\t");
+      if (tab < 0) continue;
+      const pid = Number(line.slice(0, tab));
+      if (Number.isInteger(pid)) winCommandSnapshot.set(pid, line.slice(tab + 1).trim());
+    }
+  }
+  return winCommandSnapshot;
+}
+
+// Returns the process command line, "" if the process is gone, or null if the probe itself is
+// UNAVAILABLE (Windows CIM query failed, or POSIX `ps` could not be spawned). Callers must treat
+// null as "unknown" — never as "process gone" — so a broken probe can't trigger reaping/deletion.
 function processCommand(pid) {
+  if (IS_WINDOWS) {
+    winProcessSnapshot();
+    if (!winSnapshotValid) return null;
+    return winCommandSnapshot.get(Number(pid)) || "";
+  }
   const result = spawnSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8" });
-  if (result.status !== 0) return "";
+  if (result.error) return null; // `ps` not spawnable -> unknown, not "gone"
+  if (result.status !== 0) return ""; // `ps` ran, pid not found
   return stripAnsi(result.stdout || "").trim();
 }
 
@@ -431,12 +527,29 @@ function ownerStillRunning(record) {
   const ownerPid = Number(record?.ownerPid);
   if (!Number.isInteger(ownerPid) || ownerPid <= 1 || ownerPid === process.pid) return false;
   const command = processCommand(ownerPid);
-  const argv0LooksLikeNode = /^(?:\S*\/)?node(?:\s|$)/.test(command);
+  // A null command means the process probe was unavailable (not that the owner is gone). Assume the
+  // owner is still alive so a failed probe can never make us reap pid records or delete live log dirs.
+  if (command === null) return true;
+  // Windows command lines carry a full, often-quoted node.exe path ("C:\...\node.exe"); the POSIX
+  // anchored form would never match, so detect node with a separator-aware test there instead.
+  const argv0LooksLikeNode = IS_WINDOWS
+    ? /(?:^|[\\/"\s])node(?:\.exe)?(?:["\s]|$)/i.test(command)
+    : /^(?:\S*\/)?node(?:\s|$)/.test(command);
   return argv0LooksLikeNode && /agent-bridge\.mjs/.test(command) && /\bmcp\b/.test(command);
 }
 
 function terminateProcessTree(pid, signal = "SIGTERM") {
   if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) return false;
+  if (IS_WINDOWS) {
+    // taskkill /T terminates the whole process tree. The agent may sit under a cmd.exe wrapper (for
+    // .cmd shims) or spawn its own children, so killing only the root would orphan them. /F maps to
+    // the forceful SIGKILL backstop; the graceful attempt omits it. Exit code 128 ("process not
+    // found") means the tree is already gone — treat that as success.
+    const args = ["/pid", String(pid), "/T"];
+    if (signal === "SIGKILL") args.push("/F");
+    const result = spawnSync("taskkill", args, { encoding: "utf8", windowsHide: true });
+    return result.status === 0 || result.status === 128;
+  }
   for (const childPid of listChildPids(pid)) terminateProcessTree(childPid, signal);
   try {
     process.kill(pid, signal);
@@ -537,6 +650,7 @@ function pruneLogs(activePaths = new Set()) {
 // is gone. Never touch a dir a live MCP still owns, our own run, or an owner-less brand-new dir
 // (a server that may still be writing its owner file).
 function reclaimStaleLogs() {
+  resetWinProcessSnapshot(); // fresh process snapshot per sweep (this also runs on a periodic timer)
   let entries;
   try {
     entries = fs.readdirSync(LOG_DIR, { withFileTypes: true });
@@ -579,10 +693,12 @@ function reclaimStaleLogs() {
 
 function cleanupStalePidRecords() {
   ensureDirs();
+  resetWinProcessSnapshot(); // fresh process snapshot per sweep
   const summary = {
     records: 0,
     removed: 0,
     skippedRunningOwners: 0,
+    skippedProbeFailures: 0,
     terminated: [],
   };
   for (const name of fs.readdirSync(PID_DIR)) {
@@ -603,19 +719,33 @@ function cleanupStalePidRecords() {
     }
 
     const processes = Array.isArray(record.processes) ? record.processes : [];
+    let unreapableOrphan = false;
     for (const child of processes) {
       const pid = Number(child.pid);
       if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) continue;
       const command = processCommand(pid);
       if (roleMatchesCommand(child.role, command)) {
+        // Confirmed orphan: owner is gone and the live command line still matches the role. Try a
+        // graceful kill, then schedule a SIGKILL backstop (it fires on a long-running server). If the
+        // graceful pass fails, force-kill synchronously — the `cleanup` CLI exits immediately, so the
+        // unref'd backstop timer would never fire there.
         if (terminateProcessTree(pid)) {
-          // SIGTERM may not stick; schedule a SIGKILL backstop. On the MCP-startup path the server
-          // stays alive long enough (3s, unref'd) for it to fire on a TERM-resistant orphan.
           scheduleForceKill(pid);
           summary.terminated.push({ pid, role: child.role, command });
+        } else if (terminateProcessTree(pid, "SIGKILL")) {
+          summary.terminated.push({ pid, role: child.role, command });
+        } else {
+          unreapableOrphan = true;
         }
       }
     }
+    // Preserve the record (retry next sweep) if our Windows process probe ran but failed — an empty
+    // command map would otherwise look like "all processes gone" and drop the only handle to a leak.
+    if (IS_WINDOWS && winCommandSnapshot != null && !winSnapshotValid) {
+      summary.skippedProbeFailures += 1;
+      continue;
+    }
+    if (unreapableOrphan) continue; // a matched orphan resisted termination; keep the record to retry
     removePidRecord(file);
     summary.removed += 1;
   }
@@ -628,8 +758,9 @@ class OmpRpcSession {
     this.agent = "omp";
     this.cwd = assertCwd(options.cwd);
     this.write = Boolean(options.write);
-    this.model = options.model || null;
-    this.effort = options.effort || null;
+    // OMP passes these on the command line (--model / --thinking), so sanitize at the source.
+    this.model = sanitizeAgentArg(options.model, "model");
+    this.effort = sanitizeAgentArg(options.effort, "effort");
     this.createdAt = nowIso();
     this.updatedAt = this.createdAt;
     this.status = "starting";
@@ -677,10 +808,12 @@ class OmpRpcSession {
       this.readyReject = reject;
     });
 
-    this.proc = spawn(agentBin("omp"), args, {
+    const plan = spawnPlan(agentBin("omp"), args);
+    this.proc = spawn(plan.command, plan.args, {
       cwd: this.cwd,
       env: process.env,
       stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
     });
     appendLog(this.logFile, `[agent-bridge] spawned OMP pid=${this.proc.pid}\n`);
     this.#writePidRecord(args);
@@ -992,6 +1125,7 @@ class CodexAppServerSession {
     this.agent = "codex";
     this.cwd = assertCwd(options.cwd);
     this.write = Boolean(options.write);
+    // Not sanitized like OMP: Codex receives model/effort over JSON-RPC, never on a command line.
     this.model = options.model || null;
     this.effort = options.effort || null;
     this.createdAt = nowIso();
@@ -1023,10 +1157,12 @@ class CodexAppServerSession {
   async start() {
     const args = ["app-server"];
     appendLog(this.logFile, `$ ${[agentBin("codex"), ...args].join(" ")}\n`);
-    this.proc = spawn(agentBin("codex"), args, {
+    const plan = spawnPlan(agentBin("codex"), args);
+    this.proc = spawn(plan.command, plan.args, {
       cwd: this.cwd,
       env: process.env,
       stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
     });
     appendLog(this.logFile, `[agent-bridge] spawned codex app-server pid=${this.proc.pid}\n`);
     this.#writePidRecord();
@@ -1649,7 +1785,8 @@ function doctor() {
     logDir: RUN_LOG_DIR,
     agents: Object.entries(AGENTS).map(([agent, config]) => {
       const bin = agentBin(agent);
-      const probe = spawnSync(bin, ["--version"], { encoding: "utf8" });
+      const plan = spawnPlan(bin, ["--version"]);
+      const probe = spawnSync(plan.command, plan.args, { encoding: "utf8", windowsHide: true });
       return {
         agent,
         label: config.label,
