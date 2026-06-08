@@ -287,9 +287,25 @@ function sanitizeAgentArg(value, label) {
   return str;
 }
 
+// Per-file byte counters so a live session's log can be rotated once it exceeds LOG_FILE_MAX_BYTES.
+// pruneLogs() never touches files of active sessions, so without rotation a chatty, long-lived
+// session's .log would grow unbounded. Rotation keeps at most the current file plus one ".1"
+// generation (still a *.log name, so pruneLogs reaps it under the age/total caps).
+const logBytesWritten = new Map();
 function appendLog(file, text) {
   if (!file || !text) return;
   fs.mkdirSync(path.dirname(file), { recursive: true });
+  if (LOG_FILE_MAX_BYTES > 0) {
+    const bytes = Buffer.byteLength(text, "utf8");
+    let written = logBytesWritten.get(file) || 0;
+    if (written > 0 && written + bytes > LOG_FILE_MAX_BYTES) {
+      try {
+        fs.renameSync(file, file.replace(/(\.[^.\\/]+)$/, ".1$1")); // foo.log -> foo.1.log
+      } catch {}
+      written = 0;
+    }
+    logBytesWritten.set(file, written + bytes);
+  }
   fs.appendFileSync(file, text, "utf8");
 }
 
@@ -1774,6 +1790,12 @@ function closeSession(sessionId) {
   const session = getSession(sessionId);
   const closed = session.close();
   sessions.delete(sessionId);
+  logBytesWritten.delete(session.logFile);
+  // The just-closed session's files are no longer active; prune now so the per-file/total caps are
+  // enforced promptly instead of waiting up to a full periodic interval (bounds inter-sweep buildup).
+  try {
+    pruneLogs(activeLogPaths());
+  } catch {}
   return closed;
 }
 
