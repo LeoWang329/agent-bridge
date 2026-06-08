@@ -53,15 +53,25 @@ claude plugin install agent-bridge@agent-bridge
 
 The repo self-hosts a Claude Code marketplace, so this **one install registers the MCP server _and_ the skill** — there is no separate skill step. Equivalent inside Claude Code: `/plugin marketplace add LeoWang329/agent-bridge` then `/plugin install agent-bridge@agent-bridge`. Manage it later with `claude plugin` / `/plugin`; for local development against a working copy: `claude --plugin-dir "$PWD"`.
 
-### Letting an AI agent install it for you
+### Configuring this for an AI agent
 
-If you ask Claude Code or Codex to set Agent Bridge up, point it at these steps:
+If a user asks an AI agent (Claude Code, Codex, …) to set Agent Bridge up, follow this exactly. Use **absolute paths** — the agent's shell is usually not at the repo root, so `$PWD` is unreliable. Below, `<MJS>` = the absolute path to `scripts/agent-bridge.mjs` in the cloned repo.
 
-1. Confirm prerequisites: **Node 20+**, and the backend(s) you'll use (`omp` / `codex`) launchable on `PATH`.
-2. Clone the repo to a stable location and note its **absolute** path.
-3. Register it — **Claude Code → method B** (plugin = MCP + skill in one step); **Codex → method A** with an **absolute** script path (don't rely on `$PWD` unless the shell is at the repo root).
-4. Tell the user to **restart the client** — the tools and skill only load on restart.
-5. Self-check: run `node <abs-path>/scripts/agent-bridge.mjs doctor` (every backend you'll use must print `ok`), then `claude mcp list` / `codex mcp list` should show `agent-bridge` connected.
+1. **Prerequisites:** Node 20+, plus the backend(s) the user wants — `omp` and/or `codex` — launchable on `PATH` (Agent Bridge does not install them).
+2. **Get the code:** `git clone https://github.com/LeoWang329/agent-bridge.git`; record the clone's absolute path.
+3. **Register — pick the branch for the client:**
+   - **Claude Code** (preferred — installs the MCP server **and** the skill in one step):
+     ```sh
+     claude plugin marketplace add LeoWang329/agent-bridge
+     claude plugin install agent-bridge@agent-bridge
+     ```
+     MCP-only alternative (no skill): `claude mcp add agent-bridge --scope user -- node "<MJS>" mcp`
+   - **Codex** (MCP server only). There is **no plugin install for this repo on Codex — do NOT run `codex plugin add`**, it will not find this plugin. Use:
+     ```sh
+     codex mcp add agent-bridge -- node "<MJS>" mcp
+     ```
+4. **Restart the client** — the tools (and skill) only load after a restart. Tell the user to do this.
+5. **Verify:** run `node "<MJS>" doctor` (each backend you'll use must print `ok`); then `claude mcp list` / `codex mcp list` should show `agent-bridge` connected.
 
 > In Claude Code the tools are namespaced, e.g. `mcp__agent-bridge__agent_bridge_open_session`.
 
