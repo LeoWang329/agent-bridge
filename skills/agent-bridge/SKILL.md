@@ -50,6 +50,8 @@ close_session(session_id)                  →  用完必须关
 
 ## 并行委托：同时跑多个 agent
 
+**任务能切成相互独立的子任务时，优先开多个会话并行跑**——能显著压缩总时长。前提是按真正独立的边界切分，并守住下面的并发纪律（`write` 会话别撞文件、同会话别并发 `send`）。
+
 1. 对每个会话各发一次 `send_message`（默认非阻塞），都立刻拿到 ack，后台并行跑。
 2. 用 `agent_bridge_wait` 收口，省去循环轮询 `status`。**推荐 `mode:"any"`**（先完成先处理，比 `all` 更早拿到结果、更早暴露问题）：
    - `mode:"any"`：第一个完成就返回 `{ completed, pending, pendingSnapshots }`。处理 `completed`，然后**直接拿 `pending`（纯 id 数组）当下一轮的 `session_ids`**，循环到 `pending` 空。别把 `completed.sessionId` 加回去，也别把 `pendingSnapshots`（对象）当 id 传。
