@@ -8,9 +8,15 @@ import readline from "node:readline";
 
 const IS_WINDOWS = process.platform === "win32";
 
-const BRIDGE_VERSION = "0.7.0";
+const BRIDGE_VERSION = "0.8.0";
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const DEFAULT_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
+// Start-time tolerance for the cleanup PID-reuse guard's FALLBACK path (used when the definitive env
+// marker can't be read — Windows, or a pre-0.8.0 child). A genuine child's OS creation time is at or
+// before the instant we recorded its pid record; this skew only absorbs measurement jitter between the
+// two clocks (sub-second in practice). It is not a window of accepted reuse: on Linux/macOS the env
+// marker (processMarkerMatches) is the primary, exact identity check and bypasses this entirely.
+const PID_START_SKEW_MS = 1000;
 const MAX_EVENTS = 300;
 const MAX_TEXT = 400_000;
 const STATE_ROOT = process.env.AGENT_BRIDGE_STATE_DIR || path.join(os.homedir(), ".agent-bridge");
@@ -157,6 +163,11 @@ const TOOLS = [
           description:
             "Optional cap (characters) on each returned result's text. Longer answers are truncated with truncated:true and stay retrievable via textRef. charCount/byteCount are always reported.",
         },
+        tail_chars: {
+          type: "number",
+          description:
+            "Optional cap (characters, default 240, clamped 0-4000) on each still-running session's progress tail in pendingSnapshots. The tail is the END of the in-flight partial text — what the agent is producing right now — so a timed-out wait stays actionable. Distinct from max_chars, which head-truncates a finished result.",
+        },
       },
       required: ["session_ids"],
       additionalProperties: false,
@@ -176,13 +187,16 @@ const TOOLS = [
   },
   {
     name: "agent_bridge_close_session",
-    description: "Close a persistent delegated-agent session and stop its backend process.",
+    description:
+      "Close a persistent delegated-agent session and stop its backend process. Omit session_id to close ALL sessions this server manages — the bulk-cleanup fallback after a crash or forgotten close (returns closedAll/count/sessionIds plus any that failed).",
     inputSchema: {
       type: "object",
       properties: {
-        session_id: { type: "string", description: "Session id returned by agent_bridge_open_session." },
+        session_id: {
+          type: "string",
+          description: "Session id to close. Omit to close EVERY session this server manages.",
+        },
       },
-      required: ["session_id"],
       additionalProperties: false,
     },
   },
@@ -233,6 +247,20 @@ function assertCwd(cwd) {
 function agentBin(agent) {
   const config = AGENTS[agent];
   return process.env[config.env] || config.bin;
+}
+
+// Child env = parent env plus diagnostic markers so a spawned omp/codex is attributable to this
+// bridge (and this session) at the OS level — external observers can read these via /proc/<pid>/environ
+// or `ps e` (POSIX) / a process-env viewer (Windows), instead of guessing from command-line side
+// signatures. AGENT_BRIDGE_-prefixed to avoid collisions; values are diagnostic only (the backends
+// do not read them) and never affect cleanup, which still matches on command line + spawn time.
+function childEnv(session) {
+  return {
+    ...process.env,
+    AGENT_BRIDGE_SESSION_ID: session.id,
+    AGENT_BRIDGE_OWNER_PID: String(process.pid),
+    AGENT_BRIDGE_AGENT: session.agent,
+  };
 }
 
 // Resolve `bin` to a concrete file by searching PATH and trying each PATHEXT extension in order (so a
@@ -499,7 +527,10 @@ function resetWinProcessSnapshot() {
 function winProcessSnapshot() {
   if (winCommandSnapshot) return winCommandSnapshot;
   winCommandSnapshot = new Map();
-  const script = 'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId)`t$($_.CommandLine)" }';
+  // Each row: "<pid>\t<creationDate ISO>\t<commandLine>". CreationDate feeds the PID-reuse guard in
+  // cleanup (a recycled pid's process was created long after we spawned ours) before any termination.
+  const script =
+    'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId)`t$($_.CreationDate.ToString(\'o\'))`t$($_.CommandLine)" }';
   const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
     encoding: "utf8",
     windowsHide: true,
@@ -508,10 +539,15 @@ function winProcessSnapshot() {
   if (result.status === 0 && result.stdout) {
     winSnapshotValid = true;
     for (const line of result.stdout.split(/\r?\n/)) {
-      const tab = line.indexOf("\t");
-      if (tab < 0) continue;
-      const pid = Number(line.slice(0, tab));
-      if (Number.isInteger(pid)) winCommandSnapshot.set(pid, line.slice(tab + 1).trim());
+      const firstTab = line.indexOf("\t");
+      if (firstTab < 0) continue;
+      const secondTab = line.indexOf("\t", firstTab + 1);
+      if (secondTab < 0) continue;
+      const pid = Number(line.slice(0, firstTab));
+      if (!Number.isInteger(pid)) continue;
+      const createdMs = Date.parse(line.slice(firstTab + 1, secondTab).trim());
+      const command = line.slice(secondTab + 1).trim();
+      winCommandSnapshot.set(pid, { command, createdMs: Number.isFinite(createdMs) ? createdMs : null });
     }
   }
   return winCommandSnapshot;
@@ -524,12 +560,84 @@ function processCommand(pid) {
   if (IS_WINDOWS) {
     winProcessSnapshot();
     if (!winSnapshotValid) return null;
-    return winCommandSnapshot.get(Number(pid)) || "";
+    const info = winCommandSnapshot.get(Number(pid));
+    return info ? info.command : "";
   }
-  const result = spawnSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8" });
+  // LC_ALL=C: keep ps output locale-stable (notably so processStartedAtMs's lstart is parseable).
+  const result = spawnSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8", env: { ...process.env, LC_ALL: "C" } });
   if (result.error) return null; // `ps` not spawnable -> unknown, not "gone"
   if (result.status !== 0) return ""; // `ps` ran, pid not found
   return stripAnsi(result.stdout || "").trim();
+}
+
+// OS-level process creation time in epoch ms, or null if unknown (probe unavailable / pid gone).
+// Lets cleanup detect PID reuse: if the live pid's process was created well after we recorded our
+// child's spawn time, the pid was recycled and the matching process is NOT ours — never terminate it.
+function processStartedAtMs(pid) {
+  if (IS_WINDOWS) {
+    winProcessSnapshot();
+    if (!winSnapshotValid) return null;
+    const info = winCommandSnapshot.get(Number(pid));
+    return info && Number.isFinite(info.createdMs) ? info.createdMs : null;
+  }
+  // `lstart` is an absolute start timestamp (Linux + macOS); LC_ALL=C forces an English, Date.parse-able
+  // form (e.g. "Mon Jun  9 03:55:04 2026") instead of a localized one that would fail to parse.
+  const result = spawnSync("ps", ["-p", String(pid), "-o", "lstart="], { encoding: "utf8", env: { ...process.env, LC_ALL: "C" } });
+  if (result.error || result.status !== 0) return null;
+  const raw = stripAnsi(result.stdout || "").trim();
+  if (!raw) return null;
+  const ms = Date.parse(raw);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+// Does the live process carry the AGENT_BRIDGE_SESSION_ID env marker we injected (childEnv)? This is a
+// DEFINITIVE identity check — a recycled pid running a different omp/codex will not carry our session
+// id. Returns true/false when env is readable, or null when it is not (Windows CIM doesn't expose env,
+// and a pre-0.8.0 child wasn't given the marker) so callers fall back to the start-time heuristic.
+function processMarkerMatches(pid, sessionId) {
+  if (IS_WINDOWS || !sessionId) return null; // env not readable from CIM → defer to start-time
+  const needle = `AGENT_BRIDGE_SESSION_ID=${sessionId}`;
+  try {
+    // Linux: /proc/<pid>/environ is a NUL-separated KEY=VALUE list (readable for our own-user procs).
+    const environ = fs.readFileSync(`/proc/${pid}/environ`, "utf8");
+    if (environ) return environ.split("\0").includes(needle);
+  } catch {}
+  // macOS/BSD have no /proc; `ps eww` appends the environment to the command column. LC_ALL=C for stability.
+  const r = spawnSync("ps", ["eww", "-o", "command=", "-p", String(pid)], { encoding: "utf8", env: { ...process.env, LC_ALL: "C" } });
+  if (r.error || r.status !== 0) return null;
+  const out = stripAnsi(r.stdout || "");
+  return out.trim() ? out.includes(needle) : null;
+}
+
+// Classify a recorded child pid against the live process now occupying that pid, so cleanup never kills
+// a stranger that merely matches the role regex after a pid was recycled:
+//   "gone"    — no live process matches the role (exited, or a different command) → record is removable
+//   "ours"    — confirmed the very process we spawned (env marker matches, or start time is consistent)
+//   "reuse"   — a DIFFERENT process now holds the pid (marker mismatch, or created after our record)
+//   "unknown" — identity can't be established (probe failed / raced) → keep the record and retry later
+// Identity preference: the injected env marker is definitive; OS start time is the cross-platform
+// fallback (a genuine child's creation time is at/before the instant we recorded it, within skew).
+// `referenceMs` is the recorded spawn instant (spawnedAt), or createdAt for pre-0.8.0 records that
+// predate spawnedAt. `expectMarker` must be true ONLY when the child was spawned by a marker-injecting
+// (0.8.0+) server — i.e. the record carries spawnedAt. That gate matters: a genuine PRE-0.8.0 child has
+// no marker, so on readable-env platforms processMarkerMatches returns false; trusting that as "reuse"
+// would drop a real orphan. So only consult the marker when we actually expect one; otherwise (and when
+// the marker is merely unreadable) fall back to the OS start time. Pass freshSnapshot=true to refresh
+// the cached Windows snapshot first.
+function classifyChild(role, sessionId, referenceMs, expectMarker, pid, freshSnapshot = false) {
+  if (freshSnapshot) resetWinProcessSnapshot();
+  const command = processCommand(pid);
+  if (command === null) return "unknown"; // probe unavailable — not "gone"
+  if (!roleMatchesCommand(role, command)) return "gone";
+  if (expectMarker) {
+    const marker = processMarkerMatches(pid, sessionId);
+    if (marker === true) return "ours";
+    if (marker === false) return "reuse"; // a 0.8.0 child WOULD carry our session id → this pid was recycled
+    // marker === null: env unreadable (Windows, or a transient read failure) → fall through to start time
+  }
+  const osStartedMs = processStartedAtMs(pid);
+  if (osStartedMs == null || !Number.isFinite(referenceMs)) return "unknown";
+  return osStartedMs <= referenceMs + PID_START_SKEW_MS ? "ours" : "reuse";
 }
 
 function roleMatchesCommand(role, command) {
@@ -575,7 +683,10 @@ function terminateProcessTree(pid, signal = "SIGTERM") {
   }
 }
 
-function scheduleForceKill(pid, graceMs = 3000) {
+// `verify`, when provided, is re-checked immediately before the SIGKILL fires. It guards against PID
+// reuse in the grace window: if the original target exited and its pid was recycled, we must not
+// SIGKILL the stranger now occupying it. Returning false skips the kill. No verify = legacy behavior.
+function scheduleForceKill(pid, graceMs = 3000, verify = null) {
   if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) return;
   const timer = setTimeout(() => {
     try {
@@ -583,6 +694,7 @@ function scheduleForceKill(pid, graceMs = 3000) {
     } catch {
       return; // already exited
     }
+    if (verify && !verify()) return; // target no longer confirmed (pid reused / our child already exited)
     terminateProcessTree(pid, "SIGKILL");
   }, graceMs);
   timer.unref?.();
@@ -715,8 +827,20 @@ function cleanupStalePidRecords() {
     removed: 0,
     skippedRunningOwners: 0,
     skippedProbeFailures: 0,
+    skippedPidReuse: 0,
+    skippedUnconfirmed: 0,
     terminated: [],
   };
+  // POSIX probe guard (mirrors the Windows snapshot guard below): if `ps` cannot be spawned at all,
+  // every processCommand/processStartedAtMs returns null and we could neither confirm identity nor
+  // distinguish "gone" from "unknown" — which would wrongly drop pid records. Skip the whole sweep.
+  if (!IS_WINDOWS) {
+    const probe = spawnSync("ps", ["-p", "1", "-o", "comm="], { encoding: "utf8", env: { ...process.env, LC_ALL: "C" } });
+    if (probe.error) {
+      summary.skippedProbeFailures += 1;
+      return summary;
+    }
+  }
   for (const name of fs.readdirSync(PID_DIR)) {
     if (!name.endsWith(".json")) continue;
     summary.records += 1;
@@ -736,23 +860,41 @@ function cleanupStalePidRecords() {
 
     const processes = Array.isArray(record.processes) ? record.processes : [];
     let unreapableOrphan = false;
+    // Reference instant for the start-time fallback: the child's recorded spawnedAt (0.8.0+), else the
+    // record's createdAt (constructor time, also before spawn) so pre-0.8.0 orphans still get a kill
+    // path instead of being skipped forever. The env marker (when readable) takes precedence anyway.
+    const recordCreatedMs = record.createdAt ? Date.parse(record.createdAt) : NaN;
     for (const child of processes) {
       const pid = Number(child.pid);
       if (!Number.isInteger(pid) || pid <= 1 || pid === process.pid) continue;
-      const command = processCommand(pid);
-      if (roleMatchesCommand(child.role, command)) {
-        // Confirmed orphan: owner is gone and the live command line still matches the role. Try a
-        // graceful kill, then schedule a SIGKILL backstop (it fires on a long-running server). If the
-        // graceful pass fails, force-kill synchronously — the `cleanup` CLI exits immediately, so the
-        // unref'd backstop timer would never fire there.
-        if (terminateProcessTree(pid)) {
-          scheduleForceKill(pid);
-          summary.terminated.push({ pid, role: child.role, command });
-        } else if (terminateProcessTree(pid, "SIGKILL")) {
-          summary.terminated.push({ pid, role: child.role, command });
-        } else {
-          unreapableOrphan = true;
-        }
+      const expectMarker = Boolean(child.spawnedAt); // only 0.8.0+ children were given the env marker
+      const referenceMs = child.spawnedAt ? Date.parse(child.spawnedAt) : recordCreatedMs;
+      const verdict = classifyChild(child.role, record.id, referenceMs, expectMarker, pid);
+      if (verdict === "gone") continue; // exited or a different command → record removal handled below
+      if (verdict === "unknown") {
+        // Identity can't be established (probe failed/raced). Keep the record and retry on a later
+        // sweep rather than terminate an unattributable process.
+        summary.skippedUnconfirmed += 1;
+        unreapableOrphan = true;
+        continue;
+      }
+      if (verdict === "reuse") {
+        // A different process now holds this pid → our child is gone. Do NOT kill the stranger; let the
+        // now-stale record be removed below.
+        summary.skippedPidReuse += 1;
+        continue;
+      }
+      // verdict === "ours": confirmed our orphan. Graceful kill first, then a SIGKILL backstop that
+      // RE-CONFIRMS identity before firing (the pid could be reused during the grace window). If the
+      // graceful pass fails, force-kill synchronously — the `cleanup` CLI exits immediately, so the
+      // unref'd backstop timer would never fire there.
+      if (terminateProcessTree(pid)) {
+        scheduleForceKill(pid, 3000, () => classifyChild(child.role, record.id, referenceMs, expectMarker, pid, true) === "ours");
+        summary.terminated.push({ pid, role: child.role });
+      } else if (terminateProcessTree(pid, "SIGKILL")) {
+        summary.terminated.push({ pid, role: child.role });
+      } else {
+        unreapableOrphan = true;
       }
     }
     // Preserve the record (retry next sweep) if our Windows process probe ran but failed — an empty
@@ -827,7 +969,7 @@ class OmpRpcSession {
     const plan = spawnPlan(agentBin("omp"), args);
     this.proc = spawn(plan.command, plan.args, {
       cwd: this.cwd,
-      env: process.env,
+      env: childEnv(this),
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
@@ -891,6 +1033,7 @@ class OmpRpcSession {
           role: "omp-rpc",
           pid: this.proc?.pid || null,
           command: [agentBin("omp"), ...args],
+          spawnedAt: nowIso(), // ~spawn time; cleanup's PID-reuse guard compares it to the live process's start time
         },
       ].filter(item => item.pid),
     });
@@ -1126,7 +1269,10 @@ class OmpRpcSession {
     } catch {}
     const pid = this.proc?.pid;
     terminateProcessTree(pid);
-    scheduleForceKill(pid);
+    // Backstop SIGKILL only if OUR child is still running. Node sets exitCode/signalCode the moment it
+    // exits, so if it already died (and its pid was possibly recycled) the verify fails and we skip —
+    // never SIGKILL a stranger that reused the pid during the grace window.
+    scheduleForceKill(pid, 3000, () => this.proc != null && this.proc.exitCode === null && this.proc.signalCode === null);
     if (options.removePidRecord !== false) removePidRecord(this.pidFile);
     try {
       fs.rmSync(this.answerFile, { force: true });
@@ -1176,7 +1322,7 @@ class CodexAppServerSession {
     const plan = spawnPlan(agentBin("codex"), args);
     this.proc = spawn(plan.command, plan.args, {
       cwd: this.cwd,
-      env: process.env,
+      env: childEnv(this),
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
@@ -1261,9 +1407,9 @@ class CodexAppServerSession {
       ownerPid: process.pid,
       cwd: this.cwd,
       createdAt: this.createdAt,
-      processes: [{ role: "codex-app-server", pid: this.proc?.pid || null, command: [agentBin("codex"), "app-server"] }].filter(
-        item => item.pid,
-      ),
+      processes: [
+        { role: "codex-app-server", pid: this.proc?.pid || null, command: [agentBin("codex"), "app-server"], spawnedAt: nowIso() },
+      ].filter(item => item.pid),
     });
   }
 
@@ -1624,7 +1770,9 @@ class CodexAppServerSession {
     this.#rejectAll(new Error("session closed"));
     const pid = this.proc?.pid;
     terminateProcessTree(pid);
-    scheduleForceKill(pid);
+    // Backstop SIGKILL only if OUR child is still running (see OmpRpcSession.close): guards against
+    // SIGKILLing a stranger that reused the pid after our child exited within the grace window.
+    scheduleForceKill(pid, 3000, () => this.proc != null && this.proc.exitCode === null && this.proc.signalCode === null);
     if (options.removePidRecord !== false) removePidRecord(this.pidFile);
     try {
       fs.rmSync(this.answerFile, { force: true });
@@ -1679,15 +1827,38 @@ async function openSession(params) {
     try {
       session.close({ removePidRecord: false });
     } catch {}
+    // Surface the requested model alongside the raw error so a bad provider/model string is at least
+    // diagnosable (the underlying error is often opaque, e.g. "Timed out waiting for OMP RPC ready.").
+    // Deliberately does NOT claim the model is the cause — the failure may be unrelated (missing
+    // backend, ENOENT). The caller decides; we just make the model visible and point at doctor.
+    if (params.model) {
+      const m = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `Failed to start ${params.agent} session (requested model="${params.model}"). Error: ${m}. ` +
+          "Run doctor to confirm the backend is available; if it is, check the provider/model string " +
+          "(model validity is decided by the backend, not the bridge).",
+      );
+    }
     throw err;
   }
 
   let initial = null;
   if (params.initial_prompt) {
-    initial = await session.send(params.initial_prompt, {
-      wait: Boolean(params.wait),
-      timeout_ms: params.timeout_ms,
-    });
+    try {
+      initial = await session.send(params.initial_prompt, {
+        wait: Boolean(params.wait),
+        timeout_ms: params.timeout_ms,
+      });
+    } catch (err) {
+      // The session started but the first turn failed (a wait:true timeout aborts the turn; the
+      // backend may reject the prompt). Without cleanup the session would linger in `sessions` while
+      // the caller gets only an error with no id to close it — an orphan. Tear down like start failure.
+      sessions.delete(session.id);
+      try {
+        session.close({ removePidRecord: false });
+      } catch {}
+      throw err;
+    }
   }
   return { session: session.summary(), initial };
 }
@@ -1741,8 +1912,29 @@ async function waitSessions(params) {
   if (!ids.length) throw new Error("session_ids is required (a non-empty array of session ids).");
   const mode = params.mode === "any" ? "any" : "all";
   const timeoutMs = parseNumber(params.timeout_ms, DEFAULT_WAIT_TIMEOUT_MS);
+  // Tail length for progress snapshots, bounded so a bad value can't blow up the payload or slice
+  // backwards (parseNumber only parses; clampInt enforces 0..4000).
+  const tailChars = clampInt(parseNumber(params.tail_chars, 240), 0, 4000);
   // Validate up front so an unknown id is a clear error rather than a silent timeout.
   for (const id of ids) getSession(id);
+
+  // Lightweight, actionable progress for a still-running session: what it's producing right now
+  // (tail of the live partial text, not the head), plus its latest lifecycle event — so a timed-out
+  // wait (or an `any` round with others still pending) is not an opaque list of bare ids. Reuses
+  // already-accumulated state (lastAssistantText, events); no extra backend round-trips.
+  const snapshot = id => {
+    const s = sessions.get(id);
+    if (!s) return { sessionId: id, status: "closed", gone: true };
+    const partial = s.lastAssistantText || "";
+    return {
+      sessionId: id,
+      status: s.status,
+      updatedAt: s.updatedAt,
+      charCount: partial.length,
+      tail: tailChars > 0 ? partial.slice(-tailChars) : "",
+      lastEvent: slimEvents(s.events, 1)[0] ?? null,
+    };
+  };
 
   const summarize = async id => {
     const session = sessions.get(id);
@@ -1770,13 +1962,21 @@ async function waitSessions(params) {
     }
     const settledIds = ids.filter(id => sessionSettled(sessions.get(id)));
     if (mode === "any" && settledIds.length) {
-      return { mode, completed: await summarize(settledIds[0]), pending: pendingIds() };
+      const pending = pendingIds();
+      return { mode, completed: await summarize(settledIds[0]), pending, pendingSnapshots: pending.map(snapshot) };
     }
     if (mode === "all" && settledIds.length === ids.length) {
       return { mode, results: await Promise.all(ids.map(summarize)) };
     }
     if (Date.now() - started >= timeoutMs) {
-      return { mode, timedOut: true, settled: await Promise.all(settledIds.map(summarize)), pending: pendingIds() };
+      const pending = pendingIds();
+      return {
+        mode,
+        timedOut: true,
+        settled: await Promise.all(settledIds.map(summarize)),
+        pending,
+        pendingSnapshots: pending.map(snapshot),
+      };
     }
     await sleep(250);
   }
@@ -1786,16 +1986,50 @@ async function abortSession(sessionId) {
   return await getSession(sessionId).abort();
 }
 
-function closeSession(sessionId) {
-  const session = getSession(sessionId);
+// Close one session and drop it from the maps. Does NOT prune (callers prune once after a batch so a
+// bulk close is a single filesystem sweep, not one per session).
+function closeOne(session) {
   const closed = session.close();
-  sessions.delete(sessionId);
+  sessions.delete(session.id);
   logBytesWritten.delete(session.logFile);
-  // The just-closed session's files are no longer active; prune now so the per-file/total caps are
+  return closed;
+}
+
+// Close a single session by id, or — when session_id is omitted — every session this server manages
+// (the bulk-cleanup fallback an orchestrator wants after a crash/forgotten close, mirroring how
+// `status` with no id lists all). Prunes once after closing.
+function closeSession(sessionId) {
+  // The just-closed sessions' files are no longer active; prune once so the per-file/total caps are
   // enforced promptly instead of waiting up to a full periodic interval (bounds inter-sweep buildup).
-  try {
-    pruneLogs(activeLogPaths());
-  } catch {}
+  const prune = () => {
+    try {
+      pruneLogs(activeLogPaths());
+    } catch {}
+  };
+  // Bulk close ONLY when session_id is genuinely omitted (undefined). A falsy-but-present value —
+  // "", null, or a non-string — is a malformed request, not "close everything": closing all sessions
+  // on an accidental empty string would be a destructive surprise. Reject it explicitly.
+  if (sessionId === undefined) {
+    const ids = [...sessions.keys()]; // snapshot: closeOne() mutates `sessions`
+    const failed = [];
+    for (const id of ids) {
+      const session = sessions.get(id);
+      if (!session) continue;
+      try {
+        closeOne(session);
+      } catch (err) {
+        failed.push({ sessionId: id, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+    prune();
+    // Honest accounting: count only sessions that actually closed; surface any that threw.
+    return { closedAll: failed.length === 0, count: ids.length - failed.length, sessionIds: ids, failed };
+  }
+  if (typeof sessionId !== "string" || !sessionId) {
+    throw new Error("session_id must be a non-empty string (omit it entirely to close ALL sessions).");
+  }
+  const closed = closeOne(getSession(sessionId));
+  prune();
   return closed;
 }
 
@@ -1866,6 +2100,14 @@ function parseNumber(value, fallback = undefined) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) throw new Error(`Expected a number, got: ${value}`);
   return parsed;
+}
+
+// Clamp to an integer in [min, max]; non-finite input falls back to min. Used to bound tail_chars so
+// a negative value can't slice backwards and a huge value can't defeat the lightweight-progress goal.
+function clampInt(value, min, max) {
+  const n = Math.trunc(Number(value));
+  if (!Number.isFinite(n)) return min;
+  return Math.max(min, Math.min(max, n));
 }
 
 function printCliResult(value, args = {}) {
@@ -2005,9 +2247,18 @@ async function handleMcp(message) {
     case "tools/list":
       rpcResult(message.id, { tools: TOOLS });
       return;
-    case "tools/call":
-      rpcResult(message.id, await callTool(message.params?.name, message.params?.arguments || {}));
+    case "tools/call": {
+      // Validate arguments is absent or a real object. Without this, a malformed `arguments` of null/
+      // false/0/""/[] would coerce via `|| {}` into an empty object — which for close_session means an
+      // omitted session_id and would silently bulk-close every session. Reject it instead.
+      const callArgs = message.params?.arguments;
+      if (callArgs !== undefined && (typeof callArgs !== "object" || callArgs === null || Array.isArray(callArgs))) {
+        rpcError(message.id, -32602, "tool arguments must be an object");
+        return;
+      }
+      rpcResult(message.id, await callTool(message.params?.name, callArgs || {}));
       return;
+    }
     case "ping":
       rpcResult(message.id, {});
       return;

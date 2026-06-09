@@ -83,9 +83,9 @@ If a user asks an AI agent (Claude Code, Codex, …) to set Agent Bridge up, fol
 
 1. **`open_session`** with `agent: "omp"` or `"codex"`. Keep `write: false` for review/research; set `write: true` only when the agent should edit files.
 2. **`send_message`** with the returned `session_id` — non-blocking by default (pass `wait: true` for a quick inline turn).
-3. **`wait`** to join results — `mode: "all"` blocks until every session finishes, `mode: "any"` returns on the first; always pass a `timeout_ms` so you can do other work and wait again instead of dead-waiting. This is how you fan out across parallel sessions.
+3. **`wait`** to join results — `mode: "all"` blocks until every session finishes, `mode: "any"` returns on the first; always pass a `timeout_ms` so you can do other work and wait again instead of dead-waiting. On timeout it returns `pendingSnapshots` (per still-running session: `status`, `charCount`, a `tail` of the live partial output — capped by `tail_chars`, default 240 — and the latest lifecycle event) so progress is visible without a separate `status` call. This is how you fan out across parallel sessions.
 4. Reuse the same `session_id` for follow-ups.
-5. **`close_session`** when done.
+5. **`close_session`** when done — omit `session_id` to close **every** session this server manages (a bulk-cleanup fallback after a crash or forgotten close).
 
 You can pin `model` and `effort` per session at open time (they cannot change mid-session — open a new session to switch). Tool **inputs** are snake_case, **outputs** are camelCase; the full untruncated answer is always at `textRef`, with `max_chars` capping the inline `text`. See [docs/INSTALLATION.md](docs/INSTALLATION.md) for the full guide and result shapes.
 
@@ -110,7 +110,8 @@ node scripts/agent-bridge.mjs cleanup    # reap orphaned backends + stale logs l
 
 - Read-oriented by default. Always close sessions so no backend keeps running.
 - No network listener — MCP over stdio only.
-- Child PIDs are tracked under `~/.agent-bridge/pids/`; records whose owning server is still alive are skipped, and orphans are reaped on the next startup or via `cleanup` (POSIX uses `pgrep`/signals, Windows uses `taskkill`/CIM).
+- Spawned backends carry `AGENT_BRIDGE_SESSION_ID` / `AGENT_BRIDGE_OWNER_PID` / `AGENT_BRIDGE_AGENT` in their environment, so a bridge-launched `omp`/`codex` is attributable to a session at the OS level (read via `/proc/<pid>/environ` or `ps e` on POSIX) instead of guessed from command-line side signatures.
+- Child PIDs are tracked under `~/.agent-bridge/pids/`; records whose owning server is still alive are skipped, and orphans are reaped on the next startup or via `cleanup` (POSIX uses `pgrep`/signals, Windows uses `taskkill`/CIM). Before terminating a matched orphan, cleanup confirms identity — by the env marker (POSIX) or the process start time vs the recorded spawn time — so a recycled PID that merely matches `omp --mode rpc` / `codex app-server` is never killed by mistake.
 - Don't commit secrets or machine-specific absolute paths.
 
 ## Development

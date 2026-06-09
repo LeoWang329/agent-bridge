@@ -181,3 +181,38 @@
 并清理一次性迁移残留:真实 `~/.agent-bridge/logs/` 的 538MB 旧扁平日志(1321 文件)+ 孤儿 run 目录全部清空。
 
 复测(独立 sub-agent,omp + codex 全生命周期 + A–D 回归 + 运维不变量):**9/9 PASS**——版本 0.7.0、`status` 无 `mine`、会话无 `owner`;启动扫掉 dead-owner 目录且保留新目录;`cleanup` 回收遗留目录;SIGTERM 后 pid 记录留存且被 `cleanup` 回收;无 socket/端口/daemon;omp 日志 `get_state`/`get_last_assistant_text` 仍 0 条;优雅退出删自身 run 目录、子进程清。
+
+---
+
+## v0.8.0 · 第二轮消费方反馈(进程可识别 / 进度可见 / 批量关闭 / 误杀防护)(2026-06-09)
+
+一位真实编排方使用者(用 agent-bridge 给 omp/codex/deepseek 派活做交叉审核)提了 6 条摩擦点。先做第一性原理评估(哪些是真缺口、哪些已被现有能力覆盖),完整评估与设计见 [docs/FIX_PLAN.md](FIX_PLAN.md)。
+
+| # | 反馈 | 结论 | 落地 |
+|---|---|---|---|
+| 1 | spawn 出的进程 OS 层不可区分(omp/codex 命令行长得一样,只能靠副签名硬区分) | **修** | spawn 子进程 env 注入 `AGENT_BRIDGE_SESSION_ID`/`AGENT_BRIDGE_OWNER_PID`/`AGENT_BRIDGE_AGENT`;外部可经 `/proc/<pid>/environ`、`ps e` 归属到本桥及具体会话。`status` 本就给 `pid`,无需新查询工具。 |
+| 2 | 长 `wait` 期间零进度(干等 4 分钟黑盒) | **修** | `wait` 超时(及 `mode:any` 提前命中)返回 `pendingSnapshots`:每个在跑会话 `{status,updatedAt,charCount,tail,lastEvent}`,`tail`=实时部分文本末尾(新入参 `tail_chars`,默认 240,clamp 0–4000)。一次 wait 即见"还在动 vs 卡住、在做什么"。 |
+| 3 | model 不校验、不可列举 | **Level 1** | `open_session` 因后端拒绝 model 而启动失败时,错误显式带 `requested model="…"` + 指向 doctor(不断言 model 是主因,避免 ENOENT 误导)。Level 2 枚举:codex 实测无稳定列模型命令;omp 有 `omp --list-models`(SKILL 已记),留作后续低成本接入。 |
+| 4 | 无 token/成本 | **跳过**(用户指定) | 内部 codex `tokenUsage`、omp `contextUsage` 已 track,将来加性接入成本极低。 |
+| 5 | 缺「关掉我全部会话」兜底 | **修** | `close_session` **省略 `session_id` 即关闭本进程全部会话**(镜像 `status` 无 id=列全部);复用单关路径但 **prune 合一**,诚实返回 `{closedAll,count,sessionIds,failed}`。显式 `""`/null/非串 报错,不当全关。 |
+| 6 | 非阻塞 send + 单独 wait 两步舞 | **文档** | 已可单步:`send_message(wait:true)`、`open_session(initial_prompt,wait:true)`。SKILL 点明,并补 caveat:`wait:true` **超时会 abort 该 turn**,要"等不到就继续等"须用非阻塞 send + 短超时 wait。 |
+
+**交叉评审找出的额外真缺陷(均已修):**
+
+- **N1 · 孤儿会话**:`openSession` 只 catch 了 `start()` 失败,没 catch 首轮 `send` 失败 → `initial_prompt+wait` 超时时 session 留在 Map、error 又不带 id → 无从关闭。改为首轮 send 失败时同 `start()` 失败一样清理再 rethrow。
+- **N2 · cleanup PID 复用误杀**:旧逻辑认孤儿仅靠命令行正则,dead-owner 的 pid 记录遇 PID 复用且新进程恰好匹配 `omp --mode rpc`/`codex app-server` → 可能误杀无关进程。重写为 **confirm-before-kill**:pid 记录加 `spawnedAt`,`classifyChild` 返回 `gone|ours|reuse|unknown`——**优先用 #1 注入的 env marker 做权威身份**(`processMarkerMatches` 读 `/proc/<pid>/environ` / `ps eww`,只对 0.8.0+ 记录采信),不可读时回退 **OS 进程创建时间 vs 记录时刻**(`processStartedAtMs`;Windows CIM `CreationDate`、POSIX `ps -o lstart=` 且 `LC_ALL=C`);**身份无法确认绝不靠命令行单独 kill**。force-kill backstop 同样在 SIGKILL 前重判身份;POSIX 加 `ps` 探针守卫(ps 不可 spawn 则整轮跳过);非对象 `arguments` 在 `tools/call` 层被拒(防 `null`→`{}`→误触发全关)。
+
+**dogfood 三轮交叉评审(用 Agent Bridge 自身拉起 codex + deepseek 各独立只读复审,逐轮发现→修→复测):**
+
+| 轮 | 发现 | 处置 |
+|---|---|---|
+| **1**(评审计划) | 两方认可评估表;补出 **N1 孤儿会话**(deepseek)、**N2 误杀**(codex 标"最该优先");修订 #5 prune 合一+诚实返回、#2 覆盖 any 分支+`tail_chars` 入 schema 并 clamp、#3 仅 Level 1。 | 全数纳入 [FIX_PLAN.md](FIX_PLAN.md)。 |
+| **2**(评审实现) | N2 的 locale 解析(`ps lstart` 本地化→`Date.parse` 失败)、skew 误杀窗口、force-kill 绕过守卫、`""`→全关、#3 文案误导。 | `LC_ALL=C`;改 confirm-before-kill;`scheduleForceKill` 加 verify;`session_id===undefined` 才全关;#3 不再断言因果。 |
+| **3**(收敛轮) | deepseek:旧记录无 `spawnedAt` 永久漏杀 → 加 `createdAt` 兜底。codex:start-time 仍有窗口 → 改用 **env marker 权威身份**;`arguments` falsy 校验。**又抓出**:pre-0.8.0 子进程在可读 env 平台 marker=false 会被误判 reuse → 加 `expectMarker`(仅 0.8.0+ 记录采信 marker)。 |
+| **4**(最终确认) | 两方一致 **converged / 已收敛**,无新回归、无遗留 blocker。 | — |
+
+> 留作后续(非本轮,已知且低优先):`close()` 的 force-kill backstop 仍只盯 root pid,父退出后抗信号的孙进程理论上可逃逸(既有限制,非本次回归;实践中子进程随父 stdin EOF ~50ms 自退,影响极小)——根治需进程组/job object。
+
+**版本与兼容性**:全部为**加性变更**(注入 env、`close_session` 省略 id、`wait` 新增 `pendingSnapshots`/`tail_chars`、错误信息增强、pid 记录加 `spawnedAt`),既有出参 key 不删不改名 → 既有调用零破坏,标 **0.7.0 → 0.8.0**(minor)。
+
+**实测(Windows,JSON-RPC 驱动新 server 子进程的 e2e harness)**:**15/15 PASS**——版本 0.8.0;`close_session` schema 不强制 `session_id`、`wait` 含 `tail_chars`;空串/`null`/非对象 `arguments` 均被拒(不误触发全关);非法 model 报错带 model 名;`pendingSnapshots` 结构正确含实时 `tail`/`charCount`/`lastEvent`;批量 close 返回 `closedAll`+正确 `count`+空 `failed`,关后 `status` 为空;pid 记录含 `spawnedAt`;`cleanup` 摘要含新计数器且不崩。另以真实进程验证 N2 时间比对方向(真子进程 OS 创建时间早于记录时刻→confirmed;1h 旧记录→判 reuse 不杀)。
