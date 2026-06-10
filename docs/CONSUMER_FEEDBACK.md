@@ -295,3 +295,22 @@ v0.8.1 的 P2 只在 **stdin EOF** 时回收 server。但 server 可能被孤立
 > **审慎保留/不改(附理由,非遗漏)**:F2 的"包装器启动后才死"窗口(codex Major)——deepseek 复评明确签字 F2 正确,且改成"仅显式 env 才启用看门狗"会**回退**真实插件直拉 `node`(ppid=客户端)这一主用例;此残留已在 v0.8.2/0.8.3 文档据实标注,**不为罕见边角牺牲主路径**。`close()` 把 `failed` 覆为 `closed`(deepseek minor)——会话随即从表中删除、无观测者,且改它会扰动 `proc.on("close")` 对 `status==="closed"` 的早退约定,**零收益不动**。
 
 **第二轮实测**:全部 6 个 harness 重跑 **PASS**(`repro-halfdead` 走新的时长判定路径,~3.0s 判 `failed`)。按两家具体建议**加固两个用例**:`repro-watchdog-disarm` 现用私有 `AGENT_BRIDGE_STATE_DIR` 并**正向断言** `bridge.log` 里出现 `watchdog disarmed`(堵住 PID 复用导致的假 PASS);`repro-reclaim` 增 `retention=0`(永久保留)场景。**C1 的取舍(诚实说明)**:其错误态只存在于 `#markUnresponsive` 杀进程到 `proc.on("close")` 之间的瞬态窗口(close 后 status 本就回到 `failed`),无稳定态可断言,做确定性复现需在桥里加测试钩子、得不偿失——故 C1 以**代码审查 + 两家共识**确认,不强造易碎用例。
+
+---
+
+## v0.8.4 · 全文件逻辑自审:wait 合同语义 + 日志轮转 + codex 同 chunk 竞态(2026-06-10)
+
+此前各轮评审都围绕"断连/僵尸/turn 时钟"主线;本轮对 `agent-bridge.mjs` 全文(~2600 行)做一次**不设主题的逻辑通读**,发现 4 个此前未覆盖的问题(集中在 `waitSessions` 合同语义与日志轮转——前几轮均未触及的面),全部修复并配复现/回归。
+
+| 修复 | 根因 / 为什么 | 落地 |
+|---|---|---|
+| **R1 · `wait mode:"any"` 不再丢同 tick settle 的会话**(本轮最重要) | 同一轮 250ms 轮询里 ≥2 个会话已 settle 时,只有 `settledIds[0]` 进 `completed`,而 `pending` 用 `pendingIds()` 把**所有**已 settle 的都排除 → 其余会话既不在 `completed` 也不在 `pending`,按文档"拿 `pending` 循环到空"的协议,**结果被静默丢弃**。最常见触发:并行派活给 A、B,干完别的事才调 `wait`——两个都已完成,B 永远取不到。旁证:同函数的**超时分支**把所有 settled 都返回,两个出口对"多个已完成"处理自相矛盾。 | `mode:"any"` 的 `pending` 改为「`ids` 去掉本次返回的那一个」:同 tick settle 的其余会话**留在 `pending`**,下一轮 `wait` 立即逐个吐出。协议不丢数据。 |
+| **R2 · 未发过 prompt 的 OMP 会话立即 settle(codex 对齐)** | OMP 的 settled 条件 `idle && turnStarted` 里,`turnStarted` 门是防"send 后、流式前"的假 idle 窗口——没错;但 **fresh 会话**它永远 false → `wait` 一个从未派活的 OMP 会话**死等到超时**(默认 30 分钟),而 fresh codex 会话(`!turn`)立即 settle。跨后端不一致,且失败形态是最贵的那种。 | 新增 `everPrompted`(`send()` 入口**同步**置位,先于任何 await,故与首次 send 并发的 `wait` 轮询不可能误读"还没派过活"):`settled = idle && (turnStarted \|\| !everPrompted)`。门的原有保护不受影响。 |
+| **R3 · 日志轮转 rename 成功才清零计数器** | `renameSync` 失败被吞但 `written=0` 照常执行 → 内存计数与真实文件大小脱钩,之后每**再涨满一个 cap** 才重试一次 rename;而 `pruneLogs` 的单文件上限对**活跃会话文件豁免**——rename 持续失败(被扫描器/tailer 短暂锁住)的长寿会话日志按 cap 步长无界增长,恰好绕过轮转要防的问题。 | 清零移进 `try` 内、仅 rename 成功后执行;失败则**每次后续 append 都重试**轮转直到成功。 |
+| **R4 · codex `turn/start` 响应与通知同 chunk 的竞态** | 回合簿记(清空累积文本/盖时间戳/采纳 turn id)在 `await` 续延里执行,但注释声称的"先于任何通知 tick"在**同一 stdout flush** 场景不成立:readline 同步连发整个 chunk 的行,microtask 续延要等同步链跑完。后果:① 先到的 deltas 落在**上一轮文本之后**、再被 reset 抹掉;② 极端情况(响应+整个 turn 生命周期同 chunk,如瞬时失败)turn 先 settle,续延见 `this.turn !== myTurn` 误走 "abort 介入"分支——给**已完成**的 turn 发 interrupt 并误报 `accepted:false`。 | 抽出**幂等** `#beginTurn()`(按 `turn.begun` 一次性簿记),在 `turn/started` 通知与响应续延**先到者执行**;`#settleTurn` 在 turn 对象上记 `settled:{err,status}`,续延据此区分"已完成"(如实返回 `accepted:true`/结果/原错误)与"被 abort/close 抢走"(维持原 `accepted:false`+interrupt)。失败/超时的 `turn/start` 仍不触发簿记,上一轮的 lastTurn 与结果文本照旧保留。 |
+
+**自审同时记录、本轮审慎不修的次要项**(均为低概率/有界,避免无收益扰动):stdin-error 路径只标 `failed` 不收割子进程(活到 `close_session`/server 退出,有界泄漏;与 `#markUnresponsive` 会 reap 不一致);`unresponsiveSince` 跨长空闲期可因两次相隔很久的孤立超时误判(C3 时长法的已知代价);`extractAssistantText`/`extractLikelyText` 死代码;`doctor` 的 `spawnSync` 无超时;`AGENT_BRIDGE_PARENT_PID` 为非整数时看门狗静默跳过(连 disarm 日志都没有)。
+
+**版本与兼容性**:不增删/改任何 MCP 工具的入参/出参**形状**。R1 是**合同语义修正**:`mode:"any"` 的 `pending` 现在可能包含**已 settle** 的 id(下一轮 wait 立即返回它们;`pendingSnapshots` 如实显示其 `idle`/`failed` 状态)——按文档循环的消费方行为只会变正确,不会变坏 → 标 **0.8.3 → 0.8.4**(patch)。
+
+**实测(Windows,零模型消耗)**:新增 `docs/repro-mcp-hang/repro-waitany.mjs`(fake-omp `turnstate` 模式驱动真 MCP server),**负向对照成立**——修复前同 harness 即 FAIL(`wait#1` 返回 `pending=[]`,B 被丢);修复后 **PASS**:R1 两个同时 settle 的会话经 `completed→pending→completed` 全部取到;R2 fresh 会话 `wait` **46ms** 即返回(修复前吃满超时)。R4 无法确定性构造(需后端把响应与通知打进同一 flush),以代码审查覆盖。既有 7 个 harness 全量回归 **7/7 PASS**(turnstate / halfdead / reclaim / watchdog-disarm / pipebreak / parent-death / kill)。

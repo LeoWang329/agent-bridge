@@ -24,7 +24,7 @@ function envNum(name, fallback) {
   return n;
 }
 
-const BRIDGE_VERSION = "0.8.3";
+const BRIDGE_VERSION = "0.8.4";
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const DEFAULT_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 // Bound for a single OMP RPC round-trip. Every OMP command is an immediate ack (prompt is
@@ -360,10 +360,16 @@ function appendLog(file, text) {
     const bytes = Buffer.byteLength(text, "utf8");
     let written = logBytesWritten.get(file) || 0;
     if (written > 0 && written + bytes > LOG_FILE_MAX_BYTES) {
+      // Reset the counter ONLY when the rename actually happened. On failure (file briefly locked
+      // by a scanner/tailer), resetting anyway would detach the counter from the real file size:
+      // the next rotation attempt would then wait for a whole further cap of writes, growing a
+      // live session's log in cap-sized steps without bound (pruneLogs exempts active files, so
+      // nothing else limits it). Keeping the counter makes every subsequent append retry the
+      // rename until it succeeds.
       try {
         fs.renameSync(file, file.replace(/(\.[^.\\/]+)$/, ".1$1")); // foo.log -> foo.1.log
+        written = 0;
       } catch {}
-      written = 0;
     }
     logBytesWritten.set(file, written + bytes);
   }
@@ -1003,6 +1009,12 @@ class OmpRpcSession {
     // stream deltas / a live isStreaming reading); waitIdle won't accept the idle
     // window that exists *before* a freshly-sent prompt starts.
     this.turnStarted = false;
+    // True once a prompt has ever been ATTEMPTED on this session — set synchronously at send()
+    // entry, before any await, so a wait() polling concurrently with the first send can never
+    // observe "no prompt yet" mid-flight. sessionSettled uses it: a never-prompted session has no
+    // turn to wait for and must settle immediately (codex parity), while the turnStarted gate
+    // still protects the pre-stream idle window of a real in-flight send.
+    this.everPrompted = false;
     this.sessionState = null;
     this.currentTurnId = null;
     this.lastTurnId = null;
@@ -1302,6 +1314,7 @@ class OmpRpcSession {
     // Reset before prompting so waitIdle below ignores the pre-streaming idle window
     // (a stale idle reading from before this turn actually starts).
     this.turnStarted = false;
+    this.everPrompted = true;
     setSessionStatus(this, "running", true, { source: "send" });
     try {
       await this.request("prompt", { message: String(message) });
@@ -1695,6 +1708,13 @@ class CodexAppServerSession {
           pushEvent(this, compactEvent(msg));
           return;
         }
+        // Begin OUR pending turn's bookkeeping at the FIRST signal the turn exists. The app-server
+        // can flush this notification in the same stdout chunk as the turn/start RPC response;
+        // readline then delivers it BEFORE send()'s await continuation runs (microtasks only run
+        // once the synchronous line burst ends), so without this the following deltas would append
+        // onto the PREVIOUS turn's text until the continuation got to reset it. #beginTurn is
+        // idempotent per turn — when the continuation runs first (the common case), this is a no-op.
+        if (this.turn) this.#beginTurn(params.turn?.id || null);
         this.currentTurnId = params.turn?.id || this.currentTurnId;
         if (this.turn) setSessionStatus(this, "running", true, { source: "turn/started" });
         pushEvent(this, compactEvent(msg));
@@ -1748,9 +1768,34 @@ class CodexAppServerSession {
     }
   }
 
+  // One-time bookkeeping for a newly accepted turn: adopt the backend turn id, stamp the clock, and
+  // reset the per-turn text accumulators. Runs at the FIRST signal the turn exists — the turn/start
+  // response continuation or the turn/started notification, whichever the event loop delivers first
+  // (a single stdout flush can put the notification ahead of the response's continuation).
+  // Idempotent per turn via turn.begun. Deliberately NOT run for a failed/timed-out turn/start, so
+  // the previous turn's lastTurn and result text stay intact (see send()'s catch).
+  #beginTurn(turnId) {
+    if (!this.turn || this.turn.begun) return;
+    this.turn.begun = true;
+    if (turnId) {
+      this.currentTurnId = turnId;
+      this.lastTurnId = turnId;
+    }
+    this.turnStartedAt = nowIso();
+    this.turnEndedAt = null;
+    this.finalAnswer = "";
+    this.lastAgentMessage = "";
+    this.lastAssistantText = "";
+  }
+
   #settleTurn(err, status) {
     const turn = this.turn;
     if (!turn) return;
+    // Record HOW the turn ended on the turn object itself: send()'s continuation may still be
+    // suspended (response + the whole turn lifecycle delivered in one flush) and needs to tell
+    // "already ran to completion" apart from "abort()/close() stole the turn" — only the latter
+    // should report accepted:false and fire an interrupt.
+    turn.settled = { err: err || null, status: status ?? null };
     this.turn = null;
     this.currentTurnId = null;
     this.turnCount += 1;
@@ -1826,6 +1871,15 @@ class CodexAppServerSession {
     }
     const startedTurnId = turnResp?.turn?.id || null;
     if (this.turn !== myTurn) {
+      if (myTurn.settled) {
+        // The turn already ran to completion before this continuation resumed (response and the
+        // full turn lifecycle flushed in one chunk; #beginTurn did the bookkeeping from the
+        // turn/started notification). It was NOT aborted — report it honestly instead of firing a
+        // spurious interrupt at a finished turn and mislabeling it accepted:false.
+        if (myTurn.settled.err) throw myTurn.settled.err;
+        if (options.wait) return await this.result({ maxChars: options.maxChars });
+        return { accepted: true, sessionId: this.id, status: this.status, turnId: startedTurnId || this.lastTurnId };
+      }
       // abort()/close() ran while turn/start was in flight, so it couldn't interrupt a
       // turn whose id was still unknown. Interrupt it now and ignore its trailing events.
       if (startedTurnId) {
@@ -1836,17 +1890,14 @@ class CodexAppServerSession {
       }
       return { accepted: false, sessionId: this.id, status: this.status, turnId: startedTurnId };
     }
+    // Begin the accepted turn's bookkeeping (stamp timing, adopt the turn id, reset accumulated
+    // text). Done only now — not before the request — so a failed/timed-out turn/start (the catch
+    // above) leaves the previous turn's lastTurn AND its result text intact. A no-op when the
+    // turn/started notification (same-flush delivery) already ran it, in which case the deltas
+    // that preceded this continuation correctly accumulated from empty.
+    this.#beginTurn(startedTurnId);
     this.currentTurnId = startedTurnId || this.currentTurnId;
     this.lastTurnId = startedTurnId || this.lastTurnId;
-    // Stamp timing AND reset accumulated text only now that the turn is accepted: a failed/
-    // timed-out turn/start (the catch above) then leaves the previous turn's lastTurn AND its
-    // result text intact instead of a stale-id mismatch / wiped answer. Runs synchronously
-    // before any turn notification tick, so the new turn's deltas accumulate from empty.
-    this.turnStartedAt = nowIso();
-    this.turnEndedAt = null;
-    this.finalAnswer = "";
-    this.lastAgentMessage = "";
-    this.lastAssistantText = "";
     const initialStatus = turnResp?.turn?.status;
     // Only a known-terminal status from the start response settles synchronously;
     // queued/pending/inProgress/unknown stay in flight and are driven by notifications.
@@ -2090,7 +2141,13 @@ async function result(sessionId, options = {}) {
 function sessionSettled(session) {
   if (!session) return true;
   if (session.status === "failed" || session.status === "closed") return true;
-  if (session instanceof OmpRpcSession) return session.status === "idle" && session.turnStarted;
+  if (session instanceof OmpRpcSession) {
+    // turnStarted gates the pre-stream idle window of an in-flight send (see waitIdle). But a
+    // session that has NEVER been prompted (everPrompted false) has no turn to wait on — it must
+    // settle immediately, matching the codex branch below (`!session.turn`), instead of pinning
+    // wait() until its full timeout (default 30 min) on a session that will never "finish".
+    return session.status === "idle" && (session.turnStarted || !session.everPrompted);
+  }
   return session.status === "idle" && !session.turn;
 }
 
@@ -2149,8 +2206,15 @@ async function waitSessions(params) {
     }
     const settledIds = ids.filter(id => sessionSettled(sessions.get(id)));
     if (mode === "any" && settledIds.length) {
-      const pending = pendingIds();
-      return { mode, completed: await summarize(settledIds[0]), pending, pendingSnapshots: pending.map(snapshot) };
+      // `pending` is every OTHER id — including ones that settled in this same poll tick, not just
+      // the still-running ones. The documented protocol is "pass `pending` back as the next call's
+      // session_ids; loop until empty", so excluding a simultaneously-settled id from both
+      // `completed` and `pending` (the old pendingIds() shape) silently dropped its result from the
+      // loop. A settled id left in `pending` simply comes back as `completed` on the next call,
+      // immediately. (The timeout branch below already returns ALL settled ids — same contract.)
+      const completedId = settledIds[0];
+      const pending = ids.filter(id => id !== completedId);
+      return { mode, completed: await summarize(completedId), pending, pendingSnapshots: pending.map(snapshot) };
     }
     if (mode === "all" && settledIds.length === ids.length) {
       return { mode, results: await Promise.all(ids.map(summarize)) };
