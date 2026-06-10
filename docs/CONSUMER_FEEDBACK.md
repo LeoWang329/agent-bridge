@@ -257,3 +257,29 @@ v0.8.1 的 P2 只在 **stdin EOF** 时回收 server。但 server 可能被孤立
 **版本与兼容性**:纯**加性的内部健壮性**改进(新增 env `AGENT_BRIDGE_PARENT_WATCHDOG_MS` 默认 15000、`AGENT_BRIDGE_PARENT_PID` 覆盖被监视 pid),无工具入参/出参变化、平台中立 → **0.8.1 → 0.8.2**(patch)。
 
 **实测(Windows)**:新增 `docs/repro-mcp-hang/repro-parent-death.mjs` —— **PASS**:harness 全程**不关 server 的 stdin**、只杀一个被 `AGENT_BRIDGE_PARENT_PID` 指向的替身进程,server 仍 `code=0` 自退、后端被回收(证明是看门狗而非 stdin 路径触发)。同时回归 `repro-kill`(3/3 不挂死、P2 自检通过)、`repro-pipebreak`(按时 `timedOut`)均不受看门狗干扰。
+
+---
+
+## v0.8.3 · 交叉审核收口 + turn 时钟一致性(2026-06-10)
+
+把 v0.8.1/0.8.2 的修复给 **codex / deepseek-v4-pro / minimax / xiaomi-mimo** 四家交叉审核(minimax 产出事实性错误、mimo 工具死循环,均已证伪/记录),codex 与 deepseek 一致挑出几条**真问题**;连同另一条独立记录的 [turn 时钟自相矛盾 bug](BUG-omp-turn-state-inconsistency-2026-06-10.md),一并收进本次 patch。每条都配了**确定性复现**(`docs/repro-mcp-hang/`)。
+
+| 修复 | 根因 / 为什么 | 落地 |
+|---|---|---|
+| **F1 · crash 现场按 `bridge.log` 的 mtime 老化** | P3 用**目录 mtime** 判 crash 现场是否过期。但长跑 server 的目录 mtime 是**创建时刻**(条目开头一次性建好),崩在几天后目录 mtime 依旧很旧 → 现场**当场被误删**(恰好抹掉本要保的尸检)。 | 改用 `bridge.log` 自身 mtime(写到崩溃那一刻的文件)老化;`stat` 失败时**默认保留**而非走"超大年龄=删"的方向;retention≤0 时永久保留。 |
+| **F2 · 看门狗"父进程启动时活着才武装"** | P6 看门狗无条件武装。若客户端经一个**随即退出的 shell 包装**拉起我们(ppid=包装器),包装器先死 → 看门狗误判客户端死亡而自杀(v0.8.2 文档已自认的边界)。 | 启动即同步探活:父进程**当下已不在**就**不武装**看门狗(它不是握着 stdin 的客户端的可靠代理),退回 stdin-EOF 信号。真实插件直接 spawn `node`,父进程必活,只兜 wrapper 边界。 |
+| **F3 · `send()` 的 catch 不再把已死会话改回 idle** | prompt 被 reject 后的 catch 仅看 `proc.exitCode===null` 就回 idle;但 stdin-error/process-error/`#markUnresponsive` 可能已置 `dead=true`+`failed` 而 `exitCode` 尚未翻 → catch 把**真失败**抹成误导性的 "idle"。 | catch 守卫加 `!this.dead`:只有会话确实仍可用才回 idle。 |
+| **F4 · 半死后端连续超时即判 `failed` 并回收** | 后端"进程活着、stdin 可写、但永不应答"时,`request()` 超时只 reject 单次,`wait` 仍一拍一拍 10s 超时**磨到调用方自己的(默认 30 分钟)deadline**。 | 连续 `OMP_RPC_TIMEOUT_FAILS`(默认 3)次 RPC 超时(其间无任何应答)→ 标 `dead+failed`、清退在途、**回收 wedged 子进程**;任一按时应答即清零计数(**迟到**应答不清零,持续迟到=仍判 wedged)。`wait/status` 立刻拿到失败而非干等。 |
+| **F5 · 数值 env 解析失败大声回退** | `Number(process.env.X ?? d)` 对拼错的值得到 `NaN`,而所有 `NaN > 0` 守卫都为 false → **静默关掉**它本要配置的东西(RPC 超时 / 看门狗 / 日志上限),毫无痕迹。 | 统一 `envNum()`:非数值 → 打印一行警告并用默认值;`AGENT_BRIDGE_PARENT_PID` 非数值时回退 `process.ppid`。 |
+| **F7+F8 · turn 时钟一致性** | 后端自行**重入 turn**(多步/工具循环,无新 `send()`)时:`turn_end` 盖了 `turnEndedAt`,随后的 `turn_start` 只翻 status 不清该戳;`lastTurnOf` 又不看 status → 报出"`status:running` 同时 `lastTurn.endedAt` 有值"的自相矛盾。更关键:`state()` 是**第二条写点**(`isStreaming` 时翻 running,同样不清戳),只改 `#applyEvent` 堵不住。 | **F7** 在 `turn_start` 清 `turnEndedAt=null`(让底层字段诚实);**F8(更重要)** 让 `lastTurnOf` **状态感知**——`running`/`starting` 一律不给 `endedAt`/`durationMs`,从**读侧**一次性封死现在和将来所有写点的滑漏。`charCount:0` 是**另一个** bug(`turn_start` 清 `lastAssistantText`),刻意不混入。 |
+
+> codex 建议的"codex 侧补 `dead` 标志对称"**审慎跳过**:codex 的 `#write` 已校验 `stdin.destroyed`/`exitCode`,每个 `#request` 又都被 `withTimeout` 兜底,加 `dead` 标志与现有守卫重复、不治真问题(codex 真正的同类缺口是"turn 中途半死靠通知心跳",属更大改动,本次不做、单独记)。每个改动都能回答"为什么"。
+
+**版本与兼容性**:纯**内部健壮性 + 观测一致性**修复,不增删/改任何 MCP 工具的入参/出参形状(`lastTurn` 仅由"自相矛盾"变"一致",无消费方依赖其 `running` 时的 `endedAt`)→ 标 **0.8.2 → 0.8.3**(patch)。新增可选 env 旋钮 `AGENT_BRIDGE_OMP_RPC_TIMEOUT_FAILS`(默认 3)。
+
+**实测(Windows,`docs/repro-mcp-hang/`,均零模型消耗;新增 4 个 harness 全 PASS)**:
+- `repro-turnstate`(F7/F8):后端自行 churn `turn_start→turn_end→turn_start→turn_end` 后,反复 `status` 采样——`status:running` 时 `lastTurn.endedAt` 恒 `null`。**负向对照**:临时回退 F8 后同 harness 立即 FAIL(`running` + `endedAt` 有值、`durationMs:122`),证明用例真能抓 bug。
+- `repro-halfdead`(F4):后端 ack prompt 后对 `get_state` 装死;`wait` 给 60s deadline,实测 **~3.0s** 即返回 `status:"failed"`(非 `timedOut`),远早于 deadline。
+- `repro-reclaim`(F1):合成 state 目录跑真 `cleanup` CLI——目录 mtime 旧、`bridge.log` mtime 新的 crash 现场**被保留**;目录与 log 双旧的 crash 现场、以及 `code=0` 的旧目录**被回收**(证明扫除确实在跑)。
+- `repro-watchdog-disarm`(F2):看门狗指向一个**启动时已死**的 pid → server 4s 内**不自退**(看门狗已解除武装),随后 stdin-EOF 仍 `code=0` 干净退出。
+- `repro-parent-death` / `repro-pipebreak` 回归:均不受影响、PASS。F5 单独验证:传 `AGENT_BRIDGE_OMP_RPC_TIMEOUT_MS=abc` 启动即打印回退警告、不静默失效。

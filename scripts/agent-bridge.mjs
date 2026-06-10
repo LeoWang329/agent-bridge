@@ -8,7 +8,23 @@ import readline from "node:readline";
 
 const IS_WINDOWS = process.platform === "win32";
 
-const BRIDGE_VERSION = "0.8.2";
+// Parse a numeric env override, falling back (with a one-line warning) when unset or non-numeric.
+// A bare Number("typo") is NaN, and every `NaN > 0` guard reads false — so a mistyped AGENT_BRIDGE_*
+// value would SILENTLY DISABLE the thing it configures (RPC timeout, watchdog, log caps) with no
+// trace. Fail loud to the default instead. (Callers needing a non-numeric default — e.g. a pid that
+// falls back to process.ppid — pass it through: an absent var returns the fallback verbatim.)
+function envNum(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) {
+    process.stderr.write(`[agent-bridge] ignoring non-numeric ${name}=${JSON.stringify(raw)}; using default ${fallback}\n`);
+    return fallback;
+  }
+  return n;
+}
+
+const BRIDGE_VERSION = "0.8.3";
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const DEFAULT_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 // Bound for a single OMP RPC round-trip. Every OMP command is an immediate ack (prompt is
@@ -16,7 +32,11 @@ const DEFAULT_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 // missing for this long means the backend is wedged or the pipe is half-broken — reject
 // instead of letting wait/status/result block forever on a promise nothing will settle.
 // (Codex needs no equivalent: every codex #request call site is already withTimeout-bounded.)
-const OMP_RPC_TIMEOUT_MS = Number(process.env.AGENT_BRIDGE_OMP_RPC_TIMEOUT_MS ?? 10_000);
+const OMP_RPC_TIMEOUT_MS = envNum("AGENT_BRIDGE_OMP_RPC_TIMEOUT_MS", 10_000);
+// Consecutive OMP RPC timeouts that mark a session unresponsive (failed) and reap its backend, so a
+// half-dead backend — process alive, pipe writable, but answering nothing — makes wait/status FAIL
+// FAST instead of polling 10s timeouts until the caller's own (default 30-min) wait deadline.
+const OMP_RPC_TIMEOUT_FAILS = envNum("AGENT_BRIDGE_OMP_RPC_TIMEOUT_FAILS", 3);
 // Start-time tolerance for the cleanup PID-reuse guard's FALLBACK path (used when the definitive env
 // marker can't be read — Windows, or a pre-0.8.0 child). A genuine child's OS creation time is at or
 // before the instant we recorded its pid record; this skew only absorbs measurement jitter between the
@@ -28,17 +48,17 @@ const MAX_TEXT = 400_000;
 const STATE_ROOT = process.env.AGENT_BRIDGE_STATE_DIR || path.join(os.homedir(), ".agent-bridge");
 const LOG_DIR = path.join(STATE_ROOT, "logs");
 const PID_DIR = path.join(STATE_ROOT, "pids");
-const LOG_RETENTION_DAYS = Number(process.env.AGENT_BRIDGE_LOG_RETENTION_DAYS ?? 7);
-const LOG_MAX_BYTES = Number(process.env.AGENT_BRIDGE_LOG_MAX_MB ?? 500) * 1024 * 1024;
-const LOG_FILE_MAX_BYTES = Number(process.env.AGENT_BRIDGE_LOG_FILE_MAX_MB ?? 200) * 1024 * 1024;
-const LOG_PRUNE_INTERVAL_MS = Number(process.env.AGENT_BRIDGE_LOG_PRUNE_INTERVAL_MIN ?? 30) * 60_000;
+const LOG_RETENTION_DAYS = envNum("AGENT_BRIDGE_LOG_RETENTION_DAYS", 7);
+const LOG_MAX_BYTES = envNum("AGENT_BRIDGE_LOG_MAX_MB", 500) * 1024 * 1024;
+const LOG_FILE_MAX_BYTES = envNum("AGENT_BRIDGE_LOG_FILE_MAX_MB", 200) * 1024 * 1024;
+const LOG_PRUNE_INTERVAL_MS = envNum("AGENT_BRIDGE_LOG_PRUNE_INTERVAL_MIN", 30) * 60_000;
 // Parent-death watchdog interval. An MCP server exists only to serve the client that spawned it;
 // normally a vanished client is seen as stdin EOF. But if the client dies while another process keeps
 // our stdin pipe open (a hung grandparent retaining the handle — the 0.8.0 pid-16024 zombie shape),
 // no EOF ever arrives and we'd run forever. So also poll the spawning parent's liveness and self-exit
 // (reaping our backends) once it's gone. AGENT_BRIDGE_PARENT_PID overrides which pid to watch (a
 // supervisor, or a test); default is process.ppid. Set the interval to 0 to disable.
-const PARENT_WATCHDOG_INTERVAL_MS = Number(process.env.AGENT_BRIDGE_PARENT_WATCHDOG_MS ?? 15_000);
+const PARENT_WATCHDOG_INTERVAL_MS = envNum("AGENT_BRIDGE_PARENT_WATCHDOG_MS", 15_000);
 
 const AGENTS = {
   omp: {
@@ -440,7 +460,13 @@ function slimEvents(events, limit = 12) {
 function lastTurnOf(session) {
   if (!session.lastTurnId && !session.turnStartedAt) return null;
   const startedAt = session.turnStartedAt || null;
-  const endedAt = session.turnEndedAt || null;
+  // Only surface an end stamp when the session is genuinely BETWEEN turns. A backend that re-enters a
+  // turn on its own (multi-step / tool loop), or state() flipping status→running on a live isStreaming
+  // reading, can leave a stale turnEndedAt set while status is running — a turn can't be both ended and
+  // running. Gating the READ here is the robust catch-all: it closes every present and future write-site
+  // slip, not just the #applyEvent one (which is also fixed, to clear the stamp on turn re-entry).
+  const settled = session.status !== "running" && session.status !== "starting";
+  const endedAt = settled ? session.turnEndedAt || null : null;
   const durationMs = startedAt && endedAt ? new Date(endedAt) - new Date(startedAt) : null;
   return { id: session.lastTurnId || null, startedAt, endedAt, durationMs };
 }
@@ -828,13 +854,20 @@ function reclaimStaleLogs() {
     // post-mortem scene — don't let a sibling's sweep destroy the evidence. It still ages out
     // via this same sweep once older than LOG_RETENTION_DAYS.
     try {
-      const bridgeLog = fs.readFileSync(path.join(dir, "bridge.log"), "utf8");
+      const bridgeLogPath = path.join(dir, "bridge.log");
+      const bridgeLog = fs.readFileSync(bridgeLogPath, "utf8");
       if (/shutdown code=(?!0\b)\d+/.test(bridgeLog)) {
-        let crashMtimeMs = 0;
+        // Age the crash scene by bridge.log's OWN mtime — the file written right up to the crash —
+        // not the directory's. A long-lived server's dir mtime is its creation time (entries are
+        // added once at start), so it can be far older than the crash and would reclaim the evidence
+        // immediately. On stat failure, default to PRESERVE (keep the post-mortem) rather than the
+        // huge-age path that would destroy it. Retention<=0 (disabled) keeps crash scenes forever.
+        let crashMtimeMs = null;
         try {
-          crashMtimeMs = fs.statSync(dir).mtimeMs;
+          crashMtimeMs = fs.statSync(bridgeLogPath).mtimeMs;
         } catch {}
-        if (Date.now() - crashMtimeMs < LOG_RETENTION_DAYS * 86_400_000) continue;
+        const maxAge = LOG_RETENTION_DAYS > 0 ? LOG_RETENTION_DAYS * 86_400_000 : Infinity;
+        if (crashMtimeMs === null || Date.now() - crashMtimeMs < maxAge) continue;
       }
     } catch {}
     if (!ownerPid) {
@@ -987,6 +1020,10 @@ class OmpRpcSession {
     // ever settle — the shape that wedged agent_bridge_wait forever (see
     // docs/INVESTIGATION-mcp-disconnect-2026-06-10.md).
     this.dead = false;
+    // Consecutive RPC timeouts with no intervening response. Reset to 0 whenever a response lands
+    // (see #handleLine); once it reaches OMP_RPC_TIMEOUT_FAILS the backend is declared unresponsive
+    // (#markUnresponsive) so a half-dead backend fails fast instead of stalling wait to its deadline.
+    this.rpcTimeoutStreak = 0;
     this.readyPromise = null;
     this.readyResolve = null;
     this.readyReject = null;
@@ -1139,6 +1176,10 @@ class OmpRpcSession {
     if (message.type === "response" && message.id && this.pending.has(message.id)) {
       const pending = this.pending.get(message.id);
       this.pending.delete(message.id);
+      // The backend answered on time → it is responsive; clear the timeout streak. (A LATE response,
+      // arriving after request()'s timer already deleted its pending, takes the !has(id) path below
+      // and deliberately does NOT reset the streak — a consistently-late backend stays "wedged".)
+      this.rpcTimeoutStreak = 0;
       if (message.success === false) pending.reject(new Error(message.error || "OMP RPC command failed."));
       else pending.resolve(message);
       return;
@@ -1152,6 +1193,10 @@ class OmpRpcSession {
     if (message.type === "agent_start" || message.type === "turn_start") {
       this.lastAssistantText = "";
       this.turnStarted = true;
+      // Re-entering a turn (backend's own multi-step loop, no new send()): clear the prior end stamp
+      // so the turn clock isn't left both "ended" and "running". (lastTurnOf also gates on status as
+      // the catch-all; this keeps the underlying field honest at the direct turn_end→turn_start path.)
+      this.turnEndedAt = null;
       setSessionStatus(this, "running", true, { source: message.type });
       return;
     }
@@ -1195,12 +1240,39 @@ class OmpRpcSession {
         if (pending) {
           this.pending.delete(id);
           pending.reject(new Error(`OMP RPC ${type} got no response in ${OMP_RPC_TIMEOUT_MS}ms for ${this.id}.`));
+          // A half-dead backend (writes succeed, nothing ever comes back) would otherwise keep
+          // timing out one poll at a time until the caller's wait deadline. After N consecutive
+          // timeouts, declare it unresponsive so wait/status fail fast and the zombie is reaped.
+          if (OMP_RPC_TIMEOUT_FAILS > 0 && ++this.rpcTimeoutStreak >= OMP_RPC_TIMEOUT_FAILS) {
+            this.#markUnresponsive();
+          }
         }
       }, OMP_RPC_TIMEOUT_MS);
       timer.unref?.();
       return promise.finally(() => clearTimeout(timer));
     }
     return promise;
+  }
+
+  // Backend is alive (or its pipe still accepts writes) but has stopped answering: OMP_RPC_TIMEOUT_FAILS
+  // RPCs timed out back-to-back with no response between them. Treat it like a process death — mark
+  // dead+failed, reject everything in flight, and reap the wedged child — so wait/status/result return
+  // a clear failure now instead of grinding 10s timeouts until the caller's deadline, and we don't leak
+  // an unresponsive backend for the rest of the server's life. Idempotent; a no-op once dead/closed.
+  #markUnresponsive() {
+    if (this.dead || this.status === "closed") return;
+    this.dead = true;
+    this.lastError = `OMP backend ${this.id} unresponsive: ${OMP_RPC_TIMEOUT_FAILS} consecutive RPC timeouts.`;
+    appendLog(this.logFile, `[agent-bridge] ${this.lastError} — marking failed and reaping.\n`);
+    if (this.turnStartedAt && !this.turnEndedAt) this.turnEndedAt = nowIso();
+    setSessionStatus(this, "failed", false, { source: "rpc_timeout" });
+    for (const pending of this.pending.values()) pending.reject(new Error(this.lastError));
+    this.pending.clear();
+    const pid = this.proc?.pid;
+    if (this.proc && this.proc.exitCode === null && this.proc.signalCode === null) {
+      terminateProcessTree(pid);
+      scheduleForceKill(pid, 3000, () => this.proc != null && this.proc.exitCode === null && this.proc.signalCode === null);
+    }
   }
 
   async send(message, options = {}) {
@@ -1214,9 +1286,11 @@ class OmpRpcSession {
     try {
       await this.request("prompt", { message: String(message) });
     } catch (err) {
-      // Prompt was rejected; don't leave the session stuck at "running". If the backend is
-      // still alive, return it to idle (a dead proc is handled by the close/error handlers).
-      if (this.status !== "closed" && this.proc && this.proc.exitCode === null) {
+      // Prompt was rejected; don't leave the session stuck at "running". Return to idle ONLY if the
+      // backend is genuinely still usable. `!this.dead` is the key guard: a stdin-error / process-error
+      // handler (or #markUnresponsive) can set dead=true + status=failed while proc.exitCode is briefly
+      // still null — without it this catch would flip that real failure back to a misleading "idle".
+      if (!this.dead && this.status !== "closed" && this.proc && this.proc.exitCode === null) {
         setSessionStatus(this, "idle", false, { source: "prompt_error" });
       }
       throw err;
@@ -2303,17 +2377,29 @@ function serveMcp() {
   // self-exit so we don't outlive our client and leak backends (the stdin-EOF path handles the
   // common case; this covers "client died but the pipe stayed open"). Require two consecutive "gone"
   // reads so no single odd probe can reap a live server. unref so the timer never holds us open.
-  const watchPid = Number(process.env.AGENT_BRIDGE_PARENT_PID ?? process.ppid);
+  const watchPid = envNum("AGENT_BRIDGE_PARENT_PID", process.ppid);
   if (PARENT_WATCHDOG_INTERVAL_MS > 0 && Number.isInteger(watchPid) && watchPid > 1) {
-    let goneStreak = 0;
-    const watchdog = setInterval(() => {
-      if (pidAlive(watchPid)) {
-        goneStreak = 0;
-        return;
-      }
-      if (++goneStreak >= 2) cleanupAndExit(0, `parent ${watchPid} gone`);
-    }, PARENT_WATCHDOG_INTERVAL_MS);
-    watchdog.unref?.();
+    // Arm ONLY if the parent is alive right now. If it is already gone at startup, our ppid is almost
+    // certainly a transient launcher (a shell/wrapper that spawned us and returned) rather than the
+    // client actually holding our stdin — an unreliable proxy we must never self-reap on. Leave the
+    // watchdog disarmed and let the stdin-EOF path be the signal. The real plugin spawns `node`
+    // directly, so the parent is always alive here; this only guards the wrapper edge case.
+    if (!pidAlive(watchPid)) {
+      appendLog(
+        path.join(RUN_LOG_DIR, "bridge.log"),
+        `[${nowIso()}] parent ${watchPid} already gone at startup; watchdog disarmed (relying on stdin EOF)\n`,
+      );
+    } else {
+      let goneStreak = 0;
+      const watchdog = setInterval(() => {
+        if (pidAlive(watchPid)) {
+          goneStreak = 0;
+          return;
+        }
+        if (++goneStreak >= 2) cleanupAndExit(0, `parent ${watchPid} gone`);
+      }, PARENT_WATCHDOG_INTERVAL_MS);
+      watchdog.unref?.();
+    }
   }
   const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
   let activeRequests = 0;

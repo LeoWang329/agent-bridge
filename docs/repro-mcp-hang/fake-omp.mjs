@@ -1,7 +1,13 @@
-// Fake omp backend: speaks just enough of the omp RPC protocol, then closes its OWN stdin
-// read-end after 3s while staying alive — simulating a backend in graceful teardown
-// (e.g. fatal API error) where the pipe breaks before the process exits.
-// Launched via fake-omp.cmd (Windows) or fake-omp.sh (POSIX); see repro-pipebreak.mjs.
+// Fake omp backend: speaks just enough of the omp RPC protocol to drive the repros. Behavior is
+// selected by FAKE_OMP_MODE (default "pipebreak"):
+//   pipebreak — ack prompt + agent_start, answer get_state, then destroy our OWN stdin read-end at
+//               T+3s while staying alive (graceful-teardown / broken-pipe shape). [repro-pipebreak]
+//   silent    — ack prompt + agent_start, but NEVER answer get_state (process alive, pipe writable,
+//               no responses) — the half-dead backend shape. [repro-halfdead -> P/F4 fast-fail]
+//   turnstate — ack prompt, then emit turn_start -> turn_end -> turn_start (a backend re-entering a
+//               turn on its own) and stay quiet/running. [repro-turnstate -> F7/F8 coherent clock]
+// Launched via fake-omp.cmd (Windows) or fake-omp.sh (POSIX) through OMP_BIN; env is inherited.
+const MODE = process.env.FAKE_OMP_MODE || "pipebreak";
 const say = obj => process.stdout.write(JSON.stringify(obj) + "\n");
 
 let buf = "";
@@ -15,10 +21,21 @@ process.stdin.on("data", d => {
     try {
       const msg = JSON.parse(line);
       if (msg.type === "get_state") {
+        if (MODE === "silent") continue; // half-dead: swallow the poll, never respond
         say({ type: "response", id: msg.id, command: "get_state", success: true, data: { isStreaming: true, queuedMessageCount: 0, sessionId: "fake", messageCount: 1 } });
       } else if (msg.type === "prompt") {
         say({ type: "response", id: msg.id, success: true });
-        say({ type: "agent_start" });
+        if (MODE === "turnstate") {
+          // Churn turns on our own (no new prompt): start, then end->start->end. The mid re-entry
+          // (turn_end -> turn_start) exercises F7's stamp-clear; we settle on turn_end (status idle,
+          // turnEndedAt SET) while get_state keeps reporting isStreaming:true — so the bridge's
+          // status()/state() path flips status->running with the end stamp still set. That "running +
+          // endedAt" contradiction is exactly what F8 (status-aware lastTurnOf) must suppress.
+          say({ type: "turn_start" });
+          setTimeout(() => { say({ type: "turn_end" }); say({ type: "turn_start" }); say({ type: "turn_end" }); }, 120);
+        } else {
+          say({ type: "agent_start" });
+        }
       } else if (msg.id) {
         say({ type: "response", id: msg.id, success: true, data: {} });
       }
@@ -29,9 +46,11 @@ process.stdin.on("error", () => {});
 
 say({ type: "ready" });
 
-setTimeout(() => {
-  process.stderr.write("[fake-omp] destroying my stdin now, staying alive\n");
-  process.stdin.destroy();
-}, 3000);
+if (MODE === "pipebreak") {
+  setTimeout(() => {
+    process.stderr.write("[fake-omp] destroying my stdin now, staying alive\n");
+    process.stdin.destroy();
+  }, 3000);
+}
 
 setTimeout(() => process.exit(0), 60000);
