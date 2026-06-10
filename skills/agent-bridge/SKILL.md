@@ -111,16 +111,17 @@ close_session(session_id)                  →  用完必须关
 - **OMP**：`agent: "omp"`，启动 `omp --mode rpc`（JSONL RPC 长驻）。可经 `--model` 触达多种模型。
 - **Codex**：`agent: "codex"`，启动 `codex app-server`（JSON-RPC，逐 token 流式）。读写权限由 `write` 控制，均非交互。
 - **模型是会话级参数**：在 `open_session` 用 `model` 指定，整个会话固定；`send_message` 不能逐条切模型，换模型就新开 session。`model` 原样传后端 `--model`。
+- ⚠️ **`model` 必须用 `provider/模型名` 全限定形式**（如 `deepseek/deepseek-v4-pro`、`minimax-code-cn/MiniMax-M3`），**不要传裸别名**（如 `deepseek-v4-pro`、`minimax-m3`）——裸名可能被路由到非预期的 provider，拿到的不是你要的模型。全限定 ID 以 `omp --list-models <关键字>` 的输出为准。
 - **`effort`（可选，推理强度）**：OMP 映射为 `--thinking`（`minimal|low|medium|high|xhigh`）；Codex 作为该轮 effort（`none|minimal|low|medium|high|xhigh`，其中 `none`/`minimal`/`low` 用于简单改动的评审，实施任务不建议）。不传则用后端默认。
 
 `open_session` 必传 `agent` + `cwd`；`write` / `model` / `effort` 按需（默认分工见下节「角色默认」）。
 
-**模型以活查为准**：`omp --list-models <关键字>` 查可用模型及各自支持的 thinking 上限。**不同模型最高 thinking 级别不同**，传它不支持的级别会被忽略或报错。下表只是常用举例：
+**模型以活查为准**：`omp --list-models <关键字>` 查可用模型（输出即全限定 `provider/模型名`，直接拿来当 `model`）及各自支持的 thinking 上限。**不同模型最高 thinking 级别不同**，传它不支持的级别会被忽略或报错。下表 `model` 列即应传的全限定值，只是常用举例：
 
-| `model` | 说明 | `effort` 上限 |
+| `model`（全限定，直接传这个） | 说明 | `effort` 上限 |
 |---|---|---|
-| `minimax-m3` | MiniMax 3.0（`minimax-code-cn/MiniMax-M3`） | `high`（无 `xhigh`） |
-| `deepseek-v4-pro` | DeepSeek v4 pro（`deepseek/deepseek-v4-pro`） | `xhigh`（即「max 思考」） |
+| `minimax-code-cn/MiniMax-M3` | MiniMax 3.0 | `high`（无 `xhigh`） |
+| `deepseek/deepseek-v4-pro` | DeepSeek v4 pro | `xhigh`（即「max 思考」） |
 
 > 提醒：MiniMax-M3 中止长生成后容易「接着干旧任务」（观察于早期版本的模型行为，非桥的问题，若已更新以实际为准）；需要稳定中止/复核时优先 `deepseek-v4-pro`。
 
@@ -130,7 +131,7 @@ close_session(session_id)                  →  用完必须关
 
 **默认角色：**
 
-- **实施**：`agent:"omp"` + `model:"deepseek-v4-pro"` + `effort:"xhigh"` + `write:true`。
+- **实施**：`agent:"omp"` + `model:"deepseek/deepseek-v4-pro"` + `effort:"xhigh"` + `write:true`（`model` 用全限定 `provider/名`，见上节警告）。
 - **评审 / 第二意见**：`agent:"codex"` + `write:false`。
 
 **先探后派（doctor → list-models）：**
