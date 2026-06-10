@@ -25,7 +25,7 @@ node scripts/agent-bridge.mjs doctor
 Pick one method, then **restart the client** so the tools (and skill) load:
 
 - **Claude Code — one-shot (recommended):** method **B** installs the MCP server **and** the skill together in a single step (`claude plugin install`, or `/plugin install` in-app). You do **not** install the two separately.
-- **Codex, or tools-only:** method **A** (`claude mcp add` / `codex mcp add`) registers just the MCP server (the eight `agent_bridge_*` tools). Codex has no plugin one-click for this repo's layout, so Codex uses A.
+- **Codex, or tools-only:** method **A** (`claude mcp add` / `codex mcp add`) registers just the MCP server (the eight `agent_bridge_*` tools). Codex has no Claude-Code plugin one-click, so Codex uses **A** for tools and **C** to also load the skill.
 
 ```sh
 git clone https://github.com/LeoWang329/agent-bridge.git
@@ -53,6 +53,42 @@ claude plugin install agent-bridge@agent-bridge
 
 The repo self-hosts a Claude Code marketplace, so this **one install registers the MCP server _and_ the skill** — there is no separate skill step. Equivalent inside Claude Code: `/plugin marketplace add LeoWang329/agent-bridge` then `/plugin install agent-bridge@agent-bridge`. Manage it later with `claude plugin` / `/plugin`; for local development against a working copy: `claude --plugin-dir "$PWD"`.
 
+### C. Codex (and other non-plugin MCP clients) — MCP server + skill
+
+Only Claude Code consumes method B's plugin bundle. For **Codex** — or any other MCP host that reads a per-user skills directory — give it the two pieces separately: the **MCP server** (the eight tools) via method A, and the **skill** (the usage guide that teaches the agent when and how to delegate) by linking it into the client's skills directory. Both pieces point straight at this clone, so there is no copied snapshot to go stale.
+
+`<REPO>` below is the absolute path to this clone (the directory holding `scripts/` and `skills/`).
+
+1. **MCP server (tools)** — same as method A:
+
+   ```sh
+   codex mcp add agent-bridge -- node "<REPO>/scripts/agent-bridge.mjs" mcp
+   ```
+
+2. **Skill (usage guide)** — link `skills/agent-bridge` into Codex's skills directory (`~/.codex/skills/`). Codex auto-loads any `~/.codex/skills/<name>/SKILL.md` on launch, exactly like Claude Code loads `~/.claude/skills/`. Use a symlink/junction (not a copy) so it tracks the repo:
+
+   ```sh
+   # macOS / Linux
+   ln -s "<REPO>/skills/agent-bridge" ~/.codex/skills/agent-bridge
+
+   # Windows (PowerShell or cmd) — junction, no admin needed
+   cmd /c mklink /J "%USERPROFILE%\.codex\skills\agent-bridge" "<REPO>\skills\agent-bridge"
+   ```
+
+   The same one-liner works for any client with a user skills directory — swap `~/.codex` for `~/.claude` to load the skill in Claude Code without the plugin, etc.
+
+3. **Restart Codex.** Verify: `codex mcp list` shows `agent-bridge` connected, and the `agent-bridge` skill appears in the session's skill list.
+
+#### Updating
+
+Because both the MCP server (registered as a path to `scripts/agent-bridge.mjs`) and the skill (a symlink/junction into `skills/`) reference this clone in place, **a single `git pull` updates both** — there is nothing to reinstall:
+
+```sh
+cd <REPO> && git pull
+```
+
+Then **restart the client** so it reloads the running MCP server (the skill is re-read on the next launch either way). The symlink/junction needs recreating only if you move or rename the clone.
+
 ### Configuring this for an AI agent
 
 If a user asks an AI agent (Claude Code, Codex, …) to set Agent Bridge up, follow this exactly. Use **absolute paths** — the agent's shell is usually not at the repo root, so `$PWD` is unreliable. Below, `<MJS>` = the absolute path to `scripts/agent-bridge.mjs` in the cloned repo.
@@ -66,12 +102,13 @@ If a user asks an AI agent (Claude Code, Codex, …) to set Agent Bridge up, fol
      claude plugin install agent-bridge@agent-bridge
      ```
      MCP-only alternative (no skill): `claude mcp add agent-bridge --scope user -- node "<MJS>" mcp`
-   - **Codex** (MCP server only). There is **no plugin install for this repo on Codex — do NOT run `codex plugin add`**, it will not find this plugin. Use:
+   - **Codex** (MCP server + skill, two steps — there is **no Claude-Code-style plugin for this repo on Codex, so do NOT run `codex plugin add`**). Register the tools, then link the skill into `~/.codex/skills/` (see method **C** for the per-OS link command):
      ```sh
      codex mcp add agent-bridge -- node "<MJS>" mcp
+     ln -s "<REPO>/skills/agent-bridge" ~/.codex/skills/agent-bridge   # macOS/Linux; Windows: cmd /c mklink /J
      ```
 4. **Restart the client** — the tools (and skill) only load after a restart. Tell the user to do this.
-5. **Verify:** run `node "<MJS>" doctor` (each backend you'll use must print `ok`); then `claude mcp list` / `codex mcp list` should show `agent-bridge` connected.
+5. **Verify:** run `node "<MJS>" doctor` (each backend you'll use must print `ok`); then `claude mcp list` / `codex mcp list` should show `agent-bridge` connected. To update later, `git pull` in the clone (method **C** → Updating) — both tools and skill track it in place.
 
 > In Claude Code the tools are namespaced, e.g. `mcp__agent-bridge__agent_bridge_open_session`.
 
