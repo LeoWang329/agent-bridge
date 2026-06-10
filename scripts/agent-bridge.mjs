@@ -8,9 +8,15 @@ import readline from "node:readline";
 
 const IS_WINDOWS = process.platform === "win32";
 
-const BRIDGE_VERSION = "0.8.0";
+const BRIDGE_VERSION = "0.8.1";
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const DEFAULT_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
+// Bound for a single OMP RPC round-trip. Every OMP command is an immediate ack (prompt is
+// acked up front; long work is observed by waitIdle/wait POLLING get_state), so a response
+// missing for this long means the backend is wedged or the pipe is half-broken — reject
+// instead of letting wait/status/result block forever on a promise nothing will settle.
+// (Codex needs no equivalent: every codex #request call site is already withTimeout-bounded.)
+const OMP_RPC_TIMEOUT_MS = Number(process.env.AGENT_BRIDGE_OMP_RPC_TIMEOUT_MS ?? 10_000);
 // Start-time tolerance for the cleanup PID-reuse guard's FALLBACK path (used when the definitive env
 // marker can't be read — Windows, or a pre-0.8.0 child). A genuine child's OS creation time is at or
 // before the instant we recorded its pid record; this skew only absorbs measurement jitter between the
@@ -796,6 +802,19 @@ function reclaimStaleLogs() {
       ownerPid = Number(fs.readFileSync(path.join(dir, "owner"), "utf8").trim()) || null;
     } catch {}
     if (ownerPid && ownerStillRunning({ ownerPid })) continue; // a live MCP still owns it
+    // A run dir deliberately kept by cleanupAndExit on a crash (shutdown code !== 0) is a
+    // post-mortem scene — don't let a sibling's sweep destroy the evidence. It still ages out
+    // via this same sweep once older than LOG_RETENTION_DAYS.
+    try {
+      const bridgeLog = fs.readFileSync(path.join(dir, "bridge.log"), "utf8");
+      if (/shutdown code=(?!0\b)\d+/.test(bridgeLog)) {
+        let crashMtimeMs = 0;
+        try {
+          crashMtimeMs = fs.statSync(dir).mtimeMs;
+        } catch {}
+        if (Date.now() - crashMtimeMs < LOG_RETENTION_DAYS * 86_400_000) continue;
+      }
+    } catch {}
     if (!ownerPid) {
       // No owner tag — could be a server still starting up. Only reclaim once it's clearly old.
       let mtimeMs = 0;
@@ -941,6 +960,11 @@ class OmpRpcSession {
     this.answerFile = path.join(RUN_LOG_DIR, `${this.id}.answer.txt`);
     this.pidFile = pidRecordPath(this.id);
     this.proc = null;
+    // Set once the backend can no longer answer (process error/close, stdin error, close()).
+    // request() checks it to fail fast instead of registering a pending that nothing will
+    // ever settle — the shape that wedged agent_bridge_wait forever (see
+    // docs/INVESTIGATION-mcp-disconnect-2026-06-10.md).
+    this.dead = false;
     this.readyPromise = null;
     this.readyResolve = null;
     this.readyReject = null;
@@ -977,6 +1001,21 @@ class OmpRpcSession {
     this.#writePidRecord(args);
 
     this.proc.stdin.on("close", () => appendLog(this.logFile, "[agent-bridge] OMP stdin closed\n"));
+    this.proc.stdin.on("error", err => {
+      appendLog(this.logFile, `[agent-bridge] OMP stdin error: ${err.message}\n`);
+      this.lastError = err.message;
+      // A broken stdin means no RPC can be answered; fail outstanding work instead of letting
+      // pending requests wait forever (parity with the codex stdin handler). Skip during a
+      // deliberate close() (status already "closed"), where end() can naturally emit EPIPE.
+      if (this.status !== "closed") {
+        this.dead = true;
+        if (this.turnStartedAt && !this.turnEndedAt) this.turnEndedAt = nowIso();
+        setSessionStatus(this, "failed", false, { source: "stdin_error", error: err.message });
+        this.readyReject?.(err);
+        for (const pending of this.pending.values()) pending.reject(err);
+        this.pending.clear();
+      }
+    });
     this.proc.stdout.on("close", () => appendLog(this.logFile, "[agent-bridge] OMP stdout closed\n"));
     this.proc.stderr.on("close", () => appendLog(this.logFile, "[agent-bridge] OMP stderr closed\n"));
 
@@ -990,6 +1029,7 @@ class OmpRpcSession {
     rl.on("line", line => this.#handleLine(line));
 
     this.proc.on("error", err => {
+      this.dead = true;
       this.lastError = err.message;
       if (this.turnStartedAt && !this.turnEndedAt) this.turnEndedAt = nowIso();
       setSessionStatus(this, "failed", false, { source: "process_error", error: err.message });
@@ -999,6 +1039,7 @@ class OmpRpcSession {
     });
 
     this.proc.on("close", (code, signal) => {
+      this.dead = true;
       appendLog(this.logFile, `[agent-bridge] OMP RPC exited code=${code} signal=${signal || ""}\n`);
       removePidRecord(this.pidFile);
       if (this.status === "closed") {
@@ -1112,12 +1153,31 @@ class OmpRpcSession {
   }
 
   request(type, extra = {}) {
+    // Fail fast instead of writing into a dead pipe: once the close/error handlers have run
+    // and cleared `pending`, a request registered here would never be settled by anyone —
+    // wait/status/result would hang forever on it.
+    if (this.dead || !this.proc || this.proc.exitCode !== null || !this.proc.stdin || this.proc.stdin.destroyed || !this.proc.stdin.writable) {
+      return Promise.reject(new Error(`OMP process for ${this.id} is not running.`));
+    }
     const id = `req_${++this.requestCounter}`;
     const payload = { id, type, ...extra };
     const promise = new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
     });
     this.proc.stdin.write(`${JSON.stringify(payload)}\n`);
+    if (OMP_RPC_TIMEOUT_MS > 0) {
+      // Also covers the "backend alive but unresponsive / pipe half-broken" shape, where the
+      // dead/exitCode guards above can't help because the write itself still succeeds.
+      const timer = setTimeout(() => {
+        const pending = this.pending.get(id);
+        if (pending) {
+          this.pending.delete(id);
+          pending.reject(new Error(`OMP RPC ${type} got no response in ${OMP_RPC_TIMEOUT_MS}ms for ${this.id}.`));
+        }
+      }, OMP_RPC_TIMEOUT_MS);
+      timer.unref?.();
+      return promise.finally(() => clearTimeout(timer));
+    }
     return promise;
   }
 
@@ -1256,6 +1316,7 @@ class OmpRpcSession {
   }
 
   close(options = {}) {
+    this.dead = true;
     if (this.turnStartedAt && !this.turnEndedAt) this.turnEndedAt = nowIso();
     setSessionStatus(this, "closed", false, { source: "close" });
     // Reject any in-flight RPCs (send/state/result waiters) now: once status is "closed"
@@ -1268,11 +1329,14 @@ class OmpRpcSession {
       this.proc?.stdin?.end();
     } catch {}
     const pid = this.proc?.pid;
-    terminateProcessTree(pid);
-    // Backstop SIGKILL only if OUR child is still running. Node sets exitCode/signalCode the moment it
-    // exits, so if it already died (and its pid was possibly recycled) the verify fails and we skip —
-    // never SIGKILL a stranger that reused the pid during the grace window.
-    scheduleForceKill(pid, 3000, () => this.proc != null && this.proc.exitCode === null && this.proc.signalCode === null);
+    // Both shots only while OUR child handle says it's still running. Node sets exitCode/signalCode
+    // the moment it exits, so if it already died (and its pid was possibly recycled) we skip —
+    // never terminate a stranger that reused the pid. Previously only the SIGKILL backstop
+    // verified this; the first SIGTERM shot fired unconditionally.
+    if (this.proc && this.proc.exitCode === null && this.proc.signalCode === null) {
+      terminateProcessTree(pid);
+      scheduleForceKill(pid, 3000, () => this.proc != null && this.proc.exitCode === null && this.proc.signalCode === null);
+    }
     if (options.removePidRecord !== false) removePidRecord(this.pidFile);
     try {
       fs.rmSync(this.answerFile, { force: true });
@@ -1469,8 +1533,13 @@ class CodexAppServerSession {
     if (msg.method !== "item/agentMessage/delta") appendLog(this.logFile, `${JSON.stringify(stripThinking(msg))}\n`);
     this.updatedAt = nowIso();
     if (msg.id !== undefined && msg.method) {
-      // Server-initiated request: we do not implement any, so reject.
-      this.#write({ id: msg.id, error: { code: -32601, message: "unsupported server request" } });
+      // Server-initiated request: we do not implement any, so reject. #write throws if stdin
+      // died mid-line; don't let that escape the readline handler as an uncaughtException.
+      try {
+        this.#write({ id: msg.id, error: { code: -32601, message: "unsupported server request" } });
+      } catch (err) {
+        appendLog(this.logFile, `[agent-bridge] codex reject-write failed: ${err.message}\n`);
+      }
       return;
     }
     if (msg.id !== undefined) {
@@ -1769,10 +1838,12 @@ class CodexAppServerSession {
     // so nothing is left pending; the proc "close" handler early-returns once closed.
     this.#rejectAll(new Error("session closed"));
     const pid = this.proc?.pid;
-    terminateProcessTree(pid);
-    // Backstop SIGKILL only if OUR child is still running (see OmpRpcSession.close): guards against
-    // SIGKILLing a stranger that reused the pid after our child exited within the grace window.
-    scheduleForceKill(pid, 3000, () => this.proc != null && this.proc.exitCode === null && this.proc.signalCode === null);
+    // Both shots only while OUR child handle says it's still running (see OmpRpcSession.close):
+    // a long-dead child's pid may have been recycled to a stranger — never shoot at it.
+    if (this.proc && this.proc.exitCode === null && this.proc.signalCode === null) {
+      terminateProcessTree(pid);
+      scheduleForceKill(pid, 3000, () => this.proc != null && this.proc.exitCode === null && this.proc.signalCode === null);
+    }
     if (options.removePidRecord !== false) removePidRecord(this.pidFile);
     try {
       fs.rmSync(this.answerFile, { force: true });
@@ -2232,6 +2303,13 @@ function serveMcp() {
   rl.on("close", () => {
     inputClosed = true;
     maybeExit();
+    // stdin EOF means the client is gone — nobody will ever read another response. Don't let
+    // a wedged request (e.g. a wait on a dying backend) pin a zombie server forever; give
+    // in-flight work a short grace, then exit anyway. unref so a natural drain still wins.
+    if (activeRequests > 0) {
+      const grace = setTimeout(() => cleanupAndExit(0, "stdin closed (grace expired with active requests)"), 5000);
+      grace.unref?.();
+    }
   });
 }
 
