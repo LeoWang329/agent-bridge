@@ -10,7 +10,7 @@
       "name": "agent-bridge",
       "source": "./",
       "description": "Open persistent OMP/Codex sessions, stream their output, and delegate review or implementation to a second local coding agent.",
-      "version": "0.8.0",
+      "version": "0.8.1",
       "author": {
         "name": "LeoWang329"
       },

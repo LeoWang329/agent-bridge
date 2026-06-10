@@ -216,3 +216,28 @@
 **版本与兼容性**:全部为**加性变更**(注入 env、`close_session` 省略 id、`wait` 新增 `pendingSnapshots`/`tail_chars`、错误信息增强、pid 记录加 `spawnedAt`),既有出参 key 不删不改名 → 既有调用零破坏,标 **0.7.0 → 0.8.0**(minor)。
 
 **实测(Windows,JSON-RPC 驱动新 server 子进程的 e2e harness)**:**15/15 PASS**——版本 0.8.0;`close_session` schema 不强制 `session_id`、`wait` 含 `tail_chars`;空串/`null`/非对象 `arguments` 均被拒(不误触发全关);非法 model 报错带 model 名;`pendingSnapshots` 结构正确含实时 `tail`/`charCount`/`lastEvent`;批量 close 返回 `closedAll`+正确 `count`+空 `failed`,关后 `status` 为空;pid 记录含 `spawnedAt`;`cleanup` 摘要含新计数器且不崩。另以真实进程验证 N2 时间比对方向(真子进程 OS 创建时间早于记录时刻→confirmed;1h 旧记录→判 reuse 不杀)。
+
+---
+
+## v0.8.1 · MCP「看似断连」+ 僵尸 server 堆积 的根因修复(2026-06-10)
+
+用户报"启动多个 Claude Code 时,只有最新的 agent-bridge MCP 能用,启动别的客户端就把当前的弄断了"。第一性原理排查(代码审计 + 受控复现,不打补丁),定位到**两个互相叠加、各自独立的根因**——完整调查见 [docs/INVESTIGATION-mcp-disconnect-2026-06-10.md](INVESTIGATION-mcp-disconnect-2026-06-10.md),复现脚本随仓库提交于 [docs/repro-mcp-hang/](repro-mcp-hang/)。
+
+**根因 1(外部一次性,非本程序 bug):** 那次 `Connection closed @ 12:01:10` 是用户当时安装 `node-v24.16.0-x64.msi`,MSI 的 Restart Manager 在 12:01:06–12:01:10 关停了所有 `node.exe`(Windows 事件日志逐秒吻合)——每个 agent-bridge server 都是 node 进程,被一锅端;CC +7s 自动重连重试,会话在已死 server 内存里 → `Unknown session`。顺带证伪了旧假设:同会话内 4m52s/5m13s 长 `wait` 均正常完成,CC 对长调用并不在 ~60s 杀。
+
+**根因 2(可复现的 agent-bridge bug):** `wait` 期间后端死亡会让该工具调用**永久挂死**——而非报错返回。用户感知的"MCP 断了、只有新客户端能用",真相是旧客户端的 bridge 挂死(活着但永不响应)。
+
+| 修复 | 根因 | 落地 |
+|---|---|---|
+| **P1 · `request()` fail-fast** | `OmpRpcSession.request()` 无条件往 stdin 写并注册 pending;`proc close` 只清退一次,之后由 `result()/status()/abort()` 再发的请求**永无人 settle** → `wait` 永久挂死。 | 进程死/流不可写/已关闭 → 立即 reject(`dead` 标志在 process error/close、stdin error、`close()` 四处置位);补上 omp 缺失的 stdin `error` 监听(与 codex 对齐,避免 EPIPE 冒泡成 uncaughtException 杀整个 server)。 |
+| **P1b · OMP RPC 超时** | 复现时又抓出一层:后端"活着但不应答"或管道半断(写仍成功)时,死活守卫帮不上,`wait` 卡死在 `await state()`,连自己的 `timeout_ms` 都到不了。 | 每条 omp RPC 加 `OMP_RPC_TIMEOUT_MS`(默认 10s,env 可调)超时并删 pending。安全前提:omp 命令全是即时 ack,长任务靠轮询观察。codex 各调用点已全有 `withTimeout`,无需改。 |
+| **P2 · 退出门加宽限** | `maybeExit` 要求 `activeRequests===0`;挂死请求让它永不为 0 → 客户端退出、stdin EOF 后 server **仍无法退出** → 僵尸 server + 孤儿后端堆积(复现了 7 进程并存)。 | stdin EOF 后给在途请求 5s 宽限,到点即 `cleanupAndExit(0)`。`unref` 让自然 drain 仍优先。 |
+| **P3 · 保护 crash 现场** | `cleanupAndExit` 在 `code!==0` 时刻意保留 run 目录供尸检,但任何后启 server 的 `reclaimStaleLogs` 会无条件删掉 dead-owner 目录 → 现场一轮即毁(这次 12:01 受害者就没留下痕迹,只能翻 Windows 事件日志)。 | `reclaimStaleLogs` 跳过 `bridge.log` 含 `shutdown code=非0` 且未超 `LOG_RETENTION_DAYS` 的 crash 目录;到期仍由同一轮正常老化清理。 |
+| **P4 · close() 先验明正身** | `close()` 的第一枪 `terminateProcessTree(pid)` 无身份校验,仅 SIGKILL backstop 验;long-dead 后端 pid 被复用时首枪可能误伤陌生进程。 | 首枪同 backstop 一样先校验"我们的子进程句柄仍在运行"再开;codex `#handleLine` 的裸 reject-write 包 try/catch。 |
+
+**版本与兼容性**:纯**内部健壮性修复**,不增删/改任何 MCP 工具的入参/出参形状,既有调用零破坏 → 标 **0.8.0 → 0.8.1**(patch)。新增可选 env 旋钮 `AGENT_BRIDGE_OMP_RPC_TIMEOUT_MS`(默认 10000)。
+
+**实测(Windows,随仓库提交的 `docs/repro-mcp-hang/` harness;`fake-omp` 不发 prompt,零模型消耗)**:
+- `repro-kill`:`wait` 期间 SIGKILL 后端 ×3 → 修前每次永久挂死;修后 3/3 即时返回 `status:"failed"`,且 harness 关 stdin 后 server ≤5s 干净退出(P2 自检通过)。
+- `repro-pipebreak`:后端保活但断开 stdin 读端 → 修前永久挂死;修后 `wait` 按 `timeout_ms` 准时返回 `timedOut`+`pendingSnapshots`。
+- e2e 回归:真实 omp `open→status→close_session` → 活后端被正常击杀(P4 未误伤正常路径),server 干净退出,`cleanup` 无残留可收。
