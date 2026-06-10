@@ -1009,12 +1009,18 @@ class OmpRpcSession {
     // stream deltas / a live isStreaming reading); waitIdle won't accept the idle
     // window that exists *before* a freshly-sent prompt starts.
     this.turnStarted = false;
-    // True once a prompt has ever been ATTEMPTED on this session — set synchronously at send()
-    // entry, before any await, so a wait() polling concurrently with the first send can never
-    // observe "no prompt yet" mid-flight. sessionSettled uses it: a never-prompted session has no
-    // turn to wait for and must settle immediately (codex parity), while the turnStarted gate
-    // still protects the pre-stream idle window of a real in-flight send.
-    this.everPrompted = false;
+    // True while a send/turn is in progress and NOT yet terminated — the single signal
+    // sessionSettled uses to decide "is there still something to wait for". Set synchronously at
+    // send() entry (before any await, so a concurrent wait poll can't observe a mid-flight send as
+    // settled, and it covers BOTH the first prompt and a re-prompt's pre-ack window); cleared at
+    // every terminal-for-this-turn transition (turn_end/agent_end, abort, a rejected prompt). This
+    // replaces the older turnStarted-gate / everPrompted proxy: turnStarted needed agent_start to be
+    // observed (so a never-prompted session dead-waited), and everPrompted latched true forever (so a
+    // rejected prompt or a pre-stream abort dead-waited). A flag that is honestly cleared when the
+    // turn ends settles all three — fresh, completed, and failed/aborted — without ever settling a
+    // genuinely in-flight pre-stream turn (it stays true across that window). Terminal states
+    // (failed/closed) short-circuit sessionSettled before this is read, so they need not clear it.
+    this.turnInFlight = false;
     this.sessionState = null;
     this.currentTurnId = null;
     this.lastTurnId = null;
@@ -1222,6 +1228,7 @@ class OmpRpcSession {
     }
     if (message.type === "agent_end" || message.type === "turn_end") {
       this.turnEndedAt = nowIso();
+      this.turnInFlight = false; // turn finished — the session is now settle-able
       setSessionStatus(this, "idle", false, { source: message.type });
       return;
     }
@@ -1314,7 +1321,11 @@ class OmpRpcSession {
     // Reset before prompting so waitIdle below ignores the pre-streaming idle window
     // (a stale idle reading from before this turn actually starts).
     this.turnStarted = false;
-    this.everPrompted = true;
+    // Arm the in-flight flag synchronously, before the prompt await: a wait() polling this session
+    // now sees an unsettled send even in the sub-ms pre-ack window (and on a re-prompt, before the
+    // old turn's stamps are overwritten). Cleared on completion (turn_end), rejection (catch below),
+    // or abort.
+    this.turnInFlight = true;
     setSessionStatus(this, "running", true, { source: "send" });
     try {
       await this.request("prompt", { message: String(message) });
@@ -1324,6 +1335,9 @@ class OmpRpcSession {
       // handler (or #markUnresponsive) can set dead=true + status=failed while proc.exitCode is briefly
       // still null — without it this catch would flip that real failure back to a misleading "idle".
       if (!this.dead && this.status !== "closed" && this.proc && this.proc.exitCode === null) {
+        // No turn ever started (the prompt was refused), so clear the in-flight flag: the session is
+        // genuinely idle and wait() must settle it instead of dead-waiting on a turn that won't come.
+        this.turnInFlight = false;
         setSessionStatus(this, "idle", false, { source: "prompt_error" });
       }
       throw err;
@@ -1382,6 +1396,7 @@ class OmpRpcSession {
     // Only close the clock if a turn is actually in flight; aborting an idle session must
     // not stretch the previous turn's duration to now.
     if (this.turnStartedAt && !this.turnEndedAt) this.turnEndedAt = nowIso();
+    this.turnInFlight = false; // turn cancelled — settle-able again (covers a pre-stream abort too)
     setSessionStatus(this, "idle", false, { source: "abort" });
     return { aborted: true, sessionId: this.id };
   }
@@ -2142,11 +2157,14 @@ function sessionSettled(session) {
   if (!session) return true;
   if (session.status === "failed" || session.status === "closed") return true;
   if (session instanceof OmpRpcSession) {
-    // turnStarted gates the pre-stream idle window of an in-flight send (see waitIdle). But a
-    // session that has NEVER been prompted (everPrompted false) has no turn to wait on — it must
-    // settle immediately, matching the codex branch below (`!session.turn`), instead of pinning
-    // wait() until its full timeout (default 30 min) on a session that will never "finish".
-    return session.status === "idle" && (session.turnStarted || !session.everPrompted);
+    // Settled = idle AND nothing in flight. turnInFlight is armed synchronously at send() entry and
+    // cleared at every terminal-for-this-turn transition (turn_end/agent_end, abort, rejected
+    // prompt), so this one predicate covers every shape without dead-waiting: a never-prompted
+    // session (flag false → settles, codex parity), a completed turn (cleared at turn_end → settles),
+    // and a failed/aborted send (cleared in the catch/abort → settles) — while a genuinely in-flight
+    // pre-stream turn keeps the flag true across the window where status can read a transient idle,
+    // so it is never settled early. (Mirrors the codex branch's `!session.turn` "no active turn" test.)
+    return session.status === "idle" && !session.turnInFlight;
   }
   return session.status === "idle" && !session.turn;
 }

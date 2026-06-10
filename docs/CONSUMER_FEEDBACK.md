@@ -305,7 +305,7 @@ v0.8.1 的 P2 只在 **stdin EOF** 时回收 server。但 server 可能被孤立
 | 修复 | 根因 / 为什么 | 落地 |
 |---|---|---|
 | **R1 · `wait mode:"any"` 不再丢同 tick settle 的会话**(本轮最重要) | 同一轮 250ms 轮询里 ≥2 个会话已 settle 时,只有 `settledIds[0]` 进 `completed`,而 `pending` 用 `pendingIds()` 把**所有**已 settle 的都排除 → 其余会话既不在 `completed` 也不在 `pending`,按文档"拿 `pending` 循环到空"的协议,**结果被静默丢弃**。最常见触发:并行派活给 A、B,干完别的事才调 `wait`——两个都已完成,B 永远取不到。旁证:同函数的**超时分支**把所有 settled 都返回,两个出口对"多个已完成"处理自相矛盾。 | `mode:"any"` 的 `pending` 改为「`ids` 去掉本次返回的那一个」:同 tick settle 的其余会话**留在 `pending`**,下一轮 `wait` 立即逐个吐出。协议不丢数据。 |
-| **R2 · 未发过 prompt 的 OMP 会话立即 settle(codex 对齐)** | OMP 的 settled 条件 `idle && turnStarted` 里,`turnStarted` 门是防"send 后、流式前"的假 idle 窗口——没错;但 **fresh 会话**它永远 false → `wait` 一个从未派活的 OMP 会话**死等到超时**(默认 30 分钟),而 fresh codex 会话(`!turn`)立即 settle。跨后端不一致,且失败形态是最贵的那种。 | 新增 `everPrompted`(`send()` 入口**同步**置位,先于任何 await,故与首次 send 并发的 `wait` 轮询不可能误读"还没派过活"):`settled = idle && (turnStarted \|\| !everPrompted)`。门的原有保护不受影响。 |
+| **R2 · 未发过 prompt 的 OMP 会话立即 settle(codex 对齐)** | OMP 的 settled 条件 `idle && turnStarted` 里,`turnStarted` 门是防"send 后、流式前"的假 idle 窗口——没错;但 **fresh 会话**它永远 false → `wait` 一个从未派活的 OMP 会话**死等到超时**(默认 30 分钟),而 fresh codex 会话(`!turn`)立即 settle。跨后端不一致,且失败形态是最贵的那种。 | **见下"评审收口"——根治为 `turnInFlight` 标志**(初版用 `everPrompted` 仅修了 fresh 一种)。 |
 | **R3 · 日志轮转 rename 成功才清零计数器** | `renameSync` 失败被吞但 `written=0` 照常执行 → 内存计数与真实文件大小脱钩,之后每**再涨满一个 cap** 才重试一次 rename;而 `pruneLogs` 的单文件上限对**活跃会话文件豁免**——rename 持续失败(被扫描器/tailer 短暂锁住)的长寿会话日志按 cap 步长无界增长,恰好绕过轮转要防的问题。 | 清零移进 `try` 内、仅 rename 成功后执行;失败则**每次后续 append 都重试**轮转直到成功。 |
 | **R4 · codex `turn/start` 响应与通知同 chunk 的竞态** | 回合簿记(清空累积文本/盖时间戳/采纳 turn id)在 `await` 续延里执行,但注释声称的"先于任何通知 tick"在**同一 stdout flush** 场景不成立:readline 同步连发整个 chunk 的行,microtask 续延要等同步链跑完。后果:① 先到的 deltas 落在**上一轮文本之后**、再被 reset 抹掉;② 极端情况(响应+整个 turn 生命周期同 chunk,如瞬时失败)turn 先 settle,续延见 `this.turn !== myTurn` 误走 "abort 介入"分支——给**已完成**的 turn 发 interrupt 并误报 `accepted:false`。 | 抽出**幂等** `#beginTurn()`(按 `turn.begun` 一次性簿记),在 `turn/started` 通知与响应续延**先到者执行**;`#settleTurn` 在 turn 对象上记 `settled:{err,status}`,续延据此区分"已完成"(如实返回 `accepted:true`/结果/原错误)与"被 abort/close 抢走"(维持原 `accepted:false`+interrupt)。失败/超时的 `turn/start` 仍不触发簿记,上一轮的 lastTurn 与结果文本照旧保留。 |
 
@@ -314,3 +314,15 @@ v0.8.1 的 P2 只在 **stdin EOF** 时回收 server。但 server 可能被孤立
 **版本与兼容性**:不增删/改任何 MCP 工具的入参/出参**形状**。R1 是**合同语义修正**:`mode:"any"` 的 `pending` 现在可能包含**已 settle** 的 id(下一轮 wait 立即返回它们;`pendingSnapshots` 如实显示其 `idle`/`failed` 状态)——按文档循环的消费方行为只会变正确,不会变坏 → 标 **0.8.3 → 0.8.4**(patch)。
 
 **实测(Windows,零模型消耗)**:新增 `docs/repro-mcp-hang/repro-waitany.mjs`(fake-omp `turnstate` 模式驱动真 MCP server),**负向对照成立**——修复前同 harness 即 FAIL(`wait#1` 返回 `pending=[]`,B 被丢);修复后 **PASS**:R1 两个同时 settle 的会话经 `completed→pending→completed` 全部取到;R2 fresh 会话 `wait` **46ms** 即返回(修复前吃满超时)。R4 无法确定性构造(需后端把响应与通知打进同一 flush),以代码审查覆盖。既有 7 个 harness 全量回归 **7/7 PASS**(turnstate / halfdead / reclaim / watchdog-disarm / pipebreak / parent-death / kill)。
+
+### 评审收口(codex + deepseek-v4-pro 交叉复评)+ R2 根治
+
+用 Agent Bridge 自身拉起 **codex** 与 **omp/deepseek-v4-pro** 各做一遍独立只读评审(两个不同引擎=真第二意见)。两家**高度收敛**:R1 / R3 / R4 一致判 **PASS、无回归**(R4 的 `#beginTurn` 幂等性与 `myTurn.settled` 在"同 flush 通知先到 / 续延先到 / abort / close / 终态状态竞态"五条流程被逐一走通、判为 watertight;R1 对 `mode:"all"` 与超时分支无影响)。
+
+两家**独立指向同一个边角**(codex 判 MAJOR、deepseek 判 MINOR/B1,均明确"**非本次引入的回归**"):`everPrompted` 表达的是"**尝试过 prompt**",不是"**有在途 turn 可等**"——所以 ① prompt 被后端拒绝(`send()` catch 回 idle 但 `everPrompted` 仍 true),或 ② 首个 prompt ack 后、流式前被 `abort()`,都会留下 `idle + turnStarted=false + everPrompted=true` → `wait` 仍死等到超时。情形 ① 在"**开 N 会话、逐个 send、再 wait 我开的全部 N 个 id**"这一常见编排模式下**可达**(消费方记的是 open 的 id,不是 send 的 ack)。
+
+**根治(不打补丁)**:`everPrompted` 这个"一旦置真永不复位"的代理量本身就是根因。改为 **`turnInFlight`**——`send()` 入口**同步**置真(覆盖首次与复用会话的 pre-ack 窗口),在**每个 turn 终止点**复位:`turn_end`/`agent_end`(完成)、`abort()`(取消)、prompt 被拒的 catch(无 turn)。`sessionSettled(omp) = idle && !turnInFlight`,一个谓词同时正确覆盖 fresh / 完成 / 失败 / abort 四态,且**不依赖观测到 `agent_start`**;真正在途的 pre-stream turn 期间标志恒为真,绝不提前 settle(终态 `failed`/`closed` 在更前面短路,无需复位)。`turnStarted` 仍单独服务 `waitIdle` 的内联等待路径,不动。
+
+**实测**:新增 `docs/repro-mcp-hang/repro-waitfail.mjs`(fake-omp 新增 `rejectprompt` 模式:拒绝每个 prompt、保活 idle)。**负向对照成立**——临时去掉 catch 里的 `turnInFlight=false` 即 FAIL(死等满 6068ms 超时);修复后 **PASS**:被拒会话 `wait` **45ms** 即 settle。全量 **9/9 PASS**(waitfail / waitany / turnstate / halfdead / reclaim / watchdog-disarm / pipebreak / parent-death / kill)。按用户决定**本轮不再追加评审一轮**,以负向对照 + 全量回归 + 两家已收敛的共识收口。
+
+> **schema 文案待办(已知,未计入逻辑缺陷)**:两家都点到 `agent_bridge_wait` 的入参/出参描述仍说 `mode:"any"` 的 `pending`/`pendingSnapshots` 是"still-running ids",与 R1 新语义(可能含同 tick 已 settle 的 id)不一致。属文档措辞,留待后续低成本订正。

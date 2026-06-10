@@ -6,6 +6,9 @@
 //               no responses) — the half-dead backend shape. [repro-halfdead -> P/F4 fast-fail]
 //   turnstate — ack prompt, then emit turn_start -> turn_end -> turn_start (a backend re-entering a
 //               turn on its own) and stay quiet/running. [repro-turnstate -> F7/F8 coherent clock]
+//   rejectprompt — REFUSE the prompt (respond success:false) while staying alive and idle, so no turn
+//               ever starts. send() throws, status returns to idle. [repro-waitfail -> R2/turnInFlight:
+//               a rejected-prompt session must still settle wait(), not dead-wait on a turn that never comes]
 // Launched via fake-omp.cmd (Windows) or fake-omp.sh (POSIX) through OMP_BIN; env is inherited.
 const MODE = process.env.FAKE_OMP_MODE || "pipebreak";
 const say = obj => process.stdout.write(JSON.stringify(obj) + "\n");
@@ -24,6 +27,13 @@ process.stdin.on("data", d => {
         if (MODE === "silent") continue; // half-dead: swallow the poll, never respond
         say({ type: "response", id: msg.id, command: "get_state", success: true, data: { isStreaming: true, queuedMessageCount: 0, sessionId: "fake", messageCount: 1 } });
       } else if (msg.type === "prompt") {
+        if (MODE === "rejectprompt") {
+          // Refuse the prompt; no turn ever starts. The bridge's send() rejects and returns the
+          // session to idle. A correct sessionSettled must then settle wait() (turnInFlight cleared
+          // in send()'s catch), not dead-wait. Pre-turnInFlight (everPrompted) this dead-waited.
+          say({ type: "response", id: msg.id, success: false, error: "fake-omp: prompt refused" });
+          continue;
+        }
         say({ type: "response", id: msg.id, success: true });
         if (MODE === "turnstate") {
           // Churn turns on our own (no new prompt): start, then end->start->end. The mid re-entry
