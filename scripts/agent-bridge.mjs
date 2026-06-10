@@ -1020,10 +1020,12 @@ class OmpRpcSession {
     // ever settle — the shape that wedged agent_bridge_wait forever (see
     // docs/INVESTIGATION-mcp-disconnect-2026-06-10.md).
     this.dead = false;
-    // Consecutive RPC timeouts with no intervening response. Reset to 0 whenever a response lands
-    // (see #handleLine); once it reaches OMP_RPC_TIMEOUT_FAILS the backend is declared unresponsive
-    // (#markUnresponsive) so a half-dead backend fails fast instead of stalling wait to its deadline.
-    this.rpcTimeoutStreak = 0;
+    // Timestamp (ms) of the FIRST RPC timeout in the current no-response streak, or null when the
+    // backend is responsive. Cleared whenever a response lands on time (see #handleLine). Judging the
+    // backend by a silence DURATION — rather than counting individual timeouts — keeps the trigger
+    // immune to concurrent in-flight RPCs all timing out in one quiet window (they share this one start
+    // stamp, so they can't burn the whole threshold at once). See #markUnresponsive.
+    this.unresponsiveSince = null;
     this.readyPromise = null;
     this.readyResolve = null;
     this.readyReject = null;
@@ -1176,10 +1178,10 @@ class OmpRpcSession {
     if (message.type === "response" && message.id && this.pending.has(message.id)) {
       const pending = this.pending.get(message.id);
       this.pending.delete(message.id);
-      // The backend answered on time → it is responsive; clear the timeout streak. (A LATE response,
-      // arriving after request()'s timer already deleted its pending, takes the !has(id) path below
-      // and deliberately does NOT reset the streak — a consistently-late backend stays "wedged".)
-      this.rpcTimeoutStreak = 0;
+      // The backend answered on time → it is responsive; clear the no-response streak. (A LATE response,
+      // arriving after request()'s timer already deleted its pending, takes the !has(id) path below and
+      // deliberately does NOT clear it — a consistently-late backend stays "wedged".)
+      this.unresponsiveSince = null;
       if (message.success === false) pending.reject(new Error(message.error || "OMP RPC command failed."));
       else pending.resolve(message);
       return;
@@ -1190,6 +1192,12 @@ class OmpRpcSession {
   }
 
   #applyEvent(message) {
+    // Once the session is terminal (dead via #markUnresponsive / stdin-error / process death), ignore
+    // any further backend lifecycle events. A dying proc can still have buffered stdout lines, and
+    // letting a late turn_end/turn_start flip status OUT of "failed" would make waitSessions report a
+    // dead backend as cleanly settled. From here status only moves forward to "closed" (close() /
+    // proc.on("close")), never back to running/idle.
+    if (this.dead) return;
     if (message.type === "agent_start" || message.type === "turn_start") {
       this.lastAssistantText = "";
       this.turnStarted = true;
@@ -1240,11 +1248,16 @@ class OmpRpcSession {
         if (pending) {
           this.pending.delete(id);
           pending.reject(new Error(`OMP RPC ${type} got no response in ${OMP_RPC_TIMEOUT_MS}ms for ${this.id}.`));
-          // A half-dead backend (writes succeed, nothing ever comes back) would otherwise keep
-          // timing out one poll at a time until the caller's wait deadline. After N consecutive
-          // timeouts, declare it unresponsive so wait/status fail fast and the zombie is reaped.
-          if (OMP_RPC_TIMEOUT_FAILS > 0 && ++this.rpcTimeoutStreak >= OMP_RPC_TIMEOUT_FAILS) {
-            this.#markUnresponsive();
+          // A half-dead backend (writes succeed, nothing ever comes back) would otherwise keep timing
+          // out one poll at a time until the caller's wait deadline. Track how long we've gone with NO
+          // response at all; once that silence exceeds (FAILS-1) timeout windows, declare it
+          // unresponsive so wait/status fail fast and the zombie is reaped. Duration-based ⇒ several
+          // concurrent RPCs timing out in one window can't trip it early (they share unresponsiveSince).
+          if (OMP_RPC_TIMEOUT_FAILS > 0) {
+            if (this.unresponsiveSince === null) this.unresponsiveSince = Date.now();
+            if (Date.now() - this.unresponsiveSince >= OMP_RPC_TIMEOUT_MS * (OMP_RPC_TIMEOUT_FAILS - 1)) {
+              this.#markUnresponsive();
+            }
           }
         }
       }, OMP_RPC_TIMEOUT_MS);
@@ -1254,15 +1267,16 @@ class OmpRpcSession {
     return promise;
   }
 
-  // Backend is alive (or its pipe still accepts writes) but has stopped answering: OMP_RPC_TIMEOUT_FAILS
-  // RPCs timed out back-to-back with no response between them. Treat it like a process death — mark
-  // dead+failed, reject everything in flight, and reap the wedged child — so wait/status/result return
-  // a clear failure now instead of grinding 10s timeouts until the caller's deadline, and we don't leak
-  // an unresponsive backend for the rest of the server's life. Idempotent; a no-op once dead/closed.
+  // Backend is alive (or its pipe still accepts writes) but has stopped answering: RPCs kept timing out
+  // with no response for ~(FAILS-1) timeout windows. Treat it like a process death — mark dead+failed,
+  // reject everything in flight, and reap the wedged child — so wait/status/result return a clear
+  // failure now instead of grinding 10s timeouts until the caller's deadline, and we don't leak an
+  // unresponsive backend for the rest of the server's life. Idempotent; a no-op once dead/closed.
   #markUnresponsive() {
     if (this.dead || this.status === "closed") return;
     this.dead = true;
-    this.lastError = `OMP backend ${this.id} unresponsive: ${OMP_RPC_TIMEOUT_FAILS} consecutive RPC timeouts.`;
+    const silentMs = this.unresponsiveSince ? Date.now() - this.unresponsiveSince : OMP_RPC_TIMEOUT_MS;
+    this.lastError = `OMP backend ${this.id} unresponsive: RPC timeouts with no response for ~${silentMs}ms.`;
     appendLog(this.logFile, `[agent-bridge] ${this.lastError} — marking failed and reaping.\n`);
     if (this.turnStartedAt && !this.turnEndedAt) this.turnEndedAt = nowIso();
     setSessionStatus(this, "failed", false, { source: "rpc_timeout" });
@@ -1278,6 +1292,12 @@ class OmpRpcSession {
   async send(message, options = {}) {
     if (!message || !String(message).trim()) throw new Error("message is required.");
     if (this.status === "closed") throw new Error(`OMP session ${this.id} is closed.`);
+    // Reject a terminal session BEFORE the status flip below. #markUnresponsive / a stdin/process error
+    // can set dead=true + status="failed" while proc.exitCode is still null (the close event hasn't
+    // fired yet); without this, send() would pass the exitCode guard, flip "failed"→"running", then
+    // request() rejects on its own dead-check — leaving the session stuck at a bogus "running" (F3's
+    // catch correctly refuses to touch a dead session, so nothing would restore it). Fail fast instead.
+    if (this.dead || this.status === "failed") throw new Error(`OMP session ${this.id} has failed; open a new session.`);
     if (!this.proc || this.proc.exitCode !== null) throw new Error(`OMP process for ${this.id} is not running.`);
     // Reset before prompting so waitIdle below ignores the pre-streaming idle window
     // (a stale idle reading from before this turn actually starts).

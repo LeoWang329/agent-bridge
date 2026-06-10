@@ -283,3 +283,15 @@ v0.8.1 的 P2 只在 **stdin EOF** 时回收 server。但 server 可能被孤立
 - `repro-reclaim`(F1):合成 state 目录跑真 `cleanup` CLI——目录 mtime 旧、`bridge.log` mtime 新的 crash 现场**被保留**;目录与 log 双旧的 crash 现场、以及 `code=0` 的旧目录**被回收**(证明扫除确实在跑)。
 - `repro-watchdog-disarm`(F2):看门狗指向一个**启动时已死**的 pid → server 4s 内**不自退**(看门狗已解除武装),随后 stdin-EOF 仍 `code=0` 干净退出。
 - `repro-parent-death` / `repro-pipebreak` 回归:均不受影响、PASS。F5 单独验证:传 `AGENT_BRIDGE_OMP_RPC_TIMEOUT_MS=abc` 启动即打印回退警告、不静默失效。
+
+**第二轮交叉审核(codex + deepseek-v4-pro 复评上面这版,两家高度一致)——再修三处:**
+
+| 修复 | 根因 / 为什么(两家都点到) | 落地 |
+|---|---|---|
+| **C1 · `#applyEvent` 加 `dead` 守卫**(deepseek 判 **BLOCKER**) | `#markUnresponsive`(F4)/stdin-error 置 `failed` 后,**正在死的后端 stdout 仍可能有缓冲行**;`#applyEvent` 无条件处理 → 迟到的 `turn_end`/`turn_start` 把 status 从 `failed` 翻回 `idle`/`running`,`waitSessions` 据此把**已死后端报成正常 settled**。 | `#applyEvent` 首行 `if (this.dead) return;`:终态后一律忽略后端生命周期事件,status 只能再向前到 `closed`。 |
+| **C2 · `send()` 前置拒绝终态会话** | `send()` 旧前置只查 `proc.exitCode`,不查 `dead`。`#markUnresponsive` 置 `dead+failed` 而 `proc.exitCode` 尚为 `null` 的窗口里,新 `send()` 会把 `failed` 翻成 `running`,随后 `request()` 因 dead 而 reject、F3 的 catch 又(正确地)不碰 dead 会话 → 会话**卡死在假 `running`**。 | 状态翻转前加 `if (this.dead \|\| status==="failed") throw`,直接快失败。 |
+| **C3 · F4 改"静默时长"判定,免疫并发**(codex 判 Major;deepseek 判 minor 可文档化) | 原 F4 按"连续超时**计数**";若 `wait`/`status`/`result` 并发各自在飞,一个静默窗口内多条 RPC 同时超时会把计数一次性吃满,可能误杀**只是慢**的后端。 | 改记**首次超时时刻** `unresponsiveSince`(收到按时响应即清空),超时持续 ≥ `(FAILS-1)×TIMEOUT` 才判死。并发超时共享同一起点,无法提前触发;时长语义比计数更贴合"后端哑了多久"。 |
+
+> **审慎保留/不改(附理由,非遗漏)**:F2 的"包装器启动后才死"窗口(codex Major)——deepseek 复评明确签字 F2 正确,且改成"仅显式 env 才启用看门狗"会**回退**真实插件直拉 `node`(ppid=客户端)这一主用例;此残留已在 v0.8.2/0.8.3 文档据实标注,**不为罕见边角牺牲主路径**。`close()` 把 `failed` 覆为 `closed`(deepseek minor)——会话随即从表中删除、无观测者,且改它会扰动 `proc.on("close")` 对 `status==="closed"` 的早退约定,**零收益不动**。
+
+**第二轮实测**:全部 6 个 harness 重跑 **PASS**(`repro-halfdead` 走新的时长判定路径,~3.0s 判 `failed`)。按两家具体建议**加固两个用例**:`repro-watchdog-disarm` 现用私有 `AGENT_BRIDGE_STATE_DIR` 并**正向断言** `bridge.log` 里出现 `watchdog disarmed`(堵住 PID 复用导致的假 PASS);`repro-reclaim` 增 `retention=0`(永久保留)场景。**C1 的取舍(诚实说明)**:其错误态只存在于 `#markUnresponsive` 杀进程到 `proc.on("close")` 之间的瞬态窗口(close 后 status 本就回到 `failed`),无稳定态可断言,做确定性复现需在桥里加测试钩子、得不偿失——故 C1 以**代码审查 + 两家共识**确认,不强造易碎用例。
