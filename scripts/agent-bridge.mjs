@@ -8,7 +8,7 @@ import readline from "node:readline";
 
 const IS_WINDOWS = process.platform === "win32";
 
-const BRIDGE_VERSION = "0.8.1";
+const BRIDGE_VERSION = "0.8.2";
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const DEFAULT_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 // Bound for a single OMP RPC round-trip. Every OMP command is an immediate ack (prompt is
@@ -32,6 +32,13 @@ const LOG_RETENTION_DAYS = Number(process.env.AGENT_BRIDGE_LOG_RETENTION_DAYS ??
 const LOG_MAX_BYTES = Number(process.env.AGENT_BRIDGE_LOG_MAX_MB ?? 500) * 1024 * 1024;
 const LOG_FILE_MAX_BYTES = Number(process.env.AGENT_BRIDGE_LOG_FILE_MAX_MB ?? 200) * 1024 * 1024;
 const LOG_PRUNE_INTERVAL_MS = Number(process.env.AGENT_BRIDGE_LOG_PRUNE_INTERVAL_MIN ?? 30) * 60_000;
+// Parent-death watchdog interval. An MCP server exists only to serve the client that spawned it;
+// normally a vanished client is seen as stdin EOF. But if the client dies while another process keeps
+// our stdin pipe open (a hung grandparent retaining the handle — the 0.8.0 pid-16024 zombie shape),
+// no EOF ever arrives and we'd run forever. So also poll the spawning parent's liveness and self-exit
+// (reaping our backends) once it's gone. AGENT_BRIDGE_PARENT_PID overrides which pid to watch (a
+// supervisor, or a test); default is process.ppid. Set the interval to 0 to disable.
+const PARENT_WATCHDOG_INTERVAL_MS = Number(process.env.AGENT_BRIDGE_PARENT_WATCHDOG_MS ?? 15_000);
 
 const AGENTS = {
   omp: {
@@ -651,6 +658,21 @@ function roleMatchesCommand(role, command) {
   if (role === "omp-rpc") return /\bomp\b/.test(command) && /--mode\s+rpc|--mode.*\brpc\b/.test(command);
   if (role === "codex-app-server") return /\bcodex\b/.test(command) && /\bapp-server\b/.test(command);
   return false;
+}
+
+// Cheap, non-spawning liveness probe for the parent watchdog. process.kill(pid, 0) sends no signal —
+// it only tests existence. Returns false ONLY when the pid is definitively gone (ESRCH); any other
+// error (EPERM — pid exists but owned by another user/elevated, etc.) is treated as ALIVE, so an
+// ambiguous probe can never make the server self-terminate. Deliberately does NOT verify identity:
+// a recycled pid reads as alive and merely delays exit (same as today), which is the safe direction.
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 1) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err?.code !== "ESRCH";
+  }
 }
 
 function ownerStillRunning(record) {
@@ -2275,6 +2297,23 @@ function serveMcp() {
       } catch {}
     }, LOG_PRUNE_INTERVAL_MS);
     pruneTimer.unref?.();
+  }
+  // Parent-death watchdog (see PARENT_WATCHDOG_INTERVAL_MS). Capture the spawning parent's pid ONCE
+  // at startup — process.ppid here is the client that launched us. Poll it cheaply; when it's gone,
+  // self-exit so we don't outlive our client and leak backends (the stdin-EOF path handles the
+  // common case; this covers "client died but the pipe stayed open"). Require two consecutive "gone"
+  // reads so no single odd probe can reap a live server. unref so the timer never holds us open.
+  const watchPid = Number(process.env.AGENT_BRIDGE_PARENT_PID ?? process.ppid);
+  if (PARENT_WATCHDOG_INTERVAL_MS > 0 && Number.isInteger(watchPid) && watchPid > 1) {
+    let goneStreak = 0;
+    const watchdog = setInterval(() => {
+      if (pidAlive(watchPid)) {
+        goneStreak = 0;
+        return;
+      }
+      if (++goneStreak >= 2) cleanupAndExit(0, `parent ${watchPid} gone`);
+    }, PARENT_WATCHDOG_INTERVAL_MS);
+    watchdog.unref?.();
   }
   const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
   let activeRequests = 0;

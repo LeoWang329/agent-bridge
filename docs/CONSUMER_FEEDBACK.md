@@ -241,3 +241,19 @@
 - `repro-kill`:`wait` 期间 SIGKILL 后端 ×3 → 修前每次永久挂死;修后 3/3 即时返回 `status:"failed"`,且 harness 关 stdin 后 server ≤5s 干净退出(P2 自检通过)。
 - `repro-pipebreak`:后端保活但断开 stdin 读端 → 修前永久挂死;修后 `wait` 按 `timeout_ms` 准时返回 `timedOut`+`pendingSnapshots`。
 - e2e 回归:真实 omp `open→status→close_session` → 活后端被正常击杀(P4 未误伤正常路径),server 干净退出,`cleanup` 无残留可收。
+
+---
+
+## v0.8.2 · 父进程死亡看门狗(孤儿 server 自愈的最后一块)(2026-06-10)
+
+v0.8.1 的 P2 只在 **stdin EOF** 时回收 server。但 server 可能被孤立时 stdin 管道**仍被别的进程占着**——正是那个挂了 2 天的 pid-16024 僵尸的形状:它的父进程是个**挂死(没退出)**的 `pi … models` 命令,一直握着管道,EOF 永不到来 → server 永远跑、还漏掉自己的后端。
+
+| 修复 | 落地 |
+|---|---|
+| **P6 · 父进程死亡看门狗** | 启动时记下父进程 pid(`process.ppid`),用**零 spawn** 的 `process.kill(pid,0)` 廉价探活(`pidAlive`,不碰 Windows 上会冻结事件循环的 `winProcessSnapshot`),连续两拍(`PARENT_WATCHDOG_INTERVAL_MS`,默认 15s)探到父进程消失 → `cleanupAndExit(0)`:关会话、SIGTERM 后端,孤儿**自我回收**而非泄漏。`pidAlive` **失败偏安全**:只有确定性的 `ESRCH` 才算"已死"(EPERM/其它一律当活着),歧义探测绝不误杀活 server。`AGENT_BRIDGE_PARENT_PID` 可覆盖被监视 pid(supervisor/测试钩子)。 |
+
+**范围与边界(诚实说明)**:它治的是**父进程死亡**,不是**父进程挂死**。pid-16024 那种(父进程活着但挂死)仍不自动回收——活着的父进程随时可能恢复,杀它本质上不安全。看门狗补的是更常见的"客户端进程死了、但管道还被别人占着"这条泄漏,与 stdin-EOF 路径互补。假定的 spawn 模型:客户端直接拉起 `node …mjs mcp`(ppid=客户端),这正是 README 里 CC 与 Codex 两种注册方式的形态;若用一个提前退出的 shell 包一层会误触发,故留了覆盖开关。
+
+**版本与兼容性**:纯**加性的内部健壮性**改进(新增 env `AGENT_BRIDGE_PARENT_WATCHDOG_MS` 默认 15000、`AGENT_BRIDGE_PARENT_PID` 覆盖被监视 pid),无工具入参/出参变化、平台中立 → **0.8.1 → 0.8.2**(patch)。
+
+**实测(Windows)**:新增 `docs/repro-mcp-hang/repro-parent-death.mjs` —— **PASS**:harness 全程**不关 server 的 stdin**、只杀一个被 `AGENT_BRIDGE_PARENT_PID` 指向的替身进程,server 仍 `code=0` 自退、后端被回收(证明是看门狗而非 stdin 路径触发)。同时回归 `repro-kill`(3/3 不挂死、P2 自检通过)、`repro-pipebreak`(按时 `timedOut`)均不受看门狗干扰。

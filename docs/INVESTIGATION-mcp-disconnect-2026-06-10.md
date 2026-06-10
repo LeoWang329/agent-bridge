@@ -1,7 +1,7 @@
 # Investigation — "new Claude Code disconnects the current agent-bridge MCP" + server pileup
 
 **Date:** 2026-06-10 (updated same day after controlled reproduction)
-**Status:** **ROOT CAUSES CONFIRMED — FIXES IMPLEMENTED & VERIFIED (v0.8.1, same day).** Two independent causes found — one external one-off, one reproducible agent-bridge bug. P1–P4 below are implemented in `scripts/agent-bridge.mjs`; both repro harnesses and the close-regression check pass (kill: 3/3 waits return `failed` promptly; pipebreak: wait returns `timedOut` on schedule; server exits cleanly after stdin close; `close_session` still terminates a live backend).
+**Status:** **ROOT CAUSES CONFIRMED — FIXES IMPLEMENTED & VERIFIED (v0.8.1; parent-death watchdog P6 added v0.8.2).** Two independent causes found — one external one-off, one reproducible agent-bridge bug. P1–P4 + P6 below are implemented in `scripts/agent-bridge.mjs`; all three repro harnesses and the close-regression check pass (kill: 3/3 waits return `failed` promptly; pipebreak: wait returns `timedOut` on schedule; parent-death: server self-exits with stdin held open and reaps its backend; server exits cleanly after stdin close; `close_session` still terminates a live backend).
 **Reporter symptom:** When launching multiple Claude Code instances, only the newest seems to have a working agent-bridge MCP; starting another client appears to disconnect the current client's agent-bridge MCP.
 
 ---
@@ -103,6 +103,14 @@ if (this.proc && this.proc.exitCode === null && this.proc.signalCode === null) {
 
 Mirror in `CodexAppServerSession.close()` if it has the same shape.
 
+### P6 — parent-death watchdog (added v0.8.2)
+
+P2 reaps a server only when stdin EOFs. But a server can be orphaned with its stdin pipe still **held open** by another process — the exact shape of the 2-day-old pid-16024 zombie, whose parent was a *hung* `pi … models` command retaining the pipe. No EOF ever arrives, so the server runs forever and leaks its backends.
+
+Fix: capture the spawning parent's pid once at startup (`process.ppid`) and poll its liveness on a cheap, **non-spawning** `process.kill(pid, 0)` probe (`pidAlive`, no PowerShell/CIM on the hot path — sidesteps the P5/winProcessSnapshot freeze). When the parent is gone for two consecutive ticks (`PARENT_WATCHDOG_INTERVAL_MS`, default 15s), `cleanupAndExit(0, …)` — which closes sessions and SIGTERMs backends, so the orphan reaps itself instead of leaking. `pidAlive` fails **safe**: only a definitive `ESRCH` counts as gone (EPERM/other → assume alive), so a live server is never reaped by an ambiguous probe. `AGENT_BRIDGE_PARENT_PID` overrides the watched pid (supervisor/test hook).
+
+**Scope/limits (honest):** this catches *parent death*, not *parent hang*. The literal pid-16024 case (parent alive-but-hung) is still not auto-reaped — an alive parent might resume, so reaping it is unsafe by construction. The watchdog closes the much more common "client process died but the pipe lived on" leak, complementing the stdin-EOF path. Spawn model assumed: the client launches `node …mjs mcp` directly (ppid = client), which is how both the CC and Codex registrations in the README work; a shell-wrapper that exits early would trip it, so the override exists.
+
 ### P5 — hygiene (separate, optional)
 
 Dedupe the CC registration (user scope vs repo `.mcp.json`); make `winProcessSnapshot` async/cheaper (existing backlog item).
@@ -110,13 +118,17 @@ Dedupe the CC registration (user scope vs repo `.mcp.json`); make `winProcessSna
 ### Verification (repro harness is committed in `docs/repro-mcp-hang/`)
 
 ```sh
-node docs/repro-mcp-hang/repro-kill.mjs        # backend killed mid-wait
-node docs/repro-mcp-hang/repro-pipebreak.mjs   # backend breaks its stdin pipe while alive (uses fake-omp)
+node docs/repro-mcp-hang/repro-kill.mjs           # backend killed mid-wait  (P1/P1b/P2)
+node docs/repro-mcp-hang/repro-pipebreak.mjs      # backend breaks its stdin pipe while alive (P1b)
+node docs/repro-mcp-hang/repro-parent-death.mjs   # client dies while stdin stays open (P6)
 ```
 
-- **Before fixes:** both print `wait HUNG` (tool call never returns).
-- **After P1:** the wait must return within ~1–2s with the session reported `failed` (and `repro-kill` exercises P2 implicitly: when the harness exits, the server must be gone within ~5s — check with `Get-CimInstance Win32_Process | ? { $_.CommandLine -match 'agent-bridge' }`).
+- **Before fixes:** kill/pipebreak print `wait HUNG` (tool call never returns).
+- **After P1:** the wait returns within ~1–2s with the session reported `failed` (and `repro-kill` exercises P2 implicitly: when the harness exits, the server must be gone within ~5s — check with `Get-CimInstance Win32_Process | ? { $_.CommandLine -match 'agent-bridge' }`).
+- **P6:** `repro-parent-death` keeps the server's stdin open the whole time and kills a separate watched pid; the server must still self-exit `code=0` and its backend must be reaped — proving the watchdog, not the stdin path, did it.
 - Also re-run a normal end-to-end (open → send → wait → close with a real backend) to confirm no regression, then `node scripts/agent-bridge.mjs cleanup` must report nothing to reap.
+
+All three repros + the e2e close-regression PASS as of v0.8.2 (Windows).
 
 ## Evidence index
 
