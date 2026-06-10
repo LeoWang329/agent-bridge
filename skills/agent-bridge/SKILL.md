@@ -132,7 +132,7 @@ close_session(session_id)                  →  用完必须关
 **默认角色：**
 
 - **实施**：`agent:"omp"` + `model:"deepseek/deepseek-v4-pro"` + `effort:"xhigh"` + `write:true`（`model` 用全限定 `provider/名`，见上节警告）。
-- **评审 / 第二意见**：`agent:"codex"` + `write:false`。
+- **评审 / 第二意见**：`agent:"codex"` + `effort:"xhigh"` + `write:false`（codex 的 `effort` 作为该轮 reasoning effort 生效，默认拉满；简单改动的评审可降到 `medium`）。
 
 **先探后派（doctor → list-models）：**
 
