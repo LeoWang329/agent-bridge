@@ -1391,6 +1391,19 @@ class OmpRpcSession {
     return buildSessionResult(this, full, options);
   }
 
+  // Settled = this turn is done and nothing is in flight (see sessionSettled for why BOTH signals
+  // are required — status alone misreads the pre-stream idle window). Backend-private knowledge
+  // (turnInFlight) stays inside the backend class instead of leaking into the shared dispatcher.
+  isSettled() {
+    return this.status === "idle" && !this.turnInFlight;
+  }
+
+  // Pull authoritative live status from the backend. OMP is poll-based, so status()/waitSessions()
+  // call this to refresh via get_state before reading status/settled; Codex overrides it as a no-op.
+  async refreshStatus() {
+    await this.state();
+  }
+
   async abort() {
     await this.request("abort");
     // Only close the clock if a turn is actually in flight; aborting an idle session must
@@ -1954,6 +1967,20 @@ class CodexAppServerSession {
     return buildSessionResult(this, full, options);
   }
 
+  // Settled = idle with no active turn. Mirrors OmpRpcSession.isSettled but keys off Codex's own
+  // turn promise (`this.turn`) instead of OMP's turnInFlight flag — each backend's settled signal
+  // is its own private state machine (see the interface contract above the class definitions).
+  isSettled() {
+    return this.status === "idle" && !this.turn;
+  }
+
+  // Codex is event-driven (the turn promise resolves on turn/completed), so there is no live state to
+  // poll — refreshStatus is a SYNCHRONOUS no-op. Returning nothing (a non-Promise) lets the shared call
+  // sites (status()/waitSessions()) skip the await, preserving the pre-refactor property that a Codex status
+  // snapshot is taken synchronously — before any pipelined follow-up request (e.g. a close on the same
+  // session) can mutate it. OMP's refreshStatus returns a real promise (get_state) and IS awaited.
+  refreshStatus() {}
+
   async abort() {
     const interruptedTurnId = this.currentTurnId;
     if (this.threadId && this.currentTurnId) {
@@ -2127,8 +2154,13 @@ async function status(sessionId) {
     return { sessions: [...sessions.values()].map(session => session.summary()) };
   }
   const session = getSession(sessionId);
-  if (session instanceof OmpRpcSession && session.status !== "closed" && session.status !== "failed") {
-    await session.state().catch(() => null);
+  if (session.status !== "closed" && session.status !== "failed") {
+    // Await only when the backend actually has async state to pull (OMP's get_state returns a Promise).
+    // An event-driven backend (Codex) returns nothing, so we DON'T yield here — keeping this status
+    // snapshot synchronous w.r.t. concurrently-dispatched MCP requests (serveMcp fires handleMcp without
+    // awaiting, so a yield could let a pipelined close/send mutate the session before summary() reads it).
+    const pending = session.refreshStatus();
+    if (pending instanceof Promise) await pending.catch(() => null);
   }
   // Slim projection (type/status/source only), same as result(): the raw events carry full
   // message/usage trees and bloat the caller's context into "a blob". Full raw events stay in
@@ -2156,17 +2188,14 @@ async function result(sessionId, options = {}) {
 function sessionSettled(session) {
   if (!session) return true;
   if (session.status === "failed" || session.status === "closed") return true;
-  if (session instanceof OmpRpcSession) {
-    // Settled = idle AND nothing in flight. turnInFlight is armed synchronously at send() entry and
-    // cleared at every terminal-for-this-turn transition (turn_end/agent_end, abort, rejected
-    // prompt), so this one predicate covers every shape without dead-waiting: a never-prompted
-    // session (flag false → settles, codex parity), a completed turn (cleared at turn_end → settles),
-    // and a failed/aborted send (cleared in the catch/abort → settles) — while a genuinely in-flight
-    // pre-stream turn keeps the flag true across the window where status can read a transient idle,
-    // so it is never settled early. (Mirrors the codex branch's `!session.turn` "no active turn" test.)
-    return session.status === "idle" && !session.turnInFlight;
-  }
-  return session.status === "idle" && !session.turn;
+  // Delegate the backend-specific "this turn is done" test to the session. OMP's isSettled gates on
+  // idle AND turnInFlight (armed synchronously at send() entry, cleared at every terminal-for-this-turn
+  // transition: turn_end/agent_end, abort, rejected prompt), so it covers every shape without
+  // dead-waiting — a never-prompted session (flag false → settles, codex parity), a completed turn
+  // (cleared at turn_end), and a failed/aborted send (cleared in the catch/abort) — while a genuinely
+  // in-flight pre-stream turn keeps the flag true across the window where status reads a transient
+  // idle. Codex's isSettled mirrors this with its own `!turn` "no active turn" test.
+  return session.isSettled();
 }
 
 async function waitSessions(params) {
@@ -2217,10 +2246,15 @@ async function waitSessions(params) {
 
   const started = Date.now();
   for (;;) {
-    // Refresh running OMP sessions via state() (most authoritative); Codex is event-driven.
+    // Refresh still-running sessions before reading settled. OMP polls via get_state (a real async
+    // round-trip → Promise); Codex's refreshStatus is a synchronous no-op (event-driven), so we await
+    // only a Promise — no needless yield for event-driven backends (same snapshot-preservation as status()).
     for (const id of ids) {
       const session = sessions.get(id);
-      if (session instanceof OmpRpcSession && !sessionSettled(session)) await session.state().catch(() => {});
+      if (!sessionSettled(session)) {
+        const pending = session.refreshStatus();
+        if (pending instanceof Promise) await pending.catch(() => {});
+      }
     }
     const settledIds = ids.filter(id => sessionSettled(sessions.get(id)));
     if (mode === "any" && settledIds.length) {
