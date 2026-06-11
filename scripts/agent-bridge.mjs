@@ -1021,6 +1021,38 @@ function cleanupStalePidRecords() {
   return summary;
 }
 
+// ─── Backend session contract ───────────────────────────────────────────────────────────────────
+// OmpRpcSession and CodexAppServerSession share NO base class — the contract below is the implicit
+// interface every backend must satisfy (duck-typed; verified only by the repro suite). To add a third
+// backend: implement a class with these members, add an AGENTS entry (label/env/bin/role/versionArgs/
+// matchesCommand), and late-bind `AGENTS.<name>.Session = <Class>` after the class definition.
+//
+// REQUIRED METHODS (called generically by openSession/status/sendMessage/result/waitSessions/close):
+//   async start()                  Spawn the backend, wire stdio, write the pid record, resolve when ready.
+//   async send(message, opts)      Run a turn. opts: { wait, timeout_ms, maxChars }. wait:true resolves the
+//                                  result; wait:false returns { accepted, sessionId, status, turnId }.
+//   async result(opts)             Return buildSessionResult(this, fullText, opts). MUST be async (parity).
+//   isSettled()                    TRUE iff the current turn is fully finished and a result is collectable.
+//                                  ⚠ The subtle one: `status === "idle"` ALONE is NOT enough — a pre-stream
+//                                  idle window or a never-prompted session would settle early/late. Combine
+//                                  status with the backend's OWN in-flight turn signal (OMP: !turnInFlight;
+//                                  Codex: !this.turn). Getting this wrong reproduces the v0.8.1 zombie-server
+//                                  dead-wait / false-complete. sessionSettled() adds the failed/closed
+//                                  short-circuit, so isSettled() need only handle the live case.
+//   refreshStatus()                Pull authoritative live status before a status/settled read. Return a
+//                                  PROMISE if the backend must poll asynchronously (OMP: await this.state())
+//                                  — call sites await it. Return NOTHING (sync) if event-driven (Codex):
+//                                  call sites await only a Promise, so a sync return keeps the status
+//                                  snapshot synchronous w.r.t. concurrently-dispatched MCP requests.
+//   async abort()                  Cancel the in-flight turn; clear the in-flight signal; return to idle.
+//   close(opts)                    Terminate the backend; opts.removePidRecord controls pid-record cleanup.
+//   summary()                      Return the flat session shape (id/agent/cwd/write/status/lastTurn/…).
+//
+// REQUIRED FIELDS read generically: id, agent, cwd, write, status, isStreaming, lastAssistantText,
+//   events, proc, logFile, answerFile, pidFile, createdAt, updatedAt, lastError, and the turn-clock
+//   fields (currentTurnId/lastTurnId/turnStartedAt/turnEndedAt). setSessionStatus/buildSessionResult/
+//   lastTurnOf operate on these by name.
+// ────────────────────────────────────────────────────────────────────────────────────────────────
 class OmpRpcSession {
   constructor(options) {
     this.id = makeId("omp");
@@ -1991,7 +2023,9 @@ class CodexAppServerSession {
     return { accepted: true, sessionId: this.id, status: this.status, turnId: startedTurnId };
   }
 
-  result(options = {}) {
+  // async purely for signature parity with OmpRpcSession.result (no internal await needed) — every
+  // caller already `await`s result(), so a uniform async signature removes the sync/async drift.
+  async result(options = {}) {
     // finalAnswer/lastAgentMessage hold the UNCLAMPED final text (set on item.completed);
     // prefer them over the clamped lastAssistantText so the artifact/charCount are accurate.
     const full = this.finalAnswer || this.lastAgentMessage || this.lastAssistantText || "";
