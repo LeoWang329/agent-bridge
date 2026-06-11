@@ -60,16 +60,29 @@ const LOG_PRUNE_INTERVAL_MS = envNum("AGENT_BRIDGE_LOG_PRUNE_INTERVAL_MIN", 30) 
 // supervisor, or a test); default is process.ppid. Set the interval to 0 to disable.
 const PARENT_WATCHDOG_INTERVAL_MS = envNum("AGENT_BRIDGE_PARENT_WATCHDOG_MS", 15_000);
 
+// Backend registry — the single source of truth for "which backends exist". Holds ONLY data and pure
+// functions so it is fully initialized at module load: TOOLS (enum), agentBin, assertAgent and doctor
+// all read it before the session classes below are defined. The Session constructor is bound LATER,
+// after the class definitions (search "AGENTS.omp.Session") — class refs can't appear in this literal
+// because the classes are still in the temporal dead zone when this object is evaluated.
 const AGENTS = {
   omp: {
     label: "Oh My Pi",
     env: "OMP_BIN",
     bin: "omp",
+    role: "omp-rpc", // pid-record role + cleanup matcher key
+    versionArgs: ["--version"], // doctor availability probe
+    // Identify a bridge-spawned backend from its command line for orphan cleanup. SECURITY BOUNDARY:
+    // keep the regex explicit and tight — too loose risks terminating an unrelated process during reclaim.
+    matchesCommand: cmd => /\bomp\b/.test(cmd) && /--mode\s+rpc|--mode.*\brpc\b/.test(cmd),
   },
   codex: {
     label: "Codex",
     env: "CODEX_BIN",
     bin: "codex",
+    role: "codex-app-server",
+    versionArgs: ["--version"],
+    matchesCommand: cmd => /\bcodex\b/.test(cmd) && /\bapp-server\b/.test(cmd),
   },
 };
 
@@ -89,7 +102,11 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        agent: { type: "string", enum: ["omp", "codex"], description: "Agent backend to open: omp or codex." },
+        agent: {
+          type: "string",
+          enum: Object.keys(AGENTS),
+          description: `Agent backend to open: ${Object.keys(AGENTS).join(" or ")}.`,
+        },
         cwd: { type: "string", description: "Absolute workspace directory for the delegated agent." },
         write: {
           type: "boolean",
@@ -266,7 +283,19 @@ function makeId(prefix) {
 }
 
 function assertAgent(agent) {
-  if (!AGENTS[agent]) throw new Error(`Unsupported agent "${agent}". Use omp or codex.`);
+  // The MCP tool schema declares agent as a string enum, but handleMcp does not enforce the schema, so
+  // a buggy/hostile client can send any JSON value. Validate fully here (this is the input gate):
+  //   - require a string FIRST: Object.hasOwn coerces a non-string to a property key, and an object with
+  //     a pathological/absent toString (e.g. {toString:null}, Object.create(null)) throws "Cannot convert
+  //     object to primitive value" during coercion — and again if interpolated into the error below.
+  //   - own-property only, NOT `!AGENTS[agent]`: an inherited key ("constructor", "__proto__",
+  //     "hasOwnProperty", …) resolves to an Object.prototype value (truthy) and would slip past a falsy
+  //     check, then reach `new AGENTS[agent].Session(...)` with an undefined Session → opaque TypeError.
+  // So the registry is the literal allow-list; dispatch only ever sees a real backend key.
+  if (typeof agent !== "string" || !Object.hasOwn(AGENTS, agent)) {
+    const shown = typeof agent === "string" ? agent : typeof agent; // never interpolate a raw non-string
+    throw new Error(`Unsupported agent "${shown}". Use ${Object.keys(AGENTS).join(" or ")}.`);
+  }
 }
 
 function assertCwd(cwd) {
@@ -687,9 +716,11 @@ function classifyChild(role, sessionId, referenceMs, expectMarker, pid, freshSna
 
 function roleMatchesCommand(role, command) {
   if (!command) return false;
-  if (role === "omp-rpc") return /\bomp\b/.test(command) && /--mode\s+rpc|--mode.*\brpc\b/.test(command);
-  if (role === "codex-app-server") return /\bcodex\b/.test(command) && /\bapp-server\b/.test(command);
-  return false;
+  // Find the backend whose registry role matches, then apply its explicit command matcher. Registry-
+  // driven so a new backend needs only one AGENTS entry; the matcher regex itself stays explicit in the
+  // registry (a cleanup safety boundary — process identity is never inferred generically).
+  const entry = Object.values(AGENTS).find(agent => agent.role === role);
+  return entry ? entry.matchesCommand(command) : false;
 }
 
 // Cheap, non-spawning liveness probe for the parent watchdog. process.kill(pid, 0) sends no signal —
@@ -1150,7 +1181,7 @@ class OmpRpcSession {
       createdAt: this.createdAt,
       processes: [
         {
-          role: "omp-rpc",
+          role: AGENTS[this.agent].role,
           pid: this.proc?.pid || null,
           command: [agentBin("omp"), ...args],
           spawnedAt: nowIso(), // ~spawn time; cleanup's PID-reuse guard compares it to the live process's start time
@@ -1629,7 +1660,7 @@ class CodexAppServerSession {
       cwd: this.cwd,
       createdAt: this.createdAt,
       processes: [
-        { role: "codex-app-server", pid: this.proc?.pid || null, command: [agentBin("codex"), "app-server"], spawnedAt: nowIso() },
+        { role: AGENTS[this.agent].role, pid: this.proc?.pid || null, command: [agentBin("codex"), "app-server"], spawnedAt: nowIso() },
       ].filter(item => item.pid),
     });
   }
@@ -2061,6 +2092,13 @@ class CodexAppServerSession {
   }
 }
 
+// Bind the session constructors onto the registry now that both classes exist. AGENTS is declared at
+// the top of the file (TOOLS/agentBin/doctor/assertAgent read it during early module load, when these
+// classes are still in the temporal dead zone), so the class refs can't live in that literal — they
+// are late-bound here, before openSession dispatches on AGENTS[agent].Session.
+AGENTS.omp.Session = OmpRpcSession;
+AGENTS.codex.Session = CodexAppServerSession;
+
 function extractAssistantText(value) {
   if (!value || typeof value !== "object") return "";
   const type = String(value.type || value.role || value.kind || "");
@@ -2097,8 +2135,8 @@ function extractLikelyText(raw) {
 
 async function openSession(params) {
   ensureDirs();
-  assertAgent(params.agent);
-  const session = params.agent === "omp" ? new OmpRpcSession(params) : new CodexAppServerSession(params);
+  assertAgent(params.agent); // rejects any unknown agent here, so the dispatch below can't silently fall back
+  const session = new AGENTS[params.agent].Session(params);
   sessions.set(session.id, session);
   try {
     await session.start();
@@ -2344,7 +2382,7 @@ function doctor() {
     logDir: RUN_LOG_DIR,
     agents: Object.entries(AGENTS).map(([agent, config]) => {
       const bin = agentBin(agent);
-      const plan = spawnPlan(bin, ["--version"]);
+      const plan = spawnPlan(bin, config.versionArgs);
       const probe = spawnSync(plan.command, plan.args, { encoding: "utf8", windowsHide: true });
       return {
         agent,
