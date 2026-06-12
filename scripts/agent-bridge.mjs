@@ -24,7 +24,7 @@ function envNum(name, fallback) {
   return n;
 }
 
-const BRIDGE_VERSION = "0.8.5";
+const BRIDGE_VERSION = "0.8.6";
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const DEFAULT_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 // Bound for a single OMP RPC round-trip. Every OMP command is an immediate ack (prompt is
@@ -52,6 +52,12 @@ const LOG_RETENTION_DAYS = envNum("AGENT_BRIDGE_LOG_RETENTION_DAYS", 7);
 const LOG_MAX_BYTES = envNum("AGENT_BRIDGE_LOG_MAX_MB", 500) * 1024 * 1024;
 const LOG_FILE_MAX_BYTES = envNum("AGENT_BRIDGE_LOG_FILE_MAX_MB", 200) * 1024 * 1024;
 const LOG_PRUNE_INTERVAL_MS = envNum("AGENT_BRIDGE_LOG_PRUNE_INTERVAL_MIN", 30) * 60_000;
+// Time budget for an OMP RPC backend to reach its first "ready". Cold start is dominated by omp's
+// initial handshake with the model provider; measured at ~10–14s on a quiet Windows box (omp 15.10.10
+// / MiniMax default). A 20s cap left too thin a margin — a busier box or one slow provider moment
+// tipped a first open past it into "Timed out waiting for OMP RPC ready" and failed the whole session
+// (observed ~1/3 on Windows e2e). 45s gives cold start real headroom; env-overridable for slow links.
+const OMP_READY_TIMEOUT_MS = envNum("AGENT_BRIDGE_OMP_READY_TIMEOUT_MS", 45000);
 // Parent-death watchdog interval. An MCP server exists only to serve the client that spawned it;
 // normally a vanished client is seen as stdin EOF. But if the client dies while another process keeps
 // our stdin pipe open (a hung grandparent retaining the handle — the 0.8.0 pid-16024 zombie shape),
@@ -1200,7 +1206,7 @@ class OmpRpcSession {
       this.pending.clear();
     });
 
-    await withTimeout(this.readyPromise, 20000, "Timed out waiting for OMP RPC ready.");
+    await withTimeout(this.readyPromise, OMP_READY_TIMEOUT_MS, "Timed out waiting for OMP RPC ready.");
     return this;
   }
 

@@ -1,7 +1,7 @@
 {
   "name": "agent-bridge",
   "displayName": "Agent Bridge",
-  "version": "0.8.5",
+  "version": "0.8.6",
   "description": "Persistent session bridge from Claude Code to local OMP and Codex agents over MCP. Open a delegated-agent session, stream its output, and have a second coding agent review or implement.",
   "author": {
     "name": "LeoWang329",

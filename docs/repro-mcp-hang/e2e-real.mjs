@@ -125,17 +125,33 @@ try {
   // 7. write:true — open an omp session in a fresh TEMP dir, have it create a file, verify, clean up.
   // Temp dir (never the repo) keeps this safe + reversible regardless of outcome.
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ab-e2e-write-"));
+  let wId = null;
   try {
     const oW = await call("agent_bridge_open_session", { agent: "omp", cwd: tmp, write: true });
-    const wId = oW.session?.id;
+    wId = oW.session?.id;
     check("open omp write:true (temp dir)", oW.session?.write === true && !!wId, wId);
     await call("agent_bridge_send_message", { session_id: wId, message: "Create a file named e2e_write.txt whose entire contents are exactly the line: E2E_WRITE_OK — then reply DONE.", wait: true, timeout_ms: 150000 }, 170000);
     const target = path.join(tmp, "e2e_write.txt");
     const wrote = fs.existsSync(target) && fs.readFileSync(target, "utf8").includes("E2E_WRITE_OK");
     check("write:true actually edited a file on disk", wrote, wrote ? fs.readFileSync(target, "utf8").trim().slice(0, 40) : "file not created");
-    await call("agent_bridge_close_session", { session_id: wId });
   } finally {
-    fs.rmSync(tmp, { recursive: true, force: true });
+    // Close in the finally — NOT the happy path — so a thrown/timed-out send still SIGTERMs the omp
+    // child; otherwise the cleanup below would race a still-live session and always leak. close()
+    // returns the moment it SIGTERMs the backend; the omp child (cwd == tmp) dies asynchronously.
+    if (wId) { try { await call("agent_bridge_close_session", { session_id: wId }); } catch {} }
+    // On Windows a directory with a live process's open handle can't be removed, and worse: deleting
+    // it while that handle is open leaves it "delete-pending", a state fs.rm's OWN `maxRetries` (a
+    // synchronous spin) never recovers from — the holding condition is the omp child's handle, which
+    // only the child's exit releases. So poll-and-retry from the OUTSIDE: a FRESH rmSync after a real
+    // async sleep, landing cleanly once the child has exited (~0.5–1s). POSIX never hit this.
+    let lastErr = null;
+    for (let i = 0; i < 40 && fs.existsSync(tmp); i++) {
+      try { fs.rmSync(tmp, { recursive: true, force: true }); break; }
+      catch (e) { lastErr = e; await sleep(250); }
+    }
+    // Assert the cleanup actually succeeded — without this, an exhausted retry budget would leak the
+    // temp dir while the suite still reported PASS (silent leak). Surface the real errno to debug.
+    check("step 7 temp dir cleaned up", !fs.existsSync(tmp), fs.existsSync(tmp) ? `LEAKED ${tmp} (${lastErr?.code || lastErr?.message || "unknown"})` : "");
   }
 
   // 8. unknown agent rejected (assertAgent hardening) over the REAL server
