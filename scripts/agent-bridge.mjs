@@ -24,7 +24,7 @@ function envNum(name, fallback) {
   return n;
 }
 
-const BRIDGE_VERSION = "0.8.6";
+const BRIDGE_VERSION = "0.8.7";
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const DEFAULT_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 // Bound for a single OMP RPC round-trip. Every OMP command is an immediate ack (prompt is
@@ -58,6 +58,12 @@ const LOG_PRUNE_INTERVAL_MS = envNum("AGENT_BRIDGE_LOG_PRUNE_INTERVAL_MIN", 30) 
 // tipped a first open past it into "Timed out waiting for OMP RPC ready" and failed the whole session
 // (observed ~1/3 on Windows e2e). 45s gives cold start real headroom; env-overridable for slow links.
 const OMP_READY_TIMEOUT_MS = envNum("AGENT_BRIDGE_OMP_READY_TIMEOUT_MS", 45000);
+// Bound the synchronous PowerShell CIM query that backs the Windows process snapshot. Without it, a
+// wedged powershell.exe (broken WMI repository, AppLocker/WDAC interference) would block the cleanup
+// sweep indefinitely — and that sweep runs at startup, so a hang would stall the server from becoming
+// ready. On timeout spawnSync returns an error, the snapshot is marked invalid, and processCommand
+// returns null ("unknown") so records are kept and retried — graceful, never a false reap.
+const WIN_PS_SNAPSHOT_TIMEOUT_MS = envNum("AGENT_BRIDGE_WIN_PS_TIMEOUT_MS", 15000);
 // Parent-death watchdog interval. An MCP server exists only to serve the client that spawned it;
 // normally a vanished client is seen as stdin EOF. But if the client dies while another process keeps
 // our stdin pipe open (a hung grandparent retaining the handle — the 0.8.0 pid-16024 zombie shape),
@@ -615,6 +621,7 @@ function winProcessSnapshot() {
     encoding: "utf8",
     windowsHide: true,
     maxBuffer: 64 * 1024 * 1024,
+    timeout: WIN_PS_SNAPSHOT_TIMEOUT_MS, // a wedged powershell.exe must not hang the cleanup sweep / startup
   });
   if (result.status === 0 && result.stdout) {
     winSnapshotValid = true;
@@ -1296,6 +1303,18 @@ class OmpRpcSession {
       return;
     }
     if (message.type === "agent_end" || message.type === "turn_end") {
+      // A turn can END on a provider/backend error rather than a real answer: the embedded assistant
+      // message carries stopReason:"error" + errorMessage (e.g. "402 Insufficient Balance") with empty
+      // content. Surface that to lastError so a caller can see WHY the turn returned nothing instead of
+      // a silent empty idle turn. Status still goes idle (the turn IS over and the session stays
+      // reusable); lastError just explains it. Only turn_end carries the single `message`.
+      const ended = message.message;
+      if (ended && ended.stopReason === "error") {
+        // errorMessage already carries the status text (e.g. "402 Insufficient Balance"), so use it
+        // as-is; only synthesize from errorStatus when no message is present (don't double the code).
+        const detail = ended.errorMessage || ended.error || (ended.errorStatus ? `HTTP ${ended.errorStatus}` : "backend turn ended with an error");
+        this.lastError = clampText(stripAnsi(String(detail)), 4000);
+      }
       this.turnEndedAt = nowIso();
       this.turnInFlight = false; // turn finished — the session is now settle-able
       setSessionStatus(this, "idle", false, { source: message.type });
