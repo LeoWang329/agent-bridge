@@ -96,6 +96,15 @@ const AGENTS = {
     versionArgs: ["--version"],
     matchesCommand: cmd => /\bcodex\b/.test(cmd) && /\bapp-server\b/.test(cmd),
   },
+  claude: {
+    label: "Claude Code",
+    env: "CLAUDE_BIN",
+    bin: "claude",
+    role: "claude-stream-json",
+    versionArgs: ["--version"],
+    // SECURITY BOUNDARY: keep tight — too loose risks terminating an unrelated process during reclaim.
+    matchesCommand: cmd => /\bclaude\b/.test(cmd) && /--input-format\s+stream-json/.test(cmd),
+  },
 };
 
 const sessions = new Map();
