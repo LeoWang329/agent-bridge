@@ -2171,7 +2171,7 @@ class ClaudeCodeSession {
     this.cwd = assertCwd(options.cwd);
     this.write = Boolean(options.write);
     this.model = sanitizeAgentArg(options.model, "model"); // null when unset; flows to --model
-    this.effort = options.effort || null; // accepted but IGNORED: Claude Code has no per-turn effort knob
+    this.effort = sanitizeAgentArg(options.effort, "effort") || "xhigh"; // maps to --effort; defaults to xhigh thinking, caller may override
     this.createdAt = nowIso();
     this.updatedAt = this.createdAt;
     this.status = "starting";
@@ -2200,7 +2200,8 @@ class ClaudeCodeSession {
 
   #buildArgs() {
     const args = ["--print", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--strict-mcp-config"];
-    if (this.model) args.push("--model", this.model);
+    if (this.model) args.push("--model", this.model); // omitted when unset -> claude uses its configured default model
+    if (this.effort) args.push("--effort", this.effort); // per-session reasoning effort; defaults to xhigh (constructor)
     if (this.write) {
       // Parity with OMP --auto-approve yolo / Codex workspace-write: full autonomy in cwd.
       args.push("--permission-mode", "bypassPermissions");

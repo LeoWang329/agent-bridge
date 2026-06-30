@@ -130,7 +130,7 @@ You can pin `model` and `effort` per session at open time (they cannot change mi
 
 - **`omp`** — persistent `omp --mode rpc` over JSONL stdio. Write mode adds `--auto-approve --approval-mode yolo`.
 - **`codex`** — persistent `codex app-server` over JSON-RPC. Read-only uses `sandbox: read-only`; write uses `sandbox: workspace-write`; both run non-interactively (`approvalPolicy: never`).
-- **`claude`** — persistent Claude Code headless stream-json (`claude --print --input-format stream-json --output-format stream-json`). Read-only uses `--permission-mode default` with a read-only tool allowlist (`Read,Glob,Grep,WebFetch,WebSearch`) — no shell, so `write:false` cannot mutate the filesystem; write uses `--permission-mode bypassPermissions`. Always launched with `--strict-mcp-config` so a delegated Claude loads project context (CLAUDE.md/skills) but **no MCP servers** — preventing nested delegation. `effort` is not supported by Claude Code and is ignored. Override the binary with `CLAUDE_BIN`.
+- **`claude`** — persistent Claude Code headless stream-json (`claude --print --input-format stream-json --output-format stream-json`). Read-only uses `--permission-mode default` with a read-only tool allowlist (`Read,Glob,Grep,WebFetch,WebSearch`) — no shell, so `write:false` cannot mutate the filesystem; write uses `--permission-mode bypassPermissions`. Always launched with `--strict-mcp-config` so a delegated Claude loads project context (CLAUDE.md/skills) but **no MCP servers** — preventing nested delegation. `effort` maps to Claude Code's per-session `--effort` and defaults to `xhigh` (override per session). With no `model` set, claude uses its own configured default model. Override the binary with `CLAUDE_BIN`.
 
 ## CLI
 

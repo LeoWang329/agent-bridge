@@ -121,6 +121,8 @@ claude --print --input-format stream-json --output-format stream-json --verbose
 - `effort` is **ignored** for this backend: Claude Code has no per-turn effort knob
   (unlike Codex). Documented as unsupported; not silently mapped to anything.
 
+> Post-review amendment (v0.9.0): Claude Code 2.1.196 exposes `--effort <level>`; the backend now maps `effort` to it, defaulting to `xhigh`. The original 'effort ignored' note is superseded.
+
 Permission segment, by `write`:
 
 | `write` | flags |
@@ -193,7 +195,7 @@ the session stays reusable rather than wedged at `running`.
 
 - The Agent SDK path (§3 B).
 - Partial-message/token streaming surfacing (`--include-partial-messages`).
-- An `effort` mapping for Claude Code.
+- ~~An `effort` mapping for Claude Code.~~ (superseded — see §5 amendment above)
 - Any change to the shared contract, tool schemas, or other backends.
 
 ## 11. Open item to resolve during implementation
