@@ -2372,10 +2372,40 @@ class ClaudeCodeSession {
   // status snapshots synchronous w.r.t. pipelined MCP requests (same rationale as Codex).
   refreshStatus() {}
 
-  // Forward declaration required by JavaScript's private-field scope rules: #handleControlResponse
-  // is referenced in #handleLine above but implemented in Task 4. The empty body here satisfies
-  // the parser; Task 4 replaces this declaration with the real control-channel handler.
-  #handleControlResponse(msg) {}
+  #control(subtype) {
+    const requestId = `ctl-${this.nextControlId++}`;
+    const promise = new Promise((resolve, reject) => this.controlPending.set(requestId, { resolve, reject }));
+    try { this.#write({ type: "control_request", request_id: requestId, request: { subtype } }); }
+    catch (err) { this.controlPending.delete(requestId); throw err; }
+    return promise;
+  }
+
+  #handleControlResponse(msg) {
+    const id = msg.response?.request_id ?? msg.request_id;
+    const pending = this.controlPending.get(id);
+    if (!pending) return;
+    this.controlPending.delete(id);
+    if (msg.response?.subtype === "error") pending.reject(new Error(msg.response?.error || "claude control error"));
+    else pending.resolve(msg.response ?? {});
+  }
+
+  async abort() {
+    const turn = this.turn;
+    if (!turn || !this.proc || this.proc.exitCode !== null) {
+      // Nothing in flight — just normalize to idle if still live.
+      if (this.status !== "closed" && this.proc && this.proc.exitCode === null) setSessionStatus(this, "idle", false, { source: "abort" });
+      if (this.turnStartedAt && !this.turnEndedAt) this.turnEndedAt = nowIso();
+      return { aborted: true, sessionId: this.id };
+    }
+    // Tell #handleResult the imminent terminal `result/error_during_execution` is an intentional abort.
+    this.interrupting = true;
+    try { await withTimeout(this.#control("interrupt"), 5000, "claude interrupt timeout"); } catch {}
+    // The interrupted turn settles via #handleResult when its result arrives. Wait briefly for that;
+    // if it never comes (e.g. control swallowed), settle manually so the session stays reusable.
+    try { await withTimeout(turn.promise, 5000, "claude abort settle timeout"); }
+    catch { this.interrupting = false; if (this.turn === turn) this.#settleTurn(null, "aborted"); }
+    return { aborted: true, sessionId: this.id };
+  }
 
   // Turn-failure helper (used by start()'s error handlers now; turn methods reuse it in Task 3).
   #failTurn(err) {
