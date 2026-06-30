@@ -1,11 +1,11 @@
 ---
 name: agent-bridge
-description: Agent Bridge 的使用说明——通过 MCP 把任务委托给本地 OMP / Codex（或经 OMP 调用 deepseek 等模型）执行。仅当用户明确要求使用 agent-bridge、唤起其他 agent / LLM、要独立第二意见 / 复核 / 并行多开时使用（delegate / second opinion / review / parallel；OMP / Codex / deepseek）。普通编码、小修小补、自己能做的只读评审不要触发。
+description: Agent Bridge 的使用说明——通过 MCP 把任务委托给本地 OMP / Codex / Claude（或经 OMP 调用 deepseek 等模型）执行。仅当用户明确要求使用 agent-bridge、唤起其他 agent / LLM、要独立第二意见 / 复核 / 并行多开时使用（delegate / second opinion / review / parallel；OMP / Codex / Claude / deepseek）。普通编码、小修小补、自己能做的只读评审不要触发。
 ---
 
 # Agent Bridge
 
-**仅当用户明确要求**使用 agent-bridge、唤起其他 agent（OMP / Codex / deepseek）、或要独立第二意见 / 复核 / 并行多开时，才用 Agent Bridge。普通编码、小修小补、自己读几个文件就能做的评审，**不要**委托。
+**仅当用户明确要求**使用 agent-bridge、唤起其他 agent（OMP / Codex / Claude / deepseek）、或要独立第二意见 / 复核 / 并行多开时，才用 Agent Bridge。普通编码、小修小补、自己读几个文件就能做的评审，**不要**委托。
 
 它是 session-first 的桥接器，不是一次性命令运行器：开一个持久会话、往里发消息、读结果、复用、关闭。执行委托任务**只用** `agent_bridge_*` MCP tools。
 
@@ -81,7 +81,7 @@ close_session(session_id)                  →  用完必须关
 | `agent_bridge_result` | 读**最近一轮** assistant 文本 + 最近事件（非全历史） | 想看目前为止的产出（含中途） |
 | `agent_bridge_abort` | 中断当前 turn（会话仍可复用） | 要**真正停掉**正在跑的一轮（打断主 agent ≠ 停任务） |
 | `agent_bridge_close_session` | 关会话、回收后端进程。单关返回 `{closed, sessionId}`；省略 `id` 批量关返回 `{closedAll, count, sessionIds, failed}` | 常规**显式传 `id`**；省略 `id` 仅作崩溃兜底，且要查 `closedAll`/`failed` |
-| `agent_bridge_doctor` | 检查 omp/codex/node 是否可用 | 排查「后端起不来」 |
+| `agent_bridge_doctor` | 检查 omp/codex/claude/node 是否可用 | 排查「后端起不来」 |
 
 **典型场景：**
 
@@ -110,6 +110,7 @@ close_session(session_id)                  →  用完必须关
 
 - **OMP**：`agent: "omp"`，启动 `omp --mode rpc`（JSONL RPC 长驻）。可经 `--model` 触达多种模型。
 - **Codex**：`agent: "codex"`，启动 `codex app-server`（JSON-RPC，逐 token 流式）。读写权限由 `write` 控制，均非交互。
+- **Claude**：`agent: "claude"` — a fresh-context Claude Code worker; good for an independent second opinion / review or an isolated write workspace.
 - **模型是会话级参数**：在 `open_session` 用 `model` 指定，整个会话固定；`send_message` 不能逐条切模型，换模型就新开 session。`model` 原样传后端 `--model`。
 - ⚠️ **`model` 必须用 `provider/模型名` 全限定形式**（如 `deepseek/deepseek-v4-pro`、`minimax-code-cn/MiniMax-M3`），**不要传裸别名**（如 `deepseek-v4-pro`、`minimax-m3`）——裸名可能被路由到非预期的 provider，拿到的不是你要的模型。全限定 ID 以 `omp --list-models <关键字>` 的输出为准。
 - **`effort`（可选，推理强度）**：OMP 映射为 `--thinking`（`minimal|low|medium|high|xhigh`）；Codex 作为该轮 effort（`none|minimal|low|medium|high|xhigh`，其中 `none`/`minimal`/`low` 用于简单改动的评审，实施任务不建议）。不传则用后端默认。

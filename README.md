@@ -10,15 +10,15 @@ Works on macOS, Linux, and Windows.
 
 - **Node.js 20+**
 - An MCP client: **Claude Code** or **Codex**
-- The backend(s) you delegate to, launchable on `PATH`: **`omp`** and/or **`codex`**
+- The backend(s) you delegate to, launchable on `PATH`: **`omp`**, **`codex`**, and/or **`claude`**
 
-Agent Bridge only bridges to OMP and Codex — it does not install them. Install at least the backend you plan to use, then confirm it is detected:
+Agent Bridge only bridges to OMP, Codex, and Claude — it does not install them. Install at least the backend you plan to use, then confirm it is detected:
 
 ```sh
 node scripts/agent-bridge.mjs doctor
 ```
 
-`doctor` prints `ok` for each backend it finds and flags anything missing. Override a binary path with `OMP_BIN` / `CODEX_BIN` if it lives somewhere unusual.
+`doctor` prints `ok` for each backend it finds and flags anything missing. Override a binary path with `OMP_BIN` / `CODEX_BIN` / `CLAUDE_BIN` if it lives somewhere unusual.
 
 ## Install
 
@@ -93,7 +93,7 @@ Then **restart the client** so it reloads the running MCP server (the skill is r
 
 If a user asks an AI agent (Claude Code, Codex, …) to set Agent Bridge up, follow this exactly. Use **absolute paths** — the agent's shell is usually not at the repo root, so `$PWD` is unreliable. Below, `<MJS>` = the absolute path to `scripts/agent-bridge.mjs` in the cloned repo.
 
-1. **Prerequisites:** Node 20+, plus the backend(s) the user wants — `omp` and/or `codex` — launchable on `PATH` (Agent Bridge does not install them).
+1. **Prerequisites:** Node 20+, plus the backend(s) the user wants — `omp`, `codex`, and/or `claude` — launchable on `PATH` (Agent Bridge does not install them).
 2. **Get the code:** `git clone https://github.com/LeoWang329/agent-bridge.git`; record the clone's absolute path.
 3. **Register — pick the branch for the client:**
    - **Claude Code** (preferred — installs the MCP server **and** the skill in one step):
@@ -118,7 +118,7 @@ If a user asks an AI agent (Claude Code, Codex, …) to set Agent Bridge up, fol
 
 ## Usage
 
-1. **`open_session`** with `agent: "omp"` or `"codex"`. Keep `write: false` for review/research; set `write: true` only when the agent should edit files.
+1. **`open_session`** with `agent: "omp"`, `"codex"`, or `"claude"`. Keep `write: false` for review/research; set `write: true` only when the agent should edit files.
 2. **`send_message`** with the returned `session_id` — non-blocking by default (pass `wait: true` for a quick inline turn).
 3. **`wait`** to join results — `mode: "all"` blocks until every session finishes, `mode: "any"` returns on the first; always pass a `timeout_ms` so you can do other work and wait again instead of dead-waiting. On timeout it returns `pendingSnapshots` (per still-running session: `status`, `charCount`, a `tail` of the live partial output — capped by `tail_chars`, default 240 — and the latest lifecycle event) so progress is visible without a separate `status` call. This is how you fan out across parallel sessions.
 4. Reuse the same `session_id` for follow-ups.
@@ -130,6 +130,7 @@ You can pin `model` and `effort` per session at open time (they cannot change mi
 
 - **`omp`** — persistent `omp --mode rpc` over JSONL stdio. Write mode adds `--auto-approve --approval-mode yolo`.
 - **`codex`** — persistent `codex app-server` over JSON-RPC. Read-only uses `sandbox: read-only`; write uses `sandbox: workspace-write`; both run non-interactively (`approvalPolicy: never`).
+- **`claude`** — persistent Claude Code headless stream-json (`claude --print --input-format stream-json --output-format stream-json`). Read-only uses `--permission-mode default` with a read-only tool allowlist (`Read,Glob,Grep,Bash,WebFetch,WebSearch`); write uses `--permission-mode bypassPermissions`. Always launched with `--strict-mcp-config` so a delegated Claude loads project context (CLAUDE.md/skills) but **no MCP servers** — preventing nested delegation. `effort` is not supported by Claude Code and is ignored. Override the binary with `CLAUDE_BIN`.
 
 ## CLI
 

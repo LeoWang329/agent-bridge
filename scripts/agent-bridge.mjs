@@ -24,7 +24,7 @@ function envNum(name, fallback) {
   return n;
 }
 
-const BRIDGE_VERSION = "0.8.7";
+const BRIDGE_VERSION = "0.9.0";
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const DEFAULT_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 // Bound for a single OMP RPC round-trip. Every OMP command is an immediate ack (prompt is
