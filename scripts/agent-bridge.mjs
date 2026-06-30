@@ -2160,12 +2160,162 @@ class CodexAppServerSession {
   }
 }
 
+// Claude Code over headless stream-json. A persistent `claude --print --input-format stream-json
+// --output-format stream-json` process: newline-delimited {"type":"user",...} on stdin, one `result`
+// event per turn on stdout. Structurally a twin of CodexAppServerSession (event-driven, no status
+// polling). See the backend session contract banner above OmpRpcSession.
+class ClaudeCodeSession {
+  constructor(options) {
+    this.id = makeId("claude");
+    this.agent = "claude";
+    this.cwd = assertCwd(options.cwd);
+    this.write = Boolean(options.write);
+    this.model = sanitizeAgentArg(options.model, "model"); // null when unset; flows to --model
+    this.effort = options.effort || null; // accepted but IGNORED: Claude Code has no per-turn effort knob
+    this.createdAt = nowIso();
+    this.updatedAt = this.createdAt;
+    this.status = "starting";
+    this.isStreaming = false;
+    this.lastAssistantText = "";
+    this.lastError = null;
+    this.events = [];
+    this.proc = null;
+    this.claudeSessionId = null;     // claude's own session uuid (from system/init + result.session_id)
+    this.currentTurnId = null;
+    this.lastTurnId = null;
+    this.turnStartedAt = null;
+    this.turnEndedAt = null;
+    this.turnCount = 0;
+    this.turn = null;                // { resolve, reject, promise, settled } — the in-flight turn
+    this.interrupting = false;       // true between abort()'s interrupt and the resulting error result
+    this.controlPending = new Map(); // request_id -> { resolve, reject } for control_request/response
+    this.nextControlId = 1;
+    this.finalAnswer = "";           // unclamped final text from result.result
+    this.tokenUsage = null;
+    this.logFile = path.join(RUN_LOG_DIR, `${this.id}.log`);
+    this.answerFile = path.join(RUN_LOG_DIR, `${this.id}.answer.txt`);
+    this.pidFile = pidRecordPath(this.id);
+  }
+
+  #buildArgs() {
+    const args = ["--print", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--strict-mcp-config"];
+    if (this.model) args.push("--model", this.model);
+    if (this.write) {
+      // Parity with OMP --auto-approve yolo / Codex workspace-write: full autonomy in cwd.
+      args.push("--permission-mode", "bypassPermissions");
+    } else {
+      // Read + read-only Bash. Headless has no approver, so non-allowlisted tools (Edit/Write/...) are
+      // denied. Bash is allowed for read-only commands (grep/git log); trust-by-prompt, not isolation.
+      args.push("--permission-mode", "default", "--allowedTools", "Read,Glob,Grep,Bash,WebFetch,WebSearch");
+    }
+    return args;
+  }
+
+  async start() {
+    const args = this.#buildArgs();
+    appendLog(this.logFile, `$ ${[agentBin("claude"), ...args].join(" ")}\n`);
+    const plan = spawnPlan(agentBin("claude"), args);
+    this.proc = spawn(plan.command, plan.args, { cwd: this.cwd, env: childEnv(this), stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+    appendLog(this.logFile, `[agent-bridge] spawned claude pid=${this.proc.pid}\n`);
+    this.#writePidRecord();
+
+    this.proc.stderr.setEncoding("utf8");
+    this.proc.stderr.on("data", text => { appendLog(this.logFile, text); this.lastError = clampText(stripAnsi(text), 4000); });
+    this.proc.stdout.setEncoding("utf8");
+    this.proc.stdin.on("error", err => {
+      appendLog(this.logFile, `[agent-bridge] claude stdin error: ${err.message}\n`);
+      this.lastError = err.message;
+      if (this.status !== "closed") { setSessionStatus(this, "failed", false, { source: "stdin_error", error: err.message }); this.#failTurn(err); }
+    });
+    const rl = readline.createInterface({ input: this.proc.stdout, crlfDelay: Infinity });
+    rl.on("line", line => this.#handleLine(line));
+
+    this.proc.on("error", err => { this.lastError = err.message; setSessionStatus(this, "failed", false, { source: "process_error", error: err.message }); this.#failTurn(err); });
+    this.proc.on("close", (code, signal) => {
+      appendLog(this.logFile, `[agent-bridge] claude exited code=${code} signal=${signal || ""}\n`);
+      removePidRecord(this.pidFile);
+      if (this.status === "closed") { setSessionStatus(this, "closed", false, { source: "process_close", code, signal }); return; }
+      this.lastError = code === 0 ? this.lastError : `claude exited with code ${code}`;
+      setSessionStatus(this, code === 0 && this.status !== "failed" ? "closed" : "failed", false, { source: "process_close", code, signal });
+      this.#failTurn(new Error(this.lastError || "claude exited."));
+    });
+
+    // No startup handshake: the CLI emits nothing on stdout until the first user message, and writing
+    // that message immediately after spawn is safe (verified). The live process IS readiness.
+    setSessionStatus(this, "idle", false, { source: "ready" });
+    return this;
+  }
+
+  #writePidRecord() {
+    writePidRecord(this.pidFile, {
+      id: this.id,
+      agent: this.agent,
+      ownerPid: process.pid,
+      cwd: this.cwd,
+      createdAt: this.createdAt,
+      processes: [
+        { role: AGENTS[this.agent].role, pid: this.proc?.pid || null, command: [agentBin("claude"), ...this.#buildArgs()], spawnedAt: nowIso() },
+      ].filter(item => item.pid),
+    });
+  }
+
+  // Turn-driving line handler lands in Task 3. Stub keeps start() functional: log + record raw events.
+  #handleLine(line) {
+    if (!line.trim()) return;
+    appendLog(this.logFile, `${line}\n`);
+    this.updatedAt = nowIso();
+  }
+
+  // Turn-failure helper (used by start()'s error handlers now; turn methods reuse it in Task 3).
+  #failTurn(err) {
+    if (this.turnStartedAt && !this.turnEndedAt) this.turnEndedAt = nowIso();
+    for (const p of this.controlPending.values()) p.reject(err);
+    this.controlPending.clear();
+    const turn = this.turn; this.turn = null;
+    turn?.reject?.(err);
+  }
+
+  summary() {
+    return {
+      id: this.id,
+      agent: this.agent,
+      cwd: this.cwd,
+      write: this.write,
+      model: this.model,
+      effort: this.effort,
+      status: this.status,
+      pid: this.proc?.pid || null,
+      createdAt: this.createdAt,
+      updatedAt: this.updatedAt,
+      lastError: this.lastError,
+      logFile: this.logFile,
+      lastTurn: lastTurnOf(this),
+      agentSpecific: { claudeSessionId: this.claudeSessionId, turnCount: this.turnCount },
+    };
+  }
+
+  close(options = {}) {
+    setSessionStatus(this, "closed", false, { source: "close" });
+    try { this.proc?.stdin?.end(); } catch {}
+    this.#failTurn(new Error("session closed"));
+    const pid = this.proc?.pid;
+    if (this.proc && this.proc.exitCode === null && this.proc.signalCode === null) {
+      terminateProcessTree(pid);
+      scheduleForceKill(pid, 3000, () => this.proc != null && this.proc.exitCode === null && this.proc.signalCode === null);
+    }
+    if (options.removePidRecord !== false) removePidRecord(this.pidFile);
+    try { fs.rmSync(this.answerFile, { force: true }); } catch {}
+    return { closed: true, sessionId: this.id };
+  }
+}
+
 // Bind the session constructors onto the registry now that both classes exist. AGENTS is declared at
 // the top of the file (TOOLS/agentBin/doctor/assertAgent read it during early module load, when these
 // classes are still in the temporal dead zone), so the class refs can't live in that literal — they
 // are late-bound here, before openSession dispatches on AGENTS[agent].Session.
 AGENTS.omp.Session = OmpRpcSession;
 AGENTS.codex.Session = CodexAppServerSession;
+AGENTS.claude.Session = ClaudeCodeSession;
 
 function extractAssistantText(value) {
   if (!value || typeof value !== "object") return "";
