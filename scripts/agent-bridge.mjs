@@ -2188,6 +2188,7 @@ class ClaudeCodeSession {
     this.turnCount = 0;
     this.turn = null;                // { resolve, reject, promise, settled } — the in-flight turn
     this.interrupting = false;       // true between abort()'s interrupt and the resulting error result
+    this.pendingAbortedResults = 0; // late results from abort-fallback-settled turns, to be swallowed
     this.controlPending = new Map(); // request_id -> { resolve, reject } for control_request/response
     this.nextControlId = 1;
     this.finalAnswer = "";           // unclamped final text from result.result
@@ -2204,9 +2205,11 @@ class ClaudeCodeSession {
       // Parity with OMP --auto-approve yolo / Codex workspace-write: full autonomy in cwd.
       args.push("--permission-mode", "bypassPermissions");
     } else {
-      // Read + read-only Bash. Headless has no approver, so non-allowlisted tools (Edit/Write/...) are
-      // denied. Bash is allowed for read-only commands (grep/git log); trust-by-prompt, not isolation.
-      args.push("--permission-mode", "default", "--allowedTools", "Read,Glob,Grep,Bash,WebFetch,WebSearch");
+      // Read-only: file reads + search + web. Deliberately NO Bash — `--allowedTools Bash` grants the
+      // FULL shell (write/delete/network) with no approver in headless mode, so allowlisting it would
+      // break the write:false no-mutation boundary. Keeping it off makes write:false a real read-only
+      // contract, consistent with omp (no shell tool) and codex (OS read-only sandbox).
+      args.push("--permission-mode", "default", "--allowedTools", "Read,Glob,Grep,WebFetch,WebSearch");
     }
     return args;
   }
@@ -2304,6 +2307,9 @@ class ClaudeCodeSession {
     if (msg.type === "system" && msg.subtype === "init" && msg.session_id) this.claudeSessionId = msg.session_id;
     if (msg.type === "assistant") {
       if (this.turn && !this.isStreaming) setSessionStatus(this, "running", true, { source: "assistant" });
+      const blocks = Array.isArray(msg.message?.content) ? msg.message.content : [];
+      const text = blocks.filter(b => b && b.type === "text" && typeof b.text === "string").map(b => b.text).join("");
+      if (text) this.lastAssistantText = clampText(text);
       pushEvent(this, compactEvent({ type: "assistant" }));
       return;
     }
@@ -2315,6 +2321,13 @@ class ClaudeCodeSession {
     pushEvent(this, compactEvent({ type: "result", subtype: msg.subtype, is_error: msg.is_error }));
     if (msg.session_id) this.claudeSessionId = msg.session_id;
     if (msg.usage) this.tokenUsage = msg.usage;
+    if (this.pendingAbortedResults > 0) {
+      // Late terminal result from a turn abort() already force-settled. Swallow it (don't settle the
+      // current turn). FIFO + one-result-per-turn means swallowing N matches N force-settled aborts.
+      this.pendingAbortedResults -= 1;
+      appendLog(this.logFile, `[agent-bridge] dropped stale aborted result (subtype=${msg.subtype || ""})\n`);
+      return;
+    }
     // abort()'s interrupt produces a terminal `result/error_during_execution`; consume it as an
     // intentional abort (idle, NOT failed). The interrupting flag is set in Task 4's abort().
     if (this.interrupting) { this.interrupting = false; this.#settleTurn(null, "aborted"); return; }
@@ -2399,16 +2412,27 @@ class ClaudeCodeSession {
     }
     // Tell #handleResult the imminent terminal `result/error_during_execution` is an intentional abort.
     this.interrupting = true;
-    try { await withTimeout(this.#control("interrupt"), 5000, "claude interrupt timeout"); } catch {}
+    try { await withTimeout(this.#control("interrupt"), 5000, "claude interrupt timeout"); }
+    catch (err) { appendLog(this.logFile, `[agent-bridge] claude interrupt control failed: ${err.message}\n`); }
     // The interrupted turn settles via #handleResult when its result arrives. Wait briefly for that;
     // if it never comes (e.g. control swallowed), settle manually so the session stays reusable.
     try { await withTimeout(turn.promise, 5000, "claude abort settle timeout"); }
-    catch { this.interrupting = false; if (this.turn === turn) this.#settleTurn(null, "aborted"); }
+    catch {
+      this.interrupting = false;
+      if (this.turn === turn) {
+        // Force-settling without having seen the terminal result. Claude results carry no turn id,
+        // so this turn's result will still arrive later, out of band — mark it to be swallowed so it
+        // cannot settle a subsequent turn with this turn's stale outcome.
+        this.pendingAbortedResults += 1;
+        this.#settleTurn(null, "aborted");
+      }
+    }
     return { aborted: true, sessionId: this.id };
   }
 
   // Turn-failure helper (used by start()'s error handlers now; turn methods reuse it in Task 3).
   #failTurn(err) {
+    this.pendingAbortedResults = 0;
     if (this.turnStartedAt && !this.turnEndedAt) this.turnEndedAt = nowIso();
     for (const p of this.controlPending.values()) p.reject(err);
     this.controlPending.clear();
@@ -2437,6 +2461,7 @@ class ClaudeCodeSession {
 
   close(options = {}) {
     setSessionStatus(this, "closed", false, { source: "close" });
+    this.pendingAbortedResults = 0;
     try { this.proc?.stdin?.end(); } catch {}
     this.#failTurn(new Error("session closed"));
     const pid = this.proc?.pid;

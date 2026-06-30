@@ -110,10 +110,10 @@ close_session(session_id)                  →  用完必须关
 
 - **OMP**：`agent: "omp"`，启动 `omp --mode rpc`（JSONL RPC 长驻）。可经 `--model` 触达多种模型。
 - **Codex**：`agent: "codex"`，启动 `codex app-server`（JSON-RPC，逐 token 流式）。读写权限由 `write` 控制，均非交互。
-- **Claude**：`agent: "claude"` — a fresh-context Claude Code worker; good for an independent second opinion / review or an isolated write workspace.
+- **Claude**：`agent: "claude"` — a fresh-context Claude Code worker; good for an independent second opinion / review or an isolated write workspace.（独立 Claude Code worker；适合独立复核或隔离写作业；read-only 不含 shell）
 - **模型是会话级参数**：在 `open_session` 用 `model` 指定，整个会话固定；`send_message` 不能逐条切模型，换模型就新开 session。`model` 原样传后端 `--model`。
 - ⚠️ **`model` 必须用 `provider/模型名` 全限定形式**（如 `deepseek/deepseek-v4-pro`、`minimax-code-cn/MiniMax-M3`），**不要传裸别名**（如 `deepseek-v4-pro`、`minimax-m3`）——裸名可能被路由到非预期的 provider，拿到的不是你要的模型。全限定 ID 以 `omp --list-models <关键字>` 的输出为准。
-- **`effort`（可选，推理强度）**：OMP 映射为 `--thinking`（`minimal|low|medium|high|xhigh`）；Codex 作为该轮 effort（`none|minimal|low|medium|high|xhigh`，其中 `none`/`minimal`/`low` 用于简单改动的评审，实施任务不建议）。不传则用后端默认。
+- **`effort`（可选，推理强度）**：OMP 映射为 `--thinking`（`minimal|low|medium|high|xhigh`）；Codex 作为该轮 effort（`none|minimal|low|medium|high|xhigh`，其中 `none`/`minimal`/`low` 用于简单改动的评审，实施任务不建议）。不传则用后端默认；Claude 忽略此字段。
 
 `open_session` 必传 `agent` + `cwd`；`write` / `model` / `effort` 按需（默认分工见下节「角色默认」）。
 
