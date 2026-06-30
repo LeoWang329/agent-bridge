@@ -2259,12 +2259,123 @@ class ClaudeCodeSession {
     });
   }
 
-  // Turn-driving line handler lands in Task 3. Stub keeps start() functional: log + record raw events.
+  #write(msg) {
+    appendLog(this.logFile, `> ${JSON.stringify(msg).slice(0, 600)}\n`);
+    const stdin = this.proc?.stdin;
+    if (!stdin || stdin.destroyed || this.proc.exitCode !== null) throw new Error("claude stdin is not writable");
+    stdin.write(`${JSON.stringify(msg)}\n`);
+  }
+
+  #writeUser(text) {
+    this.#write({ type: "user", message: { role: "user", content: text } });
+  }
+
+  #beginTurn(turnId) {
+    this.currentTurnId = turnId;
+    this.lastTurnId = turnId;
+    this.turnStartedAt = nowIso();
+    this.turnEndedAt = null;
+    this.finalAnswer = "";
+    this.lastAssistantText = "";
+  }
+
+  #settleTurn(err, status) {
+    const turn = this.turn;
+    if (!turn) return;
+    turn.settled = { err: err || null, status: status ?? null };
+    this.turn = null;
+    this.currentTurnId = null;
+    this.turnCount += 1;
+    this.turnEndedAt = nowIso();
+    this.updatedAt = nowIso();
+    if (err) { this.lastError = err.message; setSessionStatus(this, "failed", false, { source: "turn_error", error: err.message }); turn.reject(err); return; }
+    setSessionStatus(this, "idle", false, { source: "turn/completed", status });
+    turn.resolve();
+  }
+
   #handleLine(line) {
     if (!line.trim()) return;
-    appendLog(this.logFile, `${line}\n`);
+    let msg;
+    try { msg = JSON.parse(line); } catch { appendLog(this.logFile, `${line}\n`); pushEvent(this, { type: "raw", line }); return; }
+    // Skip verbatim-logging high-frequency streaming chunks; the result event still carries final text.
+    if (msg.type !== "assistant" && msg.type !== "stream_event") appendLog(this.logFile, `${JSON.stringify(stripThinking(msg))}\n`);
     this.updatedAt = nowIso();
+    if (msg.type === "control_response") { this.#handleControlResponse(msg); return; } // method added in Task 4
+    if (msg.type === "system" && msg.subtype === "init" && msg.session_id) this.claudeSessionId = msg.session_id;
+    if (msg.type === "assistant") {
+      if (this.turn && !this.isStreaming) setSessionStatus(this, "running", true, { source: "assistant" });
+      pushEvent(this, compactEvent({ type: "assistant" }));
+      return;
+    }
+    if (msg.type === "result") { this.#handleResult(msg); return; }
+    pushEvent(this, compactEvent({ type: msg.type, subtype: msg.subtype }));
   }
+
+  #handleResult(msg) {
+    pushEvent(this, compactEvent({ type: "result", subtype: msg.subtype, is_error: msg.is_error }));
+    if (msg.session_id) this.claudeSessionId = msg.session_id;
+    if (msg.usage) this.tokenUsage = msg.usage;
+    // abort()'s interrupt produces a terminal `result/error_during_execution`; consume it as an
+    // intentional abort (idle, NOT failed). The interrupting flag is set in Task 4's abort().
+    if (this.interrupting) { this.interrupting = false; this.#settleTurn(null, "aborted"); return; }
+    if (msg.is_error || msg.subtype !== "success") { this.#settleTurn(new Error(`claude turn ${msg.subtype || "error"}`), msg.subtype || "error"); return; }
+    const text = typeof msg.result === "string" ? msg.result : "";
+    this.finalAnswer = text;
+    this.lastAssistantText = clampText(text);
+    this.#settleTurn(null, msg.subtype);
+  }
+
+  async send(message, options = {}) {
+    if (!message || !String(message).trim()) throw new Error("message is required.");
+    if (this.status === "closed") throw new Error(`Claude session ${this.id} is closed.`);
+    if (!this.proc || this.proc.exitCode !== null) throw new Error(`Claude process for ${this.id} is not running.`);
+    if (this.turn) throw new Error(`Claude session ${this.id} already has a running turn.`);
+
+    const turnId = `${this.id}-t${this.turnCount + 1}`;
+    setSessionStatus(this, "running", true, { source: "send" });
+    const promise = new Promise((resolve, reject) => { this.turn = { resolve, reject }; });
+    this.turn.promise = promise;
+    promise.catch(() => {}); // pre-attach so an early rejection can't crash the server
+
+    try {
+      this.#writeUser(String(message));
+    } catch (err) {
+      const e = err instanceof Error ? err : new Error(String(err));
+      this.#settleTurn(e, "error");
+      throw e;
+    }
+    this.#beginTurn(turnId);
+
+    if (options.wait) {
+      try {
+        return await withTimeout(promise.then(() => this.result({ maxChars: options.maxChars })), options.timeout_ms || DEFAULT_WAIT_TIMEOUT_MS, "Timed out waiting for Claude turn.");
+      } catch (err) {
+        if (this.turn) { try { await this.abort(); } catch {} } // method added in Task 4
+        throw err;
+      }
+    }
+    promise.catch(err => { this.lastError = err.message; });
+    return { accepted: true, sessionId: this.id, status: this.status, turnId };
+  }
+
+  // async purely for signature parity with the other backends' result().
+  async result(options = {}) {
+    return buildSessionResult(this, this.finalAnswer || this.lastAssistantText || "", options);
+  }
+
+  // Settled = idle with no in-flight turn. Mirrors CodexAppServerSession.isSettled (keys off this.turn).
+  isSettled() {
+    return this.status === "idle" && !this.turn;
+  }
+
+  // Event-driven (the turn resolves on the `result` event); no live state to poll. Sync no-op keeps
+  // status snapshots synchronous w.r.t. pipelined MCP requests (same rationale as Codex).
+  refreshStatus() {}
+
+  // Forward declaration required by JavaScript's private-field scope rules: #handleControlResponse
+  // is referenced in #handleLine above but implemented in Task 4. The empty body here satisfies
+  // the parser; Task 4 replaces this declaration with the real control-channel handler.
+  #handleControlResponse(msg) {}
 
   // Turn-failure helper (used by start()'s error handlers now; turn methods reuse it in Task 3).
   #failTurn(err) {
