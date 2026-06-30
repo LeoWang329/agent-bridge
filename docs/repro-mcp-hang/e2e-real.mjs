@@ -71,6 +71,8 @@ try {
   const docText = doc.__raw || JSON.stringify(doc);
   const ompOk = /omp:\s*ok/i.test(docText);
   const cdxOk = /codex:\s*ok/i.test(docText);
+  const claudeOk = /claude:\s*ok/i.test(docText);
+  console.log(`[info] claude backend: ${claudeOk ? "ok" : "absent (claude scenarios will be skipped)"}`);
   console.log(`[info] doctor: ${docText.split("\n").filter(l => /ok|missing/.test(l)).join(" | ")}`);
   if (!ompOk || !cdxOk) {
     console.log(`>>> SKIP: real-backend e2e requires BOTH omp and codex (omp=${ompOk ? "ok" : "missing"}, codex=${cdxOk ? "ok" : "missing"}).`);
@@ -157,6 +159,43 @@ try {
   // 8. unknown agent rejected (assertAgent hardening) over the REAL server
   const bad = await call("agent_bridge_open_session", { agent: "ompp", cwd: REPO, write: false });
   check("unknown agent rejected cleanly", !!bad.__error && /Unsupported agent/.test(bad.__error.message), bad.__error?.message?.slice(0, 50));
+
+  // 8b. claude backend (only when present) — dispatch, a turn, write:true edit, abort+settle.
+  if (claudeOk) {
+    const oCl = await call("agent_bridge_open_session", { agent: "claude", cwd: REPO, write: false });
+    const clId = oCl.session?.id;
+    check("open claude (registry dispatch)", oCl.session?.agent === "claude" && !!clId, clId);
+    const clTurn = await call("agent_bridge_send_message", { session_id: clId, message: "Reply with exactly: E2E_CLAUDE_1", wait: true, timeout_ms: 120000 }, 140000);
+    check("claude turn (async result)", (clTurn.text || "").includes("E2E_CLAUDE_1"), (clTurn.text || "").slice(0, 40));
+
+    // abort: long turn non-blocking, abort, confirm idle + reusable
+    await call("agent_bridge_send_message", { session_id: clId, message: "Count slowly from 1 to 400, one number per line.", wait: false });
+    await sleep(2500);
+    const clAb = await call("agent_bridge_abort", { session_id: clId });
+    check("claude abort accepted", clAb.aborted === true, JSON.stringify(clAb).slice(0, 50));
+    await sleep(1500);
+    const clSt = await call("agent_bridge_status", { session_id: clId });
+    check("claude settles to idle after abort", clSt.session?.status === "idle", clSt.session?.status);
+    await call("agent_bridge_close_session", { session_id: clId });
+
+    // write:true — fresh temp dir, create a file, verify on disk, clean up (mirrors step 7).
+    const ctmp = fs.mkdtempSync(path.join(os.tmpdir(), "ab-e2e-claude-write-"));
+    let cwId = null;
+    try {
+      const oCW = await call("agent_bridge_open_session", { agent: "claude", cwd: ctmp, write: true });
+      cwId = oCW.session?.id;
+      check("open claude write:true (temp dir)", oCW.session?.write === true && !!cwId, cwId);
+      await call("agent_bridge_send_message", { session_id: cwId, message: "Create a file named e2e_claude.txt whose entire contents are exactly the line: E2E_CLAUDE_WRITE_OK — then reply DONE.", wait: true, timeout_ms: 150000 }, 170000);
+      const ctarget = path.join(ctmp, "e2e_claude.txt");
+      const cwrote = fs.existsSync(ctarget) && fs.readFileSync(ctarget, "utf8").includes("E2E_CLAUDE_WRITE_OK");
+      check("claude write:true edited a file on disk", cwrote, cwrote ? "ok" : "file not created");
+    } finally {
+      if (cwId) { try { await call("agent_bridge_close_session", { session_id: cwId }); } catch {} }
+      let cErr = null;
+      for (let i = 0; i < 40 && fs.existsSync(ctmp); i++) { try { fs.rmSync(ctmp, { recursive: true, force: true }); break; } catch (e) { cErr = e; await sleep(250); } }
+      check("claude temp dir cleaned up", !fs.existsSync(ctmp), fs.existsSync(ctmp) ? `LEAKED ${ctmp} (${cErr?.code || "unknown"})` : "");
+    }
+  }
 
   // 9. close all remaining + clean exit
   const closed = await call("agent_bridge_close_session", {});
