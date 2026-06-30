@@ -283,7 +283,7 @@ function usage() {
     "Usage:",
     "  agent-bridge mcp                 Run the MCP server (stdio). Sessions live in this process.",
     "  agent-bridge doctor [--json]     Report environment / backend availability.",
-    "  agent-bridge cleanup [--json]    Reap orphaned omp/codex children from dead MCP servers.",
+    "  agent-bridge cleanup [--json]    Reap orphaned omp/codex/claude children from dead MCP servers.",
     "",
     "Sessions are managed exclusively through the MCP server's tools (open/send/status/result/",
     "wait/abort/close). The CLI exposes only the server entrypoint plus doctor/cleanup helpers.",
@@ -2858,7 +2858,7 @@ async function runCli(argv) {
       return;
     }
     case "cleanup":
-      // Reap orphaned backend child processes (omp/codex) left behind by an MCP server that
+      // Reap orphaned backend child processes (omp/codex/claude) left behind by an MCP server that
       // was SIGKILLed before it could clean up its own sessions (matched by pid records whose
       // owner MCP is gone), and remove abandoned logs/<runId>/ dirs from those dead servers.
       printCliResult({ childProcesses: cleanupStalePidRecords(), staleLogs: reclaimStaleLogs() }, args);
