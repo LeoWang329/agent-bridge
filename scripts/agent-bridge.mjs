@@ -138,7 +138,7 @@ const TOOLS = [
         effort: {
           type: "string",
           description:
-            "Optional reasoning effort. OMP maps it to --thinking (minimal|low|medium|high|xhigh). Codex sends it as the turn effort (none|minimal|low|medium|high|xhigh).",
+            "Optional reasoning effort. OMP maps it to --thinking (minimal|low|medium|high|xhigh). Codex sends it as the turn effort (none|minimal|low|medium|high|xhigh). Claude maps it to --effort (minimal|low|medium|high|xhigh) and defaults to xhigh.",
         },
         initial_prompt: { type: "string", description: "Optional first message to send after opening." },
         wait: {
@@ -2206,10 +2206,9 @@ class ClaudeCodeSession {
       // Parity with OMP --auto-approve yolo / Codex workspace-write: full autonomy in cwd.
       args.push("--permission-mode", "bypassPermissions");
     } else {
-      // Read-only: file reads + search + web. Deliberately NO Bash — `--allowedTools Bash` grants the
-      // FULL shell (write/delete/network) with no approver in headless mode, so allowlisting it would
-      // break the write:false no-mutation boundary. Keeping it off makes write:false a real read-only
-      // contract, consistent with omp (no shell tool) and codex (OS read-only sandbox).
+      // Read-only: file reads + search + web. No Bash/Edit/Write among `--allowedTools`, so the model cannot
+      // directly mutate the workspace. NOTE: this is a TOOL-level boundary, not an OS/hook sandbox —
+      // project-configured hooks (if any) still run shell. For hard isolation use a throwaway workspace.
       args.push("--permission-mode", "default", "--allowedTools", "Read,Glob,Grep,WebFetch,WebSearch");
     }
     return args;
@@ -2245,8 +2244,13 @@ class ClaudeCodeSession {
     });
 
     // No startup handshake: the CLI emits nothing on stdout until the first user message, and writing
-    // that message immediately after spawn is safe (verified). The live process IS readiness.
-    setSessionStatus(this, "idle", false, { source: "ready" });
+    // that message immediately after spawn is safe (verified) — the live process IS readiness. Guard
+    // against a spawn that already died synchronously: don't advertise idle over a dead process (the
+    // error/close handlers set failed). A still-async ENOENT can briefly show idle-then-failed; that
+    // window is closed for callers by the exitCode/signalCode guards in send()/#write()/abort().
+    if (this.proc.exitCode === null && this.proc.signalCode === null) {
+      setSessionStatus(this, "idle", false, { source: "ready" });
+    }
     return this;
   }
 
@@ -2266,7 +2270,7 @@ class ClaudeCodeSession {
   #write(msg) {
     appendLog(this.logFile, `> ${JSON.stringify(msg).slice(0, 600)}\n`);
     const stdin = this.proc?.stdin;
-    if (!stdin || stdin.destroyed || this.proc.exitCode !== null) throw new Error("claude stdin is not writable");
+    if (!stdin || stdin.destroyed || this.proc.exitCode !== null || this.proc.signalCode !== null) throw new Error("claude stdin is not writable");
     stdin.write(`${JSON.stringify(msg)}\n`);
   }
 
@@ -2322,6 +2326,12 @@ class ClaudeCodeSession {
     pushEvent(this, compactEvent({ type: "result", subtype: msg.subtype, is_error: msg.is_error }));
     if (msg.session_id) this.claudeSessionId = msg.session_id;
     if (msg.usage) this.tokenUsage = msg.usage;
+    // INVARIANT (load-bearing): claude processes stdin messages in FIFO order and emits exactly one
+    // terminal `result` per user message, in that same order. So when abort() force-settles turn A
+    // without its result, A's result is guaranteed to arrive BEFORE any later turn B's result — this
+    // counter therefore swallows exactly A's stale result, never B's, and B settles normally. If a
+    // future claude pipelines turns concurrently this breaks; it would then need per-turn-id correlation
+    // (claude results carry no turn id today). Covered by the fake-claude fallback test.
     if (this.pendingAbortedResults > 0) {
       // Late terminal result from a turn abort() already force-settled. Swallow it (don't settle the
       // current turn). FIFO + one-result-per-turn means swallowing N matches N force-settled aborts.
@@ -2342,7 +2352,7 @@ class ClaudeCodeSession {
   async send(message, options = {}) {
     if (!message || !String(message).trim()) throw new Error("message is required.");
     if (this.status === "closed") throw new Error(`Claude session ${this.id} is closed.`);
-    if (!this.proc || this.proc.exitCode !== null) throw new Error(`Claude process for ${this.id} is not running.`);
+    if (!this.proc || this.proc.exitCode !== null || this.proc.signalCode !== null) throw new Error(`Claude process for ${this.id} is not running.`);
     if (this.turn) throw new Error(`Claude session ${this.id} already has a running turn.`);
 
     const turnId = `${this.id}-t${this.turnCount + 1}`;
@@ -2350,6 +2360,7 @@ class ClaudeCodeSession {
     const promise = new Promise((resolve, reject) => { this.turn = { resolve, reject }; });
     this.turn.promise = promise;
     promise.catch(() => {}); // pre-attach so an early rejection can't crash the server
+    this.#beginTurn(turnId);
 
     try {
       this.#writeUser(String(message));
@@ -2358,7 +2369,6 @@ class ClaudeCodeSession {
       this.#settleTurn(e, "error");
       throw e;
     }
-    this.#beginTurn(turnId);
 
     if (options.wait) {
       try {
@@ -2405,9 +2415,9 @@ class ClaudeCodeSession {
 
   async abort() {
     const turn = this.turn;
-    if (!turn || !this.proc || this.proc.exitCode !== null) {
+    if (!turn || !this.proc || this.proc.exitCode !== null || this.proc.signalCode !== null) {
       // Nothing in flight — just normalize to idle if still live.
-      if (this.status !== "closed" && this.proc && this.proc.exitCode === null) setSessionStatus(this, "idle", false, { source: "abort" });
+      if (this.status !== "closed" && this.proc && this.proc.exitCode === null && this.proc.signalCode === null) setSessionStatus(this, "idle", false, { source: "abort" });
       if (this.turnStartedAt && !this.turnEndedAt) this.turnEndedAt = nowIso();
       return { aborted: true, sessionId: this.id };
     }

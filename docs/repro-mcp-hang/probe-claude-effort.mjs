@@ -60,8 +60,22 @@ try {
   check("s3 has --model haiku", cmd3.includes("--model haiku"), cmd3);
   check("s3 has --effort xhigh", cmd3.includes("--effort xhigh"), cmd3);
 
+  // Arg-vector assertions: write:false session (s1) must have the right permission/tool flags
+  check("s1 write:false has --permission-mode default", cmd1.includes("--permission-mode default"), cmd1);
+  check("s1 write:false has --allowedTools Read,Glob,Grep,WebFetch,WebSearch", cmd1.includes("--allowedTools Read,Glob,Grep,WebFetch,WebSearch"), cmd1);
+  check("s1 write:false has no Bash in allowedTools", !cmd1.includes("Bash"), cmd1);
+  check("s1 write:false has no bypassPermissions", !cmd1.includes("bypassPermissions"), cmd1);
+
+  // Session 4: write:true -> must have --permission-mode bypassPermissions and NO --allowedTools
+  const s4 = await call("agent_bridge_open_session", { agent: "claude", cwd: REPO, write: true });
+  check("s4 open idle", s4.session?.status === "idle", s4.session?.status);
+  const cmd4 = firstCmdLine(s4.session?.logFile);
+  console.log(`  s4 cmd: ${cmd4}`);
+  check("s4 write:true has --permission-mode bypassPermissions", cmd4.includes("--permission-mode bypassPermissions"), cmd4);
+  check("s4 write:true has no --allowedTools", !cmd4.includes("--allowedTools"), cmd4);
+
   // Close all
   const closed = await call("agent_bridge_close_session", {});
-  check("close all", closed.closedAll === true || closed.count >= 3, JSON.stringify({ count: closed.count }));
+  check("close all", closed.closedAll === true || closed.count >= 4, JSON.stringify({ count: closed.count }));
 } catch (e) { check(`harness error: ${e.message}`, false); }
 finally { srv.stdin.end(); await sleep(800); if (!exited) srv.kill(); await sleep(300); check("server clean shutdown", exited?.code === 0, JSON.stringify(exited)); console.log(`\n>>> ${fail === 0 ? "PASS" : "FAIL"}: ${pass} passed, ${fail} failed`); process.exit(fail === 0 ? 0 : 1); }

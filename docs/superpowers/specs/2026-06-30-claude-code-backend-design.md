@@ -130,7 +130,7 @@ Permission segment, by `write`:
 | `true`  | `--permission-mode bypassPermissions` — full autonomy in `cwd` (edits + Bash + all tools), matching OMP `--auto-approve yolo` / Codex `workspace-write`. |
 | `false` | `--permission-mode default --allowedTools "Read,Glob,Grep,Bash,WebFetch,WebSearch"` — read + read-only Bash. In headless there is no approver, so non-allowlisted tools (Edit/Write/…) are denied. Bash is allowlisted for read-only commands (grep/find/git log); this is trust-by-prompt, **not** OS-level isolation (Claude Code has no read-only sandbox). |
 
-> Post-review amendment (v0.9.0): `Bash` was dropped from the read-only allowlist — `--allowedTools Bash` grants full shell with no headless approver, which would break the `write:false` no-mutation boundary. Read-only is now `Read,Glob,Grep,WebFetch,WebSearch`.
+> Post-review amendment (v0.9.0): `Bash` was dropped from the read-only allowlist — `--allowedTools Bash` grants full shell with no headless approver, which would break the `write:false` no-mutation boundary. Read-only is now `Read,Glob,Grep,WebFetch,WebSearch`. Caveat: `--strict-mcp-config` still loads project hooks, which execute outside the tool allowlist; `write:false` is a tool-level boundary, not a hook/OS sandbox.
 
 (`--allowedTools` is passed as a single comma-joined argv entry to avoid variadic
 greediness consuming following flags.)
