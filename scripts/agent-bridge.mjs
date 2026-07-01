@@ -2243,11 +2243,24 @@ class ClaudeCodeSession {
       this.#failTurn(new Error(this.lastError || "claude exited."));
     });
 
-    // No startup handshake: the CLI emits nothing on stdout until the first user message, and writing
-    // that message immediately after spawn is safe (verified) — the live process IS readiness. Guard
-    // against a spawn that already died synchronously: don't advertise idle over a dead process (the
-    // error/close handlers set failed). A still-async ENOENT can briefly show idle-then-failed; that
-    // window is closed for callers by the exitCode/signalCode guards in send()/#write()/abort().
+    // No stdout handshake: the CLI emits nothing on stdout until the first user message, and writing
+    // that message immediately after spawn is safe (verified) — there is no readiness event to await.
+    // But we DO await the OS-level spawn result so open_session returns a real error for an unspawnable
+    // binary (bad CLAUDE_BIN / ENOENT / EACCES) rather than a transiently-idle-then-failed session.
+    try {
+      await new Promise((resolve, reject) => {
+        this.proc.once("spawn", resolve);
+        this.proc.once("error", reject);
+      });
+    } catch (err) {
+      // Spawn failed; the on("error") handler above also fired and set status=failed. Surface it so the
+      // caller isn't handed a broken session (openSession catches this and tears the session down).
+      const e = err instanceof Error ? err : new Error(String(err));
+      this.lastError = e.message;
+      throw e;
+    }
+    // Guard against a process that spawned then died synchronously before we reach here (the close
+    // handler will set failed): don't advertise idle over an already-dead process.
     if (this.proc.exitCode === null && this.proc.signalCode === null) {
       setSessionStatus(this, "idle", false, { source: "ready" });
     }
@@ -2359,16 +2372,29 @@ class ClaudeCodeSession {
     setSessionStatus(this, "running", true, { source: "send" });
     const promise = new Promise((resolve, reject) => { this.turn = { resolve, reject }; });
     this.turn.promise = promise;
+    const myTurn = this.turn;
     promise.catch(() => {}); // pre-attach so an early rejection can't crash the server
-    this.#beginTurn(turnId);
 
     try {
       this.#writeUser(String(message));
     } catch (err) {
+      // The message never reached claude, so no turn actually started. Tear down cleanly WITHOUT
+      // #settleTurn — do not bump turnCount, stamp turnEndedAt, or clear the previous turn's answer for
+      // a send that never happened (mirrors CodexAppServerSession's clean teardown on turn/start
+      // failure). #writeUser only throws when stdin is dead, so the session is failed.
       const e = err instanceof Error ? err : new Error(String(err));
-      this.#settleTurn(e, "error");
+      if (this.turn === myTurn) {
+        this.turn = null;
+        this.lastError = e.message;
+        if (this.status !== "closed") setSessionStatus(this, "failed", false, { source: "write_error", error: e.message });
+        myTurn.reject(e);
+      }
       throw e;
     }
+    // The message is on the wire — the turn has now begun (mirrors Codex beginning its turn on the
+    // turn/start response). Placing #beginTurn after the write keeps a failed send from clobbering turn
+    // metadata or erasing the previous turn's result.
+    this.#beginTurn(turnId);
 
     if (options.wait) {
       try {
