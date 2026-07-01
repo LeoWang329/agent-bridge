@@ -126,21 +126,16 @@ close_session(session_id)                  →  用完必须关
 
 > 提醒：MiniMax-M3 中止长生成后容易「接着干旧任务」（观察于早期版本的模型行为，非桥的问题，若已更新以实际为准）；需要稳定中止/复核时优先 `deepseek-v4-pro`。
 
-## 角色默认与编排策略
+## 编排策略
 
-> 以下是默认分工；**用户显式指定模型 / 强度 / 其他要求时，优先遵循用户指令。**
-
-**默认角色：**
-
-- **实施**：`agent:"omp"` + `model:"deepseek/deepseek-v4-pro"` + `effort:"xhigh"` + `write:true`（`model` 用全限定 `provider/名`，见上节警告）。
-- **评审 / 第二意见**：`agent:"codex"` + `effort:"xhigh"` + `write:false`（codex 的 `effort` 作为该轮 reasoning effort 生效，默认拉满；简单改动的评审可降到 `medium`）。
+> **桥不预设「谁干什么」。用户显式指定 agent / model / effort / 读写时优先遵循；没指定就按任务性质自己判断。**
 
 **先探后派（doctor → list-models）：**
 
-- 派活前、尤其依赖 Codex 时，先 `agent_bridge_doctor` 确认哪些后端可用——「有没有 Codex」靠查不靠猜。注意 `doctor` 只是 `--version` 预检，不验证登录 / 能否真启动；真能跑以 `open_session` 为准。
+- 派活前、尤其依赖某个特定后端时，先 `agent_bridge_doctor` 确认哪些后端可用——「有没有那个后端」靠查不靠猜。注意 `doctor` 只是 `--version` 预检，不验证登录 / 能否真启动；真能跑以 `open_session` 为准。
 - **`doctor` 之后、或第一次派 OMP 会话前，先用 `omp --list-models <关键字>` 探一下可用模型及各自 thinking 上限**（用你的 shell 执行，不是 MCP tool；`doctor` 也不列模型）。据此选 `model`/`effort`，避免传后端不认的模型或它不支持的强度。
 
-**评审独立性：** 评审者必须 ≠ 实施者（引擎或模型不同才算真第二意见）。别用同模型同会话评自己刚写的代码。**没有 Codex 时**：评审退回 OMP，但换一个与实施者不同的 `model` + 新开独立会话，保住「独立第二意见」。
+**评审独立性：** 评审者必须 ≠ 实施者（引擎或模型不同才算真第二意见）。别用同模型同会话评自己刚写的代码。选评审后端时，换一个与实施者不同的引擎 / `model` + 新开独立会话，保住「独立第二意见」。
 
 **effort 量体裁衣：** 重活（复杂实施/评审）用 `xhigh`；改小范围、跑定位用 `medium`。别把 `xhigh` 当全局默认。
 
@@ -152,7 +147,7 @@ close_session(session_id)                  →  用完必须关
 
 **委托后主 agent 仍自查：** 委托方改完文件，主 agent 必须自己 `git diff` + 跑必要测试再向用户报告，不盲信。
 
-**关键改动并行双评（可选）：** 重要 diff 同时发 Codex 和 DeepSeek，并行 `wait(mode:"all")` 对比分歧——意见不一致处往往是真问题。
+**关键改动并行双评（可选）：** 重要 diff 同时发两个不同引擎 / 模型的后端，并行 `wait(mode:"all")` 对比分歧——意见不一致处往往是真问题。
 
 ## 安全规则
 
@@ -161,7 +156,7 @@ close_session(session_id)                  →  用完必须关
 - 委托方与被委托 agent **共享 `cwd`**：审查/实现让对方自己 `git diff`、自己读文件，别把整坨 diff/代码塞进 `message`（省 token）。
 - 委托 agent 改了文件，调用方仍需检查 diff、跑必要测试，再向用户报告。
 - 小任务不要委托。
-- 完成后一定要 `close_session`，避免留下后台 OMP/Codex 进程。
+- 完成后一定要 `close_session`，避免留下后台后端进程。
 
 ## Prompt 写法
 
