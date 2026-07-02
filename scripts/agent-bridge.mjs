@@ -435,6 +435,11 @@ function stripAnsi(text) {
   return String(text || "").replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "");
 }
 
+// Keep the TAIL when over the cap (drops the oldest chars). This is for accumulating in-flight text —
+// lastAssistantText / lastError / lastStderr — where the END is what matters (the latest streamed
+// output, the wait() progress `tail`). NOTE the opposite direction from buildSessionResult's
+// max_chars, which HEAD-truncates a finished answer (keeps the beginning). Two different needs: "what
+// is it producing right now" (tail) vs "preview of the finished product" (head). Don't confuse them.
 function clampText(text, max = MAX_TEXT) {
   const value = String(text || "");
   if (value.length <= max) return value;
@@ -554,6 +559,8 @@ function buildSessionResult(session, fullText, options = {}) {
   const truncated = Boolean(max && max > 0 && charCount > max && textRef);
   return {
     session: session.summary(),
+    // HEAD-truncate (keep the beginning) — a max_chars preview of the finished answer; the full text
+    // stays in textRef. Opposite direction from clampText's TAIL clamp (see note there).
     text: (truncated ? text.slice(0, max) : text) || null,
     charCount,
     byteCount,
@@ -1630,8 +1637,12 @@ class CodexAppServerSession {
     this.agent = "codex";
     this.cwd = assertCwd(options.cwd);
     this.write = Boolean(options.write);
-    // Not sanitized like OMP: Codex receives model/effort over JSON-RPC, never on a command line.
-    this.model = options.model || null;
+    // Codex passes model over JSON-RPC (no shell-injection vector, unlike OMP/Claude command-line args),
+    // so sanitizing is not a security need here — but we still do it for UNIFORM input validation: a bad
+    // model is rejected early with the same clear error across all three backends. The allowed set
+    // ([A-Za-z0-9._:/@+-]) covers known/common provider model ids; if a future/custom selector needs a
+    // wider charset, widen it once in sanitizeAgentArg (single source, not three call sites).
+    this.model = sanitizeAgentArg(options.model, "model");
     this.effort = options.effort || null;
     this.createdAt = nowIso();
     this.updatedAt = this.createdAt;
