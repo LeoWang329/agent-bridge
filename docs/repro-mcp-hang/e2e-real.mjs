@@ -109,6 +109,14 @@ try {
   // After a CLEAN turn that must NOT be in lastError anymore — it belongs in lastStderr (diagnostics).
   check("codex benign stderr NOT in lastError (T4)", stCdx.session?.lastError === null, `lastError=${JSON.stringify(stCdx.session?.lastError)} lastStderr=${JSON.stringify((stCdx.session?.lastStderr || "").slice(0, 60))}`);
 
+  // 4b. T11 (A1): Codex-native structured output. Ask for a small object and enforce it with a schema;
+  // the result must carry a PARSED top-level `json` (schemaError null). Real server-side outputSchema.
+  const SCHEMA = { type: "object", properties: { verdict: { type: "string" }, count: { type: "number" } }, required: ["verdict", "count"], additionalProperties: false };
+  await call("agent_bridge_send_message", { session_id: cdxId, message: 'Return a JSON object with verdict="ok" and count=3.', schema: SCHEMA, wait: false });
+  const schemaWait = await call("agent_bridge_wait", { session_ids: [cdxId], mode: "all", timeout_ms: 180000 }, 200000);
+  const schemaRes = schemaWait.results?.[0];
+  check("codex schema → parsed json (T11)", !!schemaRes?.json && typeof schemaRes.json === "object" && schemaRes.schemaError == null, `json=${JSON.stringify(schemaRes?.json)} schemaError=${JSON.stringify(schemaRes?.schemaError)}`);
+
   // 5. wait(mode:any) — send to both, return on first; then drain the rest
   await call("agent_bridge_send_message", { session_id: ompId, message: "Reply with exactly: E2E_ANY_OMP", wait: false });
   await call("agent_bridge_send_message", { session_id: cdxId, message: "Reply with exactly: E2E_ANY_CDX", wait: false });

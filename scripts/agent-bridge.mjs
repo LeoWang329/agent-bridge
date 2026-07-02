@@ -158,6 +158,11 @@ const TOOLS = [
             "Optional reasoning effort. OMP maps it to --thinking (minimal|low|medium|high|xhigh). Codex sends it as the turn effort (none|minimal|low|medium|high|xhigh). Claude maps it to --effort (minimal|low|medium|high|xhigh) and defaults to xhigh.",
         },
         initial_prompt: { type: "string", description: "Optional first message to send after opening." },
+        schema: {
+          type: "object",
+          description:
+            "Optional JSON Schema for structured output on the initial_prompt turn (Codex only; rejected for omp/claude). See agent_bridge_send_message's `schema`: the result carries a parsed top-level `json` (or `schemaError`).",
+        },
         wait: {
           type: "boolean",
           default: false,
@@ -194,6 +199,11 @@ const TOOLS = [
           type: "number",
           description:
             "Optional cap (characters) on the inline result text when wait=true. If the answer is longer, text is truncated, truncated:true is set, and the full answer stays retrievable via textRef. charCount/byteCount are always reported.",
+        },
+        schema: {
+          type: "object",
+          description:
+            "Optional JSON Schema for structured output (Codex only; rejected for omp/claude). Codex enforces it for this turn; the result then carries a parsed top-level `json` (or `schemaError:{error,rawText}` if the model didn't return conforming JSON). Applies to this turn only.",
         },
       },
       required: ["session_id"],
@@ -436,6 +446,14 @@ function assertString(value, label, { maxLen = 200 } = {}) {
 function assertEnum(value, label, allowed, fallback) {
   if (value == null) return fallback;
   if (!allowed.includes(value)) throw new Error(`${label} must be one of: ${allowed.join(", ")}.`);
+  return value;
+}
+
+// Validate an optional plain-object field (a JSON object literal — rejects arrays and primitives);
+// returns undefined when absent. Used for the Codex `schema` (JSON-Schema) param (T11).
+function assertPlainObject(value, label) {
+  if (value == null) return undefined;
+  if (typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be a JSON object.`);
   return value;
 }
 
@@ -705,7 +723,7 @@ function buildSessionResult(session, fullText, options = {}) {
   // and fetch the full answer. An explicit max_chars overrides ref for that call. Same safety net as
   // truncation: only omit when textRef actually holds the full text, else fall back to full inline.
   const refOmit = session.returnMode === "ref" && max == null && Boolean(textRef);
-  return {
+  const result = {
     session: session.summary(),
     // Lift health to the TOP level too: wait()'s summarize withholds the heavy `session` object (T1),
     // so this is how wait().completed.health / result().health reach the caller. (This is also the
@@ -721,6 +739,32 @@ function buildSessionResult(session, fullText, options = {}) {
     recentEvents: slimEvents(session.events),
     // logFile is intentionally NOT repeated here — it already lives in session.logFile above.
   };
+  // T11 (A1) structured output — Codex only. `_requestedSchema` is set per-turn in Codex send() (and is
+  // undefined on OMP/Claude, which reject `schema` at the sendMessage layer), so this whole block is inert
+  // unless THIS turn asked for structured output. The caller wanted machine-readable data, so we surface
+  // the outcome AS DATA, never as a thrown exception:
+  //   • turn succeeded → JSON.parse the final text → top-level `json` (or `schemaError` if it isn't JSON).
+  //   • turn FAILED (lastTurnError — e.g. the model couldn't satisfy the schema and codex reported a
+  //     failed turn) → `schemaError` carrying the failure reason, NOT a parse of the (empty) text.
+  // We trust Codex's server-side outputSchema enforcement and only JSON.parse here — there is no bundled
+  // JSON-Schema validator and hand-rolling one would be a second, divergent source of truth.
+  if (session._requestedSchema) {
+    if (session.lastTurnError) {
+      result.json = null;
+      // Prefer THIS turn's captured failure reason over the sticky session lastError, which a later
+      // turn/start failure (that never began a turn) could have overwritten (T11 round-2 edge).
+      result.schemaError = { error: session.lastTurnErrorMessage || session.lastError || "codex turn failed", rawText: text || null };
+    } else {
+      try {
+        result.json = JSON.parse(text);
+        result.schemaError = null;
+      } catch (e) {
+        result.json = null;
+        result.schemaError = { error: `model output was not valid JSON: ${e.message}`, rawText: text };
+      }
+    }
+  }
+  return result;
 }
 
 // Remove model thinking/reasoning content before logging an event (keeps the answer, tool calls,
@@ -1814,6 +1858,11 @@ class CodexAppServerSession {
     this.lastError = null;
     this.lastStderr = null; // benign backend stderr (progress/info); NOT a fatal error (T4/P1)
     this.lastTurnError = false; // did the most recently COMPLETED turn end in error? drives health (T9/A5)
+    // WHY the last COMPLETED turn failed (null if it succeeded). Paired with lastTurnError and set ONLY in
+    // #settleTurn — so, unlike the sticky session-level lastError, it is not clobbered by a later
+    // turn/start failure that never began a turn. schemaError.error reads this so a failed schema turn
+    // reports ITS OWN reason (T11; same decoupling principle as lastTurnError/T9 and lastStderr/T4).
+    this.lastTurnErrorMessage = null;
     this.events = [];
     this.proc = null;
     this.pending = new Map();
@@ -1828,6 +1877,12 @@ class CodexAppServerSession {
     this.turnCount = 0;
     this.finalAnswer = "";
     this.lastAgentMessage = "";
+    // T11 (A1): JSON-Schema of the turn whose text is currently in finalAnswer (null = plain text).
+    // Stashed on the turn object in send(), COMMITTED here-adjacent in #beginTurn (in lockstep with the
+    // finalAnswer reset), read by buildSessionResult after settle → json/schemaError. Bound to the turn's
+    // real begin — not send() entry — so a failed turn/start leaves the prior turn's flag+text in sync;
+    // cleared on abort. Persists across the settle→result gap; the next begun turn overwrites it.
+    this._requestedSchema = null;
     this.tokenUsage = null;
     this.logFile = path.join(RUN_LOG_DIR, `${this.id}.log`);
     this.answerFile = path.join(RUN_LOG_DIR, `${this.id}.answer.txt`);
@@ -2112,6 +2167,10 @@ class CodexAppServerSession {
     this.finalAnswer = "";
     this.lastAgentMessage = "";
     this.lastAssistantText = "";
+    // T11: commit the requested schema HERE — the moment the turn's text accumulators reset — so the
+    // schema flag result()/buildSessionResult read is always the schema of the turn whose text is now
+    // in finalAnswer. (Set from the turn object stashed in send(); null for a plain turn.)
+    this._requestedSchema = this.turn.schema ?? null;
   }
 
   #settleTurn(err, status) {
@@ -2123,6 +2182,7 @@ class CodexAppServerSession {
     // should report accepted:false and fire an interrupt.
     turn.settled = { err: err || null, status: status ?? null };
     this.lastTurnError = Boolean(err); // outcome of the turn just completed → health (T9); cleared on success
+    this.lastTurnErrorMessage = err ? err.message : null; // reason for THIS turn (T11); not the sticky lastError
     this.turn = null;
     this.currentTurnId = null;
     this.turnCount += 1;
@@ -2152,6 +2212,13 @@ class CodexAppServerSession {
       this.turn = { resolve, reject };
     });
     const myTurn = this.turn;
+    // T11: stash this turn's requested schema (null = plain text) ON THE TURN OBJECT. It is COMMITTED to
+    // the result-facing `_requestedSchema` only in #beginTurn — i.e. in lockstep with the finalAnswer/
+    // lastAssistantText reset — so the schema flag and the text it describes stay in sync. A turn/start
+    // that fails never calls #beginTurn, so it leaves BOTH the previous turn's text AND its schema flag
+    // intact (a stale-schema mislabel of the prior result, and the mirror where a failed plain start
+    // erased a prior schema turn's json, were the bug codex caught). Do NOT set _requestedSchema here.
+    myTurn.schema = options.schema ?? null;
     // Guard against unhandledRejection taking down the server if the turn rejects
     // (process crash / error notification) before a waiter is attached below.
     done.catch(() => {});
@@ -2167,7 +2234,8 @@ class CodexAppServerSession {
           input: [{ type: "text", text: String(message), text_elements: [] }],
           model: this.model,
           effort: this.effort,
-          outputSchema: null,
+          outputSchema: options.schema ?? null, // T11: per-turn JSON-Schema (null = plain text). Uses
+          // options directly, NOT the committed _requestedSchema, which #beginTurn may not have set yet.
         }),
         30000,
         "Timed out starting Codex turn.",
@@ -2203,7 +2271,9 @@ class CodexAppServerSession {
         // full turn lifecycle flushed in one chunk; #beginTurn did the bookkeeping from the
         // turn/started notification). It was NOT aborted — report it honestly instead of firing a
         // spurious interrupt at a finished turn and mislabeling it accepted:false.
-        if (myTurn.settled.err) throw myTurn.settled.err;
+        // T11: a FAILED schema turn is normalized to a schemaError result (wait) / ack (non-blocking)
+        // rather than thrown — the caller asked for machine-readable output, so the failure is data.
+        if (myTurn.settled.err && !this._requestedSchema) throw myTurn.settled.err;
         if (options.wait) return await this.result({ maxChars: options.maxChars });
         return { accepted: true, sessionId: this.id, status: this.status, turnId: startedTurnId || this.lastTurnId };
       }
@@ -2232,7 +2302,9 @@ class CodexAppServerSession {
     if (initialStatus && TERMINAL.has(initialStatus)) {
       const failed = initialStatus !== "completed";
       this.#settleTurn(failed ? new Error(`codex turn ${initialStatus}`) : null, initialStatus);
-      if (failed) throw new Error(`codex turn ${initialStatus}`);
+      // T11: for a schema turn, don't throw — fall through so the failure surfaces as a schemaError
+      // result (wait: via the done-rejection branch below; non-blocking: via the caller's wait/result).
+      if (failed && !this._requestedSchema) throw new Error(`codex turn ${initialStatus}`);
     }
 
     if (options.wait) {
@@ -2243,13 +2315,18 @@ class CodexAppServerSession {
           "Timed out waiting for Codex turn.",
         );
       } catch (err) {
-        // On a wait timeout the turn is still pending; interrupt the backend turn
-        // and clear it so the session stays reusable instead of wedged at running.
+        // On a wait TIMEOUT the turn is still pending (this.turn set): interrupt the backend turn and
+        // clear it so the session stays reusable, then rethrow — a timeout is an operational failure,
+        // not a schema outcome (and abort() clears lastTurnError, so it must NOT masquerade as one).
         if (this.turn) {
           try {
             await this.abort();
           } catch {}
+          throw err;
         }
+        // Otherwise the turn already settled as FAILED (done rejected, this.turn cleared by #settleTurn).
+        // T11: for a schema request, normalize that to a schemaError result instead of throwing.
+        if (this._requestedSchema) return await this.result({ maxChars: options.maxChars });
         throw err;
       }
     }
@@ -2309,6 +2386,10 @@ class CodexAppServerSession {
     // Abort is user-initiated, not a turn failure: clear lastTurnError so health doesn't read a stale
     // "degraded" from a PRIOR errored turn (abort() nulls this.turn and bypasses #settleTurn — T9).
     this.lastTurnError = false;
+    this.lastTurnErrorMessage = null; // paired with lastTurnError (T11)
+    // Likewise clear the schema flag (T11): a user-aborted turn produced no structured output, so
+    // result() should return the (partial) text plainly, not a bogus schemaError parse of it.
+    this._requestedSchema = null;
     turn?.resolve?.();
     return { aborted: true, sessionId: this.id };
   }
@@ -2811,12 +2892,22 @@ async function openSession(params) {
     throw err;
   }
 
+  // T11: schema on the initial turn — same codex-only rule as send_message. Validate up front so a bad
+  // schema/backend combination fails the open cleanly (the started session is torn down below on any
+  // initial-turn error), rather than after the process is already spawned and left dangling.
+  const initialSchema = assertPlainObject(params.schema, "schema");
+  if (initialSchema && session.agent !== "codex") {
+    sessions.delete(session.id);
+    try { session.close({ removePidRecord: false }); } catch {}
+    throw new Error(`schema (structured output) is not supported for backend "${session.agent}" yet; only codex.`);
+  }
   let initial = null;
   if (params.initial_prompt) {
     try {
       initial = await session.send(params.initial_prompt, {
         wait: Boolean(params.wait),
         timeout_ms: params.timeout_ms,
+        schema: initialSchema,
       });
     } catch (err) {
       // The session started but the first turn failed (a wait:true timeout aborts the turn; the
@@ -2879,10 +2970,17 @@ async function sendMessage(params) {
     message = readFileUnderCwd(session.cwd, params.message_file, "message_file", MESSAGE_FILE_MAX_BYTES);
     if (!message.trim()) throw new Error("message_file is empty.");
   }
+  // T11 (A1): structured output. Only Codex has native per-turn outputSchema; reject it OUTRIGHT for
+  // OMP/Claude (not silently ignore — a dropped machine-readable contract is worse than a clear error).
+  const schema = assertPlainObject(params.schema, "schema");
+  if (schema && session.agent !== "codex") {
+    throw new Error(`schema (structured output) is not supported for backend "${session.agent}" yet; only codex.`);
+  }
   return await session.send(message, {
     wait: Boolean(params.wait),
     timeout_ms: params.timeout_ms,
     maxChars: params.max_chars,
+    schema,
   });
 }
 
