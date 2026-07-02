@@ -140,6 +140,11 @@ const TOOLS = [
           description: "Allow delegated file edits. Default false. Enable only when the user explicitly wants edits.",
         },
         model: { type: "string", description: "Optional model selector for the delegated agent." },
+        name: {
+          type: "string",
+          description:
+            "Optional human-friendly alias for this session, unique among your sessions. Once set, it can be used anywhere a session_id is accepted (send/wait/status/result/abort/close) and is echoed in status. Helps re-identify sessions after a context compaction.",
+        },
         effort: {
           type: "string",
           description:
@@ -401,6 +406,18 @@ function sanitizeAgentArg(value, label) {
     throw new Error(`Invalid ${label} "${str}": only letters, digits, and . _ : / @ + - are allowed.`);
   }
   return str;
+}
+
+// Runtime validation for optional user-supplied string fields. The MCP layer does NOT enforce tool
+// input schemas (handleMcp only checks args is an object), so every new field must be validated here.
+// Returns the trimmed string, or null when the field is absent.
+function assertString(value, label, { maxLen = 200 } = {}) {
+  if (value == null) return null;
+  if (typeof value !== "string") throw new Error(`${label} must be a string.`);
+  const s = value.trim();
+  if (!s) throw new Error(`${label} must be a non-empty string when provided.`);
+  if (s.length > maxLen) throw new Error(`${label} must be at most ${maxLen} characters.`);
+  return s;
 }
 
 // Per-file byte counters so a live session's log can be rotated once it exceeds LOG_FILE_MAX_BYTES.
@@ -1585,6 +1602,7 @@ class OmpRpcSession {
       updatedAt: this.updatedAt,
       lastError: this.lastError,
       lastStderr: this.lastStderr ?? null,
+      name: this.name ?? null,
       logFile: this.logFile,
       lastTurn: lastTurnOf(this),
       // Backend-specific fields live here so the top-level shape is identical across agents
@@ -2169,6 +2187,7 @@ class CodexAppServerSession {
       updatedAt: this.updatedAt,
       lastError: this.lastError,
       lastStderr: this.lastStderr ?? null,
+      name: this.name ?? null,
       logFile: this.logFile,
       lastTurn: lastTurnOf(this),
       // Backend-specific fields kept off the top level so the shape matches omp (P3).
@@ -2532,6 +2551,7 @@ class ClaudeCodeSession {
       updatedAt: this.updatedAt,
       lastError: this.lastError,
       lastStderr: this.lastStderr ?? null,
+      name: this.name ?? null,
       logFile: this.logFile,
       lastTurn: lastTurnOf(this),
       agentSpecific: { claudeSessionId: this.claudeSessionId, turnCount: this.turnCount },
@@ -2599,7 +2619,21 @@ function extractLikelyText(raw) {
 async function openSession(params) {
   ensureDirs();
   assertAgent(params.agent); // rejects any unknown agent here, so the dispatch below can't silently fall back
+  // Optional session alias. Validate + enforce uniqueness BEFORE spawning (fail fast, no orphaned proc).
+  const name = assertString(params.name, "name", { maxLen: 120 });
+  if (name !== null) {
+    for (const existing of sessions.values()) {
+      if (existing.name === name) throw new Error(`Session name "${name}" is already in use; names must be unique.`);
+    }
+    // Reject a name equal to any existing session id: getSession() resolves by id first, so such a name
+    // would be permanently shadowed and unreachable by name. (The reverse — a LATER auto-generated id
+    // happening to equal this name — is not guarded: makeId is prefix-<base36 time>-<6 random>, so the
+    // collision is astronomically unlikely, and guarding it would cost an O(n) scan on every open or an
+    // id regeneration for effectively-zero risk. Reviewed and accepted by deepseek+codex.)
+    if (sessions.has(name)) throw new Error(`Session name "${name}" collides with an existing session id; choose another.`);
+  }
   const session = new AGENTS[params.agent].Session(params);
+  session.name = name;
   sessions.set(session.id, session);
   try {
     await session.start();
@@ -2645,7 +2679,14 @@ async function openSession(params) {
 }
 
 function getSession(sessionId) {
-  const session = sessions.get(sessionId);
+  let session = sessions.get(sessionId);
+  if (!session && sessionId != null) {
+    // Fall back to resolving by session alias (name). Ids are tried FIRST, and openSession rejects a
+    // name equal to any existing id, so a name can never shadow an id. Names are unique → at most one match.
+    for (const s of sessions.values()) {
+      if (s.name === sessionId) { session = s; break; }
+    }
+  }
   if (!session) throw new Error(`Unknown session: ${sessionId}`);
   return session;
 }
@@ -2700,15 +2741,17 @@ function sessionSettled(session) {
 }
 
 async function waitSessions(params) {
-  const ids = Array.isArray(params.session_ids) ? params.session_ids.filter(Boolean) : [];
-  if (!ids.length) throw new Error("session_ids is required (a non-empty array of session ids).");
+  const rawIds = Array.isArray(params.session_ids) ? params.session_ids.filter(Boolean) : [];
+  if (!rawIds.length) throw new Error("session_ids is required (a non-empty array of session ids).");
   const mode = params.mode === "any" ? "any" : "all";
   const timeoutMs = parseNumber(params.timeout_ms, DEFAULT_WAIT_TIMEOUT_MS);
   // Tail length for progress snapshots, bounded so a bad value can't blow up the payload or slice
   // backwards (parseNumber only parses; clampInt enforces 0..4000).
   const tailChars = clampInt(parseNumber(params.tail_chars, 240), 0, 4000);
-  // Validate up front so an unknown id is a clear error rather than a silent timeout.
-  for (const id of ids) getSession(id);
+  // Resolve any aliases (names) to canonical session ids up front (getSession throws on unknown — a
+  // clear error rather than a silent timeout), and dedup, so every internal sessions.get(id) below
+  // works and the returned completed/pending/settled ids are canonical. Supports wait-by-name too.
+  const ids = [...new Set(rawIds.map(id => getSession(id).id))];
 
   // Lightweight, actionable progress for a still-running session: what it's producing right now
   // (tail of the live partial text, not the head), plus its latest lifecycle event — so a timed-out
