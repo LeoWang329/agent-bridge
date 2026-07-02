@@ -105,7 +105,7 @@ close_session(session_id)                  →  用完必须关
 - `textRef`：一个文件路径，里面是**完整未截断**的全文。⚠️ `close_session` 会删除它——**要完整内容就先读 `textRef`、再关会话**；读不到时重新 `result`（调大或去掉 `max_chars`）。
 - `max_chars`：给 `text` 设上限；超限时 `text` 截断、`truncated:true`，但 `charCount` 仍报全长、`textRef` 仍是全文。**核心：必读内容绝不静默丢失。** 大产出（改代码/长文档）建议传个 `max_chars`（如 4000）只看头部，细节用 `git diff` / `textRef` 取。
 - `recentEvents`（`status`/`result` 带）：已**过滤掉逐 token、心跳等噪声**的精简生命周期串；要全量原始事件看 `logFile`。
-- `contextUsage`：该会话**当前上下文占用**（`{tokens, contextWindow, live, …}` 或 `null`）——判断要不要「关旧开新」防降智的信号。判定阈值与取法见「编排策略 → 上下文卫生」。
+- `contextUsage`：该会话**当前上下文占用**（`{tokens, live, …}` 或 `null`；只吐绝对 `tokens`，不含窗口/百分比）——判断要不要「关旧开新」防降智的信号。判定阈值与取法见「编排策略 → 上下文卫生」。
 
 ## Agent 与模型
 
@@ -151,10 +151,10 @@ close_session(session_id)                  →  用完必须关
 **用 `contextUsage` 提前发现「上下文腐化」：** 每个会话的返回里带 `contextUsage`（`status`/`result`/`wait`/`wait().pendingSnapshots` 都有；未测到时为 `null`）：
 
 ```
-contextUsage: { tokens, contextWindow, live, isCompacting?, autoCompactionEnabled? } | null
+contextUsage: { tokens, live, isCompacting?, autoCompactionEnabled? } | null
 ```
 
-- **`tokens` 是唯一判据**＝当前上下文的**绝对**长度。长上下文能力退化（context rot）跟**绝对 token 数**走，**不看百分比、不按窗口比例**（各后端窗口普遍 1M，百分比会低估大窗口下的腐化）。据此判断是否该「关旧开新」，纯绝对 token 硬约束：
+- **`tokens` 是唯一判据**＝当前上下文的**绝对**长度。长上下文能力退化（context rot）跟**绝对 token 数**走。**刻意只吐绝对 tokens、不吐 contextWindow / 百分比**——窗口大小会诱导算出「窗口占比」造成误解（各后端窗口普遍 1M，比例会低估大窗口下的腐化）。据此判断是否该「关旧开新」，纯绝对 token 硬约束：
 
   | 级别 | 条件 | 动作 |
   |---|---|---|
@@ -163,7 +163,6 @@ contextUsage: { tokens, contextWindow, live, isCompacting?, autoCompactionEnable
   | 重开 | `tokens ≥ 400k` | **关旧开新**，把摘要塞进新会话 `initial_prompt`；别再往旧会话发 |
 
   （依据：多数模型在 ~64–128k 就开始退化；这里取 400k 是对 1M 窗口模型**偏晚、偏保守**的触发线，跟窗口多大无关。三家分词器不同、同文本 token 数差 10–30%，当粗粒度触发器足够。）
-- **`contextWindow`**：仅供参考（窗口大小），**不参与阈值判断**——判断只看绝对 `tokens`。
 - **`live`**：`true`＝OMP 实时读数（`get_state`）；`false`＝Codex/Claude 上一轮结束的快照（下一轮从这里附近起步）。
 - **`isCompacting: true`**（仅 OMP）＝此刻正在压缩、正在丢上下文，收尾即可；`autoCompactionEnabled: false`（仅 OMP）＝到顶会硬失败而非自动压缩，更要盯 `tokens`。
 - **`null`**＝尚未测到（首轮前）或该轮没吐用量，**不等于 0、不代表安全**。

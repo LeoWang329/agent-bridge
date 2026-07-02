@@ -212,7 +212,7 @@ const TOOLS = [
   },
   {
     name: "agent_bridge_status",
-    description: "Inspect a persistent delegated-agent session, including streaming state and recent events. Omit session_id to list all sessions this server is managing. Each session carries contextUsage (current-context occupancy: absolute tokens + contextWindow, the signal for reopening before long-context degradation). Passing a session_id (and wait) refreshes an OMP session's live reading; the list-all form returns each session's LAST-KNOWN reading without a fresh poll (accurate while a session is idle — its context doesn't change — but a still-running OMP session may lag until you query it by id or via wait).",
+    description: "Inspect a persistent delegated-agent session, including streaming state and recent events. Omit session_id to list all sessions this server is managing. Each session carries contextUsage (current-context occupancy: absolute tokens — the signal for reopening before long-context degradation; no window/percent). Passing a session_id (and wait) refreshes an OMP session's live reading; the list-all form returns each session's LAST-KNOWN reading without a fresh poll (accurate while a session is idle — its context doesn't change — but a still-running OMP session may lag until you query it by id or via wait).",
     inputSchema: {
       type: "object",
       properties: {
@@ -1786,18 +1786,17 @@ class OmpRpcSession {
     throw new Error(`Timed out waiting for ${this.id} to become idle.`);
   }
 
-  // Normalized current-context occupancy — the long-context "rot" signal. Headline is ABSOLUTE
-  // `tokens` in the live context (not a percent): degradation tracks absolute length, and windows
-  // differ across models (mostly 1M here), so a percent-of-window would understate rot on a big
-  // window. The reopen decision is a pure absolute-token threshold; `contextWindow` is emitted as
-  // informational context only (window size) and is NOT used for any percent/ratio guard. OMP
-  // reports contextUsage in get_state on every poll, so this is real-time (`live:true`); its
-  // compaction flags ride along (isCompacting=true → OMP is dropping context right now). Returns null
-  // until get_state has populated contextUsage (partial → null, never a half object).
+  // Normalized current-context occupancy — the long-context "rot" signal. The ONLY number emitted is
+  // ABSOLUTE `tokens` in the live context: degradation tracks absolute length, and the model's context
+  // window is deliberately NOT surfaced — exposing it only invites a misleading percent-of-window
+  // reading (windows are mostly 1M here, so a ratio understates rot on a big window). The reopen
+  // decision is a pure absolute-token threshold (see the skill). OMP reports this in get_state on every
+  // poll, so it is real-time (`live:true`); its compaction flags ride along (isCompacting=true → OMP is
+  // dropping context right now). Returns null until get_state has populated tokens (partial → null).
   contextUsage() {
     const cu = this.sessionState?.contextUsage;
-    if (!cu || typeof cu.tokens !== "number" || typeof cu.contextWindow !== "number") return null;
-    const out = { tokens: cu.tokens, contextWindow: cu.contextWindow, live: true };
+    if (!cu || typeof cu.tokens !== "number") return null;
+    const out = { tokens: cu.tokens, live: true };
     if (typeof this.sessionState.isCompacting === "boolean") out.isCompacting = this.sessionState.isCompacting;
     if (typeof this.sessionState.autoCompactionEnabled === "boolean") out.autoCompactionEnabled = this.sessionState.autoCompactionEnabled;
     return out;
@@ -2443,12 +2442,12 @@ class CodexAppServerSession {
   // turn via thread/tokenUsage/updated; `last.inputTokens` is the tokens fed to the model on the last
   // turn = current context length — NOT `total` (cumulative cost across the session) and NOT
   // `last.totalTokens` (which also counts output). It is a last-turn snapshot, so `live:false` (the
-  // next turn starts from roughly here). null until the first turn reports usage.
+  // next turn starts from roughly here). The context window is not emitted (absolute tokens only).
+  // null until the first turn reports usage.
   contextUsage() {
     const last = this.tokenUsage?.last;
-    const window = this.tokenUsage?.modelContextWindow;
-    if (!last || typeof last.inputTokens !== "number" || typeof window !== "number") return null;
-    return { tokens: last.inputTokens, contextWindow: window, live: false };
+    if (!last || typeof last.inputTokens !== "number") return null;
+    return { tokens: last.inputTokens, live: false };
   }
 
   summary() {
@@ -2836,14 +2835,14 @@ class ClaudeCodeSession {
   }
 
   // Normalized current-context occupancy (see OmpRpcSession.contextUsage). Claude reports per-model
-  // usage in result.modelUsage — the ONLY place the context window appears. The primary model is the
-  // entry with the LARGEST contextWindow, so a turn that spun up a smaller-window subagent doesn't get
-  // mistaken for the main context. On a WINDOW TIE (e.g. main + a subagent on the same model/window),
-  // the entry with MORE input-side tokens wins — in the long-context scenario this feature targets, the
-  // main conversation has accumulated far more context than a freshly-spawned subagent, so tokens is the
-  // right discriminator (first-seen order in modelUsage is not meaningful). Current context = input-side
-  // tokens (fresh input + cache read + cache creation); output isn't part of the next turn's context.
-  // tokens:0 is a valid reading (kept, like omp/codex) — null is reserved for "no measurable entry".
+  // usage in result.modelUsage. contextWindow is used INTERNALLY to identify the primary model — the
+  // entry with the LARGEST window, so a turn that spun up a smaller-window subagent isn't mistaken for
+  // the main context — but the window is NOT emitted (absolute tokens only, no percent-inviting field).
+  // On a WINDOW TIE (main + a subagent on the same model/window), the entry with MORE input-side tokens
+  // wins — in the long-context scenario this targets, the main conversation has accumulated far more
+  // context than a freshly-spawned subagent, so tokens is the right discriminator (first-seen order in
+  // modelUsage is not meaningful). Current context = input-side tokens (fresh input + cache read + cache
+  // creation); output isn't part of the next turn's context. tokens:0 is a valid reading (like omp/codex).
   // Last-turn snapshot → live:false. null until a result lands or if no entry carries a contextWindow.
   contextUsage() {
     const mu = this.modelUsage;
@@ -2858,7 +2857,7 @@ class ClaudeCodeSession {
       }
     }
     if (!primary) return null;
-    return { tokens: primaryTokens, contextWindow: primary.contextWindow, live: false };
+    return { tokens: primaryTokens, live: false };
   }
 
   summary() {

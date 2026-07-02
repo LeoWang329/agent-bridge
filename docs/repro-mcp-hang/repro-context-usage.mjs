@@ -1,16 +1,17 @@
 // Repro/verify for contextUsage (current-context occupancy — the long-context "rot" signal). Deterministic,
 // ZERO real token spend — driven by fake-omp/fake-codex/fake-claude usage payloads. What it proves:
 //   omp live       — OMP get_state.contextUsage is normalized to top-level contextUsage
-//                    {tokens,contextWindow,live:true,isCompacting,autoCompactionEnabled}; carried through
-//                    wait() (T1 passthrough) AND status().session.
+//                    {tokens,live:true,isCompacting,autoCompactionEnabled} (NO contextWindow — absolute tokens
+//                    only, no percent-inviting field); carried through wait() (T1 passthrough) AND status().session.
 //   omp snapshot   — a LONG-running omp session's live reading appears in wait().pendingSnapshots[].contextUsage
 //                    (watch a session mid-turn, not just at the end). OMP is refreshed before the snapshot.
 //   omp null       — a get_state WITHOUT contextUsage → contextUsage:null (partial → null, never half object).
-//   codex          — last.inputTokens is chosen (NOT total, NOT last.totalTokens) + modelContextWindow, live:false,
+//   codex          — last.inputTokens is chosen (NOT total, NOT last.totalTokens), live:false, NO contextWindow,
 //                    and NO omp-only isCompacting key leaks in.
 //   codex null     — before the first usage notification → contextUsage:null.
-//   claude         — modelUsage's LARGEST-window entry is the primary (a 200k subagent is excluded), tokens are the
-//                    input-side sum (input + cacheRead + cacheCreation), live:false.
+//   claude         — modelUsage's LARGEST-window entry is the primary (a 200k subagent is excluded, via internal
+//                    window comparison), tokens are the input-side sum (input + cacheRead + cacheCreation), live:false;
+//                    contextWindow is used only internally for selection, never emitted.
 //   claude null    — before any result → contextUsage:null.
 import { spawn } from "node:child_process";
 import path from "node:path";
@@ -71,7 +72,8 @@ async function main() {
     const { id, r } = await turn(s, "omp");
     const cu = r?.contextUsage;
     if (!cu) return fail(`omp: wait result should carry contextUsage, got ${JSON.stringify(r?.contextUsage)}`);
-    if (cu.tokens !== 12345 || cu.contextWindow !== 1000000) return fail(`omp: tokens/contextWindow wrong, got ${JSON.stringify(cu)}`);
+    if (cu.tokens !== 12345) return fail(`omp: tokens wrong, got ${JSON.stringify(cu)}`);
+    if ("contextWindow" in cu) return fail(`omp: contextWindow must NOT be emitted (absolute tokens only), got ${JSON.stringify(cu)}`);
     if (cu.live !== true) return fail(`omp: OMP reading must be live:true, got ${JSON.stringify(cu.live)}`);
     if (cu.isCompacting !== false || cu.autoCompactionEnabled !== true) return fail(`omp: compaction flags should flow through, got ${JSON.stringify(cu)}`);
     // status() single-id refreshes get_state, so its session.contextUsage must match.
@@ -82,7 +84,7 @@ async function main() {
     const list = await s.call("agent_bridge_status", {});
     const listed = (list?.sessions || []).find(x => x.id === id);
     if (listed?.contextUsage?.tokens !== 12345) return fail(`omp-listall: list-all session should carry contextUsage, got ${JSON.stringify(listed?.contextUsage)}`);
-    console.log(`[harness] omp OK — live contextUsage{tokens,contextWindow,live:true,isCompacting,autoCompactionEnabled} via wait + status(id) + list-all`);
+    console.log(`[harness] omp OK — live contextUsage{tokens,live:true,isCompacting,autoCompactionEnabled} (no contextWindow) via wait + status(id) + list-all`);
     s.kill();
     await sleep(200);
   }
@@ -130,10 +132,10 @@ async function main() {
     const cu = w?.results?.[0]?.contextUsage;
     if (!cu) return fail(`codex: wait result should carry contextUsage, got ${JSON.stringify(w?.results?.[0])}`);
     if (cu.tokens !== 21401) return fail(`codex: tokens must be last.inputTokens (21401), NOT total/totalTokens — got ${JSON.stringify(cu.tokens)}`);
-    if (cu.contextWindow !== 258400) return fail(`codex: contextWindow must be modelContextWindow (258400), got ${JSON.stringify(cu.contextWindow)}`);
+    if ("contextWindow" in cu) return fail(`codex: contextWindow must NOT be emitted (absolute tokens only), got ${JSON.stringify(cu)}`);
     if (cu.live !== false) return fail(`codex: last-turn snapshot must be live:false, got ${JSON.stringify(cu.live)}`);
     if ("isCompacting" in cu) return fail(`codex: omp-only isCompacting must not appear, got ${JSON.stringify(cu)}`);
-    console.log(`[harness] codex OK — contextUsage{tokens:inputTokens,contextWindow:modelContextWindow,live:false}; null before first usage; no isCompacting leak`);
+    console.log(`[harness] codex OK — contextUsage{tokens:inputTokens,live:false} (no contextWindow); null before first usage; no isCompacting leak`);
     s.kill();
     await sleep(200);
   }
@@ -150,9 +152,10 @@ async function main() {
     const w = await s.call("agent_bridge_wait", { session_ids: [idPre], mode: "all", timeout_ms: 8000 });
     const cu = w?.results?.[0]?.contextUsage;
     if (!cu) return fail(`claude: wait result should carry contextUsage, got ${JSON.stringify(w?.results?.[0])}`);
-    // opus (1M window) is primary; haiku (200k) is a subagent and must NOT be chosen. tokens = 8000+20000+3000.
-    if (cu.contextWindow !== 1000000) return fail(`claude: primary must be the LARGEST-window entry (1M opus), not the 200k subagent — got ${JSON.stringify(cu.contextWindow)}`);
-    if (cu.tokens !== 31000) return fail(`claude: tokens must be input+cacheRead+cacheCreation (31000), got ${JSON.stringify(cu.tokens)}`);
+    // opus (1M window) is primary; haiku (200k) is a subagent and must NOT be chosen. The tokens value
+    // proves the selection: 8000+20000+3000=31000 is opus's sum; the haiku subagent would give ~500.
+    if (cu.tokens !== 31000) return fail(`claude: primary must be the LARGEST-window entry (1M opus → 31000), not the 200k subagent (~500) — got ${JSON.stringify(cu.tokens)}`);
+    if ("contextWindow" in cu) return fail(`claude: contextWindow must NOT be emitted (used internally for selection only), got ${JSON.stringify(cu)}`);
     if (cu.live !== false) return fail(`claude: last-turn snapshot must be live:false, got ${JSON.stringify(cu.live)}`);
     console.log(`[harness] claude OK — largest-window primary (subagent excluded), input-side token sum, live:false; null before first result`);
     s.kill();
@@ -183,7 +186,7 @@ async function main() {
     const cu = r?.contextUsage;
     if (!cu) return fail(`claude-tie: should carry contextUsage, got ${JSON.stringify(r)}`);
     if (cu.tokens !== 50000) return fail(`claude-tie: equal-window tie must pick the higher-token main entry (50000), NOT the first-seen subagent (1000), got ${JSON.stringify(cu.tokens)}`);
-    if (cu.contextWindow !== 1000000) return fail(`claude-tie: contextWindow should be 1M, got ${JSON.stringify(cu.contextWindow)}`);
+    if ("contextWindow" in cu) return fail(`claude-tie: contextWindow must NOT be emitted, got ${JSON.stringify(cu)}`);
     console.log(`[harness] claude-tie OK — equal contextWindow → tie-break by tokens picks the main conversation, not insertion order`);
     s.kill();
     await sleep(200);
