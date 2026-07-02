@@ -64,6 +64,11 @@ const OMP_READY_TIMEOUT_MS = envNum("AGENT_BRIDGE_OMP_READY_TIMEOUT_MS", 45000);
 // ready. On timeout spawnSync returns an error, the snapshot is marked invalid, and processCommand
 // returns null ("unknown") so records are kept and retried — graceful, never a false reap.
 const WIN_PS_SNAPSHOT_TIMEOUT_MS = envNum("AGENT_BRIDGE_WIN_PS_TIMEOUT_MS", 15000);
+// Bound each backend `--version` probe in doctor(). A single hung `--version` (wedged binary, stuck
+// auth prompt) would otherwise block the whole doctor() call — and doctor() answers a synchronous MCP
+// request, so the client would hang. On timeout the probe is killed (whole tree — see probeVersion) and
+// reported unavailable. Distinct from WIN_PS_SNAPSHOT_TIMEOUT_MS (a CIM query, 15s).
+const DOCTOR_PROBE_TIMEOUT_MS = envNum("AGENT_BRIDGE_DOCTOR_PROBE_TIMEOUT_MS", 10_000);
 // Parent-death watchdog interval. An MCP server exists only to serve the client that spawned it;
 // normally a vanished client is seen as stdin EOF. But if the client dies while another process keeps
 // our stdin pipe open (a hung grandparent retaining the handle — the 0.8.0 pid-16024 zombie shape),
@@ -2808,25 +2813,75 @@ function closeSession(sessionId) {
   return closed;
 }
 
-function doctor() {
+// Run one `--version` probe with a hard timeout. On timeout we must kill the WHOLE process tree, not
+// just the direct child: on Windows a .cmd shim (e.g. an npm-installed `codex.cmd`) runs under cmd.exe
+// with the real backend as a node grandchild — spawnSync's own killSignal would reap only cmd.exe and
+// orphan that grandchild, and doctor probes have no pid record so nothing else reaps it. So we use
+// async spawn + a manual timer that calls terminateProcessTree(child.pid) while the tree is still
+// alive (taskkill /T on Windows walks the tree). Resolves to a spawnSync-shaped {status, stdout,
+// stderr, error, timedOut} so doctor()'s classification below stays simple.
+function probeVersion(command, args) {
+  return new Promise(resolve => {
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    let child;
+    const finish = res => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(res);
+    };
+    let timer;
+    try {
+      child = spawn(command, args, { windowsHide: true });
+    } catch (err) {
+      return finish({ status: null, stdout: "", stderr: "", error: err, timedOut: false });
+    }
+    timer = setTimeout(() => {
+      terminateProcessTree(child.pid, "SIGKILL");
+      finish({ status: null, stdout, stderr, error: null, timedOut: true });
+    }, DOCTOR_PROBE_TIMEOUT_MS);
+    timer.unref?.();
+    child.stdout?.setEncoding("utf8");
+    child.stderr?.setEncoding("utf8");
+    // Bound accumulation: spawnSync had a default maxBuffer; async spawn does not, so a broken/hostile
+    // backend flooding output for the whole timeout window could grow memory. A `--version` string is
+    // tiny, so a 1 MiB cap never truncates real output while restoring the old resource boundary.
+    const MAX_PROBE_OUTPUT = 1 << 20;
+    child.stdout?.on("data", d => { if (stdout.length < MAX_PROBE_OUTPUT) stdout += d; });
+    child.stderr?.on("data", d => { if (stderr.length < MAX_PROBE_OUTPUT) stderr += d; });
+    child.on("error", err => finish({ status: null, stdout, stderr, error: err, timedOut: false }));
+    child.on("close", code => finish({ status: code, stdout, stderr, error: null, timedOut: false }));
+  });
+}
+
+async function doctor() {
+  const agents = [];
+  for (const [agent, config] of Object.entries(AGENTS)) {
+    const bin = agentBin(agent);
+    const plan = spawnPlan(bin, config.versionArgs);
+    const probe = await probeVersion(plan.command, plan.args);
+    const ok = probe.status === 0;
+    agents.push({
+      agent,
+      label: config.label,
+      bin,
+      available: ok,
+      version: ok ? stripAnsi(probe.stdout || probe.stderr).trim() : null,
+      error: ok
+        ? null
+        : probe.timedOut
+          ? `version probe timed out after ${DOCTOR_PROBE_TIMEOUT_MS}ms`
+          : stripAnsi(probe.stderr || probe.error?.message || "not available"),
+    });
+  }
   return {
     bridgeVersion: BRIDGE_VERSION,
     node: process.version,
     stateRoot: STATE_ROOT,
     logDir: RUN_LOG_DIR,
-    agents: Object.entries(AGENTS).map(([agent, config]) => {
-      const bin = agentBin(agent);
-      const plan = spawnPlan(bin, config.versionArgs);
-      const probe = spawnSync(plan.command, plan.args, { encoding: "utf8", windowsHide: true });
-      return {
-        agent,
-        label: config.label,
-        bin,
-        available: probe.status === 0,
-        version: probe.status === 0 ? stripAnsi(probe.stdout || probe.stderr).trim() : null,
-        error: probe.status === 0 ? null : stripAnsi(probe.stderr || probe.error?.message || "not available"),
-      };
-    }),
+    agents,
   };
 }
 
@@ -2902,7 +2957,7 @@ async function runCli(argv) {
       serveMcp();
       return;
     case "doctor": {
-      const value = doctor();
+      const value = await doctor();
       process.stdout.write(args.json ? `${JSON.stringify(value, null, 2)}\n` : renderDoctor(value));
       return;
     }
@@ -2949,7 +3004,7 @@ async function callTool(name, args) {
     case "agent_bridge_close_session":
       return mcpText(closeSession(args?.session_id));
     case "agent_bridge_doctor":
-      return mcpText(renderDoctor(doctor()));
+      return mcpText(renderDoctor(await doctor()));
     default:
       return mcpText(`Unknown tool: ${name}`, true);
   }
