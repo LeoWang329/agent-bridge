@@ -18,6 +18,8 @@
 //               [repro-omp-concurrent (T3)]
 //   errturn   — ack prompt + agent_start, then turn_end with stopReason:"error" so the turn completes
 //               in ERROR (session returns to idle but health must read degraded). [repro-health (T9)]
+//   echoturn  — like okturn but ECHOES the received prompt text back as the answer ("ECHO:<prompt>"), so
+//               a test can prove message_file content actually reached the backend. [repro-io (T10)]
 // Launched via fake-omp.cmd (Windows) or fake-omp.sh (POSIX) through OMP_BIN; env is inherited.
 const MODE = process.env.FAKE_OMP_MODE || "pipebreak";
 const say = obj => process.stdout.write(JSON.stringify(obj) + "\n");
@@ -34,9 +36,9 @@ process.stdin.on("data", d => {
       const msg = JSON.parse(line);
       if (msg.type === "get_state") {
         if (MODE === "silent") continue; // half-dead: swallow the poll, never respond
-        // Turns that settle idle (okturn/errturn) must report NOT streaming, else state() would flip
-        // status back to running after turn_end and the session would never settle for wait().
-        const isStreaming = !(MODE === "okturn" || MODE === "errturn");
+        // Turns that settle idle (okturn/errturn/echoturn) must report NOT streaming, else state() would
+        // flip status back to running after turn_end and the session would never settle for wait().
+        const isStreaming = !(MODE === "okturn" || MODE === "errturn" || MODE === "echoturn");
         say({ type: "response", id: msg.id, command: "get_state", success: true, data: { isStreaming, queuedMessageCount: 0, sessionId: "fake", messageCount: 1 } });
       } else if (msg.type === "prompt") {
         if (MODE === "rejectprompt") {
@@ -54,6 +56,15 @@ process.stdin.on("data", d => {
           say({ type: "agent_start" });
           setTimeout(() => {
             say({ type: "message_update", message: { type: "text_delta", delta: "OKTURN_ANSWER" } });
+            say({ type: "turn_end" });
+          }, 60);
+        } else if (MODE === "echoturn") {
+          // Echo the received prompt back as the answer, so a test can confirm the exact prompt body
+          // (e.g. a message_file's content) reached the backend.
+          say({ type: "agent_start" });
+          const echo = String(msg.message ?? "").slice(0, 2000);
+          setTimeout(() => {
+            say({ type: "message_update", message: { type: "text_delta", delta: `ECHO:${echo}` } });
             say({ type: "turn_end" });
           }, 60);
         } else if (MODE === "errturn") {

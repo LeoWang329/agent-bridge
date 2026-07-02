@@ -145,6 +145,13 @@ const TOOLS = [
           description:
             "Optional human-friendly alias for this session, unique among your sessions. Once set, it can be used anywhere a session_id is accepted (send/wait/status/result/abort/close) and is echoed in status. Helps re-identify sessions after a context compaction.",
         },
+        return_mode: {
+          type: "string",
+          enum: ["full", "ref"],
+          default: "full",
+          description:
+            "Default 'full' returns the assistant text inline. 'ref' keeps this session's results OUT of your context by default: each turn returns text:null with charCount/byteCount/textRef (read the file when you need the detail) — context hygiene for long review/loop sessions. An explicit max_chars on a call overrides ref for that call.",
+        },
         effort: {
           type: "string",
           description:
@@ -169,8 +176,13 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        session_id: { type: "string", description: "Session id returned by agent_bridge_open_session." },
-        message: { type: "string", description: "Message to send into the delegated agent session." },
+        session_id: { type: "string", description: "Session id (or the session's name/alias) to send to." },
+        message: { type: "string", description: "Message to send into the delegated agent session. Provide this OR message_file, not both." },
+        message_file: {
+          type: "string",
+          description:
+            "Alternative to `message`: read the message body from this file instead of inlining it (keeps a large prompt out of your context). Path must resolve to a regular file inside the session's cwd (≤1 MiB). Exactly one of message / message_file is required.",
+        },
         wait: {
           type: "boolean",
           default: false,
@@ -184,7 +196,7 @@ const TOOLS = [
             "Optional cap (characters) on the inline result text when wait=true. If the answer is longer, text is truncated, truncated:true is set, and the full answer stays retrievable via textRef. charCount/byteCount are always reported.",
         },
       },
-      required: ["session_id", "message"],
+      required: ["session_id"],
       additionalProperties: false,
     },
   },
@@ -420,6 +432,99 @@ function assertString(value, label, { maxLen = 200 } = {}) {
   return s;
 }
 
+// Validate an optional enum field; returns `fallback` when absent.
+function assertEnum(value, label, allowed, fallback) {
+  if (value == null) return fallback;
+  if (!allowed.includes(value)) throw new Error(`${label} must be one of: ${allowed.join(", ")}.`);
+  return value;
+}
+
+// N1 path safety: resolve `p` and confirm it is a real, regular file strictly INSIDE the session cwd.
+// Canonicalizes BOTH cwd and target with realpathSync.native — this defeats symlink escape, Windows 8.3
+// short names, and case-insensitive drive/path differences — then tests containment with path.relative
+// (NOT startsWith, which a sibling like `cwd-evil/` would fool). The target must exist (it's read).
+function resolveUnderCwd(cwd, p, label) {
+  const s = assertString(p, label, { maxLen: 4096 });
+  const realCwd = fs.realpathSync.native(path.resolve(cwd));
+  let realTarget;
+  try {
+    realTarget = fs.realpathSync.native(path.resolve(realCwd, s));
+  } catch {
+    throw new Error(`${label}: file not found or inaccessible: ${s}`);
+  }
+  const rel = path.relative(realCwd, realTarget);
+  if (rel === "" || rel === ".." || rel.startsWith(".." + path.sep) || path.isAbsolute(rel)) {
+    throw new Error(`${label} must be a path inside the session cwd.`);
+  }
+  if (!fs.statSync(realTarget).isFile()) throw new Error(`${label} must be a regular file: ${s}`);
+  return realTarget;
+}
+
+// Read a file's UTF-8 content with a hard byte cap, resistant to check/use races. resolveUnderCwd
+// validates containment, but reading the pathname separately (stat-then-read) is exploitable: a post-
+// check swap to a symlink would be followed on read (cwd escape), and a file that grows after a size stat
+// bypasses the cap. So we OPEN ONCE and operate on the fd: O_NOFOLLOW (where the OS has it) fails closed
+// if the FINAL component was swapped to a symlink; a post-open realpath re-check catches an INTERMEDIATE
+// directory swapped to point outside cwd (O_NOFOLLOW misses those); fstat on the fd (not the path) pins
+// the exact inode; an fd-vs-path inode tie (statSync(target) dev/ino == fstat) confirms the fd we will
+// read IS what the path resolves to now, closing the double-swap-back window; and we read from the fd in
+// a loop bounded at cap+1, rejecting overflow.
+//
+// THREAT MODEL: containment is a SAFETY guard against accidental out-of-cwd reads (a typo, a stray `..`,
+// a symlink) by the trusted orchestrator that supplied the path. It is NOT positioned as a hardened
+// sandbox against a malicious same-user process — such an actor already has the user's own file access,
+// so a redirected read gains it nothing, and a fully atomic guarantee would require per-component openat/
+// O_NOFOLLOW traversal that Node's stdlib does not expose. That said, the fd-vs-path inode tie below
+// closes the concrete deliberate-race path on POSIX (where ino is meaningful); on Windows (ino may be 0)
+// it degrades safely to the O_NOFOLLOW/realpath guards. The checks close every accidental case.
+function readFileUnderCwd(cwd, p, label, maxBytes) {
+  const target = resolveUnderCwd(cwd, p, label);
+  const O_NOFOLLOW = fs.constants.O_NOFOLLOW || 0; // 0 (no-op) on platforms without it, e.g. Windows
+  let fd;
+  try {
+    fd = fs.openSync(target, fs.constants.O_RDONLY | O_NOFOLLOW);
+  } catch (e) {
+    throw new Error(`${label}: cannot open file safely (${e.code || e.message}).`);
+  }
+  try {
+    const st = fs.fstatSync(fd);
+    if (!st.isFile()) throw new Error(`${label} must be a regular file.`);
+    if (st.size > maxBytes) throw new Error(`${label} too large: ${st.size} bytes (max ${maxBytes}).`);
+    // Re-confirm containment of the CURRENT resolution: if an intermediate directory was swapped to a
+    // symlink/junction pointing outside cwd between the pre-open check and the open, realpath now
+    // resolves outside and we reject before reading a byte.
+    const realCwd = fs.realpathSync.native(path.resolve(cwd));
+    const relPost = path.relative(realCwd, fs.realpathSync.native(target));
+    if (relPost === "" || relPost === ".." || relPost.startsWith(".." + path.sep) || path.isAbsolute(relPost)) {
+      throw new Error(`${label} resolved outside the session cwd during open.`);
+    }
+    // Tie the fd to the path: assert the file we'll READ (the pinned fd) is what `target` resolves to
+    // RIGHT NOW. This closes the double-swap-back race — swap an intermediate dir out before open to
+    // capture an outside inode, then swap it back before the realpath recheck: the captured fd's inode
+    // won't match the re-resolved path's. On POSIX ino is meaningful and this is exact; on Windows ino
+    // may be 0 (FAT), so 0===0 degrades safely to the O_NOFOLLOW/realpath guards (never a false reject).
+    let pathStat;
+    try { pathStat = fs.statSync(target); } catch { throw new Error(`${label}: file vanished during open.`); }
+    if (pathStat.ino !== st.ino || pathStat.dev !== st.dev) {
+      throw new Error(`${label} changed during open (fd no longer matches the path).`);
+    }
+    // Loop: readSync returns bytes-read, not "all requested" — a single call can short-read and silently
+    // truncate the prompt. Fill up to cap+1 (the +1 detects growth past the cap), then reject overflow.
+    const buf = Buffer.allocUnsafe(maxBytes + 1);
+    let n = 0;
+    for (;;) {
+      const r = fs.readSync(fd, buf, n, buf.length - n, n);
+      if (r === 0) break; // EOF
+      n += r;
+      if (n >= buf.length) break; // hit cap+1 → overflow, handled below
+    }
+    if (n > maxBytes) throw new Error(`${label} too large (exceeds ${maxBytes} bytes).`);
+    return buf.subarray(0, n).toString("utf8");
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 // Per-file byte counters so a live session's log can be rotated once it exceeds LOG_FILE_MAX_BYTES.
 // pruneLogs() never touches files of active sessions, so without rotation a chatty, long-lived
 // session's .log would grow unbounded. Rotation keeps at most the current file plus one ".1"
@@ -595,6 +700,11 @@ function buildSessionResult(session, fullText, options = {}) {
   // Only truncate when the full answer is actually retrievable (artifact written). If the
   // write failed, return the full text inline rather than silently dropping must-read content.
   const truncated = Boolean(max && max > 0 && charCount > max && textRef);
+  // return_mode:"ref" (T10) — omit the inline text by default (text:null) so a long review/loop session
+  // doesn't pour its output into the caller's context; charCount/byteCount/textRef still let them size it
+  // and fetch the full answer. An explicit max_chars overrides ref for that call. Same safety net as
+  // truncation: only omit when textRef actually holds the full text, else fall back to full inline.
+  const refOmit = session.returnMode === "ref" && max == null && Boolean(textRef);
   return {
     session: session.summary(),
     // Lift health to the TOP level too: wait()'s summarize withholds the heavy `session` object (T1),
@@ -603,7 +713,7 @@ function buildSessionResult(session, fullText, options = {}) {
     health: deriveHealth(session),
     // HEAD-truncate (keep the beginning) — a max_chars preview of the finished answer; the full text
     // stays in textRef. Opposite direction from clampText's TAIL clamp (see note there).
-    text: (truncated ? text.slice(0, max) : text) || null,
+    text: refOmit ? null : (truncated ? text.slice(0, max) : text) || null,
     charCount,
     byteCount,
     truncated,
@@ -2677,6 +2787,7 @@ async function openSession(params) {
   }
   const session = new AGENTS[params.agent].Session(params);
   session.name = name;
+  session.returnMode = assertEnum(params.return_mode, "return_mode", ["full", "ref"], "full");
   sessions.set(session.id, session);
   try {
     await session.start();
@@ -2753,9 +2864,22 @@ async function status(sessionId) {
   return { session: session.summary(), recentEvents: slimEvents(session.events, 20) };
 }
 
+const MESSAGE_FILE_MAX_BYTES = 1 << 20; // 1 MiB cap on a file-sourced message body
+
 async function sendMessage(params) {
   const session = getSession(params.session_id);
-  return await session.send(params.message, {
+  // message vs message_file: exactly one. message_file lets a large prompt live on disk (shared cwd)
+  // instead of in the caller's context; it is read from a path validated to be inside the session cwd.
+  const hasMsg = params.message != null;
+  const hasFile = params.message_file != null;
+  if (hasMsg && hasFile) throw new Error("Provide either `message` or `message_file`, not both.");
+  if (!hasMsg && !hasFile) throw new Error("Provide `message` or `message_file`.");
+  let message = params.message;
+  if (hasFile) {
+    message = readFileUnderCwd(session.cwd, params.message_file, "message_file", MESSAGE_FILE_MAX_BYTES);
+    if (!message.trim()) throw new Error("message_file is empty.");
+  }
+  return await session.send(message, {
     wait: Boolean(params.wait),
     timeout_ms: params.timeout_ms,
     maxChars: params.max_chars,
