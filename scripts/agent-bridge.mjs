@@ -554,6 +554,27 @@ function lastTurnOf(session) {
   return { id: session.lastTurnId || null, startedAt, endedAt, durationMs };
 }
 
+// A coarse, actionable triage signal derived from CURRENT liveness + the LAST turn's outcome — never
+// from the sticky `lastError` (which retains a past error even after a later success; see T4). This is
+// what lets a caller tell "scary but harmless" (a benign stderr line no longer reaches lastError at all)
+// from "actually broken":
+//   dead     — not reusable: session closed, or the backend process is gone.
+//   degraded — alive/reusable but the LAST turn ended in error (codex/claude go status:"failed" on a
+//              turn error while the app-server stays up; OMP returns to idle but sets lastTurnError).
+//   healthy  — spinning up, actively running, or idle after a clean turn.
+function deriveHealth(session) {
+  if (session.status === "closed") return "dead";
+  if (session.status === "starting" || session.status === "running") return "healthy";
+  // Settled (idle/failed): it must actually still be alive to be reusable. Check signalCode too — a
+  // signal-killed backend (SIGKILL/SIGTERM) has exitCode === null but signalCode set; without this a
+  // signal-killed codex/claude (which have no OMP-style `dead` flag) would misclassify as degraded.
+  const proc = session.proc;
+  const procGone = session.dead === true || !proc || proc.exitCode != null || proc.signalCode != null;
+  if (procGone) return "dead";
+  if (session.status === "failed" || session.lastTurnError === true) return "degraded";
+  return "healthy";
+}
+
 // Build the result payload shared by result()/wait()/send(wait). The assistant `text` is
 // must-read content, so it is never silently dropped: charCount/byteCount are always reported
 // (the "compass needle"), and the full untruncated answer is persisted to an artifact that
@@ -576,6 +597,10 @@ function buildSessionResult(session, fullText, options = {}) {
   const truncated = Boolean(max && max > 0 && charCount > max && textRef);
   return {
     session: session.summary(),
+    // Lift health to the TOP level too: wait()'s summarize withholds the heavy `session` object (T1),
+    // so this is how wait().completed.health / result().health reach the caller. (This is also the
+    // deterministic proof of the T1 passthrough: a new top-level field flows through wait unchanged.)
+    health: deriveHealth(session),
     // HEAD-truncate (keep the beginning) — a max_chars preview of the finished answer; the full text
     // stays in textRef. Opposite direction from clampText's TAIL clamp (see note there).
     text: (truncated ? text.slice(0, max) : text) || null,
@@ -1120,6 +1145,7 @@ class OmpRpcSession {
     this.lastAssistantText = "";
     this.lastError = null;
     this.lastStderr = null; // benign backend stderr (progress/info); NOT a fatal error (T4/P1)
+    this.lastTurnError = false; // did the most recently COMPLETED turn end in error? drives health (T9/A5)
     // Set true once the current turn is observed actually streaming (agent_start /
     // stream deltas / a live isStreaming reading); waitIdle won't accept the idle
     // window that exists *before* a freshly-sent prompt starts.
@@ -1351,12 +1377,16 @@ class OmpRpcSession {
       // a silent empty idle turn. Status still goes idle (the turn IS over and the session stays
       // reusable); lastError just explains it. Only turn_end carries the single `message`.
       const ended = message.message;
-      if (ended && ended.stopReason === "error") {
+      const endedInError = Boolean(ended && ended.stopReason === "error");
+      if (endedInError) {
         // errorMessage already carries the status text (e.g. "402 Insufficient Balance"), so use it
         // as-is; only synthesize from errorStatus when no message is present (don't double the code).
         const detail = ended.errorMessage || ended.error || (ended.errorStatus ? `HTTP ${ended.errorStatus}` : "backend turn ended with an error");
         this.lastError = clampText(stripAnsi(String(detail)), 4000);
       }
+      // Record the outcome of the turn that just completed for health (T9). OMP returns to idle even on a
+      // turn error, so status alone can't tell healthy from degraded — this can. A clean turn clears it.
+      this.lastTurnError = endedInError;
       this.turnEndedAt = nowIso();
       this.turnInFlight = false; // turn finished — the session is now settle-able
       setSessionStatus(this, "idle", false, { source: message.type });
@@ -1555,6 +1585,9 @@ class OmpRpcSession {
     // not stretch the previous turn's duration to now.
     if (this.turnStartedAt && !this.turnEndedAt) this.turnEndedAt = nowIso();
     this.turnInFlight = false; // turn cancelled — settle-able again (covers a pre-stream abort too)
+    // Abort is user-initiated, not a turn failure: clear lastTurnError so health doesn't read a stale
+    // "degraded" from a PRIOR errored turn after this clean abort (T9 — abort bypasses the turn_end path).
+    this.lastTurnError = false;
     setSessionStatus(this, "idle", false, { source: "abort" });
     return { aborted: true, sessionId: this.id };
   }
@@ -1603,6 +1636,7 @@ class OmpRpcSession {
       lastError: this.lastError,
       lastStderr: this.lastStderr ?? null,
       name: this.name ?? null,
+      health: deriveHealth(this),
       logFile: this.logFile,
       lastTurn: lastTurnOf(this),
       // Backend-specific fields live here so the top-level shape is identical across agents
@@ -1669,6 +1703,7 @@ class CodexAppServerSession {
     this.lastAssistantText = "";
     this.lastError = null;
     this.lastStderr = null; // benign backend stderr (progress/info); NOT a fatal error (T4/P1)
+    this.lastTurnError = false; // did the most recently COMPLETED turn end in error? drives health (T9/A5)
     this.events = [];
     this.proc = null;
     this.pending = new Map();
@@ -1977,6 +2012,7 @@ class CodexAppServerSession {
     // "already ran to completion" apart from "abort()/close() stole the turn" — only the latter
     // should report accepted:false and fire an interrupt.
     turn.settled = { err: err || null, status: status ?? null };
+    this.lastTurnError = Boolean(err); // outcome of the turn just completed → health (T9); cleared on success
     this.turn = null;
     this.currentTurnId = null;
     this.turnCount += 1;
@@ -2160,6 +2196,9 @@ class CodexAppServerSession {
     }
     // Only close the clock if a turn is actually in flight (don't stretch a finished turn).
     if (this.turnStartedAt && !this.turnEndedAt) this.turnEndedAt = nowIso();
+    // Abort is user-initiated, not a turn failure: clear lastTurnError so health doesn't read a stale
+    // "degraded" from a PRIOR errored turn (abort() nulls this.turn and bypasses #settleTurn — T9).
+    this.lastTurnError = false;
     turn?.resolve?.();
     return { aborted: true, sessionId: this.id };
   }
@@ -2188,6 +2227,7 @@ class CodexAppServerSession {
       lastError: this.lastError,
       lastStderr: this.lastStderr ?? null,
       name: this.name ?? null,
+      health: deriveHealth(this),
       logFile: this.logFile,
       lastTurn: lastTurnOf(this),
       // Backend-specific fields kept off the top level so the shape matches omp (P3).
@@ -2237,6 +2277,7 @@ class ClaudeCodeSession {
     this.lastAssistantText = "";
     this.lastError = null;
     this.lastStderr = null; // benign backend stderr (progress/info); NOT a fatal error (T4/P1)
+    this.lastTurnError = false; // did the most recently COMPLETED turn end in error? drives health (T9/A5)
     this.events = [];
     this.proc = null;
     this.claudeSessionId = null;     // claude's own session uuid (from system/init + result.session_id)
@@ -2364,6 +2405,7 @@ class ClaudeCodeSession {
     const turn = this.turn;
     if (!turn) return;
     turn.settled = { err: err || null, status: status ?? null };
+    this.lastTurnError = Boolean(err); // outcome of the turn just completed → health (T9); cleared on success
     this.turn = null;
     this.currentTurnId = null;
     this.turnCount += 1;
@@ -2552,6 +2594,7 @@ class ClaudeCodeSession {
       lastError: this.lastError,
       lastStderr: this.lastStderr ?? null,
       name: this.name ?? null,
+      health: deriveHealth(this),
       logFile: this.logFile,
       lastTurn: lastTurnOf(this),
       agentSpecific: { claudeSessionId: this.claudeSessionId, turnCount: this.turnCount },

@@ -16,6 +16,8 @@
 //   slowturn  — ack prompt + agent_start, then stay running ~2.5s before message_update + turn_end, so a
 //               SECOND send() lands mid-turn and must be rejected ("already has a running turn").
 //               [repro-omp-concurrent (T3)]
+//   errturn   — ack prompt + agent_start, then turn_end with stopReason:"error" so the turn completes
+//               in ERROR (session returns to idle but health must read degraded). [repro-health (T9)]
 // Launched via fake-omp.cmd (Windows) or fake-omp.sh (POSIX) through OMP_BIN; env is inherited.
 const MODE = process.env.FAKE_OMP_MODE || "pipebreak";
 const say = obj => process.stdout.write(JSON.stringify(obj) + "\n");
@@ -32,9 +34,9 @@ process.stdin.on("data", d => {
       const msg = JSON.parse(line);
       if (msg.type === "get_state") {
         if (MODE === "silent") continue; // half-dead: swallow the poll, never respond
-        // okturn settles idle, so it must report NOT streaming (else state() would flip status back to
-        // running after turn_end and the session would never settle for wait()).
-        const isStreaming = MODE !== "okturn";
+        // Turns that settle idle (okturn/errturn) must report NOT streaming, else state() would flip
+        // status back to running after turn_end and the session would never settle for wait().
+        const isStreaming = !(MODE === "okturn" || MODE === "errturn");
         say({ type: "response", id: msg.id, command: "get_state", success: true, data: { isStreaming, queuedMessageCount: 0, sessionId: "fake", messageCount: 1 } });
       } else if (msg.type === "prompt") {
         if (MODE === "rejectprompt") {
@@ -53,6 +55,13 @@ process.stdin.on("data", d => {
           setTimeout(() => {
             say({ type: "message_update", message: { type: "text_delta", delta: "OKTURN_ANSWER" } });
             say({ type: "turn_end" });
+          }, 60);
+        } else if (MODE === "errturn") {
+          // Turn completes IN ERROR: session returns to idle but the last-turn outcome is error, so
+          // health must read "degraded" (not healthy) and lastError carries the reason.
+          say({ type: "agent_start" });
+          setTimeout(() => {
+            say({ type: "turn_end", message: { stopReason: "error", errorMessage: "fake-omp: simulated turn error" } });
           }, 60);
         } else if (MODE === "slowturn") {
           // Stay running long enough that a concurrent second send() is attempted mid-turn.
