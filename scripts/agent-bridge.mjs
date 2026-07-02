@@ -723,6 +723,10 @@ function buildSessionResult(session, fullText, options = {}) {
   // and fetch the full answer. An explicit max_chars overrides ref for that call. Same safety net as
   // truncation: only omit when textRef actually holds the full text, else fall back to full inline.
   const refOmit = session.returnMode === "ref" && max == null && Boolean(textRef);
+  // The single inline-text projection, honoring both hygiene policies (ref omit + max_chars HEAD-truncate).
+  // Everything that echoes model text inline — `text` AND schemaError.rawText (T11) — MUST use this so a
+  // ref/capped session never leaks the full body through a side field; the full text is always in textRef.
+  const displayText = refOmit ? null : (truncated ? text.slice(0, max) : text) || null;
   const result = {
     session: session.summary(),
     // Lift health to the TOP level too: wait()'s summarize withholds the heavy `session` object (T1),
@@ -731,7 +735,7 @@ function buildSessionResult(session, fullText, options = {}) {
     health: deriveHealth(session),
     // HEAD-truncate (keep the beginning) — a max_chars preview of the finished answer; the full text
     // stays in textRef. Opposite direction from clampText's TAIL clamp (see note there).
-    text: refOmit ? null : (truncated ? text.slice(0, max) : text) || null,
+    text: displayText,
     charCount,
     byteCount,
     truncated,
@@ -748,19 +752,22 @@ function buildSessionResult(session, fullText, options = {}) {
   //     failed turn) → `schemaError` carrying the failure reason, NOT a parse of the (empty) text.
   // We trust Codex's server-side outputSchema enforcement and only JSON.parse here — there is no bundled
   // JSON-Schema validator and hand-rolling one would be a second, divergent source of truth.
+  // rawText echoes the raw model output for debugging, so it uses `displayText` (the ref/max_chars-honored
+  // projection) — NOT the full `text` — or a ref/capped session would leak the whole body here (the full
+  // output stays in textRef either way). JSON.parse still runs on the FULL `text`, so parsing is unaffected.
   if (session._requestedSchema) {
     if (session.lastTurnError) {
       result.json = null;
       // Prefer THIS turn's captured failure reason over the sticky session lastError, which a later
       // turn/start failure (that never began a turn) could have overwritten (T11 round-2 edge).
-      result.schemaError = { error: session.lastTurnErrorMessage || session.lastError || "codex turn failed", rawText: text || null };
+      result.schemaError = { error: session.lastTurnErrorMessage || session.lastError || "codex turn failed", rawText: displayText };
     } else {
       try {
         result.json = JSON.parse(text);
         result.schemaError = null;
       } catch (e) {
         result.json = null;
-        result.schemaError = { error: `model output was not valid JSON: ${e.message}`, rawText: text };
+        result.schemaError = { error: `model output was not valid JSON: ${e.message}`, rawText: displayText };
       }
     }
   }
@@ -2262,6 +2269,13 @@ class CodexAppServerSession {
         this.lastError = err instanceof Error ? err.message : String(err);
         if (this.status !== "closed") setSessionStatus(this, "idle", false, { source: "turn_start_error" });
       }
+      // The turn NEVER BEGAN (#beginTurn didn't run): we deliberately leave lastTurnError, _requestedSchema,
+      // and the text accumulators untouched, so the previous completed turn's result stays intact and
+      // addressable (the drift-2 contract). health therefore reflects that prior turn — "idle after a clean
+      // turn" ⇒ healthy — which is correct: the backend is still alive and reusable (a backend that actually
+      // died sets proc.exitCode ⇒ deriveHealth's procGone ⇒ dead). THIS turn's failure is reported the only
+      // honest way it can be for a turn that never started: by THROWING here (the send()/send_message error),
+      // not by mutating the prior turn's outcome. wait() shows the last SETTLED turn by design.
       throw err instanceof Error ? err : new Error(this.lastError);
     }
     const startedTurnId = turnResp?.turn?.id || null;
@@ -2866,6 +2880,12 @@ async function openSession(params) {
     // id regeneration for effectively-zero risk. Reviewed and accepted by deepseek+codex.)
     if (sessions.has(name)) throw new Error(`Session name "${name}" collides with an existing session id; choose another.`);
   }
+  // T11: validate the optional structured-output schema BEFORE spawning too (same fail-fast rule as name)
+  // — only codex supports it, so a bad shape or a non-codex backend is rejected without an orphaned proc.
+  const initialSchema = assertPlainObject(params.schema, "schema");
+  if (initialSchema && params.agent !== "codex") {
+    throw new Error(`schema (structured output) is not supported for backend "${params.agent}" yet; only codex.`);
+  }
   const session = new AGENTS[params.agent].Session(params);
   session.name = name;
   session.returnMode = assertEnum(params.return_mode, "return_mode", ["full", "ref"], "full");
@@ -2892,18 +2912,10 @@ async function openSession(params) {
     throw err;
   }
 
-  // T11: schema on the initial turn — same codex-only rule as send_message. Validate up front so a bad
-  // schema/backend combination fails the open cleanly (the started session is torn down below on any
-  // initial-turn error), rather than after the process is already spawned and left dangling.
-  const initialSchema = assertPlainObject(params.schema, "schema");
-  if (initialSchema && session.agent !== "codex") {
-    sessions.delete(session.id);
-    try { session.close({ removePidRecord: false }); } catch {}
-    throw new Error(`schema (structured output) is not supported for backend "${session.agent}" yet; only codex.`);
-  }
   let initial = null;
   if (params.initial_prompt) {
     try {
+      // initialSchema was validated pre-spawn (codex-only); apply it to the first turn.
       initial = await session.send(params.initial_prompt, {
         wait: Boolean(params.wait),
         timeout_ms: params.timeout_ms,

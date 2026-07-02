@@ -12,6 +12,7 @@
 //                 health reads "degraded" (last turn errored).
 //   reject omp / reject claude — sending `schema` to a non-codex backend is rejected at sendMessage.
 import { spawn } from "node:child_process";
+import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -102,12 +103,24 @@ async function main() {
   const sBad = makeServer("schemabad");
   await sBad.init();
   {
-    const { r } = await codexSchemaTurn(sBad);
+    const { id, r } = await codexSchemaTurn(sBad);
     if (!r) return fail("schemabad: no wait result (a parse failure must NOT throw the call)");
     if (r.json != null) return fail(`schemabad: json should be null, got ${JSON.stringify(r.json)}`);
     if (!r.schemaError || !/not valid JSON/i.test(r.schemaError.error)) return fail(`schemabad: schemaError.error should flag invalid JSON, got ${JSON.stringify(r.schemaError)}`);
     if (!/not JSON/i.test(r.schemaError.rawText || "")) return fail(`schemabad: schemaError.rawText should hold the raw non-JSON text, got ${JSON.stringify(r.schemaError?.rawText)}`);
-    console.log(`[harness] schemabad OK — invalid JSON → schemaError{error,rawText}, no throw`);
+    // F3 (holistic-review finding): max_chars must cap schemaError.rawText too, not just text.
+    const capped = await sBad.call("agent_bridge_result", { session_id: id, max_chars: 5 });
+    if (capped?.schemaError?.rawText == null || capped.schemaError.rawText.length > 5) return fail(`schemabad+max_chars: rawText should be capped to ≤5 like text, got ${JSON.stringify(capped?.schemaError?.rawText)}`);
+    console.log(`[harness] schemabad OK — invalid JSON → schemaError{error,rawText}, no throw; max_chars caps rawText (F3)`);
+  }
+  // F3: under return_mode:"ref" the rawText must be omitted (null) like text — the full raw output stays in textRef.
+  {
+    const { r } = await codexSchemaTurn(sBad, { return_mode: "ref" });
+    if (!r?.schemaError) return fail("schemabad+ref: schemaError should be present");
+    if (r.schemaError.rawText !== null) return fail(`schemabad+ref: rawText must be null under ref (F3 — no full-body leak), got ${JSON.stringify(r.schemaError.rawText)}`);
+    if (!r.textRef) return fail("schemabad+ref: full raw output should still be in textRef");
+    if (!/not JSON/i.test(fs.readFileSync(r.textRef, "utf8"))) return fail("schemabad+ref: textRef should hold the full raw non-JSON text");
+    console.log(`[harness] schemabad+ref OK — rawText nulled under ref, full raw text still in textRef (F3)`);
   }
   sBad.kill();
   await sleep(200);
