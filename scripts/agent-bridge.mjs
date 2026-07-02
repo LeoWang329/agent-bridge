@@ -1789,7 +1789,8 @@ class OmpRpcSession {
   // Normalized current-context occupancy — the long-context "rot" signal. Headline is ABSOLUTE
   // `tokens` in the live context (not a percent): degradation tracks absolute length, and windows
   // differ across models (mostly 1M here), so a percent-of-window would understate rot on a big
-  // window. `contextWindow` is kept only for a small-window hard-limit guard, never a percent. OMP
+  // window. The reopen decision is a pure absolute-token threshold; `contextWindow` is emitted as
+  // informational context only (window size) and is NOT used for any percent/ratio guard. OMP
   // reports contextUsage in get_state on every poll, so this is real-time (`live:true`); its
   // compaction flags ride along (isCompacting=true → OMP is dropping context right now). Returns null
   // until get_state has populated contextUsage (partial → null, never a half object).
