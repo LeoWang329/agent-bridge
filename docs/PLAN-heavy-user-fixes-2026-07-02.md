@@ -104,7 +104,8 @@
 
 #### T9 · (A5) 派生 `health` 三态（不自动重试）
 - **依赖**：T4（lastError 语义先干净）。
-- **修法**：`summary()` 派生 `health`：`status∈{failed,closed}` 或 `proc?.exitCode!=null` → `dead`；活着但有真实 `lastError`（T4 后语义）→ `degraded`；否则 `healthy`。保留 `lastError`/`lastStderr` 诊断。**不实现对 stderr 串自动重试**（评审共识：太脆）。按全局契约，`buildSessionResult` 顶层也上提 `health`。
+- **修法**：`summary()` 派生 `health`：`status∈{failed,closed}` 或 `proc?.exitCode!=null` → `dead`；否则看**最近一轮的结果**（见下）→ `degraded`/`healthy`。**不实现对 stderr 串自动重试**（评审共识：太脆）。按全局契约，`buildSessionResult` 顶层也上提 `health`。
+- **⚠️ T4 双评审的关键修正**：`degraded` **不能**定义为"活着且 `lastError` 非空"——`lastError` 现在是"最近一次**曾经**发生的真错误"，是粘滞诊断字段；一个可复用会话失败后又成功 turn，会残留旧 `lastError` 却被误判 degraded。→ `health` 必须**从最近一轮的结果**推导，不能读粘滞 `lastError`。做法：加一个 `lastTurnError` 布尔（在各后端 `#settleTurn(err)`/turn 错误路径置 true，成功 settle 置 false），或直接用 `status==="failed"`。`degraded = 活着 && (status==="failed" || lastTurnError)`。`lastError`/`lastStderr` 仅作诊断保留。
 - **验证**：`repro-health.mjs`（fake）：正常→`healthy`；kill 后→`dead`；注入真错误→`degraded`；一条无害 stderr **不**把 `healthy` 打成 `degraded`（与 T4 联动）。**并断言 `wait().completed.health` 顶层可读**（顺带证明 T1 透传机制）。
 - **验收**：既有 status 消费者不受影响（新增字段）。
 

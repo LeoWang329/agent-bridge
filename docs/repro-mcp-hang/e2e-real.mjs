@@ -105,6 +105,9 @@ try {
   const stCdx = await call("agent_bridge_status", { session_id: cdxId });
   check("status(omp) idle after turn (refreshStatus poll)", stOmp.session?.status === "idle", stOmp.session?.status);
   check("status(codex) idle (refreshStatus no-op)", stCdx.session?.status === "idle", stCdx.session?.status);
+  // T4/P1: codex writes "failed to refresh available models" (and other progress) to stderr on startup.
+  // After a CLEAN turn that must NOT be in lastError anymore — it belongs in lastStderr (diagnostics).
+  check("codex benign stderr NOT in lastError (T4)", stCdx.session?.lastError === null, `lastError=${JSON.stringify(stCdx.session?.lastError)} lastStderr=${JSON.stringify((stCdx.session?.lastStderr || "").slice(0, 60))}`);
 
   // 5. wait(mode:any) — send to both, return on first; then drain the rest
   await call("agent_bridge_send_message", { session_id: ompId, message: "Reply with exactly: E2E_ANY_OMP", wait: false });

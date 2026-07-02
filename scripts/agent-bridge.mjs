@@ -1095,6 +1095,7 @@ class OmpRpcSession {
     this.isStreaming = false;
     this.lastAssistantText = "";
     this.lastError = null;
+    this.lastStderr = null; // benign backend stderr (progress/info); NOT a fatal error (T4/P1)
     // Set true once the current turn is observed actually streaming (agent_start /
     // stream deltas / a live isStreaming reading); waitIdle won't accept the idle
     // window that exists *before* a freshly-sent prompt starts.
@@ -1191,7 +1192,10 @@ class OmpRpcSession {
     this.proc.stderr.on("data", chunk => {
       const text = chunk.toString("utf8");
       appendLog(this.logFile, text);
-      this.lastError = clampText(stripAnsi(text), 4000);
+      // stderr is NOT an error channel: these CLIs write progress/info to it routinely (e.g. codex's
+      // "failed to refresh available models" line). Route it to lastStderr (diagnostics), not lastError,
+      // so one benign line can't permanently masquerade as a fatal error in status/health (T4/P1).
+      this.lastStderr = clampText(stripAnsi(text), 4000);
     });
 
     const rl = readline.createInterface({ input: this.proc.stdout, crlfDelay: Infinity });
@@ -1573,6 +1577,7 @@ class OmpRpcSession {
       createdAt: this.createdAt,
       updatedAt: this.updatedAt,
       lastError: this.lastError,
+      lastStderr: this.lastStderr ?? null,
       logFile: this.logFile,
       lastTurn: lastTurnOf(this),
       // Backend-specific fields live here so the top-level shape is identical across agents
@@ -1634,6 +1639,7 @@ class CodexAppServerSession {
     this.isStreaming = false;
     this.lastAssistantText = "";
     this.lastError = null;
+    this.lastStderr = null; // benign backend stderr (progress/info); NOT a fatal error (T4/P1)
     this.events = [];
     this.proc = null;
     this.pending = new Map();
@@ -1670,7 +1676,8 @@ class CodexAppServerSession {
     this.proc.stderr.setEncoding("utf8");
     this.proc.stderr.on("data", text => {
       appendLog(this.logFile, text);
-      this.lastError = clampText(stripAnsi(text), 4000);
+      // stderr is diagnostics, not a fatal error — see the OMP handler note. Route to lastStderr (T4/P1).
+      this.lastStderr = clampText(stripAnsi(text), 4000);
     });
     this.proc.stdout.setEncoding("utf8");
     this.proc.stdin.on("error", err => {
@@ -2150,6 +2157,7 @@ class CodexAppServerSession {
       createdAt: this.createdAt,
       updatedAt: this.updatedAt,
       lastError: this.lastError,
+      lastStderr: this.lastStderr ?? null,
       logFile: this.logFile,
       lastTurn: lastTurnOf(this),
       // Backend-specific fields kept off the top level so the shape matches omp (P3).
@@ -2198,6 +2206,7 @@ class ClaudeCodeSession {
     this.isStreaming = false;
     this.lastAssistantText = "";
     this.lastError = null;
+    this.lastStderr = null; // benign backend stderr (progress/info); NOT a fatal error (T4/P1)
     this.events = [];
     this.proc = null;
     this.claudeSessionId = null;     // claude's own session uuid (from system/init + result.session_id)
@@ -2243,7 +2252,8 @@ class ClaudeCodeSession {
     this.#writePidRecord();
 
     this.proc.stderr.setEncoding("utf8");
-    this.proc.stderr.on("data", text => { appendLog(this.logFile, text); this.lastError = clampText(stripAnsi(text), 4000); });
+    // stderr is diagnostics, not a fatal error — see the OMP handler note. Route to lastStderr (T4/P1).
+    this.proc.stderr.on("data", text => { appendLog(this.logFile, text); this.lastStderr = clampText(stripAnsi(text), 4000); });
     this.proc.stdout.setEncoding("utf8");
     this.proc.stdin.on("error", err => {
       appendLog(this.logFile, `[agent-bridge] claude stdin error: ${err.message}\n`);
@@ -2510,6 +2520,7 @@ class ClaudeCodeSession {
       createdAt: this.createdAt,
       updatedAt: this.updatedAt,
       lastError: this.lastError,
+      lastStderr: this.lastStderr ?? null,
       logFile: this.logFile,
       lastTurn: lastTurnOf(this),
       agentSpecific: { claudeSessionId: this.claudeSessionId, turnCount: this.turnCount },

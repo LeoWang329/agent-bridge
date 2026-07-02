@@ -15,6 +15,11 @@ import readline from "node:readline";
 
 const say = obj => process.stdout.write(JSON.stringify(obj) + "\n");
 
+// T4/P1: when FAKE_CLAUDE_STDERR is set, emit one benign line to STDERR on startup (real claude/CLIs
+// write progress/info to stderr). It must land in the session's lastStderr, NOT lastError. Gated so the
+// abort-fallback test's behavior is unchanged.
+if (process.env.FAKE_CLAUDE_STDERR) process.stderr.write("[fake-claude] benign progress on stderr\n");
+
 let userMsgCount = 0;
 
 const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
