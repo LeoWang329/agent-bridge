@@ -1333,6 +1333,16 @@ class OmpRpcSession {
       this.turnInFlight = false; // turn finished — the session is now settle-able
       setSessionStatus(this, "idle", false, { source: message.type });
       return;
+      // KNOWN LIMITATION: OMP terminal events carry no turn id, so this clears turnInFlight for
+      // WHATEVER turn is current — it cannot tell "my current turn's terminal" from a stale/duplicate
+      // one (e.g. a late turn_end from a turn that was already aborted, landing after a new send() armed
+      // a fresh turn). That stale terminal wrongly clears the new turn's in-flight flag, which the T3
+      // send() guard relies on. We deliberately do NOT "swallow N terminals after abort" to patch this:
+      // that heuristic is only correct if the backend ALWAYS emits a post-abort terminal — if it
+      // sometimes doesn't, the counter eats the next REAL terminal and bricks the session (a strictly
+      // worse failure). A correct fix needs turn-id correlation the OMP RPC does not provide. In
+      // practice the window is tiny (abort → immediate re-send → a genuinely late terminal from the
+      // aborted turn); real aborts terminate promptly. Tracked as a follow-up in PLAN doc.
     }
     if (message.type === "message_update") {
       const update = message.assistantMessageEvent || message.message || message;
@@ -1420,6 +1430,11 @@ class OmpRpcSession {
     // catch correctly refuses to touch a dead session, so nothing would restore it). Fail fast instead.
     if (this.dead || this.status === "failed") throw new Error(`OMP session ${this.id} has failed; open a new session.`);
     if (!this.proc || this.proc.exitCode !== null) throw new Error(`OMP process for ${this.id} is not running.`);
+    // Reject a concurrent turn, like Codex (`already has a running turn`) and Claude do. OMP's RPC would
+    // otherwise accept a second `prompt` mid-turn and interleave it into the same context — a silent
+    // corruption rather than a clear error. turnInFlight is armed for the whole turn (below), so this is
+    // the authoritative "busy" signal. To run turns in parallel, open separate sessions.
+    if (this.turnInFlight) throw new Error(`OMP session ${this.id} already has a running turn; wait for it to finish.`);
     // Reset before prompting so waitIdle below ignores the pre-streaming idle window
     // (a stale idle reading from before this turn actually starts).
     this.turnStarted = false;

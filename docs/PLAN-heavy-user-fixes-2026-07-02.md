@@ -65,6 +65,7 @@
 - **修法**：在现有 dead/failed/proc 守卫之后、**`this.turnInFlight = true` 之前**插入 `if (this.turnInFlight) throw new Error(\`OMP session ${this.id} already has a running turn; wait for it to finish.\`);`（与另两后端报错语义对齐）。
 - **验证**：`repro-omp-concurrent.mjs`（fake-omp 慢 turn）：第二次并发 `send` 立即抛错、首 turn 不受影响、完成后可再 `send`。
 - **验收**：`repro-waitany.mjs` 等 OMP 顺序 re-prompt 用例回归 PASS（没误伤正常复用）。
+- **已知限制（codex 复审提出，已实测复现）**：OMP 的 turn_end/agent_end **不带 turn id**，`#applyEvent` 只能无差别清 `turnInFlight`。因此一个 **已 abort 的旧 turn 的迟到 terminal**，若在新 `send()` 已 arm 新 turn 之后才到达，会错误清掉新 turn 的 in-flight 标志、绕过本护栏（scratchpad 探针实测 send#4 被误接受）。**不修**：唯一的关联办法是"abort 后吞掉 N 个 terminal"计数器，但它只在"后端 abort 后必发 terminal"时才正确；若后端有时不发，计数器会吞掉**下一个真 terminal** → 会话永久卡死（更糟）。正确修法需要 OMP 协议提供 turn id（当前没有）。实际窗口很小（abort→立刻重发→旧 turn 的迟到 terminal；真实 abort 通常即时终止）。代码 `#applyEvent` 处已注释，列为后续。
 
 #### T4 · (P1) `lastError` 粘滞（分通道 stderr / error）
 - **根因**：`lastError` 仅构造置 `null`（`:1092/1616/2180`），成功轮不清零；且**三后端**都在 `stderr.on("data")` 每块写 `lastError`——OMP `:1189`、Codex `:1653`、Claude `:2226`（**codex 补出 OMP 1189，deepseek 漏了；已核实 1186-1189 确为 OMP stderr handler**）。→ 一条无害 stderr 永久污染 `status.lastError`。

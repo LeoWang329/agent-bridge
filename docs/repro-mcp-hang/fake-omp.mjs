@@ -13,6 +13,9 @@
 //               report isStreaming:false to get_state so the session settles idle with real answer text.
 //               A benign line is written to STDERR mid-turn (must NOT be treated as a fatal lastError).
 //               [repro-wait-shape (T1 result-field passthrough) / repro-laststderr (T4) / repro-health (T9)]
+//   slowturn  — ack prompt + agent_start, then stay running ~2.5s before message_update + turn_end, so a
+//               SECOND send() lands mid-turn and must be rejected ("already has a running turn").
+//               [repro-omp-concurrent (T3)]
 // Launched via fake-omp.cmd (Windows) or fake-omp.sh (POSIX) through OMP_BIN; env is inherited.
 const MODE = process.env.FAKE_OMP_MODE || "pipebreak";
 const say = obj => process.stdout.write(JSON.stringify(obj) + "\n");
@@ -51,6 +54,13 @@ process.stdin.on("data", d => {
             say({ type: "message_update", message: { type: "text_delta", delta: "OKTURN_ANSWER" } });
             say({ type: "turn_end" });
           }, 60);
+        } else if (MODE === "slowturn") {
+          // Stay running long enough that a concurrent second send() is attempted mid-turn.
+          say({ type: "agent_start" });
+          setTimeout(() => {
+            say({ type: "message_update", message: { type: "text_delta", delta: "SLOW_DONE" } });
+            say({ type: "turn_end" });
+          }, 2500);
         } else if (MODE === "turnstate") {
           // Churn turns on our own (no new prompt): start, then end->start->end. The mid re-entry
           // (turn_end -> turn_start) exercises F7's stamp-clear; we settle on turn_end (status idle,
