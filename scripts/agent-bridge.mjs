@@ -2690,7 +2690,14 @@ async function waitSessions(params) {
     const session = sessions.get(id);
     if (!session) return { sessionId: id, status: "closed", text: null, gone: true };
     const r = await result(id, { maxChars: params.max_chars }).catch(() => null);
-    return {
+    // `base` is the flat shape wait() has always returned. When result() succeeds we ALSO spread
+    // any EXTRA top-level field buildSessionResult produced — this is the N3 fix: new result fields
+    // (json/schemaError/health) propagate through wait automatically instead of being silently
+    // dropped by a hand-copied field list. Two heavy fields are deliberately withheld: `session`
+    // (the full summary snapshot) and `recentEvents` (the event stream) would bloat every wait
+    // result and undercut the context hygiene callers use wait for. Today `extra` is empty, so this
+    // is byte-identical to the old output; it only starts carrying fields once later tasks add them.
+    const base = {
       sessionId: id,
       status: session.status,
       text: r?.text ?? null,
@@ -2700,6 +2707,12 @@ async function waitSessions(params) {
       textRef: r?.textRef ?? null,
       lastTurn: lastTurnOf(session),
     };
+    if (!r) return base;
+    const { session: _session, recentEvents: _recentEvents, text, charCount, byteCount, truncated, textRef, ...extra } = r;
+    // Spread `extra` FIRST so wait-owned keys in `base` (sessionId/status/lastTurn) always win: a
+    // future buildSessionResult field that happened to reuse one of those names must never override
+    // wait()'s authoritative values. Non-colliding new fields (json/schemaError/health) still surface.
+    return { ...extra, ...base };
   };
   const pendingIds = () => ids.filter(id => !sessionSettled(sessions.get(id)));
 
