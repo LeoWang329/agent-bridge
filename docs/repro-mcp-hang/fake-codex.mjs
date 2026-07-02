@@ -18,6 +18,10 @@
 //                REFUSED. Exercises the round-2 edge: schemaError.error must report turn #1's OWN failure
 //                reason (from #settleTurn), not the sticky lastError that turn #2's start-refusal
 //                overwrote. [repro-schema failure-reason scenario]
+//   ctxturn    — a clean plain turn that ALSO emits a thread/tokenUsage/updated notification carrying
+//                {last:{inputTokens,totalTokens,...}, total:{...}, modelContextWindow}. Proves the bridge
+//                normalizes contextUsage from last.inputTokens (NOT total, NOT totalTokens) + modelContext-
+//                Window, with live:false. [repro-context-usage]
 // Requests answered: initialize, thread/start, turn/start, turn/interrupt (+ any other id'd request → {}).
 // Notifications are emitted ~50ms after the turn/start RESPONSE so the normal async path runs (send()
 // returns its ack / arms the wait, THEN the turn settles via notification) rather than the same-flush path.
@@ -67,6 +71,23 @@ process.stdin.on("error", () => {});
 
 function driveTurn(tid, schema) {
   say({ method: "turn/started", params: { turn: { id: tid } } });
+  if (MODE === "ctxturn") {
+    // Report per-turn usage the way codex does. inputTokens = the tokens fed to the model this turn =
+    // current context length; totalTokens/total are decoys the bridge must NOT pick. Then a plain answer.
+    say({
+      method: "thread/tokenUsage/updated",
+      params: {
+        tokenUsage: {
+          total: { totalTokens: 987654, inputTokens: 900000, outputTokens: 87654 },
+          last: { totalTokens: 99999, inputTokens: 21401, cachedInputTokens: 12000, outputTokens: 300, reasoningOutputTokens: 50 },
+          modelContextWindow: 258400,
+        },
+      },
+    });
+    say({ method: "item/completed", params: { turn: { id: tid }, item: { type: "agentMessage", text: "ctx answer", phase: "final_answer", id: "item-1" } } });
+    say({ method: "turn/completed", params: { turn: { id: tid, status: "completed" } } });
+    return;
+  }
   if (MODE === "schemafail" || MODE === "failstart") {
     // Turn fails outright (model couldn't satisfy the schema). No final answer item.
     say({ method: "turn/completed", params: { turn: { id: tid, status: "failed" } } });

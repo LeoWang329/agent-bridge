@@ -131,6 +131,16 @@ try {
     bText.slice(0, 120),
   );
 
+  // 7b. contextUsage must NOT carry the swallowed A result's usage. A's stale result carries a 500k
+  //     modelUsage; B's result omits modelUsage. If the bridge captured usage BEFORE the swallow gate
+  //     (the bug), that 500k would leak here since nothing overwrites it. With the fix (capture after
+  //     the gate + reset at #beginTurn), B reported no usage → contextUsage is null.
+  check(
+    "contextUsage null after B — swallowed A's stale modelUsage did NOT leak",
+    r0?.contextUsage == null,
+    JSON.stringify(r0?.contextUsage),
+  );
+
   // 8. Clean up.
   await call("agent_bridge_close_session", { session_id: id });
 

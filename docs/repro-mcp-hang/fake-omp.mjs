@@ -20,6 +20,12 @@
 //               in ERROR (session returns to idle but health must read degraded). [repro-health (T9)]
 //   echoturn  — like okturn but ECHOES the received prompt text back as the answer ("ECHO:<prompt>"), so
 //               a test can prove message_file content actually reached the backend. [repro-io (T10)]
+//   ctxturn   — like okturn (settles clean) but get_state ALSO reports contextUsage{tokens,contextWindow}
+//               + isCompacting/autoCompactionEnabled, so the bridge's normalized top-level contextUsage
+//               (live:true) can be asserted through result()/wait()/status(). [repro-context-usage]
+//   ctxslow   — like slowturn (stays running ~2.5s) with the SAME contextUsage in get_state, so a
+//               short-timeout wait times out with the session still running and the OMP reading is LIVE
+//               in pendingSnapshots[].contextUsage (mid-wait watch of a long session). [repro-context-usage]
 // Launched via fake-omp.cmd (Windows) or fake-omp.sh (POSIX) through OMP_BIN; env is inherited.
 const MODE = process.env.FAKE_OMP_MODE || "pipebreak";
 const say = obj => process.stdout.write(JSON.stringify(obj) + "\n");
@@ -36,10 +42,19 @@ process.stdin.on("data", d => {
       const msg = JSON.parse(line);
       if (msg.type === "get_state") {
         if (MODE === "silent") continue; // half-dead: swallow the poll, never respond
-        // Turns that settle idle (okturn/errturn/echoturn) must report NOT streaming, else state() would
-        // flip status back to running after turn_end and the session would never settle for wait().
-        const isStreaming = !(MODE === "okturn" || MODE === "errturn" || MODE === "echoturn");
-        say({ type: "response", id: msg.id, command: "get_state", success: true, data: { isStreaming, queuedMessageCount: 0, sessionId: "fake", messageCount: 1 } });
+        // Turns that settle idle (okturn/errturn/echoturn/ctxturn) must report NOT streaming, else state()
+        // would flip status back to running after turn_end and the session would never settle for wait().
+        const isStreaming = !(MODE === "okturn" || MODE === "errturn" || MODE === "echoturn" || MODE === "ctxturn");
+        const data = { isStreaming, queuedMessageCount: 0, sessionId: "fake", messageCount: 1 };
+        // ctx* modes: real omp reports current-context occupancy in get_state.data (contextUsage sub-object
+        // + isCompacting/autoCompactionEnabled siblings — see the probe dump). The bridge normalizes this to
+        // the top-level contextUsage{tokens,contextWindow,live:true,isCompacting,autoCompactionEnabled}.
+        if (MODE === "ctxturn" || MODE === "ctxslow") {
+          data.contextUsage = { tokens: 12345, contextWindow: 1000000, percent: 1.2345 };
+          data.isCompacting = false;
+          data.autoCompactionEnabled = true;
+        }
+        say({ type: "response", id: msg.id, command: "get_state", success: true, data });
       } else if (msg.type === "prompt") {
         if (MODE === "rejectprompt") {
           // Refuse the prompt; no turn ever starts. The bridge's send() rejects and returns the
@@ -49,7 +64,7 @@ process.stdin.on("data", d => {
           continue;
         }
         say({ type: "response", id: msg.id, success: true });
-        if (MODE === "okturn") {
+        if (MODE === "okturn" || MODE === "ctxturn") {
           // A clean, fully-settling turn with real answer text. Emit a benign STDERR line mid-turn so
           // tests can assert it does NOT become a fatal lastError (T4). Then agent_start -> text -> turn_end.
           process.stderr.write("[fake-omp] progress: thinking...\n");
@@ -74,7 +89,7 @@ process.stdin.on("data", d => {
           setTimeout(() => {
             say({ type: "turn_end", message: { stopReason: "error", errorMessage: "fake-omp: simulated turn error" } });
           }, 60);
-        } else if (MODE === "slowturn") {
+        } else if (MODE === "slowturn" || MODE === "ctxslow") {
           // Stay running long enough that a concurrent second send() is attempted mid-turn.
           say({ type: "agent_start" });
           setTimeout(() => {

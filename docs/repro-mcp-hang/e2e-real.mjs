@@ -96,6 +96,14 @@ try {
   check("wait(all) settled omp (isSettled/refresh)", (byId[ompId]?.text || "").includes("E2E_OMP_1"), (byId[ompId]?.text || "").slice(0, 40));
   check("wait(all) settled codex (isSettled/refresh)", (byId[cdxId]?.text || "").includes("E2E_CDX_1"), (byId[cdxId]?.text || "").slice(0, 40));
 
+  // 2b. contextUsage — current-context occupancy normalized across backends from the REAL usage payloads
+  // (omp get_state.contextUsage → live:true; codex thread/tokenUsage/updated → live:false). tokens and
+  // contextWindow must be positive; this is the signal an orchestrator watches to reopen before rot.
+  const cuOmp = byId[ompId]?.contextUsage;
+  const cuCdx = byId[cdxId]?.contextUsage;
+  check("omp contextUsage present + live (real get_state)", !!cuOmp && cuOmp.tokens > 0 && cuOmp.contextWindow > 0 && cuOmp.live === true, JSON.stringify(cuOmp));
+  check("codex contextUsage present + snapshot (real tokenUsage)", !!cuCdx && cuCdx.tokens > 0 && cuCdx.contextWindow > 0 && cuCdx.live === false, JSON.stringify(cuCdx));
+
   // 3. session reuse — 2nd turn on the SAME omp session, inline wait:true (async result path)
   const reuse = await call("agent_bridge_send_message", { session_id: ompId, message: "Reply with exactly: E2E_OMP_2", wait: true, timeout_ms: 120000 }, 140000);
   check("session reuse (omp 2nd turn, async result)", (reuse.text || "").includes("E2E_OMP_2"), (reuse.text || "").slice(0, 40));
@@ -178,6 +186,8 @@ try {
     check("open claude (registry dispatch)", oCl.session?.agent === "claude" && !!clId, clId);
     const clTurn = await call("agent_bridge_send_message", { session_id: clId, message: "Reply with exactly: E2E_CLAUDE_1", wait: true, timeout_ms: 120000 }, 140000);
     check("claude turn (async result)", (clTurn.text || "").includes("E2E_CLAUDE_1"), (clTurn.text || "").slice(0, 40));
+    // contextUsage from real modelUsage (last-turn snapshot; primary = largest-window model entry).
+    check("claude contextUsage present + snapshot (real modelUsage)", !!clTurn.contextUsage && clTurn.contextUsage.tokens > 0 && clTurn.contextUsage.contextWindow > 0 && clTurn.contextUsage.live === false, JSON.stringify(clTurn.contextUsage));
 
     // abort: long turn non-blocking, abort, confirm idle + reusable
     await call("agent_bridge_send_message", { session_id: clId, message: "Count slowly from 1 to 400, one number per line.", wait: false });

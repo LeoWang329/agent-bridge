@@ -212,7 +212,7 @@ const TOOLS = [
   },
   {
     name: "agent_bridge_status",
-    description: "Inspect a persistent delegated-agent session, including streaming state and recent events. Omit session_id to list all sessions this server is managing.",
+    description: "Inspect a persistent delegated-agent session, including streaming state and recent events. Omit session_id to list all sessions this server is managing. Each session carries contextUsage (current-context occupancy: absolute tokens + contextWindow, the signal for reopening before long-context degradation). Passing a session_id (and wait) refreshes an OMP session's live reading; the list-all form returns each session's LAST-KNOWN reading without a fresh poll (accurate while a session is idle — its context doesn't change — but a still-running OMP session may lag until you query it by id or via wait).",
     inputSchema: {
       type: "object",
       properties: {
@@ -733,6 +733,10 @@ function buildSessionResult(session, fullText, options = {}) {
     // so this is how wait().completed.health / result().health reach the caller. (This is also the
     // deterministic proof of the T1 passthrough: a new top-level field flows through wait unchanged.)
     health: deriveHealth(session),
+    // Lift contextUsage to the top level too (same rationale as health): wait() withholds the heavy
+    // `session` object, so this is how a caller sees the delegated session's current-context occupancy
+    // through result()/wait() and decides whether to reopen before long-context rot sets in.
+    contextUsage: session.contextUsage(),
     // HEAD-truncate (keep the beginning) — a max_chars preview of the finished answer; the full text
     // stays in textRef. Opposite direction from clampText's TAIL clamp (see note there).
     text: displayText,
@@ -1782,6 +1786,22 @@ class OmpRpcSession {
     throw new Error(`Timed out waiting for ${this.id} to become idle.`);
   }
 
+  // Normalized current-context occupancy — the long-context "rot" signal. Headline is ABSOLUTE
+  // `tokens` in the live context (not a percent): degradation tracks absolute length, and windows
+  // differ across models (mostly 1M here), so a percent-of-window would understate rot on a big
+  // window. `contextWindow` is kept only for a small-window hard-limit guard, never a percent. OMP
+  // reports contextUsage in get_state on every poll, so this is real-time (`live:true`); its
+  // compaction flags ride along (isCompacting=true → OMP is dropping context right now). Returns null
+  // until get_state has populated contextUsage (partial → null, never a half object).
+  contextUsage() {
+    const cu = this.sessionState?.contextUsage;
+    if (!cu || typeof cu.tokens !== "number" || typeof cu.contextWindow !== "number") return null;
+    const out = { tokens: cu.tokens, contextWindow: cu.contextWindow, live: true };
+    if (typeof this.sessionState.isCompacting === "boolean") out.isCompacting = this.sessionState.isCompacting;
+    if (typeof this.sessionState.autoCompactionEnabled === "boolean") out.autoCompactionEnabled = this.sessionState.autoCompactionEnabled;
+    return out;
+  }
+
   summary() {
     return {
       id: this.id,
@@ -1798,6 +1818,7 @@ class OmpRpcSession {
       lastStderr: this.lastStderr ?? null,
       name: this.name ?? null,
       health: deriveHealth(this),
+      contextUsage: this.contextUsage(),
       logFile: this.logFile,
       lastTurn: lastTurnOf(this),
       // Backend-specific fields live here so the top-level shape is identical across agents
@@ -2417,6 +2438,18 @@ class CodexAppServerSession {
     }
   }
 
+  // Normalized current-context occupancy (see OmpRpcSession.contextUsage). Codex reports usage per
+  // turn via thread/tokenUsage/updated; `last.inputTokens` is the tokens fed to the model on the last
+  // turn = current context length — NOT `total` (cumulative cost across the session) and NOT
+  // `last.totalTokens` (which also counts output). It is a last-turn snapshot, so `live:false` (the
+  // next turn starts from roughly here). null until the first turn reports usage.
+  contextUsage() {
+    const last = this.tokenUsage?.last;
+    const window = this.tokenUsage?.modelContextWindow;
+    if (!last || typeof last.inputTokens !== "number" || typeof window !== "number") return null;
+    return { tokens: last.inputTokens, contextWindow: window, live: false };
+  }
+
   summary() {
     return {
       id: this.id,
@@ -2433,6 +2466,7 @@ class CodexAppServerSession {
       lastStderr: this.lastStderr ?? null,
       name: this.name ?? null,
       health: deriveHealth(this),
+      contextUsage: this.contextUsage(),
       logFile: this.logFile,
       lastTurn: lastTurnOf(this),
       // Backend-specific fields kept off the top level so the shape matches omp (P3).
@@ -2498,6 +2532,9 @@ class ClaudeCodeSession {
     this.nextControlId = 1;
     this.finalAnswer = "";           // unclamped final text from result.result
     this.tokenUsage = null;
+    // Per-model usage from result.modelUsage — the ONLY place claude reports the context window
+    // (top-level result.usage omits it). Needed by contextUsage(); null until a result lands.
+    this.modelUsage = null;
     this.logFile = path.join(RUN_LOG_DIR, `${this.id}.log`);
     this.answerFile = path.join(RUN_LOG_DIR, `${this.id}.answer.txt`);
     this.pidFile = pidRecordPath(this.id);
@@ -2604,6 +2641,11 @@ class ClaudeCodeSession {
     this.turnEndedAt = null;
     this.finalAnswer = "";
     this.lastAssistantText = "";
+    // Clear last turn's usage as THIS turn begins: if this turn's result omits modelUsage (some claude
+    // results do), contextUsage() then returns null ("not measured this turn") instead of silently
+    // reporting the PREVIOUS turn's token count as if it were current. Repopulated in #handleResult.
+    this.tokenUsage = null;
+    this.modelUsage = null;
   }
 
   #settleTurn(err, status) {
@@ -2645,7 +2687,9 @@ class ClaudeCodeSession {
   #handleResult(msg) {
     pushEvent(this, compactEvent({ type: "result", subtype: msg.subtype, is_error: msg.is_error }));
     if (msg.session_id) this.claudeSessionId = msg.session_id;
-    if (msg.usage) this.tokenUsage = msg.usage;
+    // NB: usage/modelUsage are captured LOWER DOWN — only from a result we actually keep. Capturing
+    // them here would let a swallowed stale-abort result (below) overwrite the current context snapshot
+    // with a discarded turn's numbers (contextUsage would then report the aborted turn). See below.
     // INVARIANT (load-bearing): claude processes stdin messages in FIFO order and emits exactly one
     // terminal `result` per user message, in that same order. So when abort() force-settles turn A
     // without its result, A's result is guaranteed to arrive BEFORE any later turn B's result — this
@@ -2662,6 +2706,12 @@ class ClaudeCodeSession {
     // abort()'s interrupt produces a terminal `result/error_during_execution`; consume it as an
     // intentional abort (idle, NOT failed). The interrupting flag is set in Task 4's abort().
     if (this.interrupting) { this.interrupting = false; this.#settleTurn(null, "aborted"); return; }
+    // Now we KEEP this result (a real completed turn — success or genuine error, not a swallowed stale
+    // abort and not a clean interrupt). Capture usage HERE so contextUsage() reflects THIS turn only.
+    // Combined with the reset in #beginTurn, a turn that omits modelUsage yields contextUsage:null
+    // (honest "not measured") rather than a stale prior turn's number.
+    if (msg.usage) this.tokenUsage = msg.usage;
+    if (msg.modelUsage) this.modelUsage = msg.modelUsage;
     if (msg.is_error || msg.subtype !== "success") { this.#settleTurn(new Error(`claude turn ${msg.subtype || "error"}`), msg.subtype || "error"); return; }
     const text = typeof msg.result === "string" ? msg.result : "";
     this.finalAnswer = text;
@@ -2784,6 +2834,32 @@ class ClaudeCodeSession {
     turn?.reject?.(err);
   }
 
+  // Normalized current-context occupancy (see OmpRpcSession.contextUsage). Claude reports per-model
+  // usage in result.modelUsage — the ONLY place the context window appears. The primary model is the
+  // entry with the LARGEST contextWindow, so a turn that spun up a smaller-window subagent doesn't get
+  // mistaken for the main context. On a WINDOW TIE (e.g. main + a subagent on the same model/window),
+  // the entry with MORE input-side tokens wins — in the long-context scenario this feature targets, the
+  // main conversation has accumulated far more context than a freshly-spawned subagent, so tokens is the
+  // right discriminator (first-seen order in modelUsage is not meaningful). Current context = input-side
+  // tokens (fresh input + cache read + cache creation); output isn't part of the next turn's context.
+  // tokens:0 is a valid reading (kept, like omp/codex) — null is reserved for "no measurable entry".
+  // Last-turn snapshot → live:false. null until a result lands or if no entry carries a contextWindow.
+  contextUsage() {
+    const mu = this.modelUsage;
+    if (!mu || typeof mu !== "object") return null;
+    let primary = null, primaryTokens = 0;
+    for (const entry of Object.values(mu)) {
+      if (!entry || typeof entry.contextWindow !== "number") continue;
+      const tokens = (entry.inputTokens || 0) + (entry.cacheReadInputTokens || 0) + (entry.cacheCreationInputTokens || 0);
+      if (!primary || entry.contextWindow > primary.contextWindow || (entry.contextWindow === primary.contextWindow && tokens > primaryTokens)) {
+        primary = entry;
+        primaryTokens = tokens;
+      }
+    }
+    if (!primary) return null;
+    return { tokens: primaryTokens, contextWindow: primary.contextWindow, live: false };
+  }
+
   summary() {
     return {
       id: this.id,
@@ -2800,6 +2876,7 @@ class ClaudeCodeSession {
       lastStderr: this.lastStderr ?? null,
       name: this.name ?? null,
       health: deriveHealth(this),
+      contextUsage: this.contextUsage(),
       logFile: this.logFile,
       lastTurn: lastTurnOf(this),
       agentSpecific: { claudeSessionId: this.claudeSessionId, turnCount: this.turnCount },
@@ -3045,6 +3122,9 @@ async function waitSessions(params) {
       charCount: partial.length,
       tail: tailChars > 0 ? partial.slice(-tailChars) : "",
       lastEvent: slimEvents(s.events, 1)[0] ?? null,
+      // Current-context occupancy so a LONG running session can be watched mid-wait (not just at the
+      // end): OMP is refreshed via get_state just above before this snapshot, so its reading is live.
+      contextUsage: s.contextUsage(),
     };
   };
 

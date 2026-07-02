@@ -105,6 +105,7 @@ close_session(session_id)                  →  用完必须关
 - `textRef`：一个文件路径，里面是**完整未截断**的全文。⚠️ `close_session` 会删除它——**要完整内容就先读 `textRef`、再关会话**；读不到时重新 `result`（调大或去掉 `max_chars`）。
 - `max_chars`：给 `text` 设上限；超限时 `text` 截断、`truncated:true`，但 `charCount` 仍报全长、`textRef` 仍是全文。**核心：必读内容绝不静默丢失。** 大产出（改代码/长文档）建议传个 `max_chars`（如 4000）只看头部，细节用 `git diff` / `textRef` 取。
 - `recentEvents`（`status`/`result` 带）：已**过滤掉逐 token、心跳等噪声**的精简生命周期串；要全量原始事件看 `logFile`。
+- `contextUsage`：该会话**当前上下文占用**（`{tokens, contextWindow, live, …}` 或 `null`）——判断要不要「关旧开新」防降智的信号。判定阈值与取法见「编排策略 → 上下文卫生」。
 
 ## Agent 与模型
 
@@ -143,9 +144,31 @@ close_session(session_id)                  →  用完必须关
 
 **上下文卫生（长任务降智 → 关旧开新）：**
 
-- 同一任务线的追问/迭代复用同一 `session_id`。出现下面任一情况就 `close_session` 旧的、`open_session` 新的，避免上下文越攒越胖拖垮效果：**①新任务且与前面无关；②委托方开始遗漏 prompt 里的关键约束**。
+- 同一任务线的追问/迭代复用同一 `session_id`。出现下面任一情况就 `close_session` 旧的、`open_session` 新的，避免上下文越攒越胖拖垮效果：**①新任务且与前面无关；②委托方开始遗漏 prompt 里的关键约束；③当前上下文用量过大（见下 `contextUsage`）**。
 - reopen 时按「交接物」带上下文（文件路径、规格、上一步 diff 写进新 prompt），不靠旧会话记忆——新 session 不记得旧 session 聊过什么。
 - 一条任务线结束就及时关，别攒到最后。
+
+**用 `contextUsage` 提前发现「上下文腐化」：** 每个会话的返回里带 `contextUsage`（`status`/`result`/`wait`/`wait().pendingSnapshots` 都有；未测到时为 `null`）：
+
+```
+contextUsage: { tokens, contextWindow, live, isCompacting?, autoCompactionEnabled? } | null
+```
+
+- **`tokens` 是主信号**＝当前上下文的**绝对**长度。长上下文能力退化（context rot）跟**绝对 token 数**走，不看百分比——各后端窗口普遍 1M，百分比会低估大窗口下的腐化。据此判断是否该「关旧开新」：
+
+  | 级别 | 条件 | 动作 |
+  |---|---|---|
+  | 正常 | `tokens < 300k` | 无 |
+  | 关注 | `tokens ≥ 300k` | 收尾当前轮，备好交接摘要 |
+  | 重开 | `tokens ≥ 400k` | **关旧开新**，把摘要塞进新会话 `initial_prompt`；别再往旧会话发 |
+  | 硬上限兜底 | `tokens ≥ contextWindow × 0.85` | 同上——防小窗口模型溢出 |
+
+  （依据：多数模型在 ~64–128k 就开始退化；这里取 400k 是对 1M 窗口模型**偏晚、偏保守**的触发线，跟窗口多大无关。三家分词器不同、同文本 token 数差 10–30%，当粗粒度触发器足够。）
+- **`live`**：`true`＝OMP 实时读数（`get_state`）；`false`＝Codex/Claude 上一轮结束的快照（下一轮从这里附近起步）。
+- **`isCompacting: true`**（仅 OMP）＝此刻正在压缩、正在丢上下文，收尾即可；`autoCompactionEnabled: false`（仅 OMP）＝到顶会硬失败而非自动压缩，更要盯 `tokens`。
+- **`null`**＝尚未测到（首轮前）或该轮没吐用量，**不等于 0、不代表安全**。
+- **实时性注意**：`status` 不传 `session_id`（列全部）给的是**上次已知**读数、不刷新；空闲会话的读数本就是当前值（不发消息上下文不变），但要 OMP **正在跑**会话的实时用量，用 `status(session_id)` 或 `wait`（它们会刷新）。
+- **桥永不自动重开**：它只吐数据，重开与否由你判断，且 reopen 必带「交接物」。
 
 **委托后主 agent 仍自查：** 委托方改完文件，主 agent 必须自己 `git diff` + 跑必要测试再向用户报告，不盲信。
 
