@@ -18,7 +18,7 @@ wait(session_ids, mode:"any", timeout_ms)  →  收结果；先完成先处理
 close_session(session_id)                  →  用完必须关
 ```
 
-- ⚠️ `wait` **必须显式传 `timeout_ms`**（建议 ≤ 8 分钟＝`480000`，简单任务再降）；**不传默认死等 30 分钟**。
+- ⚠️ `wait` **必须显式传 `timeout_ms`**（建议 **≤ 5 分钟＝`300000` 短轮询 + 循环**，简单任务再降）；**不传默认死等 30 分钟**。
 - ⚠️ **别给 `send_message` / `open_session` 传 `wait:true`**——超时会 **abort 掉那轮 turn**（任务被中断，不是回头再取）；用非阻塞 send + `wait` 收口。
 - 收口默认 `mode:"any"`（先完成先处理）；`wait` 的返回 shape 随 mode / 超时而不同，见「并行委托」。
 - 要完整产出，在 `close_session` **之前**读 `textRef`（关会话会删它）。
@@ -33,10 +33,14 @@ close_session(session_id)                  →  用完必须关
 委托一轮可能要几分钟甚至更久。**不要用阻塞调用死等**——会卡住主 agent、看不到进展、也不好被打断。标准做法：
 
 1. `agent_bridge_send_message`（默认非阻塞）→ 立刻拿到 ack，任务在后端会话里跑。
-2. `agent_bridge_wait` 传**短 `timeout_ms`**（建议 ≤ 8 分钟＝`480000`，简单任务再降；**不传默认死等 30 分钟**）：
+2. `agent_bridge_wait` 传**短 `timeout_ms`**（建议 **≤ 5 分钟＝`300000`**，简单任务再降；**不传默认死等 30 分钟**）：
    - 超时前结束 → 直接返回结果（含 `text`）。
    - 到点没完 → 返回 `{ timedOut, settled, pending, pendingSnapshots }`，**不报错**。
 3. 「`wait` → 看 `pendingSnapshots` → 再 `wait`」循环，直到完成。
+
+> **短的是「单次请求」，不是任务本身。** 一轮委托要跑 4~5 分钟很正常，就多轮 `wait` 接着等——别为了怕超时去砍任务。短请求让 stdio 传输尽快回到 idle，压掉「长请求 × 机器重载 → 客户端 teardown 掉整个 MCP 连接」这个最危险组合的暴露面（见 `docs/INVESTIGATION-mcp-cleanexit-heavy-delegation-2026-07-02.md`）。
+>
+> **别和被委托 agent 同时榨满机器**：委托重活（build / 起服务 / 大量并发）期间，主 agent 自己别也跑重构建——两边抢 CPU/IO 会让 bridge 回刷变慢、更易被判停滞而 teardown。孤儿进程（next build/dev、僵死后端）会级联拖垮机器 → 定期 `node scripts/agent-bridge.mjs cleanup` 回收。
 
 `pendingSnapshots` 给每个还在跑的会话一个轻量进度快照：`{ sessionId, status, updatedAt, charCount, tail, lastEvent }`。
 

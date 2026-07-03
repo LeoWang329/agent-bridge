@@ -51,6 +51,17 @@ const PID_DIR = path.join(STATE_ROOT, "pids");
 const LOG_RETENTION_DAYS = envNum("AGENT_BRIDGE_LOG_RETENTION_DAYS", 7);
 const LOG_MAX_BYTES = envNum("AGENT_BRIDGE_LOG_MAX_MB", 500) * 1024 * 1024;
 const LOG_FILE_MAX_BYTES = envNum("AGENT_BRIDGE_LOG_FILE_MAX_MB", 200) * 1024 * 1024;
+// Durable exit journal: one JSONL line per server shutdown (clean OR crash), written to STATE_ROOT so
+// it survives the run dir being deleted on clean exit (that deletion takes bridge.log — the only record
+// of WHY we exited — with it). Bounded across process lifetimes by pruneExitJournal() at startup, which
+// is the SOLE size manager here: appendLog's own per-file rotation never fires for this file (one ~200B
+// line per process lifetime stays far under LOG_FILE_MAX_BYTES), so its differently-named `.1` sibling
+// (exit-journal.1.jsonl vs pruneExitJournal's exit-journal.jsonl.1) is never created — do not rely on it.
+const EXIT_JOURNAL = path.join(STATE_ROOT, "exit-journal.jsonl");
+const EXIT_JOURNAL_MAX_BYTES = envNum("AGENT_BRIDGE_EXIT_JOURNAL_MAX_MB", 5) * 1024 * 1024;
+// Max size of an append_system_prompt_file (open_session). A system prompt should be concise — this is
+// far below MESSAGE_FILE_MAX_BYTES (1 MiB). Env-overridable.
+const APPEND_SYSTEM_MAX_BYTES = envNum("AGENT_BRIDGE_APPEND_SYSTEM_MAX_KB", 64) * 1024;
 const LOG_PRUNE_INTERVAL_MS = envNum("AGENT_BRIDGE_LOG_PRUNE_INTERVAL_MIN", 30) * 60_000;
 // Time budget for an OMP RPC backend to reach its first "ready". Cold start is dominated by omp's
 // initial handshake with the model provider; measured at ~10–14s on a quiet Windows box (omp 15.10.10
@@ -119,6 +130,9 @@ let shuttingDown = false;
 // prune each other's files. Set in serveMcp(); defaults to the base LOG_DIR for one-shot CLI
 // commands (doctor/cleanup) that never open sessions.
 let RUN_LOG_DIR = LOG_DIR;
+// In-flight MCP request count. Module-scoped (not local to serveMcp) so cleanupAndExit can journal
+// whether a request — e.g. a wait on a dying backend — was still in flight when we exited.
+let activeRequests = 0;
 
 const TOOLS = [
   {
@@ -156,6 +170,11 @@ const TOOLS = [
           type: "string",
           description:
             "Optional reasoning effort. OMP maps it to --thinking (minimal|low|medium|high|xhigh). Codex sends it as the turn effort (none|minimal|low|medium|high|xhigh). Claude maps it to --effort (minimal|low|medium|high|xhigh) and defaults to xhigh.",
+        },
+        append_system_prompt_file: {
+          type: "string",
+          description:
+            "Optional ABSOLUTE path to a markdown/text file whose contents are injected as an APPENDED system prompt for the whole session (persistent per-session role/instructions). Unlike message_file this MAY live outside cwd (a shared prompt library); ≤64 KiB. omp: `--append-system-prompt=<path>`; claude: `--append-system-prompt-file <path>` (both a true appended system prompt); codex: thread developerInstructions. Reflected in the session summary's appendSystemPrompt. Note: omp honors it reliably with a capable model (e.g. deepseek-v4-pro); omp's default model may follow appended instructions only loosely.",
         },
         initial_prompt: { type: "string", description: "Optional first message to send after opening." },
         schema: {
@@ -541,6 +560,62 @@ function readFileUnderCwd(cwd, p, label, maxBytes) {
   } finally {
     fs.closeSync(fd);
   }
+}
+
+// Read an ABSOLUTE-path file with the same fd-safety as readFileUnderCwd but WITHOUT cwd containment —
+// for an operator-supplied instruction file (append_system_prompt_file) that legitimately lives OUTSIDE
+// the session cwd (a shared prompt/role library). Same threat model as readFileUnderCwd: the path comes
+// from the trusted orchestrator, so containment is not a sandbox — but we keep the fd pin (O_NOFOLLOW +
+// fstat cap + inode tie) so a swapped symlink or a file that grows past the cap is still rejected.
+// Requires an absolute path (no cwd-relative ambiguity). Returns { path: <realpath>, content }.
+function readFileAbs(input, label, maxBytes) {
+  const s = assertString(input, label, { maxLen: 4096 });
+  if (!path.isAbsolute(s)) throw new Error(`${label} must be an absolute path.`);
+  let target;
+  try {
+    target = fs.realpathSync.native(s);
+  } catch {
+    throw new Error(`${label}: file not found or inaccessible: ${s}`);
+  }
+  if (!fs.statSync(target).isFile()) throw new Error(`${label} must be a regular file: ${s}`);
+  const O_NOFOLLOW = fs.constants.O_NOFOLLOW || 0;
+  let fd;
+  try {
+    fd = fs.openSync(target, fs.constants.O_RDONLY | O_NOFOLLOW);
+  } catch (e) {
+    throw new Error(`${label}: cannot open file safely (${e.code || e.message}).`);
+  }
+  try {
+    const st = fs.fstatSync(fd);
+    if (!st.isFile()) throw new Error(`${label} must be a regular file.`);
+    if (st.size > maxBytes) throw new Error(`${label} too large: ${st.size} bytes (max ${maxBytes}).`);
+    let pathStat;
+    try { pathStat = fs.statSync(target); } catch { throw new Error(`${label}: file vanished during open.`); }
+    if (pathStat.ino !== st.ino || pathStat.dev !== st.dev) {
+      throw new Error(`${label} changed during open (fd no longer matches the path).`);
+    }
+    const buf = Buffer.allocUnsafe(maxBytes + 1);
+    let n = 0;
+    for (;;) {
+      const r = fs.readSync(fd, buf, n, buf.length - n, n);
+      if (r === 0) break;
+      n += r;
+      if (n >= buf.length) break;
+    }
+    if (n > maxBytes) throw new Error(`${label} too large (exceeds ${maxBytes} bytes).`);
+    return { path: target, content: buf.subarray(0, n).toString("utf8") };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// Flat, content-free summary of a session's injected append-system-prompt (null when none). Content is
+// NEVER echoed back (it would pull the delegated agent's system prompt into the orchestrator's context);
+// only the path/size/mode. injectionMode: "system" (omp/claude — a true appended system prompt) vs
+// "developer" (codex — thread developerInstructions).
+function appendSystemPromptSummary(sess, injectionMode) {
+  const a = sess.appendSystemPrompt;
+  return a ? { file: a.path, bytes: a.bytes, injectionMode } : null;
 }
 
 // Per-file byte counters so a live session's log can be rotated once it exceeds LOG_FILE_MAX_BYTES.
@@ -1303,6 +1378,7 @@ class OmpRpcSession {
     // OMP passes these on the command line (--model / --thinking), so sanitize at the source.
     this.model = sanitizeAgentArg(options.model, "model");
     this.effort = sanitizeAgentArg(options.effort, "effort");
+    this.appendSystemPrompt = options.appendSystemPrompt || null; // {path,content,bytes}|null — validated/read in openSession
     this.createdAt = nowIso();
     this.updatedAt = this.createdAt;
     this.status = "starting";
@@ -1357,6 +1433,12 @@ class OmpRpcSession {
 
   async start() {
     const args = ["--mode", "rpc", "--no-title", "--no-extensions", "--no-rules"];
+    // Append-system prompt: omp reads the flag value as a file when it is a path (verified 2026-07-03 in
+    // `--mode rpc` via a get_state probe: the file's contents land in the session's systemPrompt array).
+    // Pass the PATH, not inlined content — it keeps the system prompt out of argv/logs and dodges the
+    // ~32 KB Windows argv limit a large inlined prompt would hit. (Adherence is MODEL-dependent: omp's
+    // default model may follow appended instructions only loosely; a capable model honors them reliably.)
+    if (this.appendSystemPrompt) args.push(`--append-system-prompt=${this.appendSystemPrompt.path}`);
     if (this.model) args.push("--model", this.model);
     if (this.effort) args.push("--thinking", this.effort);
     if (this.write) {
@@ -1819,6 +1901,7 @@ class OmpRpcSession {
       name: this.name ?? null,
       health: deriveHealth(this),
       contextUsage: this.contextUsage(),
+      appendSystemPrompt: appendSystemPromptSummary(this, "system"),
       logFile: this.logFile,
       lastTurn: lastTurnOf(this),
       // Backend-specific fields live here so the top-level shape is identical across agents
@@ -1878,6 +1961,7 @@ class CodexAppServerSession {
     // wider charset, widen it once in sanitizeAgentArg (single source, not three call sites).
     this.model = sanitizeAgentArg(options.model, "model");
     this.effort = options.effort || null;
+    this.appendSystemPrompt = options.appendSystemPrompt || null; // {path,content,bytes}|null — validated/read in openSession
     this.createdAt = nowIso();
     this.updatedAt = this.createdAt;
     this.status = "starting";
@@ -1991,6 +2075,11 @@ class CodexAppServerSession {
         serviceName: "agent_bridge",
         ephemeral: true,
         experimentalRawEvents: false,
+        // Append-system prompt for codex: the app-server's native per-thread developer-instruction channel
+        // (schema-confirmed + runtime-verified 2026-07-03 that the model honors it). Content goes over
+        // JSON-RPC/stdin, so arbitrary text is safe (no argv length/metachar concern). NOT baseInstructions
+        // (that REPLACES codex's base scaffolding).
+        ...(this.appendSystemPrompt ? { developerInstructions: this.appendSystemPrompt.content } : {}),
       }),
       20000,
       "Timed out on codex thread/start.",
@@ -2467,6 +2556,7 @@ class CodexAppServerSession {
       name: this.name ?? null,
       health: deriveHealth(this),
       contextUsage: this.contextUsage(),
+      appendSystemPrompt: appendSystemPromptSummary(this, "developer"),
       logFile: this.logFile,
       lastTurn: lastTurnOf(this),
       // Backend-specific fields kept off the top level so the shape matches omp (P3).
@@ -2509,6 +2599,7 @@ class ClaudeCodeSession {
     this.write = Boolean(options.write);
     this.model = sanitizeAgentArg(options.model, "model"); // null when unset; flows to --model
     this.effort = sanitizeAgentArg(options.effort, "effort") || "xhigh"; // maps to --effort; defaults to xhigh thinking, caller may override
+    this.appendSystemPrompt = options.appendSystemPrompt || null; // {path,content,bytes}|null — validated/read in openSession
     this.createdAt = nowIso();
     this.updatedAt = this.createdAt;
     this.status = "starting";
@@ -2542,6 +2633,9 @@ class ClaudeCodeSession {
 
   #buildArgs() {
     const args = ["--print", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--strict-mcp-config"];
+    // Append-system prompt: claude's native file variant reads the file itself. Pass the path, not inlined
+    // content — keeps the prompt out of argv/logs and dodges the ~32 KB Windows argv limit.
+    if (this.appendSystemPrompt) args.push("--append-system-prompt-file", this.appendSystemPrompt.path);
     if (this.model) args.push("--model", this.model); // omitted when unset -> claude uses its configured default model
     if (this.effort) args.push("--effort", this.effort); // per-session reasoning effort; defaults to xhigh (constructor)
     if (this.write) {
@@ -2877,6 +2971,7 @@ class ClaudeCodeSession {
       name: this.name ?? null,
       health: deriveHealth(this),
       contextUsage: this.contextUsage(),
+      appendSystemPrompt: appendSystemPromptSummary(this, "system"),
       logFile: this.logFile,
       lastTurn: lastTurnOf(this),
       agentSpecific: { claudeSessionId: this.claudeSessionId, turnCount: this.turnCount },
@@ -2963,7 +3058,21 @@ async function openSession(params) {
   if (initialSchema && params.agent !== "codex") {
     throw new Error(`schema (structured output) is not supported for backend "${params.agent}" yet; only codex.`);
   }
-  const session = new AGENTS[params.agent].Session(params);
+  // Optional append_system_prompt_file: validate + read BEFORE spawning (fail-fast, no orphan proc — same
+  // rule as name/schema). Read content once here: codex injects it over JSON-RPC (needs the string) and the
+  // read also enforces the size cap; omp/claude pass the PATH and re-read it themselves at spawn. Absolute
+  // path, NOT cwd-contained: an operator-supplied instruction file may live in a shared library outside cwd,
+  // and the trust boundary is the orchestrator that supplied the path (same as message_file content) — this
+  // is NOT a sandbox against a malicious caller. TOCTOU: omp/claude re-read the file at spawn a few ms after
+  // this check, so a swap in that window is on the trusted operator (codex is frozen — it uses this content).
+  // Pass via a fresh object (do NOT mutate params) so the content can't leak into logging/reuse of params.
+  let appendSystemPrompt = null;
+  if (params.append_system_prompt_file != null) {
+    const r = readFileAbs(params.append_system_prompt_file, "append_system_prompt_file", APPEND_SYSTEM_MAX_BYTES);
+    if (!r.content.trim()) throw new Error("append_system_prompt_file is empty.");
+    appendSystemPrompt = { path: r.path, content: r.content, bytes: Buffer.byteLength(r.content, "utf8") };
+  }
+  const session = new AGENTS[params.agent].Session(appendSystemPrompt ? { ...params, appendSystemPrompt } : params);
   session.name = name;
   session.returnMode = assertEnum(params.return_mode, "return_mode", ["full", "ref"], "full");
   sessions.set(session.id, session);
@@ -3459,6 +3568,7 @@ function serveMcp() {
   } catch {}
   cleanupStalePidRecords();
   reclaimStaleLogs(); // sweep run dirs left by servers that did not exit cleanly
+  pruneExitJournal(); // cap the durable exit journal before this run appends to it
   installProcessHandlers();
   // Periodic prune of THIS run's logs while the server is long-lived (the per-file/total caps
   // matter most for chatty OMP sessions), plus a sweep of other servers' abandoned run dirs.
@@ -3502,7 +3612,7 @@ function serveMcp() {
     }
   }
   const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
-  let activeRequests = 0;
+  activeRequests = 0; // declared at module scope (see above) so cleanupAndExit can read it
   let inputClosed = false;
   const maybeExit = () => {
     if (inputClosed && activeRequests === 0) cleanupAndExit(0, "stdin closed");
@@ -3589,9 +3699,42 @@ function cleanupSessions(options = {}) {
   sessions.clear();
 }
 
+// Bound the durable exit journal across process lifetimes: it gains one line per shutdown and (unlike
+// run dirs) is never swept, so cap it. When it exceeds EXIT_JOURNAL_MAX_BYTES, rotate to a single .1
+// sibling — keeps the most recent ~cap of history. Best-effort; called once at server startup.
+function pruneExitJournal() {
+  if (EXIT_JOURNAL_MAX_BYTES <= 0) return;
+  try {
+    const st = fs.statSync(EXIT_JOURNAL);
+    if (st.size > EXIT_JOURNAL_MAX_BYTES) fs.renameSync(EXIT_JOURNAL, `${EXIT_JOURNAL}.1`);
+  } catch {}
+}
+
 function cleanupAndExit(code = 0, reason = "shutdown", error = null) {
   if (shuttingDown) return;
   shuttingDown = true;
+  // Durable exit journal FIRST — it is the record that SURVIVES run-dir deletion, so write it before
+  // anything else here can throw (the bridge.log append below is unguarded; the run dir is removed at the
+  // end). One line to STATE_ROOT/exit-journal.jsonl keeps a clean code-0 teardown diagnosable afterwards —
+  // the gap that made the 2026-07-02 field report unresolvable. Capture session state while the registry
+  // is still intact (cleanupSessions() clears it below). Best-effort; must never throw and block exit.
+  try {
+    const sessionStates = [];
+    for (const s of sessions.values()) {
+      try { sessionStates.push({ id: s.id, status: s.status, backendPid: s.proc?.pid ?? null }); } catch {}
+    }
+    appendLog(EXIT_JOURNAL, `${JSON.stringify({
+      ts: nowIso(),
+      runId: path.basename(RUN_LOG_DIR),
+      code,
+      reason,
+      pid: process.pid,
+      ppid: process.ppid,
+      uptimeSec: Math.round(process.uptime()),
+      activeRequests,
+      sessions: sessionStates,
+    })}\n`);
+  } catch {}
   appendLog(path.join(RUN_LOG_DIR, "bridge.log"), `[${nowIso()}] Agent Bridge shutdown code=${code} reason=${reason}\n`);
   if (error) {
     process.stderr.write(`${reason}: ${error instanceof Error ? error.stack || error.message : String(error)}\n`);
