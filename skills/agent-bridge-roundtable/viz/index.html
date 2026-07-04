@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Agent Roundtable</title>
+<style>
+  :root{
+    --bg:#f6f7f9; --panel:#fff; --ink:#1b1f24; --muted:#6b7280; --line:#e5e7eb;
+    --accent:#3b5bdb; --warn:#b45309; --warnbg:#fef3c7; --good:#0f7b4f; --hot:#c2410c;
+    --chip:#eef1f6;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{ --bg:#0e1116; --panel:#161b22; --ink:#e6edf3; --muted:#9aa4b2; --line:#2a313c;
+      --accent:#7aa2ff; --warn:#fbbf24; --warnbg:#3a2f0b; --good:#4ade80; --hot:#fb923c; --chip:#222a35; }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,"Microsoft YaHei",sans-serif}
+  header{position:sticky;top:0;z-index:5;background:var(--panel);border-bottom:1px solid var(--line);padding:12px 18px}
+  h1{margin:0 0 4px;font-size:16px;display:flex;align-items:center;gap:8px}
+  .q{color:var(--muted);font-size:13px;max-width:70ch}
+  .seats{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+  .seat{font-size:12px;padding:2px 8px;border-radius:999px;background:var(--chip);border:1px solid var(--line);white-space:nowrap}
+  .seat b{font-weight:600}
+  .status{margin-left:auto;font-size:12px;color:var(--muted)}
+  .status.done{color:var(--good)}
+  main{max-width:920px;margin:0 auto;padding:16px 18px 80px}
+  .round{margin:18px 0 8px}
+  .round-h{display:flex;align-items:center;gap:8px;font-weight:600;color:var(--muted);font-size:12px;
+    text-transform:uppercase;letter-spacing:.04em;margin:0 0 8px;border-top:1px dashed var(--line);padding-top:12px}
+  .card{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--line);
+    border-radius:8px;padding:10px 12px;margin:8px 0}
+  .card .top{display:flex;align-items:center;gap:8px;margin-bottom:4px}
+  .badge{font-size:11px;font-weight:600;padding:1px 7px;border-radius:999px;background:var(--chip)}
+  .dot{width:9px;height:9px;border-radius:50%;display:inline-block;flex:0 0 auto}
+  .who{font-weight:600}
+  .meta{color:var(--muted);font-size:12px;margin-left:auto}
+  .body{white-space:pre-wrap;word-break:break-word}
+  .rationale{color:var(--ink);background:var(--chip);border-radius:6px;padding:6px 9px;margin-top:6px;font-size:13px}
+  .card.decision{border-left-color:var(--accent)}
+  .card.disagreement{border-left-color:var(--hot)}
+  .card.produced{border-left-color:var(--good)}
+  .card.skip{border-left-color:var(--warn);color:var(--muted)}
+  .card.human{border-left-color:var(--warn)}
+  .pos{margin:4px 0;padding-left:10px;border-left:2px solid var(--line)}
+  .pos b{color:var(--accent)}
+  button.load{font:inherit;font-size:12px;color:var(--accent);background:none;border:1px solid var(--line);
+    border-radius:6px;padding:2px 8px;cursor:pointer}
+  button.load:hover{background:var(--chip)}
+  pre.full{white-space:pre-wrap;word-break:break-word;background:var(--bg);border:1px solid var(--line);
+    border-radius:6px;padding:10px;margin:6px 0 0;max-height:420px;overflow:auto;font:12.5px/1.5 ui-monospace,Consolas,monospace}
+  .banner{position:sticky;top:0;z-index:9;background:var(--warnbg);color:var(--warn);border-bottom:1px solid var(--line);
+    padding:10px 18px;font-weight:600;display:none}
+  .banner.on{display:block}
+  .final{background:var(--panel);border:2px solid var(--good);border-radius:10px;padding:14px 16px;margin:22px 0}
+  .final h2{margin:0 0 8px;font-size:15px;color:var(--good)}
+  .final ul{margin:6px 0;padding-left:20px}
+  .conn{font-size:11px;color:var(--muted)}
+  .kv{color:var(--muted);font-size:12px}
+</style>
+</head>
+<body>
+<div class="banner" id="banner"></div>
+<header>
+  <h1>🗣️ Agent Roundtable <span class="status" id="status"><span class="conn" id="conn">连接中…</span></span></h1>
+  <div class="q" id="question">等待 run:started…</div>
+  <div class="seats" id="seats"></div>
+</header>
+<main id="feed"></main>
+
+<script>
+"use strict";
+const PALETTE = ["#3b5bdb","#0f7b4f","#c2410c","#7c3aed","#0891b2","#be185d","#4d7c0f","#a16207"];
+const seatColor = {};   // seat -> color
+const seatMeta = {};    // seat -> {agent,model,role}
+const rounds = {};      // round -> DOM section
+const pendingHuman = {};// questionId -> question
+const feed = document.getElementById("feed");
+const banner = document.getElementById("banner");
+const seen = new Set();  // 已处理的 ev.seq;SSE 断线重连会全量重放,靠它去重
+
+function esc(s){ return String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+
+function roundSection(n){
+  if(rounds[n]) return rounds[n];
+  const sec=document.createElement("section"); sec.className="round";
+  const h=document.createElement("div"); h.className="round-h";
+  h.textContent = n===0 ? "Round 0 · 盲发发散" : (n<0? "—" : "Round "+n+" · 收敛");
+  sec.appendChild(h); rounds[n]=sec;
+  // 按 round 号插入到正确位置(事件通常有序,这里稳妥处理乱序)
+  const secs=[...feed.querySelectorAll("section.round")];
+  const after=secs.find(s=>Number(s.dataset.n)>n);
+  sec.dataset.n=n;
+  if(after) feed.insertBefore(sec,after); else feed.appendChild(sec);
+  return sec;
+}
+function addCard(round, cls, html){
+  const c=document.createElement("div"); c.className="card "+(cls||""); c.innerHTML=html;
+  roundSection(round==null?-1:round).appendChild(c); return c;
+}
+function dot(seat){ const c=seatColor[seat]||"var(--muted)"; return `<span class="dot" style="background:${c}"></span>`; }
+function loadBtn(ref,label){ return ref ? `<button class="load" data-ref="${esc(ref)}">${label||"查看全文"}</button>` : ""; }
+
+function handle(ev){
+  if(ev && ev.seq!=null){ if(seen.has(ev.seq)) return; seen.add(ev.seq); } // 重连去重
+  const p = ev.payload || {};
+  const r = ev.round;
+  switch(ev.event){
+    case "run:started": {
+      document.getElementById("question").textContent = p.question || "(未命名议题)";
+      const box=document.getElementById("seats"); box.innerHTML="";
+      (p.seats||[]).forEach((s,i)=>{
+        seatColor[s.seat]=PALETTE[i%PALETTE.length]; seatMeta[s.seat]=s;
+        const el=document.createElement("span"); el.className="seat";
+        el.innerHTML=`${dot(s.seat)} <b>${esc(s.seat)}</b> · ${esc(s.agent)}${s.model?"/"+esc(s.model):""}${s.role?" · "+esc(s.role):""}`;
+        box.appendChild(el);
+      });
+      const b=[]; if(p.maxRounds!=null)b.push("轮上限 "+p.maxRounds); if(p.budget)b.push("预算 "+JSON.stringify(p.budget));
+      setStatus((p.vizEnabled?"可视化开 · ":"")+"进行中"+(b.length?" · "+b.join(" · "):""));
+      break;
+    }
+    case "round:started":
+      addCard(r,"", `<div class="top"><span class="badge">Round ${esc(r)}</span><span class="who">${p.mode==="parallel"?"并行":"串行"}</span>`
+        +`<span class="meta">${(p.plannedSpeakers||[]).map(s=>`${dot(s)}${esc(s)}`).join(" ")}</span></div>`
+        +(p.rationale?`<div class="rationale">排序理由:${esc(p.rationale)}</div>`:""));
+      break;
+    case "turn:assigned":
+      addCard(r,"", `<div class="top">${dot(p.seat)}<span class="who">${esc(p.seat)}</span><span class="badge">指派发言</span>`
+        +`<span class="meta">${loadBtn(p.briefRef,"本轮简报")}</span></div>`
+        +(p.why?`<div class="kv">依据:${esc(p.why)}</div>`:""));
+      break;
+    case "turn:produced": {
+      const c=addCard(r,"produced", `<div class="top">${dot(p.seat)}<span class="who">${esc(p.seat)}</span>`
+        +`<span class="badge">${esc(p.agent||"")}${p.model?"/"+esc(p.model):""}</span>`
+        +`<span class="meta">${p.charCount!=null?esc(p.charCount)+" 字 · ":""}${loadBtn(p.outputRef)}</span></div>`
+        +(p.summary?`<div class="body">${esc(p.summary)}</div>`:""));
+      break;
+    }
+    case "schedule:decision":
+      addCard(r,"decision", `<div class="top"><span class="badge">主席决策</span><span class="who">${esc(p.decision||"")}</span>`
+        +`<span class="meta">${(p.nextSpeakers||[]).map(s=>`${dot(s)}${esc(s)}`).join(" ")}</span></div>`
+        +(p.convergenceSignals?`<div class="kv">收敛信号:${esc(p.convergenceSignals)}</div>`:"")
+        +(p.rationale?`<div class="rationale">${esc(p.rationale)}</div>`:""));
+      break;
+    case "disagreement": {
+      const pos=(p.positions||[]).map(x=>`<div class="pos"><b>${esc(x.label)}</b>:${esc(x.stance)}</div>`).join("");
+      addCard(r,"disagreement", `<div class="top"><span class="badge">分歧</span><span class="who">${esc(p.topic||"")}</span>`
+        +`<span class="meta">${p.kind==="needs-human"?"⏸ 需人拍板":"可论证解决"}</span></div>`+pos);
+      break;
+    }
+    case "human:asked": {
+      pendingHuman[p.questionId]=p.question;
+      refreshBanner();
+      addCard(r,"human", `<div class="top"><span class="badge">⏸ 升级问人</span><span class="who">${esc(p.question||"")}</span></div>`
+        +(p.why?`<div class="kv">为何:${esc(p.why)}</div>`:"")
+        +((p.options&&p.options.length)?`<div class="kv">选项:${p.options.map(esc).join(" / ")}</div>`:""));
+      break;
+    }
+    case "human:answered":
+      delete pendingHuman[p.questionId]; refreshBanner();
+      addCard(r,"", `<div class="top"><span class="badge">✔ 人已答</span><span class="who">${esc(p.answer||"")}</span></div>`);
+      break;
+    case "seat:skipped":
+      addCard(r,"skip", `<div class="top">${dot(p.seat)}<span class="who">${esc(p.seat)}</span>`
+        +`<span class="badge">跳过</span><span class="meta">${esc(p.reason||"")}</span></div>`);
+      break;
+    case "run:final": {
+      const div=document.createElement("div"); div.className="final";
+      div.innerHTML=`<h2>✅ 最终方案 ${loadBtn(p.decisionRef,"完整方案")}</h2>`
+        +(p.adopted?`<div class="body"><b>采纳:</b> ${esc(p.adopted)}</div>`:"")
+        +(p.tradeoffs&&p.tradeoffs.length?`<div class="kv">权衡</div><ul>${p.tradeoffs.map(t=>`<li>${esc(t)}</li>`).join("")}</ul>`:"")
+        +(p.openIssues&&p.openIssues.length?`<div class="kv">未决</div><ul>${p.openIssues.map(t=>`<li>${esc(t)}</li>`).join("")}</ul>`:"");
+      feed.appendChild(div);
+      break;
+    }
+    case "run:terminated":
+      setStatus("已结束 · "+(p.reason||""), true);
+      break;
+    case "viz:started": case "viz:stopped": break; // 无需展示
+  }
+}
+
+// 服务器检测到 transcript 被截断/替换时发 reset:清空整个视图,等新文件从头重放
+function resetView(){
+  seen.clear();
+  Object.keys(rounds).forEach(k=>delete rounds[k]);
+  Object.keys(pendingHuman).forEach(k=>delete pendingHuman[k]);
+  Object.keys(seatColor).forEach(k=>delete seatColor[k]);
+  Object.keys(seatMeta).forEach(k=>delete seatMeta[k]);
+  feed.innerHTML=""; document.getElementById("seats").innerHTML="";
+  document.getElementById("question").textContent="等待 run:started…";
+  refreshBanner();
+}
+
+function refreshBanner(){
+  const qs=Object.values(pendingHuman);
+  if(qs.length){ banner.className="banner on"; banner.textContent="⏸ 等待人类决断:"+qs.join(" ｜ "); }
+  else banner.className="banner";
+}
+function setStatus(t,done){ const s=document.getElementById("status"); s.className="status"+(done?" done":""); s.textContent=t; }
+
+// 点击加载旁挂全文(按需 /file?ref=)
+feed.addEventListener("click", async e=>{
+  const btn=e.target.closest("button.load"); if(!btn) return;
+  const ref=btn.dataset.ref; if(!ref) return;
+  let pre=btn.closest(".card,.final").querySelector("pre.full");
+  if(pre){ pre.remove(); return; } // 再点收起
+  btn.disabled=true;
+  try{
+    const res=await fetch("/file?ref="+encodeURIComponent(ref));
+    const text=res.ok? await res.text() : "加载失败:"+res.status;
+    pre=document.createElement("pre"); pre.className="full"; pre.textContent=text;
+    btn.closest(".card,.final").appendChild(pre);
+  }catch(err){ /* 忽略 */ }
+  finally{ btn.disabled=false; }
+});
+
+// SSE:回放 + 实时,断线自动重连(EventSource 内建)
+const conn=document.getElementById("conn");
+const es=new EventSource("/events");
+es.onopen=()=>{ conn.textContent="● 实时"; };
+es.onerror=()=>{ conn.textContent="○ 重连中…"; };
+es.addEventListener("reset", resetView);
+es.onmessage=e=>{ let ev; try{ ev=JSON.parse(e.data); }catch{ return; } try{ handle(ev); }catch{} };
+</script>
+</body>
+</html>
