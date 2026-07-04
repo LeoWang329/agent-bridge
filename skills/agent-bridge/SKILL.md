@@ -26,7 +26,7 @@ close_session(session_id)                  →  用完必须关
 ## 核心机制
 
 - 会话**活在 MCP server 进程内**：你所在的客户端启动了一个 `agent-bridge mcp` 进程，它直接 spawn 并持有你 open 的 OMP/Codex 后端。**没有共享 daemon、没有 UI、不跨客户端共享**；客户端退出，这些会话随之被清理。
-- CLI 只剩三条：`mcp`（由插件拉起，你一般不手动跑）、`doctor`（查后端可用性）、`cleanup`（回收被 kill 的 server 残留的子进程）。**没有 CLI 会话命令，也没有 daemon/ui 命令**。
+- CLI 只剩三条：`mcp`（由 MCP 客户端拉起，你一般不手动跑）、`doctor`（查后端可用性）、`cleanup`（回收被 kill 的 server 残留的子进程）。**没有 CLI 会话命令，也没有 daemon/ui 命令**。
 
 ## 工作流：非阻塞 + 短超时 wait（看进展，不死等）
 

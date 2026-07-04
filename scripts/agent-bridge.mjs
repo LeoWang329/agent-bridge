@@ -3592,7 +3592,7 @@ function serveMcp() {
     // Arm ONLY if the parent is alive right now. If it is already gone at startup, our ppid is almost
     // certainly a transient launcher (a shell/wrapper that spawned us and returned) rather than the
     // client actually holding our stdin — an unreliable proxy we must never self-reap on. Leave the
-    // watchdog disarmed and let the stdin-EOF path be the signal. The real plugin spawns `node`
+    // watchdog disarmed and let the stdin-EOF path be the signal. The MCP client spawns `node`
     // directly, so the parent is always alive here; this only guards the wrapper edge case.
     if (!pidAlive(watchPid)) {
       appendLog(

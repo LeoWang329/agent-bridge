@@ -1,19 +1,19 @@
 # Agent Bridge Development
 
-This document explains how Agent Bridge is structured, how to test it, and how to release a local plugin build.
+This document explains how Agent Bridge is structured, how to test it, and how to cut a release.
 
 ## Project Layout
 
 ```text
 agent-bridge/
-  .codex-plugin/plugin.json      Codex plugin manifest
-  .mcp.json                      MCP server declaration used by the plugin
-  scripts/agent-bridge.mjs       MCP server and backend adapter implementation
-  skills/agent-bridge/SKILL.md   Instructions Codex should follow when using the bridge
-  docs/REQUIREMENTS.md           Product requirements and TODOs
-  docs/INSTALLATION.md           Installation and usage guide
-  docs/DEVELOPMENT.md            Development notes
-  README.md                      User-facing documentation
+  .mcp.json                          Project-scoped MCP server declaration (auto-loaded when a client runs in the repo)
+  scripts/agent-bridge.mjs           MCP server and backend adapter implementation
+  skills/agent-bridge/SKILL.md       Bridge usage guide the delegating agent follows
+  skills/agent-bridge-dev/SKILL.md   Optional companion: delegated-role dev/review/design/debug orchestration
+  docs/REQUIREMENTS.md               Product requirements and TODOs
+  docs/INSTALLATION.md               Installation and usage guide
+  docs/DEVELOPMENT.md                Development notes
+  README.md                          User-facing documentation
 ```
 
 There are no npm dependencies. The runtime uses Node built-ins plus external CLIs:
@@ -100,12 +100,6 @@ node scripts/agent-bridge.mjs cleanup
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | node scripts/agent-bridge.mjs mcp
 ```
 
-If you have the plugin validator from Codex's plugin creator skill:
-
-```sh
-python /path/to/validate_plugin.py .
-```
-
 ## End-to-End Test (real backends)
 
 `docs/repro-mcp-hang/e2e-real.mjs` drives the working-tree MCP server over real JSON-RPC stdio against **real `omp` + `codex`** and asserts the full delegated-session surface: registry dispatch (open both backends), `wait` mode all/any across both backend types, session reuse, `status` refresh, `abort` + settle, a `write: true` file edit in a temp dir, `assertAgent` rejection of a bad agent, and clean shutdown. Unlike the `repro-*.mjs` (which use the fake-omp stub for zero model usage), this spends **real model tokens** and needs both backends on `PATH`; it SKIPs cleanly (exit 0) if either is missing. Transient backend network blips can flake individual scenarios — re-run to confirm.
@@ -116,11 +110,10 @@ node docs/repro-mcp-hang/e2e-real.mjs   # prints PASS/FAIL per scenario, then a 
 
 ## Codex CLI Smoke Tests
 
-After installing the plugin, verify Codex can call it:
+After registering the MCP server, verify Codex can call it:
 
 ```sh
 codex mcp list | rg agent-bridge
-codex plugin list | rg agent-bridge
 ```
 
 Minimal non-mutating session test:
@@ -186,51 +179,15 @@ node scripts/agent-bridge.mjs cleanup --json
 ps -axo pid,ppid,command | rg 'omp --mode rpc|codex app-server' || true
 ```
 
-## Personal Marketplace Example
-
-Codex plugin installation expects a marketplace entry. A minimal personal marketplace can look like this:
-
-```json
-{
-  "name": "personal",
-  "interface": {
-    "displayName": "Personal"
-  },
-  "plugins": [
-    {
-      "name": "agent-bridge",
-      "source": {
-        "source": "local",
-        "path": "./plugins/agent-bridge"
-      },
-      "policy": {
-        "installation": "AVAILABLE",
-        "authentication": "ON_INSTALL"
-      },
-      "category": "Productivity"
-    }
-  ]
-}
-```
-
-With that marketplace configured:
-
-```sh
-mkdir -p "$HOME/plugins"
-ln -sfn /absolute/path/to/agent-bridge "$HOME/plugins/agent-bridge"
-codex plugin add agent-bridge@personal
-```
-
 ## Release Checklist
 
 1. Update `BRIDGE_VERSION` in `scripts/agent-bridge.mjs`.
-2. Update `.codex-plugin/plugin.json`.
-3. Run syntax and plugin validation.
-4. Run the MCP stdio verification (including the no-listening-port check) if MCP or session code changed.
-5. Run the process-cleanup / per-run-log-dir checks if lifecycle code changed.
-6. Reinstall the plugin through Codex.
-7. Run the Codex CLI smoke tests.
-8. Confirm no delegated backend processes are left running:
+2. Run syntax validation (`node --check scripts/agent-bridge.mjs`).
+3. Run the MCP stdio verification (including the no-listening-port check) if MCP or session code changed.
+4. Run the process-cleanup / per-run-log-dir checks if lifecycle code changed.
+5. Restart the client so it reloads the running MCP server.
+6. Run the Codex CLI smoke tests.
+7. Confirm no delegated backend processes are left running:
 
 ```sh
 ps -axo pid,ppid,command | rg 'agent-bridge|omp --mode rpc|codex app-server' || true
@@ -248,9 +205,8 @@ ps -axo pid,ppid,command | rg 'agent-bridge|omp --mode rpc|codex app-server' || 
 
 If `agent_bridge_doctor` cannot find a backend, set `OMP_BIN` or `CODEX_BIN`.
 
-If Codex cannot see the MCP server, reinstall the plugin and check:
+If Codex cannot see the MCP server, re-add it (`codex mcp add agent-bridge -- node "<REPO>/scripts/agent-bridge.mjs" mcp`), restart Codex, and check:
 
 ```sh
 codex mcp list
-codex plugin list
 ```

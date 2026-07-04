@@ -1,6 +1,6 @@
-// Structure + shared-principles consistency + injectability smoke for the `agent-bridge:dev` skill.
+// Structure + shared-principles consistency + injectability smoke for the `agent-bridge-dev` skill.
 //
-// Part A (always, no tokens): skills/dev/SKILL.md exists with `name: dev`; exactly the four role files exist,
+// Part A (always, no tokens): skills/agent-bridge-dev/SKILL.md exists with `name: agent-bridge-dev`; exactly the four role files exist,
 //   non-empty, each carrying a PAIRED <!-- SHARED-PRINCIPLES … --> … <!-- /SHARED-PRINCIPLES --> block; and the
 //   block is BYTE-IDENTICAL across all four (guards against copy-drift — DESIGN §4/§8).
 // Part B (real backend, SKIPs if omp absent): ACCEPTANCE/injectability check — open an omp session per role with
@@ -18,7 +18,7 @@ import { fileURLToPath } from "node:url";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BRIDGE = path.resolve(HERE, "../../scripts/agent-bridge.mjs");
 const REPO = path.resolve(HERE, "../..");
-const SKILL_DIR = path.join(REPO, "skills", "dev");
+const SKILL_DIR = path.join(REPO, "skills", "agent-bridge-dev");
 const ROLES_DIR = path.join(SKILL_DIR, "roles");
 const ROLES = ["implementer", "reviewer", "architect", "debugger"];
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -28,10 +28,10 @@ const check = (label, ok, extra = "") => { console.log(`[${ok ? "PASS" : "FAIL"}
 
 // ── Part A: structure + shared-block consistency (no backend) ──
 const skillMd = path.join(SKILL_DIR, "SKILL.md");
-check("skills/dev/SKILL.md exists", fs.existsSync(skillMd));
+check("skills/agent-bridge-dev/SKILL.md exists", fs.existsSync(skillMd));
 if (fs.existsSync(skillMd)) {
   const fm = fs.readFileSync(skillMd, "utf8").split(/\r?\n/).slice(0, 12).join("\n");
-  check("SKILL.md frontmatter name: dev", /^name:\s*dev\s*$/m.test(fm), fm.match(/name:.*/)?.[0]);
+  check("SKILL.md frontmatter name: agent-bridge-dev", /^name:\s*agent-bridge-dev\s*$/m.test(fm), fm.match(/name:.*/)?.[0]);
 }
 
 // allow-list: roles/ holds exactly the four .md role files, nothing else
