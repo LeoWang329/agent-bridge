@@ -130,6 +130,12 @@ a{color:var(--accent)}
 }
 .q-label{ font:11px/1 var(--mono); letter-spacing:.12em; text-transform:uppercase; color:var(--faint); display:block; margin-bottom:5px; }
 
+/* 匿名边界说明:告诉观察者「viz 显示引擎」不破坏匿名——匿名约束的是席位彼此 */
+.anon-note{ margin-top:10px; display:flex; align-items:center; gap:8px; font:11.5px/1.5 var(--mono); color:var(--faint); }
+.anon-note svg{ width:14px; height:14px; flex:0 0 auto; opacity:.85; }
+.anon-note code{ font-family:var(--mono); background:var(--surface-2); border:1px solid var(--line);
+  border-radius:4px; padding:1px 5px; color:var(--ink-soft); }
+
 .metarow{ display:flex; flex-wrap:wrap; align-items:center; gap:8px 10px; margin-top:11px; }
 .seats{ display:flex; flex-wrap:wrap; gap:7px; min-width:0; }
 .seat-chip{
@@ -158,6 +164,8 @@ a{color:var(--accent)}
   background:var(--sc, var(--faint));
   box-shadow: inset 0 0 0 1px rgba(255,255,255,.16);
 }
+/* 仅供屏幕阅读器:视觉靠色块徽标映射席位,SR 靠这段文字拿到同样的"来自哪一席" */
+.sr-only{ position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
 
 /* ---- 等待人类横幅 ---- */
 .human-banner{
@@ -240,6 +248,8 @@ main{ max-width:var(--maxw); margin:0 auto; padding:20px 22px 120px; }
 .c-meta{ margin-left:auto; display:inline-flex; align-items:center; gap:9px; flex-wrap:wrap;
   font:11.5px/1 var(--mono); color:var(--faint); }
 .c-body{ margin-top:8px; color:var(--ink); line-height:1.68; text-wrap:pretty; overflow-wrap:anywhere; max-width:72ch; }
+.body-src{ font:10.5px/1 var(--mono); letter-spacing:.06em; color:var(--faint); background:var(--surface-2);
+  border:1px solid var(--line); border-radius:5px; padding:2px 6px; margin-right:8px; white-space:nowrap; }
 .c-kv{ margin-top:8px; font-size:12.8px; color:var(--ink-soft); line-height:1.62; text-wrap:pretty; max-width:72ch; }
 .c-kv .k{ font:10.5px/1 var(--mono); letter-spacing:.08em; text-transform:uppercase; color:var(--faint);
   display:inline-block; margin-right:6px; }
@@ -253,6 +263,17 @@ main{ max-width:var(--maxw); margin:0 auto; padding:20px 22px 120px; }
 .card.assign .who{ font-weight:600; }
 .card.skip{ background:var(--canvas); box-shadow:none; padding:10px 14px; border-style:dashed; color:var(--ink-soft); }
 .card.skip .badge{ opacity:.6; }
+
+/* 主席策展账(coverage):弱化,审计味 */
+.card.coverage{ background:var(--canvas); box-shadow:none; padding:11px 14px; }
+.cov-body{ margin-top:9px; display:grid; gap:7px; }
+.cov-row{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; font-size:12.8px; }
+.cov-tag{ font:10.5px/1 var(--mono); padding:3px 7px; border-radius:5px; white-space:nowrap; border:1px solid var(--line); flex:0 0 auto; }
+.cov-included{ color:var(--c-final); background:color-mix(in oklab,var(--c-final) 10%,var(--surface)); border-color:color-mix(in oklab,var(--c-final) 30%,var(--line)); }
+.cov-parked{ color:var(--c-pause); background:color-mix(in oklab,var(--c-pause) 12%,var(--surface)); border-color:color-mix(in oklab,var(--c-pause) 32%,var(--line)); }
+.cov-irrelevant{ color:var(--faint); background:var(--surface-2); }
+.cov-ref{ display:inline-flex; align-items:center; gap:6px; }
+.cov-why{ color:var(--ink-soft); flex:1 1 220px; min-width:0; line-height:1.55; text-wrap:pretty; }
 
 /* 人已答复(内联小卡) */
 .card.answered{ border-left:3px solid var(--c-final); background:color-mix(in oklab,var(--c-final) 5%,var(--surface)); }
@@ -291,8 +312,8 @@ main{ max-width:var(--maxw); margin:0 auto; padding:20px 22px 120px; }
 .positions{ margin-top:12px; display:grid; gap:8px; }
 .pos{ display:grid; grid-template-columns:auto 1fr; gap:11px; align-items:start;
   padding:9px 12px; background:var(--surface-2); border:1px solid var(--line); border-radius:9px; }
-.pos-label{ font:600 11.5px/1.3 var(--mono); color:var(--c-disagree); white-space:nowrap;
-  padding-top:2px; letter-spacing:.02em; }
+.pos-label{ display:inline-flex; align-items:center; gap:6px; white-space:nowrap; }
+.pos-lt{ font:600 11.5px/1.3 var(--mono); color:var(--c-disagree); letter-spacing:.02em; }
 .pos-stance{ color:var(--ink); line-height:1.62; text-wrap:pretty; overflow-wrap:anywhere; }
 
 /* 等待拍板卡(human:asked) */
@@ -321,6 +342,9 @@ main{ max-width:var(--maxw); margin:0 auto; padding:20px 22px 120px; }
 .file-slot{ margin-top:11px; border-top:1px dashed var(--line-2); padding-top:11px; animation:cardIn .24s ease both; }
 .file-loading, .file-error{ font:12.5px/1.5 var(--mono); color:var(--faint); }
 .file-error{ color:var(--c-disagree); }
+/* 席位原文出处小注:一眼确认是原话、未经主席转写 */
+.prov-note{ font:11px/1.5 var(--mono); color:var(--faint); margin-bottom:9px;
+  padding-left:9px; border-left:2px solid var(--line-2); }
 /* 发言全文展开:席位色左引用条 —— 强化"谁在说" */
 .card.produced > .file-slot{ border-left:3px solid var(--sc, var(--line-2)); padding-left:13px;
   border-top-color:color-mix(in oklab, var(--sc, var(--line-2)) 34%, var(--line-2)); }
@@ -420,6 +444,11 @@ main{ max-width:var(--maxw); margin:0 auto; padding:20px 22px 120px; }
         <span class="pill" id="statusPill"><span class="dotp"></span><span id="statusText">未开始</span></span>
         <span class="budget" id="budget"></span>
       </div>
+    </div>
+
+    <div class="anon-note" aria-label="匿名边界说明">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg>
+      <span>你(观察者)可见引擎/模型;席位之间彼此匿名 —— 只互读匿名 <code>rounds/</code> 与 <code>briefs/</code>、不读 <code>transcript</code></span>
     </div>
   </div>
 </header>
@@ -578,7 +607,7 @@ function handle(ev){
       addCard(r, "assign",
         '<div class="c-head">'+stoken(p.seat,true)
         + '<span class="tag">指派发言</span>'
-        + '<span class="c-meta">'+fileBtn(p.briefRef,"本轮简报")+'</span></div>'
+        + '<span class="c-meta">'+fileBtn(p.briefRef,"主席分歧索引")+'</span></div>'
         + (p.why ? '<div class="c-kv"><span class="k">依据</span>'+esc(p.why)+'</div>' : ''));
       break;
 
@@ -586,8 +615,8 @@ function handle(ev){
       var c = addCard(r, "produced",
         '<div class="c-head">'+stoken(p.seat,true)
         + (p.agent ? '<span class="tag">'+esc(p.agent)+(p.model?"/"+esc(p.model):"")+'</span>' : '')
-        + '<span class="c-meta">'+(p.charCount!=null?esc(p.charCount)+" 字":"")+fileBtn(p.outputRef,"查看全文")+'</span></div>'
-        + (p.summary ? '<div class="c-body">'+esc(p.summary)+'</div>' : '<div class="c-body" style="color:var(--faint)">(无摘要)</div>'));
+        + '<span class="c-meta">'+(p.charCount!=null?esc(p.charCount)+" 字":"")+fileBtn(p.roundRef,"席位逐字原文")+'</span></div>'
+        + (p.summary ? '<div class="c-body"><span class="body-src">主席摘要</span>'+esc(p.summary)+'</div>' : '<div class="c-body" style="color:var(--faint)">(无摘要)</div>'));
       if(p.seat && seatColor[p.seat]) c.style.setProperty("--sc", seatColor[p.seat]);
       break;
     }
@@ -604,11 +633,14 @@ function handle(ev){
     }
 
     case "disagreement": {
-      // fromSeat 仅供审计,不在界面泄露 → 立场保持匿名
+      // fromSeat 对人类观察者可见(匿名约束的是席位彼此,不含观察台);pK 徽标与发言卡同色,便于把立场映射到某席
       var kindCls = p.kind==="needs-human" ? "human" : "merit";
       var kindTxt = p.kind==="needs-human" ? "⏸ 需人拍板" : "可论证解决";
       var posHtml = (p.positions||[]).map(function(x){
-        return '<div class="pos"><span class="pos-label">'+esc(x.label||"立场")+'</span><span class="pos-stance">'+esc(x.stance||"")+'</span></div>';
+        return '<div class="pos"><span class="pos-label">'
+          + (x.fromSeat ? stoken(x.fromSeat,false)+'<span class="sr-only">来自 '+esc(x.fromSeat)+' · </span>' : '')
+          + '<span class="pos-lt">'+esc(x.label||"立场")+'</span></span>'
+          + '<span class="pos-stance">'+esc(x.stance||"")+'</span></div>';
       }).join("");
       addCard(r, "hi disagree",
         '<div class="strip"><span class="s-ic">'+ICONS.bolt+'</span>分歧点'
@@ -654,6 +686,22 @@ function handle(ev){
         + '<span class="tag">'+ICONS.skip+' 掉线跳过</span>'
         + '<span class="c-meta">'+esc(p.reason||"")+'</span></div>');
       break;
+
+    case "coverage": {
+      // 主席策展账:上一轮每条发言本轮被纳入/搁置/判无关 —— 让"无声漏点"可审计
+      var dmap = { included:"纳入", parked:"搁置", irrelevant:"判无关" };
+      var rows = (p.entries||[]).map(function(en){
+        var d = en.disposition||"";
+        return '<div class="cov-row"><span class="cov-tag cov-'+esc(d)+'">'+esc(dmap[d]||d||"?")+'</span>'
+          + '<span class="cov-ref">'+stoken(en.seatRef, true)+'</span>'
+          + (en.reason ? '<span class="cov-why">'+esc(en.reason)+'</span>' : '')+'</div>';
+      }).join("");
+      addCard(r, "coverage",
+        '<div class="c-head"><span class="tag">'+ICONS.doc+' 主席策展账</span>'
+        + '<span class="c-meta">coverage · 上轮每条发言的取用</span></div>'
+        + '<div class="cov-body">'+(rows||'<span style="color:var(--faint)">(无条目)</span>')+'</div>');
+      break;
+    }
 
     case "run:final": {
       hideEmpty();
@@ -778,7 +826,9 @@ document.getElementById("main").addEventListener("click", async function(e){
   host.appendChild(slot); btn.setAttribute("aria-expanded","true");
   try{
     var text = await fetchFile(btn.dataset.ref);
-    slot.innerHTML = '<div class="md-body">' + mdToHtml(text) + '</div>';
+    var prov = /^rounds\//.test(btn.dataset.ref)
+      ? '<div class="prov-note">席位原文 · 桥 textRef 字节直传 · 非主席转写</div>' : '';
+    slot.innerHTML = prov + '<div class="md-body">' + mdToHtml(text) + '</div>';
   }catch(err){
     slot.innerHTML = '<div class="file-error">无法载入:' + esc(btn.dataset.ref) + '</div>';
   }
@@ -901,35 +951,36 @@ function startDemo(force){
    —— 取自 skills/agent-bridge-roundtable/viz/sample,覆盖全部事件类型
    ============================================================ */
 var DEMO_EVENTS = [
-{"v":1,"seq":0,"ts":1781080000000,"event":"run:started","rtId":"rt-sample","round":-1,"payload":{"question":"通知服务的存储层选型:关系型 / 文档型 / 事件溯源,选哪个?","seats":[{"seat":"seat-a","agent":"codex","model":"gpt","role":"panelist"},{"seat":"seat-b","agent":"claude","model":"opus","role":"panelist"},{"seat":"seat-c","agent":"omp","model":"deepseek-v4-pro","role":"panelist"}],"maxRounds":3,"budget":{"seats":3,"maxTurns":12},"vizEnabled":true}},
-{"v":1,"seq":1,"ts":1781080005000,"event":"round:started","rtId":"rt-sample","round":0,"payload":{"mode":"parallel","plannedSpeakers":["seat-a","seat-b","seat-c"],"rationale":"盲发发散:三席互不可见,各自独立回答同一份中立框设,拿最纯的独立信号。"}},
-{"v":1,"seq":2,"ts":1781080060000,"event":"turn:produced","rtId":"rt-sample","round":0,"payload":{"seat":"seat-a","agent":"codex","model":"gpt","outputRef":"outputs/seat-a-r0.md","charCount":1180,"summary":"主张关系型(Postgres):通知有明确 schema 与查询模式(按用户/状态/时间),事务和二级索引成熟,团队熟;文档型的灵活性此处用不上。"}},
-{"v":1,"seq":3,"ts":1781080062000,"event":"turn:produced","rtId":"rt-sample","round":0,"payload":{"seat":"seat-b","agent":"claude","model":"opus","outputRef":"outputs/seat-b-r0.md","charCount":1360,"summary":"主张事件溯源:通知的核心是状态流转(已发/已读/撤回)与可审计,事件流天然贴合;读模型可另投影。但承认运维复杂度更高。"}},
-{"v":1,"seq":4,"ts":1781080064000,"event":"turn:produced","rtId":"rt-sample","round":0,"payload":{"seat":"seat-c","agent":"omp","model":"deepseek-v4-pro","outputRef":"outputs/seat-c-r0.md","charCount":1020,"summary":"主张文档型(Mongo):通知 payload 形态多变、按用户聚合读取、写多读多,单文档聚合能省 join;强一致需求不高。"}},
-{"v":1,"seq":5,"ts":1781080070000,"event":"disagreement","rtId":"rt-sample","round":0,"payload":{"topic":"数据模型:结构化查询 vs 状态流转可审计 vs 聚合灵活","positions":[{"label":"立场A","stance":"schema 稳定、查询模式清晰,关系型的事务/索引成熟度压过灵活性收益","fromSeat":"seat-a"},{"label":"立场B","stance":"通知本质是状态流转与审计,事件溯源贴合;灵活读模型可投影解决","fromSeat":"seat-b"},{"label":"立场C","stance":"形态多变 + 按用户聚合,文档型省 join、写路径简单","fromSeat":"seat-c"}],"kind":"by-merit"}},
-{"v":1,"seq":6,"ts":1781080075000,"event":"schedule:decision","rtId":"rt-sample","round":0,"payload":{"decision":"probe","nextSpeakers":["seat-b"],"convergenceSignals":"三席在'读取以用户维度聚合'上一致;分歧集中在'是否需要事件级审计'与'运维复杂度'。","rationale":"当前领先的是立场A(关系型,最稳妥)。指派 seat-b 扮红队:专门论证'为什么关系型在通知场景会踩坑',把最强反例摆出来,避免过早共识。"}},
-{"v":1,"seq":7,"ts":1781080080000,"event":"round:started","rtId":"rt-sample","round":1,"payload":{"mode":"serial","plannedSpeakers":["seat-b","seat-a"],"rationale":"串行:先让 seat-b 定向反驳立场A,再让 seat-a 针对该反驳回应,形成对质。"}},
-{"v":1,"seq":8,"ts":1781080085000,"event":"turn:assigned","rtId":"rt-sample","round":1,"payload":{"seat":"seat-b","briefRef":"briefs/r1-brief.md","why":"红队:先 steelman 立场A,再给出关系型在通知场景的最强失效模式。"}},
-{"v":1,"seq":9,"ts":1781080140000,"event":"turn:produced","rtId":"rt-sample","round":1,"payload":{"seat":"seat-b","agent":"claude","model":"opus","outputRef":"outputs/seat-b-r1.md","charCount":1490,"summary":"承认关系型在稳定 schema 下最省心;但指出真实痛点是'撤回/已读的历史审计'与'多渠道扇出的最终一致',这两点关系型要靠额外审计表+outbox 补,复杂度并不比事件溯源低。"}},
-{"v":1,"seq":10,"ts":1781080150000,"event":"disagreement","rtId":"rt-sample","round":1,"payload":{"topic":"一致性取舍:强一致(用户看到即时准确状态) vs 最终一致(扇出可延迟)","positions":[{"label":"立场A","stance":"用户对'已读/未读'期望即时准确,倾向强一致","fromSeat":"seat-a"},{"label":"立场B","stance":"多渠道扇出本就异步,最终一致更贴合且更简单","fromSeat":"seat-b"}],"kind":"needs-human"}},
-{"v":1,"seq":11,"ts":1781080155000,"event":"human:asked","rtId":"rt-sample","round":1,"payload":{"questionId":"q1","question":"通知的'已读/未读'状态,产品上要求强一致(用户操作后立刻全端准确)还是可接受最终一致(短暂延迟)?","options":["强一致优先","最终一致优先","按渠道区分"],"why":"这是无客观优劣的产品取舍,直接决定存储与一致性模型,只能由你拍板。"}},
-{"v":1,"seq":12,"ts":1781080200000,"event":"human:answered","rtId":"rt-sample","round":1,"payload":{"questionId":"q1","answer":"最终一致优先(已读状态可接受秒级延迟)"}},
-{"v":1,"seq":13,"ts":1781080205000,"event":"turn:assigned","rtId":"rt-sample","round":1,"payload":{"seat":"seat-a","briefRef":"briefs/r1-brief.md","why":"把'最终一致优先'作为约束,回应 seat-b 的审计/扇出反驳,给收敛后的方案。"}},
-{"v":1,"seq":14,"ts":1781080260000,"event":"turn:produced","rtId":"rt-sample","round":1,"payload":{"seat":"seat-a","agent":"codex","model":"gpt","outputRef":"outputs/seat-a-r1.md","charCount":1240,"summary":"接受最终一致后,主张折中:关系型作主存 + outbox/事件表承载状态流转与审计,读模型按用户聚合缓存。既保留关系型成熟度,又拿到审计与扇出解耦,不必上完整事件溯源。"}},
-{"v":1,"seq":15,"ts":1781080265000,"event":"seat:skipped","rtId":"rt-sample","round":1,"payload":{"seat":"seat-c","reason":"timeout"}},
-{"v":1,"seq":16,"ts":1781080270000,"event":"schedule:decision","rtId":"rt-sample","round":1,"payload":{"decision":"terminate","nextSpeakers":[],"convergenceSignals":"用户已就一致性拍板;三方论点收敛到'关系型主存 + outbox 审计'的折中,seat-b 也认可其覆盖了审计诉求。","rationale":"关键取舍(一致性)已由用户决定,剩余为实现细节而非架构分歧,达到收敛条件,终结讨论。seat-c 超时缺席,其文档型主张已在综合中作为'读模型缓存'部分吸收。"}},
-{"v":1,"seq":17,"ts":1781080275000,"event":"run:final","rtId":"rt-sample","round":-1,"payload":{"decisionRef":"final.md","adopted":"关系型(Postgres)作主存 + outbox/事件表承载状态流转与审计 + 按用户聚合的读模型缓存;一致性采最终一致。","tradeoffs":["拿到关系型成熟度与团队熟悉度,同时通过 outbox 解耦扇出与审计,避免上完整事件溯源的运维复杂度","代价:需维护 outbox 投影与缓存失效逻辑;已读状态为秒级最终一致"],"openIssues":["读模型缓存的失效策略待定(TTL vs 事件驱动)","seat-c 的文档型主张仅部分吸收(缓存层),未独立评估其在超大扇出下的表现"]}},
-{"v":1,"seq":18,"ts":1781080280000,"event":"run:terminated","rtId":"rt-sample","round":-1,"payload":{"reason":"converged"}}
+{"v":1,"seq":0,"ts":1781080000000,"event":"run:started","rtId":"rt-sample","round":-1,"payload":{"question":"通知服务的存储层选型:关系型 / 文档型 / 事件溯源,选哪个?","seats":[{"seat":"p1","agent":"codex","model":"gpt","role":"panelist"},{"seat":"p2","agent":"claude","model":"opus","role":"panelist"},{"seat":"p3","agent":"omp","model":"deepseek-v4-pro","role":"panelist"}],"maxRounds":3,"budget":{"seats":3,"maxTurns":12},"vizEnabled":true}},
+{"v":1,"seq":1,"ts":1781080005000,"event":"round:started","rtId":"rt-sample","round":0,"payload":{"mode":"parallel","plannedSpeakers":["p1","p2","p3"],"rationale":"盲发发散:三席互不可见,各自独立回答同一份中立框设,拿最纯的独立信号。"}},
+{"v":1,"seq":2,"ts":1781080060000,"event":"turn:produced","rtId":"rt-sample","round":0,"payload":{"seat":"p1","agent":"codex","model":"gpt","roundRef":"rounds/p1-r0.md","charCount":1180,"summary":"主张关系型(Postgres):通知有明确 schema 与查询模式(按用户/状态/时间),事务和二级索引成熟,团队熟;文档型的灵活性此处用不上。"}},
+{"v":1,"seq":3,"ts":1781080062000,"event":"turn:produced","rtId":"rt-sample","round":0,"payload":{"seat":"p2","agent":"claude","model":"opus","roundRef":"rounds/p2-r0.md","charCount":1360,"summary":"主张事件溯源:通知的核心是状态流转(已发/已读/撤回)与可审计,事件流天然贴合;读模型可另投影。但承认运维复杂度更高。"}},
+{"v":1,"seq":4,"ts":1781080064000,"event":"turn:produced","rtId":"rt-sample","round":0,"payload":{"seat":"p3","agent":"omp","model":"deepseek-v4-pro","roundRef":"rounds/p3-r0.md","charCount":1020,"summary":"主张文档型(Mongo):通知 payload 形态多变、按用户聚合读取、写多读多,单文档聚合能省 join;强一致需求不高。"}},
+{"v":1,"seq":5,"ts":1781080070000,"event":"disagreement","rtId":"rt-sample","round":0,"payload":{"topic":"数据模型:结构化查询 vs 状态流转可审计 vs 聚合灵活","positions":[{"label":"立场A","stance":"schema 稳定、查询模式清晰,关系型的事务/索引成熟度压过灵活性收益","fromSeat":"p1"},{"label":"立场B","stance":"通知本质是状态流转与审计,事件溯源贴合;灵活读模型可投影解决","fromSeat":"p2"},{"label":"立场C","stance":"形态多变 + 按用户聚合,文档型省 join、写路径简单","fromSeat":"p3"}],"kind":"by-merit"}},
+{"v":1,"seq":6,"ts":1781080075000,"event":"schedule:decision","rtId":"rt-sample","round":0,"payload":{"decision":"probe","nextSpeakers":["p2"],"convergenceSignals":"三席在'读取以用户维度聚合'上一致;分歧集中在'是否需要事件级审计'与'运维复杂度'。","rationale":"当前领先的是立场A(关系型,最稳妥)。指派 p2 扮红队:专门论证'为什么关系型在通知场景会踩坑',把最强反例摆出来,避免过早共识。"}},
+{"v":1,"seq":7,"ts":1781080077000,"event":"coverage","rtId":"rt-sample","round":1,"payload":{"entries":[{"seatRef":"p1","disposition":"included","reason":"关系型主张=立场A,本轮红队要打的靶"},{"seatRef":"p2","disposition":"included","reason":"事件溯源=立场B,指派其扮红队反驳立场A"},{"seatRef":"p3","disposition":"parked","reason":"文档型聚合优点已并入读模型缓存讨论,本轮暂不单列"}]}},
+{"v":1,"seq":8,"ts":1781080080000,"event":"round:started","rtId":"rt-sample","round":1,"payload":{"mode":"serial","plannedSpeakers":["p2","p1"],"rationale":"串行:先让 p2 定向反驳立场A,再让 p1 针对该反驳回应,形成对质。"}},
+{"v":1,"seq":9,"ts":1781080085000,"event":"turn:assigned","rtId":"rt-sample","round":1,"payload":{"seat":"p2","briefRef":"briefs/r1-brief.md","why":"红队:先 steelman 立场A,再给出关系型在通知场景的最强失效模式。"}},
+{"v":1,"seq":10,"ts":1781080140000,"event":"turn:produced","rtId":"rt-sample","round":1,"payload":{"seat":"p2","agent":"claude","model":"opus","roundRef":"rounds/p2-r1.md","charCount":1490,"summary":"承认关系型在稳定 schema 下最省心;但指出真实痛点是'撤回/已读的历史审计'与'多渠道扇出的最终一致',这两点关系型要靠额外审计表+outbox 补,复杂度并不比事件溯源低。"}},
+{"v":1,"seq":11,"ts":1781080150000,"event":"disagreement","rtId":"rt-sample","round":1,"payload":{"topic":"一致性取舍:强一致(用户看到即时准确状态) vs 最终一致(扇出可延迟)","positions":[{"label":"立场A","stance":"用户对'已读/未读'期望即时准确,倾向强一致","fromSeat":"p1"},{"label":"立场B","stance":"多渠道扇出本就异步,最终一致更贴合且更简单","fromSeat":"p2"}],"kind":"needs-human"}},
+{"v":1,"seq":12,"ts":1781080155000,"event":"human:asked","rtId":"rt-sample","round":1,"payload":{"questionId":"q1","question":"通知的'已读/未读'状态,产品上要求强一致(用户操作后立刻全端准确)还是可接受最终一致(短暂延迟)?","options":["强一致优先","最终一致优先","按渠道区分"],"why":"这是无客观优劣的产品取舍,直接决定存储与一致性模型,只能由你拍板。"}},
+{"v":1,"seq":13,"ts":1781080200000,"event":"human:answered","rtId":"rt-sample","round":1,"payload":{"questionId":"q1","answer":"最终一致优先(已读状态可接受秒级延迟)"}},
+{"v":1,"seq":14,"ts":1781080205000,"event":"turn:assigned","rtId":"rt-sample","round":1,"payload":{"seat":"p1","briefRef":"briefs/r1-brief.md","why":"把'最终一致优先'作为约束,回应 p2 的审计/扇出反驳,给收敛后的方案。"}},
+{"v":1,"seq":15,"ts":1781080260000,"event":"turn:produced","rtId":"rt-sample","round":1,"payload":{"seat":"p1","agent":"codex","model":"gpt","roundRef":"rounds/p1-r1.md","charCount":1240,"summary":"接受最终一致后,主张折中:关系型作主存 + outbox/事件表承载状态流转与审计,读模型按用户聚合缓存。既保留关系型成熟度,又拿到审计与扇出解耦,不必上完整事件溯源。"}},
+{"v":1,"seq":16,"ts":1781080265000,"event":"seat:skipped","rtId":"rt-sample","round":1,"payload":{"seat":"p3","reason":"timeout"}},
+{"v":1,"seq":17,"ts":1781080270000,"event":"schedule:decision","rtId":"rt-sample","round":1,"payload":{"decision":"terminate","nextSpeakers":[],"convergenceSignals":"用户已就一致性拍板;三方论点收敛到'关系型主存 + outbox 审计'的折中,p2 也认可其覆盖了审计诉求。","rationale":"关键取舍(一致性)已由用户决定,剩余为实现细节而非架构分歧,达到收敛条件,终结讨论。p3 超时缺席,其文档型主张已在综合中作为'读模型缓存'部分吸收。"}},
+{"v":1,"seq":18,"ts":1781080275000,"event":"run:final","rtId":"rt-sample","round":-1,"payload":{"decisionRef":"final.md","adopted":"关系型(Postgres)作主存 + outbox/事件表承载状态流转与审计 + 按用户聚合的读模型缓存;一致性采最终一致。","tradeoffs":["拿到关系型成熟度与团队熟悉度,同时通过 outbox 解耦扇出与审计,避免上完整事件溯源的运维复杂度","代价:需维护 outbox 投影与缓存失效逻辑;已读状态为秒级最终一致"],"openIssues":["读模型缓存的失效策略待定(TTL vs 事件驱动)","立场C 的文档型主张仅部分吸收(缓存层),未独立评估其在超大扇出下的表现"]}},
+{"v":1,"seq":19,"ts":1781080280000,"event":"run:terminated","rtId":"rt-sample","round":-1,"payload":{"reason":"converged"}}
 ];
 
 var DEMO_FILES = {
-"outputs/seat-a-r0.md": "# seat-a · Round 0(盲发)\n\n**我的立场**:通知服务用**关系型(Postgres)**作主存。\n\n**论证**\n- 通知有**稳定的 schema**:接收者、类型、渠道、状态(未读/已读/撤回)、时间戳、去重键。字段清晰、演进缓慢。\n- 查询模式明确且以**关系型索引**高效覆盖:按用户拉未读列表(`user_id, status, created_at`)、按去重键幂等、按类型统计。\n- **事务**天然:一次写入 + 状态机流转要原子,关系型不必额外拼装。\n- 团队已有 Postgres 运维经验,**引入新存储的边际成本**(备份/监控/故障处理)不划算。\n\n**对其它路径的预判**\n- 文档型的\"灵活 payload\"在此**用不上**:通知 payload 可以塞进一个 `jsonb` 列,不需要为它换整套存储。\n- 事件溯源能力强,但**运维与心智负担**明显更高;通知场景没到非它不可。\n\n**需人拍板**:无(除非已读状态要求强一致 vs 最终一致,这会影响是否引入异步扇出)。",
-"outputs/seat-b-r0.md": "# seat-b · Round 0(盲发)\n\n**我的立场**:采用**事件溯源(Event Sourcing)**。\n\n**论证**\n- 通知的本质是**状态流转**:创建 → 投递 → 已读 → 撤回。把这些当作**不可变事件**记录,当前状态是事件的投影。\n- **可审计**天然满足:\"这条通知何时被谁标记已读/撤回\"是产品和合规常问的问题,事件流直接回答,不必额外补审计表。\n- **读模型可分离**:按用户聚合的未读列表、按类型的统计,各自投影,互不干扰写路径。\n\n**权衡(诚实说)**\n- 运维复杂度更高:事件存储 + 投影 + 重放,团队需要爬坡。\n- 简单场景会显得\"重\"。若通知永远只是\"插一行、标已读\",事件溯源是杀鸡用牛刀。\n\n**需人拍板**:是否真的需要**事件级审计**。若审计不是硬需求,事件溯源的核心优势就打折。",
-"outputs/seat-c-r0.md": "# seat-c · Round 0(盲发)\n\n**我的立场**:用**文档型(MongoDB)**。\n\n**论证**\n- 通知 **payload 形态多变**(不同类型字段差异大),文档型不必为每种类型改 schema。\n- 读取以**用户维度聚合**:一个用户的通知列表可放进按 `user_id` 分片的集合,单次查询取回,**省 join**。\n- 写多读多、**强一致需求不高**:通知不是账务,少量延迟可接受,文档型的写入路径简单、水平扩展直接。\n\n**权衡**\n- 跨用户的全局统计/复杂查询不如关系型顺手。\n- 缺事务时,状态流转要靠单文档原子更新兜住(通知恰好能做到单文档聚合,风险可控)。\n\n**需人拍板**:预期**扇出规模**(单条通知触达多少用户)——超大扇出会影响分片与写放大策略。",
-"outputs/seat-b-r1.md": "# seat-b · Round 1(红队:反驳\"关系型最稳妥\")\n\n**先 steelman 立场A**:关系型在稳定 schema + 清晰查询下确实最省心,事务与索引成熟,团队零学习成本。这是**默认正确**的选择,反对它需要给出关系型会真正踩坑的地方。\n\n**最强失效模式(我的反驳)**\n1. **审计诉求**:一旦产品要\"这条通知的完整状态历史(何时投递/已读/撤回/重发)\",关系型的单行 `status` 就地更新会**丢历史**。补救要加审计表 + 触发器/应用层双写——这本质是在关系型里**手搓一个残缺的事件流**,复杂度并不比事件溯源低,还更易出错(双写不一致)。\n2. **多渠道扇出的最终一致**:一条通知要发 push/邮件/站内信,各渠道结果异步回收。关系型要可靠做到,通常得引入 **outbox 模式**(又是一张事件表 + 投递器)。所以\"关系型 = 简单\"在扇出场景并不成立。\n\n**结论**:关系型不是错,但\"它最简单\"这个理由在**审计 + 扇出**面前站不住。真正的取舍是:要么上事件溯源一次性解决,要么关系型 + outbox/审计表把事件流补回来。**这更多是一致性与审计需求的取舍,不是纯技术优劣。**",
-"outputs/seat-a-r1.md": "# seat-a · Round 1(回应红队 + 收敛)\n\n**接受约束**:用户已拍板**最终一致优先**(已读状态可秒级延迟)。这削弱了我原先\"强一致更省心\"的隐含前提,我据此调整。\n\n**回应 seat-b 的两点反驳**\n- **审计**:反驳成立。若审计是硬需求,单行就地更新确实丢历史。但我不认为要为此上完整事件溯源——用 **outbox/事件表**承载状态流转事件即可,主存仍是关系型的当前态投影。\n- **扇出**:同意扇出天然异步。既然已接受最终一致,**outbox + 投递器**正是标准解,且它同时把审计事件一并记了——一张表解决两个问题。\n\n**我的收敛方案**\n- **Postgres 作主存**(当前态,团队熟、事务/索引成熟)。\n- **outbox/事件表**承载状态流转事件 → 驱动多渠道扇出 + 充当审计流。\n- **按用户聚合的读模型缓存**(吸收 seat-c 的文档型聚合优点,但只做缓存,不作主存)。\n\n这样既保住关系型成熟度,又拿到 seat-b 要的审计与扇出解耦,**不必承担完整事件溯源的运维复杂度**。剩下是实现细节(缓存失效策略),非架构分歧。",
-"final.md": "# 最终方案(主席综合)\n\n## 采纳\n**Postgres 作主存 + outbox/事件表(状态流转 + 审计)+ 按用户聚合的读模型缓存;一致性采最终一致。**\n\n## 为什么\n三席从关系型 / 事件溯源 / 文档型三个独立起点出发,经一轮红队对质与用户对\"一致性\"的拍板,收敛到一个折中:\n- 保留**关系型**的成熟度与团队熟悉度(seat-a 主张);\n- 用 **outbox/事件表**拿到 seat-b 要的**状态流转审计 + 多渠道扇出解耦**,而不承担完整事件溯源的运维复杂度;\n- 以**读模型缓存**部分吸收 seat-c 的**按用户聚合**优点(仅作缓存,不作主存)。\n\n## 权衡\n- 关系型成熟度 + 审计/扇出能力,复杂度低于完整事件溯源。\n- 需维护 outbox 投影与缓存失效逻辑;已读状态为秒级最终一致(用户已接受)。\n\n## 未决(交实现阶段/用户)\n1. 读模型缓存的失效策略:TTL vs 事件驱动失效。\n2. seat-c 的文档型主张仅在缓存层部分吸收,**超大扇出**下的表现未独立评估——若扇出规模远超预期,需回头专项评估。\n\n## 人类决策记录\n- **Q**:已读/未读要强一致还是最终一致? **A**:最终一致优先(可接受秒级延迟)。",
-"briefs/r1-brief.md": "# Round 1 · 本轮简报(主席策展 · 已匿名)\n\n> 参会席只读本简报,不读原始 transcript;各方立场匿名呈现。\n\n## 上一轮要点(盲发)\n- **立场A**:关系型(Postgres)最稳妥——schema 稳定、事务/索引成熟、团队熟。\n- **立场B**:事件溯源——贴合状态流转与审计诉求,承认运维更重。\n- **立场C**:文档型——payload 多变 + 按用户聚合省 join,强一致需求不高。\n\n## 本轮任务\n1. **seat-b(红队)**:先 steelman 立场A,再给出关系型在通知场景的**最强失效模式**。\n2. **seat-a**:针对红队反驳作回应,尝试给出收敛方案。\n\n## 待澄清\n- 一致性取舍(强一致 / 最终一致)可能需要升级问人。"
+"briefs/r1-brief.md": "# Round 1 · 本轮简报(分歧索引 · 匿名)\n\n> 参会席读本索引 + **按需读它指向的 `rounds/` 匿名全文**核对/深挖;不读 `transcript.jsonl`(那里有 p↔引擎 身份映射)。立场匿名呈现——就论点谈论点,别问是谁说的。\n\n## 本轮焦点分歧:是否需要事件级审计 + 运维复杂度\n(round0 三席在「读取按用户维度聚合」上已一致;分歧集中在此。)\n\n- **立场A**(完整论证 → `rounds/p1-r0.md`):关系型(Postgres)最稳妥——schema 稳定、事务/索引成熟、团队熟。\n- **立场B**(完整论证 → `rounds/p2-r0.md`):事件溯源——贴合状态流转与审计,承认运维更重。\n- **立场C**(完整论证 → `rounds/p3-r0.md`):文档型——payload 多变 + 按用户聚合省 join。\n\n> 上面每条只是**中立标签**,实质以 `rounds/` 全文为准(主席只索引,不复述、不改写)。\n\n## 本轮任务\n1. **红队席**:先 steelman 立场A(读其 `rounds/` 全文),再给出关系型在通知场景的**最强失效模式**。\n2. **持立场A席**:针对红队反驳作回应,尝试给出收敛方案。\n\n## 待澄清\n- 一致性取舍(强一致 / 最终一致)可能需要升级问人。\n",
+"final.md": "# 最终方案(主席综合)\n\n## 采纳\n**Postgres 作主存 + outbox/事件表(状态流转 + 审计)+ 按用户聚合的读模型缓存;一致性采最终一致。**\n\n## 为什么\n三席从关系型 / 事件溯源 / 文档型三个独立起点出发,经一轮红队对质与用户对\"一致性\"的拍板,收敛到一个折中:\n- 保留**关系型**的成熟度与团队熟悉度(立场A);\n- 用 **outbox/事件表**拿到立场B 要的**状态流转审计 + 多渠道扇出解耦**,而不承担完整事件溯源的运维复杂度;\n- 以**读模型缓存**部分吸收立场C 的**按用户聚合**优点(仅作缓存,不作主存)。\n\n## 权衡\n- ✅ 关系型成熟度 + 审计/扇出能力,复杂度低于完整事件溯源。\n- ⚠️ 需维护 outbox 投影与缓存失效逻辑;已读状态为秒级最终一致(用户已接受)。\n\n## 未决(交实现阶段/用户)\n1. 读模型缓存的失效策略:TTL vs 事件驱动失效。\n2. 立场C 的文档型主张仅在缓存层部分吸收,**超大扇出**下的表现未独立评估——若扇出规模远超预期,需回头专项评估。\n\n## 人类决策记录\n- **Q**:已读/未读要强一致还是最终一致? **A**:最终一致优先(可接受秒级延迟)。\n",
+"rounds/p1-r0.md": "# 匿名论证 · Round 0(盲发)\n\n**我的立场**:通知服务用**关系型(Postgres)**作主存。\n\n**论证**\n- 通知有**稳定的 schema**:接收者、类型、渠道、状态(未读/已读/撤回)、时间戳、去重键。字段清晰、演进缓慢。\n- 查询模式明确且以**关系型索引**高效覆盖:按用户拉未读列表(`user_id, status, created_at`)、按去重键幂等、按类型统计。\n- **事务**天然:一次写入 + 状态机流转要原子,关系型不必额外拼装。\n- 团队已有 Postgres 运维经验,**引入新存储的边际成本**(备份/监控/故障处理)不划算。\n\n**对其它路径的预判**\n- 文档型的\"灵活 payload\"在此**用不上**:通知 payload 可以塞进一个 `jsonb` 列,不需要为它换整套存储。\n- 事件溯源能力强,但**运维与心智负担**明显更高;通知场景没到非它不可。\n\n**需人拍板**:无(除非已读状态要求强一致 vs 最终一致,这会影响是否引入异步扇出)。\n",
+"rounds/p1-r1.md": "# 匿名论证 · Round 1(回应红队 + 收敛)\n\n**接受约束**:用户已拍板**最终一致优先**(已读状态可秒级延迟)。这削弱了我原先\"强一致更省心\"的隐含前提,我据此调整。\n\n**回应 立场B 的两点反驳**\n- **审计**:反驳成立。若审计是硬需求,单行就地更新确实丢历史。但我不认为要为此上完整事件溯源——用 **outbox/事件表**承载状态流转事件即可,主存仍是关系型的当前态投影。\n- **扇出**:同意扇出天然异步。既然已接受最终一致,**outbox + 投递器**正是标准解,且它同时把审计事件一并记了——一张表解决两个问题。\n\n**我的收敛方案**\n- **Postgres 作主存**(当前态,团队熟、事务/索引成熟)。\n- **outbox/事件表**承载状态流转事件 → 驱动多渠道扇出 + 充当审计流。\n- **按用户聚合的读模型缓存**(吸收 立场C 的文档型聚合优点,但只做缓存,不作主存)。\n\n这样既保住关系型成熟度,又拿到 立场B 要的审计与扇出解耦,**不必承担完整事件溯源的运维复杂度**。剩下是实现细节(缓存失效策略),非架构分歧。\n",
+"rounds/p2-r0.md": "# 匿名论证 · Round 0(盲发)\n\n**我的立场**:采用**事件溯源(Event Sourcing)**。\n\n**论证**\n- 通知的本质是**状态流转**:创建 → 投递 → 已读 → 撤回。把这些当作**不可变事件**记录,当前状态是事件的投影。\n- **可审计**天然满足:\"这条通知何时被谁标记已读/撤回\"是产品和合规常问的问题,事件流直接回答,不必额外补审计表。\n- **读模型可分离**:按用户聚合的未读列表、按类型的统计,各自投影,互不干扰写路径。\n\n**权衡(诚实说)**\n- 运维复杂度更高:事件存储 + 投影 + 重放,团队需要爬坡。\n- 简单场景会显得\"重\"。若通知永远只是\"插一行、标已读\",事件溯源是杀鸡用牛刀。\n\n**需人拍板**:是否真的需要**事件级审计**。若审计不是硬需求,事件溯源的核心优势就打折。\n",
+"rounds/p2-r1.md": "# 匿名论证 · Round 1(红队:反驳\"关系型最稳妥\")\n\n**先 steelman 立场A**:关系型在稳定 schema + 清晰查询下确实最省心,事务与索引成熟,团队零学习成本。这是**默认正确**的选择,反对它需要给出关系型会真正踩坑的地方。\n\n**最强失效模式(我的反驳)**\n1. **审计诉求**:一旦产品要\"这条通知的完整状态历史(何时投递/已读/撤回/重发)\",关系型的单行 `status` 就地更新会**丢历史**。补救要加审计表 + 触发器/应用层双写——这本质是在关系型里**手搓一个残缺的事件流**,复杂度并不比事件溯源低,还更易出错(双写不一致)。\n2. **多渠道扇出的最终一致**:一条通知要发 push/邮件/站内信,各渠道结果异步回收。关系型要可靠做到,通常得引入 **outbox 模式**(又是一张事件表 + 投递器)。所以\"关系型 = 简单\"在扇出场景并不成立。\n\n**结论**:关系型不是错,但\"它最简单\"这个理由在**审计 + 扇出**面前站不住。真正的取舍是:要么上事件溯源一次性解决,要么关系型 + outbox/审计表把事件流补回来。**这更多是一致性与审计需求的取舍,不是纯技术优劣。**\n",
+"rounds/p3-r0.md": "# 匿名论证 · Round 0(盲发)\n\n**我的立场**:用**文档型(MongoDB)**。\n\n**论证**\n- 通知 **payload 形态多变**(不同类型字段差异大),文档型不必为每种类型改 schema。\n- 读取以**用户维度聚合**:一个用户的通知列表可放进按 `user_id` 分片的集合,单次查询取回,**省 join**。\n- 写多读多、**强一致需求不高**:通知不是账务,少量延迟可接受,文档型的写入路径简单、水平扩展直接。\n\n**权衡**\n- 跨用户的全局统计/复杂查询不如关系型顺手。\n- 缺事务时,状态流转要靠单文档原子更新兜住(通知恰好能做到单文档聚合,风险可控)。\n\n**需人拍板**:预期**扇出规模**(单条通知触达多少用户)——超大扇出会影响分片与写放大策略。\n"
 };
 
 /* 启动 */

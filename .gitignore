@@ -7,5 +7,7 @@ node_modules/
 logs/
 .agent-bridge/
 /.roundtable/
+# serve.mjs writes viz.pid into whatever run-dir it's given; the sample fixture doubles as one under test.
+skills/agent-bridge-roundtable/viz/sample/viz.pid
 dist/
 coverage/
