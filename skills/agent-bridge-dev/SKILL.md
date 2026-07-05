@@ -100,9 +100,8 @@ close_session(session_id)                 用完必关
 1. **实现**:open implementer(`write:true`,能力/effort 按任务)→ send 任务 → `wait(mode:"any", timeout_ms:300000)`
    → 读产出。
 2. **独立评审**:open reviewer(`write:false`,**异于 implementer 的引擎/模型**)→ 给**冻结的评审范围**(明确 `base..head` + 路径,并要求
-   "评审期间该范围不得变更";未提交改动先让实现者 commit/stash 定住,或你保证工作区静止)。**若 reviewer 后端无 shell
-   (如 Claude `write:false` 只有文件读取工具),先自己生成 diff 文件、把路径给 reviewer 让它 `read`**(见 reviewer.md
-   的降级路径)→ `wait(mode:"any", timeout_ms:300000)` → 读 verdict。
+   "评审期间该范围不得变更";未提交改动先让实现者 commit/stash 定住,或你保证工作区静止)。`write:false`(=read 档)**自带 shell**,reviewer
+   能自己 `git diff` 拉取范围(三后端 read 档都有 shell)→ `wait(mode:"any", timeout_ms:300000)` → 读 verdict。
 3. **修 → 复评**:按 Critical/Important 让实现者修(同会话追问)→ 重新 open/送 reviewer 复评,直到 `APPROVE`。
 4. **整支 broad review**:全部任务完成后,做一次覆盖整分支的评审(最强档模型)。
 5. **主 agent 自查**:委托方收口后,**你(主 agent)仍须自己 `git diff` + 跑必要测试再向用户报告,不盲信委托 agent**
@@ -180,9 +179,8 @@ reopen 时按交接物带上下文(文件路径、规格、上一步 diff 写进
    send "实现 X(读 docs/spec-X.md 为准),完成标准:… 边界:不动 Y。"
    wait(mode:"any", timeout_ms:300000) → 读 Status/commits/测试小结。
 3. 定住范围:实现者已 commit → 直接用 base..head;未 commit → 先让它 commit/stash 定住,或你保证工作区静止。记下 base..head。
-   (reviewer 后端无 shell 时,顺手 `git diff <base>..<head> > <某diff文件>` 备用。)
 4. open reviewer(write:false, **异于 implementer 的引擎/模型**, append_system_prompt_file=<base>/roles/reviewer.md)
-   send "评审范围 <base>..<head>,路径 src/x/**;评审期间该范围不变。[无 shell 时:diff 文件在 <路径>,请 read 它。]"
+   send "评审范围 <base>..<head>,路径 src/x/**;评审期间该范围不变。"(read 档自带 shell,reviewer 自己 `git diff` 即可)
    wait(mode:"any", timeout_ms:300000) → 读 规格符合度 + 问题 + verdict。
 5. verdict=NEEDS_FIXES → 回 implementer 会话追问修 → 重新送 reviewer 复评(同样 `wait(mode:"any", timeout_ms:300000)`),直到 APPROVE。
 6. 主 agent 自己 git diff + 跑测试 → 向用户报告。

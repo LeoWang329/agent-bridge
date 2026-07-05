@@ -114,13 +114,24 @@ close_session(session_id)                  →  用完必须关
 ## Agent 与模型
 
 - **OMP**：`agent: "omp"`，启动 `omp --mode rpc`（JSONL RPC 长驻）。可经 `--model` 触达多种模型。
-- **Codex**：`agent: "codex"`，启动 `codex app-server`（JSON-RPC，逐 token 流式）。读写权限由 `write` 控制，均非交互。
-- **Claude**：`agent: "claude"` — a fresh-context Claude Code worker; good for an independent second opinion / review or an isolated write workspace.（独立 Claude Code worker；适合独立复核或隔离写作业；read-only 不含 shell；默认模型为 claude 自身配置默认，思考强度默认 xhigh）
+- **Codex**：`agent: "codex"`，启动 `codex app-server`（JSON-RPC，逐 token 流式）。能力档由 `access` 控制（见下），均非交互。Codex 的 `read` 是 OS 沙箱 `read-only`：能跑命令、写被沙箱硬拦——所以 codex 的 read 是**硬**只读。
+- **Claude**：`agent: "claude"` — a fresh-context Claude Code worker; good for an independent second opinion / review or an isolated write workspace.（独立 Claude Code worker；适合独立复核或调查/隔离写作业；能力档由 `access` 控制：`read` 含 Bash 可跑命令、但 Bash 能写盘=**软**（非 OS 沙箱）；默认模型为 claude 自身配置默认，思考强度默认 xhigh）
 - **模型是会话级参数**：在 `open_session` 用 `model` 指定，整个会话固定；`send_message` 不能逐条切模型，换模型就新开 session。`model` 原样传后端 `--model`。
 - ⚠️ **`model` 必须用 `provider/模型名` 全限定形式**（如 `deepseek/deepseek-v4-pro`、`minimax-code-cn/MiniMax-M3`），**不要传裸别名**（如 `deepseek-v4-pro`、`minimax-m3`）——裸名可能被路由到非预期的 provider，拿到的不是你要的模型。全限定 ID 以 `omp --list-models <关键字>` 的输出为准。
 - **`effort`（可选，推理强度）**：OMP 映射为 `--thinking`（`minimal|low|medium|high|xhigh`）；Codex 作为该轮 effort（`none|minimal|low|medium|high|xhigh`，其中 `none`/`minimal`/`low` 用于简单改动的评审，实施任务不建议）。不传则用后端默认；Claude 映射到 --effort，默认 xhigh。
 
-`open_session` 必传 `agent` + `cwd`；`write` / `model` / `effort` 按需。
+`open_session` 必传 `agent` + `cwd`；`access` / `model` / `effort` 按需。
+
+**`access` 能力档（`read` | `write`，默认 `read`）：** 调用方只判断"要不要改文件",与引擎无关。
+
+| 档 | 能力 | 用于 |
+|---|---|---|
+| `read` | **读+执行**：读文件、搜索、**跑 shell 命令**（跑测试/探针）——但无 Edit/Write 工具，不打算改文件 | 审议 + 调查:代码审查、方案设计、读文档、跑测试、只读分析 |
+| `write` | 完整改文件/写盘 | 只有用户明确要改文件才用 |
+
+- **`read` 含 shell**（=读+执行）：想调查就用 shell 跑命令、不想用就纯读，不用为此单开一档。
+- ⚠️ **`read` 的写边界分后端**：**codex = 硬**只读（read-only OS 沙箱,shell 里写盘被拦）；**omp / claude = 软**（bash/Bash **能**写盘,靠角色纪律不是 OS 沙箱）——所以 omp/claude 的 `read` **不是**硬不可写。要**硬**保证不写盘 → 用 codex 的 read,或直接上 `write` + 抛弃式工作区/worktree。
+- `write`（旧布尔）是 `access` 的别名(`true`→`write`、`false`→`read`)。两者同传必须一致,否则报错。⚠️ `write:false`（=read）**也带 shell**、omp/claude 下能软写,不是"绝对只读"。**新代码优先用 `access`。**
 
 **模型以活查为准**：`omp --list-models <关键字>` 查可用模型（输出即全限定 `provider/模型名`，直接拿来当 `model`）及各自支持的 thinking 上限。**不同模型最高 thinking 级别不同**，传它不支持的级别会被忽略或报错。下表 `model` 列即应传的全限定值，只是常用举例：
 
@@ -180,7 +191,7 @@ contextUsage: { tokens, live, isCompacting?, autoCompactionEnabled? } | null
 ## 安全规则
 
 - `cwd` 必须是当前工作区的绝对路径——桥不校验 workspace root，主 agent 自己负责别传 home / 父目录 / 临时目录。
-- 代码审查、问题定位、方案设计、只读复核 → `write: false`。只有用户明确要求改文件才 `write: true`。
+- 能力档就低不就高（见「Agent 与模型 → `access` 能力档」）：代码审查、方案设计、只读复核、跑测试/命令做调查 → `access:"read"`（read 自带 shell,够调查用；注意 omp/claude 的 read 能软写、只有 codex 硬只读）；只有用户明确要改文件才 `access:"write"`。
 - 委托方与被委托 agent **共享 `cwd`**：审查/实现让对方自己 `git diff`、自己读文件，别把整坨 diff/代码塞进 `message`（省 token）。
 - 委托 agent 改了文件，调用方仍需检查 diff、跑必要测试，再向用户报告。
 - 小任务不要委托。

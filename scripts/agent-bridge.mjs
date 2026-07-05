@@ -148,10 +148,18 @@ const TOOLS = [
           description: `Agent backend to open: ${Object.keys(AGENTS).join(" or ")}.`,
         },
         cwd: { type: "string", description: "Absolute workspace directory for the delegated agent." },
+        access: {
+          type: "string",
+          enum: ["read", "write"],
+          description:
+            "Capability tier for the delegated agent (default read). read = read + EXECUTE: file reads, search, AND run shell commands for investigation (run tests/probes) — but NOT meant to edit files, so no Edit/Write tools. The write-boundary of read's shell varies by backend: codex hard-blocks disk writes via its read-only OS sandbox; omp/claude allow shell that CAN write (SOFT — a tool-level allow + role discipline, not an OS sandbox), so a `read` session on omp/claude is NOT a hard read-only. write = full edit/write autonomy in cwd. Prefer this over the legacy `write` boolean; the two must agree if both are passed.",
+        },
         write: {
           type: "boolean",
-          default: false,
-          description: "Allow delegated file edits. Default false. Enable only when the user explicitly wants edits.",
+          // No JSON-schema `default`: if a client materialized default:false, it would collide with an
+          // explicit access:"write" and assertAccess would reject the call. Omitting both simply defaults
+          // to read (assertAccess), so the alias never fights an explicit access.
+          description: "Legacy alias for `access`: true→write, false→read. Kept for back-compat; if both `write` and `access` are given they must be consistent or the call is rejected. NOTE: `write:false` (read) still grants a shell for investigation — on omp/claude that shell can write to disk (soft), so `write:false` is not a hard no-write guarantee. Enable write only when the user explicitly wants file edits.",
         },
         model: { type: "string", description: "Optional model selector for the delegated agent." },
         name: {
@@ -1374,7 +1382,8 @@ class OmpRpcSession {
     this.id = makeId("omp");
     this.agent = "omp";
     this.cwd = assertCwd(options.cwd);
-    this.write = Boolean(options.write);
+    this.access = resolveAccess(options); // "read" | "write"
+    this.write = this.access === "write"; // derived: kept for back-compat across summary()/pid/logs
     // OMP passes these on the command line (--model / --thinking), so sanitize at the source.
     this.model = sanitizeAgentArg(options.model, "model");
     this.effort = sanitizeAgentArg(options.effort, "effort");
@@ -1441,10 +1450,16 @@ class OmpRpcSession {
     if (this.appendSystemPrompt) args.push(`--append-system-prompt=${this.appendSystemPrompt.path}`);
     if (this.model) args.push("--model", this.model);
     if (this.effort) args.push("--thinking", this.effort);
-    if (this.write) {
+    if (this.access === "write") {
       args.push("--auto-approve", "--approval-mode", "yolo");
     } else {
-      args.push("--tools", "read,grep,find,lsp,web_search", "--approval-mode", "yolo");
+      // read tier = read + EXECUTE: `bash` in the tool list gives a real shell for investigation (probed
+      // 2026-07-04: node -v runs). Edit/Write tools are deliberately OUT, but the shell itself is a SOFT
+      // write boundary — bash CAN write to disk; this is a tool-level allow + role discipline, NOT an OS
+      // sandbox. A half-hard "run but can't write" via `--approval-mode write` is impossible in RPC: omp
+      // classifies bash wholesale as write-class and, non-interactively, blocks even read-only commands
+      // like `node -v` (probed) — and the bridge has no approval responder — so yolo is the only usable mode.
+      args.push("--tools", "read,bash,grep,find,lsp,web_search", "--approval-mode", "yolo");
     }
 
     appendLog(this.logFile, `$ ${[agentBin("omp"), ...args.map(shellQuote)].join(" ")}\n`);
@@ -1889,6 +1904,7 @@ class OmpRpcSession {
       id: this.id,
       agent: this.agent,
       cwd: this.cwd,
+      access: this.access,
       write: this.write,
       model: this.model,
       effort: this.effort,
@@ -1953,7 +1969,8 @@ class CodexAppServerSession {
     this.id = makeId("codex");
     this.agent = "codex";
     this.cwd = assertCwd(options.cwd);
-    this.write = Boolean(options.write);
+    this.access = resolveAccess(options); // "read" | "write"
+    this.write = this.access === "write"; // derived: kept for back-compat across summary()/pid/logs
     // Codex passes model over JSON-RPC (no shell-injection vector, unlike OMP/Claude command-line args),
     // so sanitizing is not a security need here — but we still do it for UNIFORM input validation: a bad
     // model is rejected early with the same clear error across all three backends. The allowed set
@@ -2071,7 +2088,11 @@ class CodexAppServerSession {
         cwd: this.cwd,
         model: this.model,
         approvalPolicy: "never",
-        sandbox: this.write ? "workspace-write" : "read-only",
+        // read tier → read-only OS sandbox: it already RUNS commands (isolates the filesystem, not
+        // execution), so `read` gets its investigation shell for free — and, unlike omp/claude, codex's
+        // read-tier write-boundary is HARD (the sandbox blocks disk writes at the OS level, verified
+        // enforced on Windows, not by role discipline). Only the write tier widens to workspace-write.
+        sandbox: this.access === "write" ? "workspace-write" : "read-only",
         serviceName: "agent_bridge",
         ephemeral: true,
         experimentalRawEvents: false,
@@ -2544,6 +2565,7 @@ class CodexAppServerSession {
       id: this.id,
       agent: this.agent,
       cwd: this.cwd,
+      access: this.access,
       write: this.write,
       model: this.model,
       effort: this.effort,
@@ -2596,7 +2618,8 @@ class ClaudeCodeSession {
     this.id = makeId("claude");
     this.agent = "claude";
     this.cwd = assertCwd(options.cwd);
-    this.write = Boolean(options.write);
+    this.access = resolveAccess(options); // "read" | "write"
+    this.write = this.access === "write"; // derived: kept for back-compat across summary()/pid/logs
     this.model = sanitizeAgentArg(options.model, "model"); // null when unset; flows to --model
     this.effort = sanitizeAgentArg(options.effort, "effort") || "xhigh"; // maps to --effort; defaults to xhigh thinking, caller may override
     this.appendSystemPrompt = options.appendSystemPrompt || null; // {path,content,bytes}|null — validated/read in openSession
@@ -2638,14 +2661,16 @@ class ClaudeCodeSession {
     if (this.appendSystemPrompt) args.push("--append-system-prompt-file", this.appendSystemPrompt.path);
     if (this.model) args.push("--model", this.model); // omitted when unset -> claude uses its configured default model
     if (this.effort) args.push("--effort", this.effort); // per-session reasoning effort; defaults to xhigh (constructor)
-    if (this.write) {
+    if (this.access === "write") {
       // Parity with OMP --auto-approve yolo / Codex workspace-write: full autonomy in cwd.
       args.push("--permission-mode", "bypassPermissions");
     } else {
-      // Read-only: file reads + search + web. No Bash/Edit/Write among `--allowedTools`, so the model cannot
-      // directly mutate the workspace. NOTE: this is a TOOL-level boundary, not an OS/hook sandbox —
-      // project-configured hooks (if any) still run shell. For hard isolation use a throwaway workspace.
-      args.push("--permission-mode", "default", "--allowedTools", "Read,Glob,Grep,WebFetch,WebSearch");
+      // read tier = read + EXECUTE: read-only tools + Bash for investigation. Bash in the allow-list runs
+      // without prompts (probed 2026-07-04: node -v runs). Edit/Write stay OUT so the model won't casually
+      // mutate files — but the shell is a SOFT write boundary: Bash CAN write to disk. This is a TOOL-level
+      // allow, not an OS/hook sandbox (unlike codex read-only, which hard-blocks writes); project-configured
+      // hooks, if any, still run shell. For a hard no-write guarantee use codex read or a throwaway workspace.
+      args.push("--permission-mode", "default", "--allowedTools", "Read,Glob,Grep,WebFetch,WebSearch,Bash");
     }
     return args;
   }
@@ -2959,6 +2984,7 @@ class ClaudeCodeSession {
       id: this.id,
       agent: this.agent,
       cwd: this.cwd,
+      access: this.access,
       write: this.write,
       model: this.model,
       effort: this.effort,
@@ -3036,6 +3062,40 @@ function extractLikelyText(raw) {
   return "";
 }
 
+// Access tiers: "read" | "write". `read` = read + execute (shell for investigation, no Edit/Write tools);
+// `write` = full edits. `write:boolean` is the legacy alias (true→write, false→read). openSession
+// pre-normalizes via assertAccess and rejects conflicts, so by construction options.access is authoritative
+// here; the write fallback keeps direct construction sane.
+const ACCESS_TIERS = ["read", "write"];
+function resolveAccess(options) {
+  if (ACCESS_TIERS.includes(options.access)) return options.access;
+  return options.write ? "write" : "read";
+}
+// Validate the requested tier BEFORE spawning (fail-fast, no orphan proc — same rule as name/schema).
+// Accepts `access` (preferred) and/or the legacy `write` boolean; if both are present they must agree.
+function assertAccess(params) {
+  const hasAccess = params.access != null;
+  const hasWrite = params.write != null;
+  if (hasAccess && !ACCESS_TIERS.includes(params.access)) {
+    throw new Error(`access must be one of ${ACCESS_TIERS.join("|")} (got ${JSON.stringify(params.access)}).`);
+  }
+  if (hasWrite && typeof params.write !== "boolean") {
+    throw new Error(`write must be a boolean (got ${JSON.stringify(params.write)}).`);
+  }
+  if (hasAccess && hasWrite) {
+    const aliasAccess = params.write ? "write" : "read";
+    if (aliasAccess !== params.access) {
+      throw new Error(
+        `access="${params.access}" conflicts with write=${params.write} ` +
+          "(write is a legacy alias: true→write, false→read). Pass only one, or make them consistent.",
+      );
+    }
+  }
+  if (hasAccess) return params.access;
+  if (hasWrite) return params.write ? "write" : "read";
+  return "read";
+}
+
 async function openSession(params) {
   ensureDirs();
   assertAgent(params.agent); // rejects any unknown agent here, so the dispatch below can't silently fall back
@@ -3058,6 +3118,8 @@ async function openSession(params) {
   if (initialSchema && params.agent !== "codex") {
     throw new Error(`schema (structured output) is not supported for backend "${params.agent}" yet; only codex.`);
   }
+  // Capability tier (read|write). Validate + reconcile the write alias BEFORE spawning (fail-fast).
+  const access = assertAccess(params);
   // Optional append_system_prompt_file: validate + read BEFORE spawning (fail-fast, no orphan proc — same
   // rule as name/schema). Read content once here: codex injects it over JSON-RPC (needs the string) and the
   // read also enforces the size cap; omp/claude pass the PATH and re-read it themselves at spawn. Absolute
@@ -3072,7 +3134,7 @@ async function openSession(params) {
     if (!r.content.trim()) throw new Error("append_system_prompt_file is empty.");
     appendSystemPrompt = { path: r.path, content: r.content, bytes: Buffer.byteLength(r.content, "utf8") };
   }
-  const session = new AGENTS[params.agent].Session(appendSystemPrompt ? { ...params, appendSystemPrompt } : params);
+  const session = new AGENTS[params.agent].Session({ ...params, access, ...(appendSystemPrompt ? { appendSystemPrompt } : {}) });
   session.name = name;
   session.returnMode = assertEnum(params.return_mode, "return_mode", ["full", "ref"], "full");
   sessions.set(session.id, session);
@@ -3721,7 +3783,7 @@ function cleanupAndExit(code = 0, reason = "shutdown", error = null) {
   try {
     const sessionStates = [];
     for (const s of sessions.values()) {
-      try { sessionStates.push({ id: s.id, status: s.status, backendPid: s.proc?.pid ?? null }); } catch {}
+      try { sessionStates.push({ id: s.id, status: s.status, access: s.access ?? null, backendPid: s.proc?.pid ?? null }); } catch {}
     }
     appendLog(EXIT_JOURNAL, `${JSON.stringify({
       ts: nowIso(),

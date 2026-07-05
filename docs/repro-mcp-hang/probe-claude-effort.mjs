@@ -60,11 +60,13 @@ try {
   check("s3 has --model haiku", cmd3.includes("--model haiku"), cmd3);
   check("s3 has --effort xhigh", cmd3.includes("--effort xhigh"), cmd3);
 
-  // Arg-vector assertions: write:false session (s1) must have the right permission/tool flags
-  check("s1 write:false has --permission-mode default", cmd1.includes("--permission-mode default"), cmd1);
-  check("s1 write:false has --allowedTools Read,Glob,Grep,WebFetch,WebSearch", cmd1.includes("--allowedTools Read,Glob,Grep,WebFetch,WebSearch"), cmd1);
-  check("s1 write:false has no Bash in allowedTools", !cmd1.includes("Bash"), cmd1);
-  check("s1 write:false has no bypassPermissions", !cmd1.includes("bypassPermissions"), cmd1);
+  // Arg-vector assertions: the read tier (s1, write:false alias) must have the right permission/tool flags.
+  // read = read + EXECUTE, so the allow-list now INCLUDES Bash (shell for investigation); Edit/Write stay out.
+  check("s1 read has --permission-mode default", cmd1.includes("--permission-mode default"), cmd1);
+  check("s1 read has --allowedTools Read,Glob,Grep,WebFetch,WebSearch,Bash", cmd1.includes("--allowedTools Read,Glob,Grep,WebFetch,WebSearch,Bash"), cmd1);
+  check("s1 read has Bash (shell for investigation)", cmd1.includes("Bash"), cmd1);
+  check("s1 read has no Edit/Write tool", !cmd1.includes("Edit") && !cmd1.includes("Write"), cmd1);
+  check("s1 read has no bypassPermissions", !cmd1.includes("bypassPermissions"), cmd1);
 
   // Session 4: write:true -> must have --permission-mode bypassPermissions and NO --allowedTools
   const s4 = await call("agent_bridge_open_session", { agent: "claude", cwd: REPO, write: true });
