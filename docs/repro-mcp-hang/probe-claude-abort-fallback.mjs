@@ -131,12 +131,12 @@ try {
     bText.slice(0, 120),
   );
 
-  // 7b. contextUsage must NOT carry the swallowed A result's usage. A's stale result carries a 500k
-  //     modelUsage; B's result omits modelUsage. If the bridge captured usage BEFORE the swallow gate
-  //     (the bug), that 500k would leak here since nothing overwrites it. With the fix (capture after
-  //     the gate + reset at #beginTurn), B reported no usage → contextUsage is null.
+  // 7b. contextUsage must be null after B. contextUsage now derives from per-call assistant usage, and
+  //     neither A's nor B's assistant message carries usage; #beginTurn also resets it each turn. So the
+  //     swallowed A result (500k modelUsage) is doubly irrelevant — contextUsage no longer reads modelUsage
+  //     at all, and B streamed no assistant usage → null.
   check(
-    "contextUsage null after B — swallowed A's stale modelUsage did NOT leak",
+    "contextUsage null after B — no assistant usage streamed; swallowed A's aggregate is not a source",
     r0?.contextUsage == null,
     JSON.stringify(r0?.contextUsage),
   );

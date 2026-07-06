@@ -14,6 +14,8 @@
 import readline from "node:readline";
 
 const say = obj => process.stdout.write(JSON.stringify(obj) + "\n");
+// Emit an assistant message carrying ONE call's per-call usage (input side = `inputSide`), like real claude.
+const asstUsage = (text, inputSide) => say({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text }], usage: { input_tokens: inputSide, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 5 } } });
 
 // T4/P1: when FAKE_CLAUDE_STDERR is set, emit one benign line to STDERR on startup (real claude/CLIs
 // write progress/info to stderr). It must land in the session's lastStderr, NOT lastError. Gated so the
@@ -21,14 +23,23 @@ const say = obj => process.stdout.write(JSON.stringify(obj) + "\n");
 if (process.env.FAKE_CLAUDE_STDERR) process.stderr.write("[fake-claude] benign progress on stderr\n");
 
 // FAKE_CLAUDE_MODE selects behavior; default "abortfallback" preserves the abort-fallback dance below.
-//   ctxturn  — a single CLEAN turn whose success result carries modelUsage with TWO model entries: a
-//              1M-window primary and a 200k-window subagent. Proves contextUsage picks the LARGEST-window
-//              entry (subagent excluded) and sums the input-side tokens, with live:false.
-//   ctxstale — turn 1's result carries modelUsage; turn 2's result OMITS it. Proves the #beginTurn reset:
-//              contextUsage must be null after turn 2 (not turn 1's stale number).
-//   ctxtie   — a turn whose modelUsage has TWO entries with the SAME (1M) contextWindow: a subagent listed
-//              FIRST with few tokens, the main model SECOND with more. Proves the equal-window tie-break
-//              picks the higher-token entry (the main conversation), not first-seen.
+//   abortusage — the abort dance, but turn A's assistant CARRIES usage (77000), and on turn B a LATE
+//              turn-A assistant carrying usage (99000) is flushed BEFORE A's stale result (i.e. while
+//              pendingAbortedResults>0). B's own assistant carries NO usage. Proves the #handleLine gate:
+//              the late aborted-turn usage is skipped (pending>0) and #beginTurn already reset A's 77000,
+//              so contextUsage is null after B — the aborted turn's reading never leaks into B.
+// The ctx* modes mirror REAL claude stream-json: each API call streams as an `assistant` message whose
+// message.usage carries that ONE call's input side (input_tokens + cache_read + cache_creation). Verified
+// empirically 2026-07-06 (a 3-call turn: last call 33663 vs the whole-turn modelUsage sum 100374).
+//   ctxturn  — a clean turn with THREE growing assistant calls (last input-side = 41002). The result ALSO
+//              carries a large whole-turn modelUsage/usage aggregate (100004). Proves contextUsage takes
+//              the LAST per-call value (41002) and IGNORES the aggregate — the regression guard for the
+//              old sum-based over-count. live:false.
+//   ctxstale — turn 1 streams assistant usage (41002); turn 2 streams an assistant with NO usage. Proves
+//              the #beginTurn reset: contextUsage must be null after turn 2 (not turn 1's stale number).
+//   ctxlast  — three calls 30000 → 60000 (peak) → 45000 (after a mid-turn compaction). Proves contextUsage
+//              is the LAST call (45000), not the max (60000) and not the sum (135000) — last reflects
+//              post-compaction reality, which max would miss.
 const CMODE = process.env.FAKE_CLAUDE_MODE || "abortfallback";
 let userMsgCount = 0;
 let ctxTurns = 0;
@@ -43,26 +54,32 @@ rl.on("line", line => {
 
   if (CMODE.startsWith("ctx") && msg.type === "user") {
     ctxTurns += 1;
-    say({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "CTX_ANSWER" }] } });
+    // Each assistant message carries ONE call's per-call usage (input + cache_read + cache_creation),
+    // exactly like real claude. contextUsage takes the LAST such call, never the sum across the turn.
+    const asst = (text, usage) => say({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text }], ...(usage ? { usage } : {}) } });
+    const u = (input, cr, cc) => ({ input_tokens: input, cache_read_input_tokens: cr, cache_creation_input_tokens: cc, output_tokens: 5 });
     const base = { type: "result", subtype: "success", is_error: false, result: "CTX_ANSWER", session_id: "fake-claude-ctx" };
-    if (CMODE === "ctxtie") {
-      // Equal windows (both 1M): subagent entry FIRST (fewer tokens), main SECOND (more). Tie-break by
-      // tokens must pick the main model (40000+10000=50000), NOT the first-seen subagent (1000).
-      say({ ...base, modelUsage: {
-        "claude-opus-4-7[1m]": { inputTokens: 1000, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, contextWindow: 1000000 },
-        "claude-opus-4-8[1m]": { inputTokens: 40000, cacheReadInputTokens: 10000, cacheCreationInputTokens: 0, contextWindow: 1000000 },
-      } });
+    if (CMODE === "ctxlast") {
+      // Three calls: 30000 → 60000 (peak) → 45000 (after a mid-turn compaction). contextUsage must be the
+      // LAST (45000), NOT the max (60000) and NOT the sum (135000).
+      asst("A", u(10000, 20000, 0));    // 30000
+      asst("B", u(10000, 45000, 5000)); // 60000 (peak)
+      asst("CTX_ANSWER", u(5000, 40000, 0)); // 45000 (last — post-compaction)
+      say(base);
     } else if (CMODE === "ctxstale" && ctxTurns >= 2) {
-      // Turn 2 OMITS modelUsage → contextUsage must reset to null (not report turn 1's number).
+      // Turn 2's assistant carries NO usage → lastCallContextTokens stays null → contextUsage null.
+      asst("CTX_ANSWER", null);
       say(base);
     } else {
-      // ctxturn, and ctxstale turn 1: report modelUsage (1M primary + a 200k subagent to exclude).
+      // ctxturn, and ctxstale turn 1: three growing calls, last = 41002. The result ALSO carries a big
+      // whole-turn aggregate (usage/modelUsage sum to 100004) — contextUsage must IGNORE it (the old code
+      // summed modelUsage and would report 100004; the fix reports the last per-call value 41002).
+      asst("D", u(5000, 20000, 3000)); // 28000
+      asst("E", u(2, 30000, 1000));    // 31002
+      asst("CTX_ANSWER", u(2, 40000, 1000)); // 41002 (last)
       say({ ...base,
-        usage: { input_tokens: 8000, cache_read_input_tokens: 20000, cache_creation_input_tokens: 3000, output_tokens: 5 },
-        modelUsage: {
-          "claude-opus-4-8[1m]": { inputTokens: 8000, cacheReadInputTokens: 20000, cacheCreationInputTokens: 3000, contextWindow: 1000000, maxOutputTokens: 64000 },
-          "claude-haiku-4-5": { inputTokens: 400, cacheReadInputTokens: 100, cacheCreationInputTokens: 0, contextWindow: 200000, maxOutputTokens: 8000 },
-        },
+        usage: { input_tokens: 5004, cache_read_input_tokens: 90000, cache_creation_input_tokens: 5000, output_tokens: 15 },
+        modelUsage: { "claude-opus-4-8[1m]": { inputTokens: 5004, cacheReadInputTokens: 90000, cacheCreationInputTokens: 5000, contextWindow: 1000000, maxOutputTokens: 64000 } },
       });
     }
     return;
@@ -85,7 +102,8 @@ rl.on("line", line => {
       //   1. Send interrupt control_request → we ack immediately above.
       //   2. Wait 5s for turn.promise to settle → times out (we never emit a result).
       //   3. Force-settle: pendingAbortedResults = 1, #settleTurn(null, "aborted") → status "idle".
-      say({
+      if (CMODE === "abortusage") asstUsage("FAKE_CLAUDE_A_PARTIAL", 77000); // A's assistant carries usage
+      else say({
         type: "assistant",
         message: { role: "assistant", content: [{ type: "text", text: "FAKE_CLAUDE_A_PARTIAL" }] },
       });
@@ -109,6 +127,11 @@ rl.on("line", line => {
       // session's context. Turn B's result deliberately OMITS modelUsage, so a leak would persist
       // (nothing overwrites it) — after B, contextUsage must be null, not 500k. Isolates the capture-
       // after-gate + reset-at-beginTurn fix.
+      // abortusage: BEFORE flushing A's stale result, emit a LATE turn-A assistant carrying usage (99000).
+      // It arrives while pendingAbortedResults>0 and this.turn=B, so the #handleLine gate must SKIP it —
+      // otherwise it would leak as B's contextUsage. B's own assistant (below) carries NO usage, so a leak
+      // would survive to the assertion.
+      if (CMODE === "abortusage") asstUsage("FAKE_CLAUDE_A_LATE", 99000);
       say({
         type: "result", subtype: "error_during_execution", is_error: true, session_id: "fake-claude-1",
         modelUsage: { "claude-opus-4-8[1m]": { inputTokens: 500000, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, contextWindow: 1000000 } },
@@ -117,7 +140,7 @@ rl.on("line", line => {
         type: "assistant",
         message: { role: "assistant", content: [{ type: "text", text: "FAKE_CLAUDE_B_OK" }] },
       });
-      // Turn B's success result intentionally has NO modelUsage.
+      // Turn B's success result intentionally has NO modelUsage; B's assistant carries no usage either.
       say({ type: "result", subtype: "success", is_error: false, result: "FAKE_CLAUDE_B_OK", session_id: "fake-claude-1" });
       return;
     }

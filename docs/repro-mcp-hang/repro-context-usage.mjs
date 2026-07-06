@@ -9,10 +9,12 @@
 //   codex          — last.inputTokens is chosen (NOT total, NOT last.totalTokens), live:false, NO contextWindow,
 //                    and NO omp-only isCompacting key leaks in.
 //   codex null     — before the first usage notification → contextUsage:null.
-//   claude         — modelUsage's LARGEST-window entry is the primary (a 200k subagent is excluded, via internal
-//                    window comparison), tokens are the input-side sum (input + cacheRead + cacheCreation), live:false;
-//                    contextWindow is used only internally for selection, never emitted.
-//   claude null    — before any result → contextUsage:null.
+//   claude         — tokens = the LAST assistant call's input side (input + cacheRead + cacheCreation of ONE
+//                    call), taken from the streaming assistant messages; the whole-turn modelUsage/usage
+//                    aggregate is IGNORED (regression guard for the old sum-based ~N× over-count), live:false.
+//   claude last    — with a mid-turn compaction (30000 → 60000 → 45000) the LAST call wins (45000), not the
+//                    max (60000) and not the sum (135000).
+//   claude null    — before any assistant call with usage → contextUsage:null.
 import { spawn } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -140,8 +142,8 @@ async function main() {
     await sleep(200);
   }
 
-  // ===== claude: largest-window entry is the primary (subagent excluded); input-side token sum; live:false =====
-  // Also null before any result.
+  // ===== claude: LAST assistant call's input side; whole-turn aggregate IGNORED; live:false =====
+  // Also null before any assistant call with usage.
   {
     const s = makeServer({ claude: "ctxturn" });
     await s.init();
@@ -152,42 +154,42 @@ async function main() {
     const w = await s.call("agent_bridge_wait", { session_ids: [idPre], mode: "all", timeout_ms: 8000 });
     const cu = w?.results?.[0]?.contextUsage;
     if (!cu) return fail(`claude: wait result should carry contextUsage, got ${JSON.stringify(w?.results?.[0])}`);
-    // opus (1M window) is primary; haiku (200k) is a subagent and must NOT be chosen. The tokens value
-    // proves the selection: 8000+20000+3000=31000 is opus's sum; the haiku subagent would give ~500.
-    if (cu.tokens !== 31000) return fail(`claude: primary must be the LARGEST-window entry (1M opus → 31000), not the 200k subagent (~500) — got ${JSON.stringify(cu.tokens)}`);
-    if ("contextWindow" in cu) return fail(`claude: contextWindow must NOT be emitted (used internally for selection only), got ${JSON.stringify(cu)}`);
+    // Three growing calls: 28000, 31002, 41002. tokens must be the LAST call (41002), NOT the whole-turn
+    // modelUsage/usage aggregate (100004) — that aggregate is the old sum-based over-count.
+    if (cu.tokens !== 41002) return fail(`claude: tokens must be the LAST call's input side (41002), NOT the whole-turn aggregate (100004) — got ${JSON.stringify(cu.tokens)}`);
+    if ("contextWindow" in cu) return fail(`claude: contextWindow must NOT be emitted, got ${JSON.stringify(cu)}`);
     if (cu.live !== false) return fail(`claude: last-turn snapshot must be live:false, got ${JSON.stringify(cu.live)}`);
-    console.log(`[harness] claude OK — largest-window primary (subagent excluded), input-side token sum, live:false; null before first result`);
+    console.log(`[harness] claude OK — LAST assistant call's input side (41002), whole-turn aggregate (100004) ignored, live:false; null before first usage`);
     s.kill();
     await sleep(200);
   }
 
-  // ===== claude: modelUsage reset across turns — turn 2 omitting modelUsage yields null, not turn 1's number =====
+  // ===== claude: usage reset across turns — turn 2 with no assistant usage yields null, not turn 1's number =====
   {
     const s = makeServer({ claude: "ctxstale" });
     await s.init();
     const id = await open(s, "claude");
     await s.call("agent_bridge_send_message", { session_id: id, message: "turn one" });
     const w1 = await s.call("agent_bridge_wait", { session_ids: [id], mode: "all", timeout_ms: 8000 });
-    if (w1?.results?.[0]?.contextUsage?.tokens !== 31000) return fail(`claude-stale: turn 1 should report contextUsage, got ${JSON.stringify(w1?.results?.[0]?.contextUsage)}`);
+    if (w1?.results?.[0]?.contextUsage?.tokens !== 41002) return fail(`claude-stale: turn 1 should report contextUsage (41002), got ${JSON.stringify(w1?.results?.[0]?.contextUsage)}`);
     await s.call("agent_bridge_send_message", { session_id: id, message: "turn two" });
     const w2 = await s.call("agent_bridge_wait", { session_ids: [id], mode: "all", timeout_ms: 8000 });
-    if (w2?.results?.[0]?.contextUsage !== null) return fail(`claude-stale: turn 2 omits modelUsage → contextUsage MUST be null (not turn 1's stale number), got ${JSON.stringify(w2?.results?.[0]?.contextUsage)}`);
-    console.log(`[harness] claude-stale OK — #beginTurn reset: a turn that omits modelUsage → contextUsage:null, no stale carry-over`);
+    if (w2?.results?.[0]?.contextUsage !== null) return fail(`claude-stale: turn 2 (no assistant usage) → contextUsage MUST be null (not turn 1's stale number), got ${JSON.stringify(w2?.results?.[0]?.contextUsage)}`);
+    console.log(`[harness] claude-stale OK — #beginTurn reset: a turn with no assistant usage → contextUsage:null, no stale carry-over`);
     s.kill();
     await sleep(200);
   }
 
-  // ===== claude: equal-window tie-break picks the higher-token (main) entry, not first-seen (subagent) =====
+  // ===== claude: LAST call wins over an earlier peak (mid-turn compaction), never the max or the sum =====
   {
-    const s = makeServer({ claude: "ctxtie" });
+    const s = makeServer({ claude: "ctxlast" });
     await s.init();
     const { r } = await turn(s, "claude");
     const cu = r?.contextUsage;
-    if (!cu) return fail(`claude-tie: should carry contextUsage, got ${JSON.stringify(r)}`);
-    if (cu.tokens !== 50000) return fail(`claude-tie: equal-window tie must pick the higher-token main entry (50000), NOT the first-seen subagent (1000), got ${JSON.stringify(cu.tokens)}`);
-    if ("contextWindow" in cu) return fail(`claude-tie: contextWindow must NOT be emitted, got ${JSON.stringify(cu)}`);
-    console.log(`[harness] claude-tie OK — equal contextWindow → tie-break by tokens picks the main conversation, not insertion order`);
+    if (!cu) return fail(`claude-last: should carry contextUsage, got ${JSON.stringify(r)}`);
+    if (cu.tokens !== 45000) return fail(`claude-last: must be the LAST call (45000), NOT the max (60000) nor the sum (135000), got ${JSON.stringify(cu.tokens)}`);
+    if ("contextWindow" in cu) return fail(`claude-last: contextWindow must NOT be emitted, got ${JSON.stringify(cu)}`);
+    console.log(`[harness] claude-last OK — last call after a mid-turn compaction (45000) beats the peak (60000) and the sum (135000)`);
     s.kill();
     await sleep(200);
   }

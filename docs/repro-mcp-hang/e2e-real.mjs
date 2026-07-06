@@ -186,9 +186,9 @@ try {
     check("open claude (registry dispatch)", oCl.session?.agent === "claude" && !!clId, clId);
     const clTurn = await call("agent_bridge_send_message", { session_id: clId, message: "Reply with exactly: E2E_CLAUDE_1", wait: true, timeout_ms: 120000 }, 140000);
     check("claude turn (async result)", (clTurn.text || "").includes("E2E_CLAUDE_1"), (clTurn.text || "").slice(0, 40));
-    // contextUsage from real modelUsage (last-turn snapshot; primary = largest-window entry, chosen
-    // internally; window itself not emitted).
-    check("claude contextUsage present + snapshot + no window (real modelUsage)", !!clTurn.contextUsage && clTurn.contextUsage.tokens > 0 && !("contextWindow" in clTurn.contextUsage) && clTurn.contextUsage.live === false, JSON.stringify(clTurn.contextUsage));
+    // contextUsage = the LAST assistant call's per-call input side (last-turn snapshot); the whole-turn
+    // modelUsage aggregate is not used, and the window itself is not emitted.
+    check("claude contextUsage present + snapshot + no window (last per-call usage)", !!clTurn.contextUsage && clTurn.contextUsage.tokens > 0 && !("contextWindow" in clTurn.contextUsage) && clTurn.contextUsage.live === false, JSON.stringify(clTurn.contextUsage));
 
     // abort: long turn non-blocking, abort, confirm idle + reusable
     await call("agent_bridge_send_message", { session_id: clId, message: "Count slowly from 1 to 400, one number per line.", wait: false });

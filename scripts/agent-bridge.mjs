@@ -2645,10 +2645,11 @@ class ClaudeCodeSession {
     this.controlPending = new Map(); // request_id -> { resolve, reject } for control_request/response
     this.nextControlId = 1;
     this.finalAnswer = "";           // unclamped final text from result.result
-    this.tokenUsage = null;
-    // Per-model usage from result.modelUsage — the ONLY place claude reports the context window
-    // (top-level result.usage omits it). Needed by contextUsage(); null until a result lands.
-    this.modelUsage = null;
+    // Current-context occupancy = input-side tokens of the LAST assistant API call this turn (fresh input
+    // + cache read + cache creation of ONE call, not the whole-turn sum). Captured from the streaming
+    // assistant messages in #handleLine; reset each turn in #beginTurn. null until an assistant call
+    // with usage lands. This is the correct signal (see contextUsage); the old modelUsage-sum was ~N×.
+    this.lastCallContextTokens = null;
     this.logFile = path.join(RUN_LOG_DIR, `${this.id}.log`);
     this.answerFile = path.join(RUN_LOG_DIR, `${this.id}.answer.txt`);
     this.pidFile = pidRecordPath(this.id);
@@ -2760,11 +2761,11 @@ class ClaudeCodeSession {
     this.turnEndedAt = null;
     this.finalAnswer = "";
     this.lastAssistantText = "";
-    // Clear last turn's usage as THIS turn begins: if this turn's result omits modelUsage (some claude
-    // results do), contextUsage() then returns null ("not measured this turn") instead of silently
-    // reporting the PREVIOUS turn's token count as if it were current. Repopulated in #handleResult.
-    this.tokenUsage = null;
-    this.modelUsage = null;
+    // Clear last turn's reading as THIS turn begins: if this turn emits no assistant call carrying usage,
+    // contextUsage() then returns null ("not measured this turn") instead of silently reporting the
+    // PREVIOUS turn's token count as if it were current. Repopulated from the streaming assistant
+    // messages in #handleLine.
+    this.lastCallContextTokens = null;
   }
 
   #settleTurn(err, status) {
@@ -2796,6 +2797,21 @@ class ClaudeCodeSession {
       const blocks = Array.isArray(msg.message?.content) ? msg.message.content : [];
       const text = blocks.filter(b => b && b.type === "text" && typeof b.text === "string").map(b => b.text).join("");
       if (text) this.lastAssistantText = clampText(text);
+      // Current-context occupancy: the input side of THIS single API call (fresh input + cache read +
+      // cache creation) — the input snapshot at the start of the call (excludes this call's output and
+      // the next user turn). Each assistant message = one real API call; we keep the LATEST of the turn,
+      // never sum — summing across the turn's round-trips is exactly the over-count bug. Only main-loop
+      // calls stream as top-level assistant messages (subagent internals don't), so this is inherently the
+      // main context, no window-based subagent filtering needed. Mid-turn auto-compaction lowers the last
+      // call's input below an earlier peak — keeping the last (not the max) correctly reflects that.
+      //   GATE (mirrors the usage capture in #handleResult): only capture from a LIVE, KEPT turn — skip
+      // when no turn is active, while an interrupt is in flight, or while a force-settled abort's stale
+      // tail is still pending. FIFO (A's messages precede B's) means a swallowed turn's late assistant
+      // arrives while pendingAbortedResults>0 and is skipped, so it can't leak into a later turn.
+      const u = msg.message?.usage;
+      if (u && typeof u.input_tokens === "number" && this.turn && this.pendingAbortedResults === 0 && !this.interrupting) {
+        this.lastCallContextTokens = (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
+      }
       pushEvent(this, compactEvent({ type: "assistant" }));
       return;
     }
@@ -2806,9 +2822,6 @@ class ClaudeCodeSession {
   #handleResult(msg) {
     pushEvent(this, compactEvent({ type: "result", subtype: msg.subtype, is_error: msg.is_error }));
     if (msg.session_id) this.claudeSessionId = msg.session_id;
-    // NB: usage/modelUsage are captured LOWER DOWN — only from a result we actually keep. Capturing
-    // them here would let a swallowed stale-abort result (below) overwrite the current context snapshot
-    // with a discarded turn's numbers (contextUsage would then report the aborted turn). See below.
     // INVARIANT (load-bearing): claude processes stdin messages in FIFO order and emits exactly one
     // terminal `result` per user message, in that same order. So when abort() force-settles turn A
     // without its result, A's result is guaranteed to arrive BEFORE any later turn B's result — this
@@ -2825,12 +2838,10 @@ class ClaudeCodeSession {
     // abort()'s interrupt produces a terminal `result/error_during_execution`; consume it as an
     // intentional abort (idle, NOT failed). The interrupting flag is set in Task 4's abort().
     if (this.interrupting) { this.interrupting = false; this.#settleTurn(null, "aborted"); return; }
-    // Now we KEEP this result (a real completed turn — success or genuine error, not a swallowed stale
-    // abort and not a clean interrupt). Capture usage HERE so contextUsage() reflects THIS turn only.
-    // Combined with the reset in #beginTurn, a turn that omits modelUsage yields contextUsage:null
-    // (honest "not measured") rather than a stale prior turn's number.
-    if (msg.usage) this.tokenUsage = msg.usage;
-    if (msg.modelUsage) this.modelUsage = msg.modelUsage;
+    // We KEEP this result (a real completed turn — not a swallowed stale abort, not a clean interrupt).
+    // contextUsage is sourced from the streaming assistant messages (see #handleLine), not from the
+    // result's whole-turn usage/modelUsage aggregate — the raw result (with its usage) is already logged
+    // verbatim, so nothing is captured here.
     if (msg.is_error || msg.subtype !== "success") { this.#settleTurn(new Error(`claude turn ${msg.subtype || "error"}`), msg.subtype || "error"); return; }
     const text = typeof msg.result === "string" ? msg.result : "";
     this.finalAnswer = text;
@@ -2953,30 +2964,23 @@ class ClaudeCodeSession {
     turn?.reject?.(err);
   }
 
-  // Normalized current-context occupancy (see OmpRpcSession.contextUsage). Claude reports per-model
-  // usage in result.modelUsage. contextWindow is used INTERNALLY to identify the primary model — the
-  // entry with the LARGEST window, so a turn that spun up a smaller-window subagent isn't mistaken for
-  // the main context — but the window is NOT emitted (absolute tokens only, no percent-inviting field).
-  // On a WINDOW TIE (main + a subagent on the same model/window), the entry with MORE input-side tokens
-  // wins — in the long-context scenario this targets, the main conversation has accumulated far more
-  // context than a freshly-spawned subagent, so tokens is the right discriminator (first-seen order in
-  // modelUsage is not meaningful). Current context = input-side tokens (fresh input + cache read + cache
-  // creation); output isn't part of the next turn's context. tokens:0 is a valid reading (like omp/codex).
-  // Last-turn snapshot → live:false. null until a result lands or if no entry carries a contextWindow.
+  // Normalized current-context occupancy (see OmpRpcSession.contextUsage). Claude's value = the input
+  // side of the LAST assistant API call this turn that carried usage (input + cache read + cache creation
+  // of ONE call), captured from the streaming assistant messages in #handleLine. It is the input snapshot
+  // of that call — the same "last-call snapshot" meaning as codex's last.inputTokens (not the exact bytes
+  // of the next request, but the current accumulated context to within one turn), so all three backends
+  // compare on one absolute-token scale (window/percent never emitted).
+  //
+  // WHY NOT result.modelUsage (the previous source): modelUsage is a per-model aggregate over the WHOLE
+  // turn, so its cacheReadInputTokens is base-context × (number of API round-trips). Summing it reported
+  // ~N× the true context (an N-tool-call turn over-counted by N), tripping the reopen threshold far
+  // early and making claude incomparable to omp/codex. See docs/BUG-claude-contextusage-overcounts-*.
+  // The per-call value has no such multiplier and needs no window-based subagent filtering (subagent
+  // internals don't stream as top-level assistant messages). tokens:0 is a valid reading (like omp/codex).
+  // Last-turn snapshot → live:false. null until an assistant call with usage lands (partial → null).
   contextUsage() {
-    const mu = this.modelUsage;
-    if (!mu || typeof mu !== "object") return null;
-    let primary = null, primaryTokens = 0;
-    for (const entry of Object.values(mu)) {
-      if (!entry || typeof entry.contextWindow !== "number") continue;
-      const tokens = (entry.inputTokens || 0) + (entry.cacheReadInputTokens || 0) + (entry.cacheCreationInputTokens || 0);
-      if (!primary || entry.contextWindow > primary.contextWindow || (entry.contextWindow === primary.contextWindow && tokens > primaryTokens)) {
-        primary = entry;
-        primaryTokens = tokens;
-      }
-    }
-    if (!primary) return null;
-    return { tokens: primaryTokens, live: false };
+    if (typeof this.lastCallContextTokens !== "number") return null;
+    return { tokens: this.lastCallContextTokens, live: false };
   }
 
   summary() {
