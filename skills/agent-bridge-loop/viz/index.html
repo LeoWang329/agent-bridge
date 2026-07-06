@@ -1,0 +1,1064 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Loop 交付 · 观察台</title>
+<style>
+/* ============================================================
+   Agent Loop · 只读实时观察台(爬坡视图)
+   零外部请求 · 系统字体 · 浅/深色跟随系统(可手动覆盖)
+   基础设施(token/卡片/文件展开/主题/连接)与圆桌观察台同源
+   ============================================================ */
+
+/* ---- 设计 token:浅色为基线 ---- */
+:root{
+  --bg:        #eef1f5;
+  --canvas:    #f6f8fb;
+  --surface:   #ffffff;
+  --surface-2: #f1f4f8;
+  --ink:       #16202c;
+  --ink-soft:  #4a5765;
+  --faint:     #7d8b9b;
+  --line:      #e2e8f0;
+  --line-2:    #cdd6e2;
+
+  --accent:    #3061d6;   /* 一般强调 / 链接 */
+  --c-ctrl:    #5457d6;   /* 主控(合同/编排) */
+  --c-gen:     #2f7fd0;   /* 生成者 */
+  --c-pass:    #0f875b;   /* 验收通过 / 交付 */
+  --c-fail:    #c23d3d;   /* 验收不过 */
+  --c-warn:    #c2610c;   /* 审计/增补/needs-fixes */
+  --c-pause:   #b0730a;   /* 等待人类 */
+
+  --shadow: 0 1px 2px rgba(16,32,48,.05), 0 6px 18px -12px rgba(16,32,48,.22);
+  --shadow-lift: 0 2px 6px rgba(16,32,48,.07), 0 14px 34px -18px rgba(16,32,48,.30);
+  --radius: 12px;
+  --maxw: 960px;
+
+  --mono: ui-monospace, "Cascadia Code", "SFMono-Regular", "JetBrains Mono", Consolas, "Liberation Mono", monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+}
+
+/* ---- 深色:手动覆盖优先,否则跟随系统 ---- */
+:root[data-theme="dark"]{
+  --bg:        #0b0f15;
+  --canvas:    #0e131b;
+  --surface:   #141b24;
+  --surface-2: #1a222e;
+  --ink:       #e7eef6;
+  --ink-soft:  #a4b2c2;
+  --faint:     #6d7d8f;
+  --line:      #232d3a;
+  --line-2:    #313d4d;
+
+  --accent:    #6e97f7;
+  --c-ctrl:    #8f92f2;
+  --c-gen:     #63aef2;
+  --c-pass:    #42cf95;
+  --c-fail:    #ef6a6a;
+  --c-warn:    #f0953f;
+  --c-pause:   #f2c14e;
+
+  --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 22px -14px rgba(0,0,0,.7);
+  --shadow-lift: 0 2px 6px rgba(0,0,0,.5), 0 18px 40px -20px rgba(0,0,0,.8);
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]):not([data-theme="dark"]){
+    --bg:#0b0f15; --canvas:#0e131b; --surface:#141b24; --surface-2:#1a222e;
+    --ink:#e7eef6; --ink-soft:#a4b2c2; --faint:#6d7d8f; --line:#232d3a; --line-2:#313d4d;
+    --accent:#6e97f7; --c-ctrl:#8f92f2; --c-gen:#63aef2; --c-pass:#42cf95; --c-fail:#ef6a6a;
+    --c-warn:#f0953f; --c-pause:#f2c14e;
+    --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 22px -14px rgba(0,0,0,.7);
+    --shadow-lift:0 2px 6px rgba(0,0,0,.5),0 18px 40px -20px rgba(0,0,0,.8);
+  }
+}
+
+/* ---- 基础 ---- */
+*{box-sizing:border-box}
+html,body{margin:0}
+body{
+  background:
+    radial-gradient(1200px 480px at 50% -160px, color-mix(in oklab, var(--accent) 8%, var(--bg)), transparent 70%),
+    var(--bg);
+  color:var(--ink);
+  font:14.5px/1.6 var(--sans);
+  overflow-x:hidden;
+  -webkit-font-smoothing:antialiased;
+  text-rendering:optimizeLegibility;
+}
+a{color:var(--accent)}
+::selection{background:color-mix(in oklab, var(--accent) 26%, transparent)}
+
+/* ---- 顶部页头(含等待横幅,整体 sticky) ---- */
+.topbar{
+  position:sticky; top:0; z-index:20;
+  background:color-mix(in oklab, var(--surface) 86%, transparent);
+  backdrop-filter:saturate(1.4) blur(10px);
+  border-bottom:1px solid var(--line);
+}
+.topbar-inner{ max-width:var(--maxw); margin:0 auto; padding:13px 22px 14px; }
+
+.brandrow{ display:flex; align-items:center; gap:10px; }
+.brand{ display:flex; align-items:center; gap:9px; font-weight:650; letter-spacing:.01em; font-size:15px; }
+.brand .glyph{
+  width:26px;height:26px;border-radius:8px;flex:0 0 auto;
+  display:grid;place-items:center;color:#fff;
+  background:linear-gradient(150deg, var(--c-ctrl), var(--c-pass));
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,.15);
+}
+.brand .glyph svg{width:15px;height:15px}
+.spacer{flex:1 1 auto}
+
+.conn{ display:inline-flex; align-items:center; gap:7px; font:12px/1 var(--mono); color:var(--faint);
+  padding:5px 10px; border:1px solid var(--line); border-radius:999px; background:var(--surface); white-space:nowrap; }
+.conn .led{ width:8px;height:8px;border-radius:50%; background:var(--faint); flex:0 0 auto; }
+.conn[data-s="live"] .led{ background:var(--c-pass); box-shadow:0 0 0 3px color-mix(in oklab,var(--c-pass) 26%, transparent); }
+.conn[data-s="reconnect"] .led{ background:var(--c-pause); animation:blink 1s steps(2) infinite; }
+.conn[data-s="demo"] .led{ background:var(--accent); box-shadow:0 0 0 3px color-mix(in oklab,var(--accent) 26%, transparent); }
+.conn .replay{ margin-left:2px; color:var(--accent); cursor:pointer; text-decoration:none; border-left:1px solid var(--line-2); padding-left:8px; }
+.conn .replay:hover{ text-decoration:underline; }
+
+.theme-toggle{
+  font:12px/1 var(--sans); color:var(--ink-soft); cursor:pointer;
+  display:inline-flex; align-items:center; gap:6px;
+  padding:6px 10px; border:1px solid var(--line); border-radius:999px; background:var(--surface);
+}
+.theme-toggle:hover{ border-color:var(--line-2); color:var(--ink); }
+.theme-toggle svg{width:14px;height:14px}
+
+.task{
+  margin:11px 0 0; font-size:17px; line-height:1.45; font-weight:600; color:var(--ink);
+  max-width:64ch; text-wrap:pretty;
+}
+.t-label{ font:11px/1 var(--mono); letter-spacing:.12em; text-transform:uppercase; color:var(--faint); display:block; margin-bottom:5px; }
+
+/* 验收权威说明:观察者一眼看懂这个循环的裁判是谁 */
+.auth-note{ margin-top:10px; display:flex; align-items:center; gap:8px; font:11.5px/1.5 var(--mono); color:var(--faint); }
+.auth-note svg{ width:14px; height:14px; flex:0 0 auto; opacity:.85; }
+.auth-note code{ font-family:var(--mono); background:var(--surface-2); border:1px solid var(--line);
+  border-radius:4px; padding:1px 5px; color:var(--ink-soft); }
+
+.metarow{ display:flex; flex-wrap:wrap; align-items:center; gap:8px 10px; margin-top:11px; }
+.modes{ display:flex; flex-wrap:wrap; gap:7px; min-width:0; }
+.mode-chip{
+  display:inline-flex; align-items:center; gap:6px; min-width:0;
+  padding:4px 10px; border:1px solid var(--line); border-radius:999px; background:var(--surface); font-size:12px;
+  color:var(--ink-soft);
+}
+.mode-chip b{ color:var(--ink); font-weight:650; }
+
+.runstatus{ margin-left:auto; display:inline-flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.pill{ display:inline-flex; align-items:center; gap:6px; font:12px/1 var(--sans); font-weight:600;
+  padding:5px 11px; border-radius:999px; border:1px solid var(--line); background:var(--surface-2); color:var(--ink-soft); }
+.pill .dotp{ width:7px;height:7px;border-radius:50%; background:var(--faint); }
+.pill.running{ color:var(--accent); border-color:color-mix(in oklab,var(--accent) 40%,var(--line)); background:color-mix(in oklab,var(--accent) 10%, var(--surface)); }
+.pill.running .dotp{ background:var(--accent); animation:pulse 1.8s ease-in-out infinite; }
+.pill.ended{ color:var(--c-pass); border-color:color-mix(in oklab,var(--c-pass) 40%,var(--line)); background:color-mix(in oklab,var(--c-pass) 10%, var(--surface)); }
+.pill.ended .dotp{ background:var(--c-pass); }
+.pill.halted{ color:var(--c-fail); border-color:color-mix(in oklab,var(--c-fail) 40%,var(--line)); background:color-mix(in oklab,var(--c-fail) 10%, var(--surface)); }
+.pill.halted .dotp{ background:var(--c-fail); }
+.gprog{ font:11.5px/1 var(--mono); color:var(--faint); }
+
+/* 仅供屏幕阅读器 */
+.sr-only{ position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
+
+/* ---- 等待人类横幅 ---- */
+.human-banner{
+  max-width:var(--maxw); margin:0 auto;
+  display:flex; align-items:flex-start; gap:11px;
+  padding:11px 22px; margin-bottom:2px;
+  color:color-mix(in oklab, var(--c-pause) 82%, var(--ink));
+  background:color-mix(in oklab, var(--c-pause) 16%, var(--surface));
+  border:1px solid color-mix(in oklab, var(--c-pause) 45%, var(--line));
+  border-radius:10px;
+}
+.human-banner[hidden]{ display:none; }
+.human-banner .hb-ic{ flex:0 0 auto; margin-top:1px; display:grid; place-items:center;
+  width:22px;height:22px;border-radius:50%; color:#fff; background:var(--c-pause);
+  animation:pulse 1.6s ease-in-out infinite; }
+.human-banner .hb-ic svg{width:13px;height:13px}
+.human-banner .hb-body{ min-width:0; }
+.human-banner .hb-k{ font:11px/1 var(--mono); letter-spacing:.1em; text-transform:uppercase; opacity:.85; }
+.human-banner .hb-q{ font-weight:650; margin-top:3px; text-wrap:pretty; }
+.human-banner .hb-opts{ margin-top:6px; display:flex; flex-wrap:wrap; gap:6px; }
+.human-banner .hb-opt{ font:11.5px/1 var(--sans); padding:3px 9px; border-radius:999px;
+  border:1px solid color-mix(in oklab,var(--c-pause) 40%, var(--line)); background:var(--surface); }
+
+/* ---- 主区 ---- */
+main{ max-width:var(--maxw); margin:0 auto; padding:20px 22px 120px; }
+
+.empty{
+  margin:64px auto; max-width:440px; text-align:center; color:var(--faint);
+}
+.empty .e-ic{ width:44px;height:44px;margin:0 auto 14px; color:var(--faint);
+  border:1.5px dashed var(--line-2); border-radius:14px; display:grid; place-items:center; }
+.empty .e-ic svg{ width:22px;height:22px; opacity:.7; }
+.empty h2{ margin:0 0 6px; font-size:15px; font-weight:600; color:var(--ink-soft); }
+.empty p{ margin:0; font-size:13px; }
+.empty .dots span{ animation:blink 1.4s infinite; }
+.empty .dots span:nth-child(2){ animation-delay:.2s } .empty .dots span:nth-child(3){ animation-delay:.4s }
+
+/* 分段(需求→合同 / 每个 goal / 收官)+ 时间线脊 */
+.seg{ position:relative; margin:22px 0 4px; }
+.seg-head{ display:flex; align-items:center; flex-wrap:wrap; gap:9px 10px; padding-bottom:2px; }
+.seg-no{ font:600 12px/1 var(--mono); letter-spacing:.06em; color:#fff;
+  background:var(--gc, var(--faint)); padding:5px 9px; border-radius:7px;
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,.16); }
+.seg-no.plain{ color:var(--ink); background:var(--surface-2); border:1px solid var(--line); box-shadow:none; }
+.seg-title{ font-size:13px; color:var(--ink); font-weight:650; }
+.goal-status{ font:11.5px/1 var(--sans); font-weight:600; padding:4px 9px; border-radius:999px;
+  border:1px solid var(--line); background:var(--surface-2); color:var(--ink-soft); }
+.goal-status.running{ color:var(--accent); border-color:color-mix(in oklab,var(--accent) 40%,var(--line)); background:color-mix(in oklab,var(--accent) 9%,var(--surface)); }
+.goal-status.passed{ color:var(--c-pass); border-color:color-mix(in oklab,var(--c-pass) 40%,var(--line)); background:color-mix(in oklab,var(--c-pass) 10%,var(--surface)); }
+.goal-status.stuck{ color:var(--c-fail); border-color:color-mix(in oklab,var(--c-fail) 40%,var(--line)); background:color-mix(in oklab,var(--c-fail) 10%,var(--surface)); }
+
+/* AC 爬坡条:每迭代一根,高度 = 通过占比;红=该轮 FAIL,绿=PASS */
+.climb{ display:inline-flex; align-items:center; gap:8px; margin-left:auto; }
+.climb-label{ font:10.5px/1 var(--mono); letter-spacing:.08em; text-transform:uppercase; color:var(--faint); }
+.climb-bars{ display:inline-flex; align-items:flex-end; gap:3px; height:22px; }
+.climb-bars i{ display:inline-block; width:9px; min-height:3px; border-radius:2px 2px 0 0;
+  background:var(--c-fail); opacity:.85; }
+.climb-bars i.pass{ background:var(--c-pass); }
+.climb-text{ font:11px/1 var(--mono); color:var(--ink-soft); white-space:nowrap; }
+
+.seg-body{ position:relative; margin-top:11px; padding-left:26px; }
+.seg-body::before{ content:""; position:absolute; left:8px; top:6px; bottom:6px; width:2px;
+  background:linear-gradient(var(--line-2), transparent); border-radius:2px; }
+
+/* 卡片通用 */
+.card{
+  position:relative; background:var(--surface); border:1px solid var(--line);
+  border-radius:var(--radius); padding:13px 15px; margin:11px 0; box-shadow:var(--shadow);
+}
+.card::before{ /* 时间线节点 */
+  content:""; position:absolute; left:-22px; top:19px; width:9px;height:9px; border-radius:50%;
+  background:var(--surface); border:2px solid var(--line-2);
+}
+.card.enter{ animation:cardIn .3s cubic-bezier(.2,.7,.3,1) both; }
+
+.c-head{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; min-width:0; }
+.who{ font-weight:650; min-width:0; }
+.tag{ font:11.5px/1 var(--mono); color:var(--ink-soft); background:var(--surface-2);
+  border:1px solid var(--line); border-radius:6px; padding:3px 7px; white-space:nowrap; }
+.tag.gen{ color:color-mix(in oklab,var(--c-gen) 75%,var(--ink)); border-color:color-mix(in oklab,var(--c-gen) 35%,var(--line)); background:color-mix(in oklab,var(--c-gen) 9%,var(--surface)); }
+.c-meta{ margin-left:auto; display:inline-flex; align-items:center; gap:9px; flex-wrap:wrap;
+  font:11.5px/1 var(--mono); color:var(--faint); }
+.c-body{ margin-top:8px; color:var(--ink); line-height:1.68; text-wrap:pretty; overflow-wrap:anywhere; max-width:72ch; }
+.body-src{ font:10.5px/1 var(--mono); letter-spacing:.06em; color:var(--faint); background:var(--surface-2);
+  border:1px solid var(--line); border-radius:5px; padding:2px 6px; margin-right:8px; white-space:nowrap; }
+.c-kv{ margin-top:8px; font-size:12.8px; color:var(--ink-soft); line-height:1.62; text-wrap:pretty; max-width:72ch; }
+.c-kv .k{ font:10.5px/1 var(--mono); letter-spacing:.08em; text-transform:uppercase; color:var(--faint);
+  display:inline-block; margin-right:6px; }
+.commit-chip{ font:11px/1 var(--mono); color:var(--ink-soft); background:var(--surface-2);
+  border:1px solid var(--line); border-radius:5px; padding:2px 6px; white-space:nowrap; }
+
+/* 生成者交付卡 */
+.card.gen{ border-left:3px solid var(--c-gen); }
+.card.gen::before{ border-color:var(--c-gen); }
+
+/* 访谈 / 面板 / 定稿:弱化 */
+.card.lite{ background:var(--canvas); box-shadow:none; padding:10px 14px; }
+.card.lite .who{ font-weight:600; }
+
+/* === 高层级卡(strip 头) === */
+.card.hi{ box-shadow:var(--shadow-lift); border-width:1px; }
+.card.hi .strip{
+  display:flex; align-items:center; gap:9px; flex-wrap:wrap;
+  margin:-13px -15px 12px; padding:11px 15px; border-radius:var(--radius) var(--radius) 0 0;
+  font-weight:650; letter-spacing:.01em;
+}
+.card.hi .strip .s-ic{ display:grid; place-items:center; width:22px;height:22px;border-radius:7px; color:#fff; flex:0 0 auto; }
+.card.hi .strip .s-ic svg{ width:14px;height:14px; }
+.card.hi .strip .s-sub{ font:12px/1 var(--sans); font-weight:600; opacity:.9; }
+.card.hi .strip .s-right{ margin-left:auto; display:inline-flex; align-items:center; gap:6px; font-weight:500; }
+.c-rationale{ margin-top:10px; font-size:14px; line-height:1.72; color:var(--ink); text-wrap:pretty; max-width:74ch; }
+
+/* 合同(主控色) */
+.card.contract{ border-left:4px solid var(--c-ctrl); }
+.card.contract::before{ background:var(--c-ctrl); border-color:var(--c-ctrl); }
+.card.contract .strip{ background:color-mix(in oklab,var(--c-ctrl) 12%, var(--surface));
+  color:color-mix(in oklab,var(--c-ctrl) 78%, var(--ink)); border-bottom:1px solid color-mix(in oklab,var(--c-ctrl) 24%,var(--line)); }
+.card.contract .strip .s-ic{ background:var(--c-ctrl); }
+.goal-list{ margin-top:10px; display:grid; gap:7px; }
+.goal-row{ display:flex; align-items:center; gap:9px; padding:8px 11px; background:var(--surface-2);
+  border:1px solid var(--line); border-radius:9px; font-size:13px; }
+.goal-row .seg-no{ font-size:11px; padding:4px 7px; }
+.goal-row .g-ac{ margin-left:auto; font:11px/1 var(--mono); color:var(--faint); white-space:nowrap; }
+
+/* 验收 verdict 卡 */
+.card.verdict.pass{ border-left:4px solid var(--c-pass); }
+.card.verdict.pass::before{ background:var(--c-pass); border-color:var(--c-pass); }
+.card.verdict.pass .strip{ background:color-mix(in oklab,var(--c-pass) 12%, var(--surface));
+  color:color-mix(in oklab,var(--c-pass) 70%, var(--ink)); border-bottom:1px solid color-mix(in oklab,var(--c-pass) 24%,var(--line)); }
+.card.verdict.pass .strip .s-ic{ background:var(--c-pass); }
+.card.verdict.fail{ border-left:4px solid var(--c-fail); }
+.card.verdict.fail::before{ background:var(--c-fail); border-color:var(--c-fail); }
+.card.verdict.fail .strip{ background:color-mix(in oklab,var(--c-fail) 11%, var(--surface));
+  color:color-mix(in oklab,var(--c-fail) 74%, var(--ink)); border-bottom:1px solid color-mix(in oklab,var(--c-fail) 24%,var(--line)); }
+.card.verdict.fail .strip .s-ic{ background:var(--c-fail); }
+.acgrid{ margin-top:11px; display:grid; gap:6px; }
+.ac-row{ display:grid; grid-template-columns:auto auto 1fr; gap:9px; align-items:baseline;
+  padding:7px 11px; background:var(--surface-2); border:1px solid var(--line); border-radius:8px; }
+.ac-id{ font:600 11.5px/1.3 var(--mono); color:var(--ink); white-space:nowrap; }
+.ac-st{ font:600 11px/1 var(--mono); padding:3px 7px; border-radius:5px; white-space:nowrap; }
+.ac-st.pass{ color:var(--c-pass); background:color-mix(in oklab,var(--c-pass) 10%,var(--surface)); border:1px solid color-mix(in oklab,var(--c-pass) 30%,var(--line)); }
+.ac-st.fail{ color:var(--c-fail); background:color-mix(in oklab,var(--c-fail) 10%,var(--surface)); border:1px solid color-mix(in oklab,var(--c-fail) 30%,var(--line)); }
+.ac-st.skipped{ color:var(--faint); background:var(--surface-2); border:1px solid var(--line); }
+.ac-st.blocked{ color:var(--c-warn); background:color-mix(in oklab,var(--c-warn) 12%,var(--surface)); border:1px solid color-mix(in oklab,var(--c-warn) 32%,var(--line)); }
+.ac-ev{ font-size:12.5px; color:var(--ink-soft); line-height:1.55; overflow-wrap:anywhere; }
+.defects{ margin-top:11px; }
+.defects h4{ margin:0 0 6px; font:11px/1 var(--mono); letter-spacing:.08em; text-transform:uppercase; color:var(--c-fail); }
+.defects ul{ margin:0; padding-left:18px; }
+.defects li{ margin:4px 0; font-size:12.8px; color:var(--ink-soft); line-height:1.6; text-wrap:pretty; }
+.defects li b{ font:600 11px/1 var(--mono); color:var(--c-fail); }
+
+/* 洁净树审计卡 */
+.card.tainted{ border-left:4px solid var(--c-warn); background:color-mix(in oklab,var(--c-warn) 5%,var(--surface)); }
+.card.tainted::before{ background:var(--c-warn); border-color:var(--c-warn); }
+
+/* 合同增补卡 */
+.card.amend{ border-left:3px solid var(--c-warn); }
+.card.amend::before{ border-color:var(--c-warn); }
+
+/* 等待拍板卡(human:asked) */
+.card.ask{ border-left:4px solid var(--c-pause); }
+.card.ask::before{ background:var(--c-pause); border-color:var(--c-pause); }
+.card.ask .strip{ background:color-mix(in oklab,var(--c-pause) 15%, var(--surface));
+  color:color-mix(in oklab,var(--c-pause) 78%, var(--ink)); border-bottom:1px solid color-mix(in oklab,var(--c-pause) 30%,var(--line)); }
+.card.ask .strip .s-ic{ background:var(--c-pause); }
+.ask-q{ margin-top:10px; font-size:15px; font-weight:600; line-height:1.55; text-wrap:pretty; max-width:70ch; }
+.ask-opts{ margin-top:9px; display:flex; flex-wrap:wrap; gap:7px; }
+.ask-opt{ font:12px/1 var(--sans); padding:5px 11px; border-radius:8px; background:var(--surface);
+  border:1px solid var(--line-2); color:var(--ink-soft); }
+.ask-state{ margin-top:11px; display:inline-flex; align-items:center; gap:7px; font-size:12.5px; font-weight:600;
+  color:color-mix(in oklab,var(--c-pause) 80%,var(--ink)); }
+.ask-state .dotp{ width:7px;height:7px;border-radius:50%;background:var(--c-pause); animation:pulse 1.6s ease-in-out infinite; }
+.card.ask.resolved{ border-left-color:var(--c-pass); }
+.card.ask.resolved::before{ background:var(--c-pass); border-color:var(--c-pass); }
+.card.ask.resolved .ask-state{ color:var(--c-pass); }
+.card.ask.resolved .ask-state .dotp{ background:var(--c-pass); animation:none; }
+
+/* 访谈卡等待态 */
+.intake-state{ margin-top:8px; display:inline-flex; align-items:center; gap:7px; font-size:12px; font-weight:600; color:var(--faint); }
+.intake-state .dotp{ width:6px;height:6px;border-radius:50%;background:var(--faint); animation:pulse 1.6s ease-in-out infinite; }
+.card.intake.resolved .intake-state{ color:var(--c-pass); }
+.card.intake.resolved .intake-state .dotp{ background:var(--c-pass); animation:none; }
+
+/* 收官评审卡 */
+.card.review.approve{ border-left:4px solid var(--c-pass); }
+.card.review.approve::before{ background:var(--c-pass); border-color:var(--c-pass); }
+.card.review.approve .strip{ background:color-mix(in oklab,var(--c-pass) 12%,var(--surface));
+  color:color-mix(in oklab,var(--c-pass) 70%,var(--ink)); border-bottom:1px solid color-mix(in oklab,var(--c-pass) 24%,var(--line)); }
+.card.review.approve .strip .s-ic{ background:var(--c-pass); }
+.card.review.needsfixes{ border-left:4px solid var(--c-warn); }
+.card.review.needsfixes::before{ background:var(--c-warn); border-color:var(--c-warn); }
+.card.review.needsfixes .strip{ background:color-mix(in oklab,var(--c-warn) 12%,var(--surface));
+  color:color-mix(in oklab,var(--c-warn) 76%,var(--ink)); border-bottom:1px solid color-mix(in oklab,var(--c-warn) 24%,var(--line)); }
+.card.review.needsfixes .strip .s-ic{ background:var(--c-warn); }
+
+/* 文件按钮 + 展开区 */
+.filebtn{ display:inline-flex; align-items:center; gap:5px; font:12px/1 var(--sans); color:var(--accent);
+  background:none; border:1px solid var(--line-2); border-radius:7px; padding:5px 9px; cursor:pointer; }
+.filebtn:hover{ background:color-mix(in oklab,var(--accent) 8%,var(--surface)); border-color:color-mix(in oklab,var(--accent) 35%,var(--line-2)); }
+.filebtn svg{ width:13px;height:13px; }
+.file-slot{ margin-top:11px; border-top:1px dashed var(--line-2); padding-top:11px; animation:cardIn .24s ease both; }
+.file-loading, .file-error{ font:12.5px/1.5 var(--mono); color:var(--faint); }
+.file-error{ color:var(--c-fail); }
+/* 原文出处小注:一眼确认是委托 agent 原话、未经主控转写 */
+.prov-note{ font:11px/1.5 var(--mono); color:var(--faint); margin-bottom:9px;
+  padding-left:9px; border-left:2px solid var(--line-2); }
+
+/* 内联 Markdown 渲染 */
+.md-body{ color:var(--ink); line-height:1.72; font-size:14px; overflow-wrap:anywhere; }
+.md-body h3,.md-body h4,.md-body h5{ margin:14px 0 6px; line-height:1.4; }
+.md-body h3{ font-size:15px; } .md-body h4{ font-size:13.5px; color:var(--ink-soft); }
+.md-body h3:first-child,.md-body h4:first-child{ margin-top:0; }
+.md-body p{ margin:7px 0; text-wrap:pretty; max-width:72ch; }
+.md-body ul,.md-body ol{ margin:7px 0; padding-left:22px; }
+.md-body li{ margin:3px 0; text-wrap:pretty; }
+.md-body strong{ font-weight:650; color:var(--ink); }
+.md-body code{ font:12.5px/1 var(--mono); background:var(--surface-2); border:1px solid var(--line);
+  border-radius:5px; padding:1px 5px; }
+.md-body hr{ border:none; border-top:1px solid var(--line); margin:12px 0; }
+
+/* === 收官面板 === */
+.final{
+  position:relative; margin:26px 0 6px; padding:0; overflow:hidden;
+  background:var(--surface); border:1px solid color-mix(in oklab,var(--c-pass) 34%,var(--line));
+  border-radius:16px; box-shadow:var(--shadow-lift);
+}
+.final::after{ content:""; position:absolute; inset:0 auto 0 0; width:5px; background:var(--c-pass); }
+.final.enter{ animation:cardIn .38s cubic-bezier(.2,.7,.3,1) both; }
+.final-head{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; padding:14px 18px;
+  background:color-mix(in oklab,var(--c-pass) 12%, var(--surface));
+  border-bottom:1px solid color-mix(in oklab,var(--c-pass) 22%,var(--line)); }
+.final-head .f-ic{ width:26px;height:26px;border-radius:8px;display:grid;place-items:center;color:#fff;background:var(--c-pass);flex:0 0 auto; }
+.final-head .f-ic svg{ width:16px;height:16px; }
+.final-head h2{ margin:0; font-size:16px; color:color-mix(in oklab,var(--c-pass) 62%,var(--ink)); }
+.final-head .filebtn{ margin-left:auto; }
+.final-pad{ padding:16px 18px 18px; }
+.final-line{ font-size:15.5px; font-weight:600; line-height:1.6; color:var(--ink); text-wrap:pretty; max-width:74ch; }
+.final-line .k{ display:block; font:11px/1 var(--mono); letter-spacing:.1em; text-transform:uppercase; color:var(--c-pass); margin-bottom:6px; }
+.final-branch{ margin-top:10px; }
+.final .file-slot{ margin:0 18px 18px; }
+
+/* 「↓ 有新进展」浮标 */
+.jump{ position:fixed; left:50%; bottom:22px; transform:translateX(-50%);
+  display:inline-flex; align-items:center; gap:7px; font:12.5px/1 var(--sans); font-weight:600; color:#fff;
+  background:var(--accent); border:none; border-radius:999px; padding:9px 15px; cursor:pointer;
+  box-shadow:0 8px 24px -8px color-mix(in oklab,var(--accent) 70%,transparent); z-index:15; }
+.jump[hidden]{ display:none; }
+.jump:hover{ filter:brightness(1.06); }
+.jump svg{ width:13px;height:13px; }
+
+/* icon 基类 */
+.ic{ width:15px;height:15px; vertical-align:-2px; }
+
+/* 动画 */
+@keyframes cardIn{ from{opacity:0; transform:translateY(7px);} to{opacity:1; transform:none;} }
+@keyframes pulse{ 0%,100%{opacity:1;} 50%{opacity:.35;} }
+@keyframes blink{ 0%,100%{opacity:1;} 50%{opacity:.25;} }
+@media (prefers-reduced-motion: reduce){ *{ animation:none !important; scroll-behavior:auto !important; } }
+
+/* 响应式:窄窗口 */
+@media (max-width:640px){
+  .topbar-inner{ padding:11px 15px; }
+  main{ padding:16px 15px 120px; }
+  .task{ font-size:15.5px; }
+  .runstatus{ margin-left:0; width:100%; }
+  .seg-body{ padding-left:20px; }
+  .card::before{ left:-17px; }
+  .c-meta{ width:100%; margin-left:0; }
+  .climb{ margin-left:0; width:100%; }
+  .ac-row{ grid-template-columns:auto auto; }
+  .ac-ev{ grid-column:1 / -1; }
+}
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <div id="human-banner" class="human-banner" role="alert" aria-live="assertive" hidden></div>
+
+    <div class="brandrow">
+      <span class="brand">
+        <span class="glyph" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12a8 8 0 0 1 13.6-5.7L20 8.5"/><path d="M20 4v4.5h-4.5"/><path d="M20 12a8 8 0 0 1-13.6 5.7L4 15.5"/><path d="M4 20v-4.5h4.5"/></svg></span>
+        Loop 交付 · 观察台
+      </span>
+      <span class="spacer"></span>
+      <span class="conn" id="conn" data-s="connecting" aria-live="polite"><span class="led"></span><span id="connText">连接中…</span></span>
+      <button class="theme-toggle" id="themeToggle" type="button" aria-label="切换配色主题">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v2M12 19v2M5 12H3M21 12h-2M6 6l-1.5-1.5M19.5 19.5 18 18M18 6l1.5-1.5M4.5 19.5 6 18"/><circle cx="12" cy="12" r="4"/></svg>
+        <span id="themeLabel">自动</span>
+      </button>
+    </div>
+
+    <div class="task" id="task"><span class="t-label">任务</span><span id="taskText">等待 loop 开始…</span></div>
+
+    <div class="metarow">
+      <div class="modes" id="modes" aria-label="运行模式"></div>
+      <div class="runstatus" id="runstatus">
+        <span class="pill" id="statusPill"><span class="dotp"></span><span id="statusText">未开始</span></span>
+        <span class="gprog" id="gprog"></span>
+      </div>
+    </div>
+
+    <div class="auth-note" aria-label="验收权威说明">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l7 4v5c0 4.4-3 8.2-7 9-4-.8-7-4.6-7-9V7z"/><path d="M9 12l2 2 4-4.5"/></svg>
+      <span>验收权威 = 独立验证者(引擎≠生成者,逐条 <code>AC</code> 亲手执行);生成者自述不作数,主控只记账不验收</span>
+    </div>
+  </div>
+</header>
+
+<main id="main">
+  <div class="empty" id="empty">
+    <div class="e-ic" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12a8 8 0 0 1 13.6-5.7L20 8.5"/><path d="M20 4v4.5h-4.5"/><path d="M20 12a8 8 0 0 1-13.6 5.7L4 15.5"/><path d="M4 20v-4.5h4.5"/></svg></div>
+    <h2>等待 loop 开始</h2>
+    <p>连接就绪后,这里会实时放出访谈、合同、每轮生成与验收、爬坡与终稿<span class="dots"><span>·</span><span>·</span><span>·</span></span></p>
+  </div>
+  <div id="timeline" role="log" aria-live="polite" aria-label="交付时间线"></div>
+  <div id="finalSlot"></div>
+</main>
+
+<button class="jump" id="jump" type="button" hidden>
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M6 13l6 6 6-6"/></svg>
+  有新进展 <span id="jumpN"></span>
+</button>
+
+<script>
+"use strict";
+/* ============================================================
+   数据契约(与服务器一致,勿改字段名):
+     GET /events  — SSE:先回放已发生的全部事件,再实时推送
+                    · 默认 message 事件,e.data 是一行 JSON
+                    · 具名 reset 事件 → 清空整个视图
+                    · 按 seq 去重(断线重连会全量重放)
+     GET /file?ref=<相对路径>  — 按需取旁挂大文本(text/plain)
+   —— 若探测不到服务器(纯原型/独立打开),自动回放内联样例,
+      走同一套 handle()/去重/渲染 管线;服务器一在即用真实数据。
+   事件 schema 见 EVENTS.md(agent-bridge-loop)。
+   ============================================================ */
+
+/* ---------- goal 固定色(浅深色下均可辨;不只靠颜色,另有 G 编号) ---------- */
+var GOAL_PALETTE = ["#0f9d8f","#7c5cff","#e24a7a","#2f9be0","#c98a17","#5b8def"];
+var STUCK_LABEL = { "halt":"无人值守中止", "user-extend":"用户:加轮", "user-amend":"用户:改合同", "user-abandon":"用户:放弃" };
+var TERM_LABEL = { done:"交付完成", stuck:"卡死中止", user:"用户终止", error:"异常终止" };
+
+var goals = {};            // goalId -> {sec, body, statusEl, climbEl, climb:[], color, title}
+var segs = {};             // 分段 key(@intake/@closing/goalId) -> {sec, body}
+var currentKey = "@intake"; // 无显式 goal 的事件按时间挂到当前分段
+var goalsTotal = null, goalsPassed = 0;
+var pendingHuman = {};     // questionId -> question
+var askedCards = {};       // questionId -> card element
+var intakeQueue = [];      // 未答的访谈卡(FIFO)
+var seen = new Set();      // 已见 seq → 去重
+
+var elTimeline = document.getElementById("timeline");
+var elFinal    = document.getElementById("finalSlot");
+var elEmpty    = document.getElementById("empty");
+var elBanner   = document.getElementById("human-banner");
+
+/* ---------- 工具 ---------- */
+function esc(s){ return String(s==null?"":s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];}); }
+
+var ICONS = {
+  contract:'<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7v18h10V7z"/><path d="M14 3v4h3M9.5 12h5M9.5 15.5h5M9.5 8.5H11"/></svg>',
+  flask:'<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M10 3v6L4.8 18a2 2 0 0 0 1.7 3h11a2 2 0 0 0 1.7-3L14 9V3"/><path d="M8.5 3h7M7.5 14h9"/></svg>',
+  hammer:'<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 4.5 19 9l-2.2 2.2-4.5-4.5z"/><path d="M12.3 6.7 4 15l3 3 8.3-8.3"/></svg>',
+  pause:'<svg class="ic" viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="6.5" y="5" width="3.6" height="14" rx="1.2"/><rect x="13.9" y="5" width="3.6" height="14" rx="1.2"/></svg>',
+  check:'<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 13l4 4L19 7"/></svg>',
+  cross:'<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 6l12 12M18 6L6 18"/></svg>',
+  shield:'<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 4v5c0 4.4-3 8.2-7 9-4-.8-7-4.6-7-9V7z"/><path d="M9 12l2 2 4-4.5"/></svg>',
+  warn:'<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4 2.8 20h18.4z"/><path d="M12 10v4M12 17.2v.3"/></svg>',
+  doc:'<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7v18h10V7z"/><path d="M14 3v4h3M9.5 12h5M9.5 15.5h5"/></svg>',
+  chat:'<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a8 8 0 0 1-8 8H4l2.2-2.6A8 8 0 1 1 21 12z"/><path d="M8.5 10.5h7M8.5 13.5h4.5"/></svg>'
+};
+
+function fileBtn(ref, label){
+  if(!ref) return "";
+  return '<button class="filebtn" type="button" data-ref="'+esc(ref)+'" aria-expanded="false">'+ICONS.doc+esc(label||"查看全文")+'</button>';
+}
+
+/* ---------- 分段(需求→合同 / goal / 收官) ---------- */
+function segMeta(key){
+  if(key === "@intake")  return { no:"起点", plain:true,  title:"需求 → 合同" };
+  if(key === "@closing") return { no:"收官", plain:true,  title:"整支评审 → 交付" };
+  var g = goals[key] || {};
+  return { no:key, plain:false, title:g.title || "", color:g.color };
+}
+function segFor(key){
+  if(segs[key]) return segs[key];
+  var m = segMeta(key);
+  var sec = document.createElement("section"); sec.className="seg"; sec.dataset.k = key;
+  var head = document.createElement("div"); head.className="seg-head";
+  head.innerHTML = '<span class="seg-no'+(m.plain?' plain':'')+'"'+(m.color?' style="--gc:'+m.color+'"':'')+'>'+esc(m.no)+'</span>'
+    + '<span class="seg-title">'+esc(m.title)+'</span>'
+    + (m.plain ? '' : '<span class="goal-status running">进行中</span><span class="climb" hidden><span class="climb-label">AC 爬坡</span><span class="climb-bars"></span><span class="climb-text"></span></span>');
+  var body = document.createElement("div"); body.className="seg-body";
+  sec.appendChild(head); sec.appendChild(body);
+  elTimeline.appendChild(sec);   // 事件按时间到达,分段按创建序排列
+  segs[key] = { sec:sec, head:head, body:body,
+    statusEl: head.querySelector(".goal-status"),
+    climbEl:  head.querySelector(".climb") };
+  return segs[key];
+}
+function addCard(key, cls, html){
+  hideEmpty();
+  var c = document.createElement("div");
+  c.className = "card enter" + (cls?(" "+cls):"");
+  c.innerHTML = html;
+  c.addEventListener("animationend", function(){ c.classList.remove("enter"); }, {once:true});
+  segFor(key).body.appendChild(c);
+  maybeFollow();
+  return c;
+}
+function hideEmpty(){ if(elEmpty && !elEmpty.hidden){ elEmpty.hidden = true; } }
+
+/* ---------- 爬坡 ---------- */
+function renderClimb(goalId){
+  var g = goals[goalId]; if(!g) return;
+  var seg = segs[goalId]; if(!seg || !seg.climbEl) return;
+  if(!g.climb.length){ seg.climbEl.hidden = true; return; }
+  seg.climbEl.hidden = false;
+  var bars = seg.climbEl.querySelector(".climb-bars");
+  var text = seg.climbEl.querySelector(".climb-text");
+  bars.innerHTML = g.climb.map(function(it){
+    var pct = it.total ? Math.max(14, Math.round(it.passed/it.total*100)) : 14;
+    return '<i class="'+(it.verdict==="pass"?"pass":"")+'" style="height:'+pct+'%" title="i'+it.n+": "+it.passed+"/"+it.total+'"></i>';
+  }).join("");
+  text.textContent = g.climb.map(function(it){ return it.passed+"/"+it.total; }).join(" → ");
+}
+function setGoalStatus(goalId, cls, label){
+  var seg = segs[goalId]; if(!seg || !seg.statusEl) return;
+  seg.statusEl.className = "goal-status "+cls;
+  seg.statusEl.textContent = label;
+}
+function setGprog(){
+  var el = document.getElementById("gprog");
+  if(goalsTotal!=null) el.textContent = "goals "+goalsPassed+"/"+goalsTotal+(goalsPassed===goalsTotal?" ✅":"");
+}
+
+/* ---------- 事件分发 ---------- */
+function handle(ev){
+  if(!ev || typeof ev !== "object") return;
+  if(ev.seq != null){ if(seen.has(ev.seq)) return; seen.add(ev.seq); }  // 断线重连去重
+  var p = ev.payload || {};
+  switch(ev.event){
+
+    case "run:started": {
+      hideEmpty();
+      setText("taskText", p.task || "(未命名任务)");
+      var m = p.mode || {};
+      var box = document.getElementById("modes"); box.innerHTML = "";
+      var chips = [
+        (m.human===false) ? "模式 <b>无人值守</b>" : "模式 <b>人在环</b>",
+        "评审团 <b>"+esc(m.panel==="architects"?"双架构师":(m.panel==="roundtable"?"圆桌":"无"))+"</b>",
+        "工作区 <b>"+esc(m.workspace==="worktree"?"worktree+branch":"主树")+"</b>"
+      ];
+      if(p.iterCap!=null) chips.push("迭代上限 <b>"+esc(p.iterCap)+"</b>/goal");
+      if(p.branch) chips.push("branch <b>"+esc(p.branch)+"</b>");
+      chips.forEach(function(h){ var s=document.createElement("span"); s.className="mode-chip"; s.innerHTML=h; box.appendChild(s); });
+      setStatus("进行中", "running");
+      break;
+    }
+
+    case "intake:asked": {
+      var card = addCard(currentKey, "lite intake",
+        '<div class="c-head"><span class="tag">'+ICONS.chat+' 需求访谈</span></div>'
+        + '<div class="c-body">'+esc(p.question||"")+'</div>'
+        + '<div class="intake-state"><span class="dotp"></span>等待回答…</div>');
+      intakeQueue.push(card);
+      break;
+    }
+    case "intake:answered": {
+      var ic = intakeQueue.shift();
+      if(ic){
+        ic.classList.add("resolved");
+        var st = ic.querySelector(".intake-state");
+        if(st) st.innerHTML = '<span class="dotp"></span>已答 · '+esc(p.answer||"");
+        maybeFollow();
+      } else {
+        addCard(currentKey, "lite", '<div class="c-head"><span class="tag">'+ICONS.check+' 访谈已答</span><span class="who" style="font-weight:600">'+esc(p.answer||"")+'</span></div>');
+      }
+      break;
+    }
+
+    case "panel:launched":
+      addCard(currentKey, "lite",
+        '<div class="c-head"><span class="tag">评审团拉起</span>'
+        + '<span class="who">'+esc(p.kind==="roundtable"?"圆桌":"双架构师")+'</span>'
+        + (p.runDir ? '<span class="c-meta">'+esc(p.runDir)+'</span>' : '')+'</div>');
+      break;
+    case "panel:concluded":
+      addCard(currentKey, "lite",
+        '<div class="c-head"><span class="tag">'+ICONS.check+' 评审团收口</span>'
+        + '<span class="c-meta">'+fileBtn(p.summaryRef,"面板结论")+'</span></div>');
+      break;
+
+    case "contract:drafted": {
+      var rows = (p.goals||[]).map(function(g, i){
+        return '<div class="goal-row"><span class="seg-no" style="--gc:'+GOAL_PALETTE[i%GOAL_PALETTE.length]+'">'+esc(g.id)+'</span>'
+          + '<span>'+esc(g.title||"")+'</span>'
+          + '<span class="g-ac">'+esc(g.acCount!=null?g.acCount:"?")+' AC</span></div>';
+      }).join("");
+      goalsTotal = (p.goals||[]).length || goalsTotal; setGprog();
+      addCard(currentKey, "hi contract",
+        '<div class="strip"><span class="s-ic">'+ICONS.contract+'</span>验收合同<span class="s-sub">· 草案</span>'
+        + '<span class="s-right">'+fileBtn(p.contractRef,"合同全文")+'</span></div>'
+        + '<div class="goal-list">'+(rows||'<span style="color:var(--faint)">(无 goal)</span>')+'</div>');
+      break;
+    }
+    case "contract:confirmed":
+      addCard(currentKey, "lite",
+        '<div class="c-head"><span class="tag">'+ICONS.check+' 合同定稿</span>'
+        + '<span class="who">'+(p.by==="panel"?"面板批判后定稿":"用户确认")+'</span></div>'
+        + (p.changes ? '<div class="c-kv"><span class="k">改动</span>'+esc(p.changes)+'</div>' : ''));
+      break;
+    case "contract:amended":
+      addCard(currentKey, "amend",
+        '<div class="c-head"><span class="tag">'+ICONS.warn+' 合同增补</span>'
+        + ((p.affectedGoals&&p.affectedGoals.length) ? '<span class="c-meta">影响 '+esc(p.affectedGoals.join(", "))+'</span>' : '')+'</div>'
+        + (p.changes ? '<div class="c-body">'+esc(p.changes)+'</div>' : ''));
+      break;
+
+    case "goal:started": {
+      var gid = p.goalId; if(!gid) break;
+      var idx = Object.keys(goals).length;
+      goals[gid] = { title:p.title||"", acCount:p.acCount, color:GOAL_PALETTE[idx%GOAL_PALETTE.length], climb:[] };
+      currentKey = gid;
+      segFor(gid);
+      break;
+    }
+
+    case "iter:started":
+      break; // 迭代号由 gen/verdict 卡自带,不单独出卡
+
+    case "gen:produced": {
+      var key = p.goalId || currentKey;
+      addCard(key, "gen",
+        '<div class="c-head"><span class="tag gen">'+ICONS.hammer+' 生成者 · i'+esc(p.n!=null?p.n:"?")+'</span>'
+        + (p.commit ? '<span class="commit-chip">'+esc(p.commit)+'</span>' : '')
+        + '<span class="c-meta">'+((p.filesChanged&&p.filesChanged.length)?p.filesChanged.length+" 文件":"")+fileBtn(p.genRef,"生成者原文")+'</span></div>'
+        + (p.summary ? '<div class="c-body"><span class="body-src">主控摘要</span>'+esc(p.summary)+'</div>' : '<div class="c-body" style="color:var(--faint)">(无摘要)</div>'));
+      break;
+    }
+
+    case "val:verdict": {
+      var key2 = p.goalId || currentKey;
+      var isPass = p.verdict === "pass";
+      var acHtml = (p.acResults||[]).map(function(a){
+        var st = a.status||"?";
+        var stTxt = ({pass:"PASS",fail:"FAIL",skipped:"未执行",blocked:"BLOCKED"})[st] || st;
+        return '<div class="ac-row"><span class="ac-id">'+esc(a.acId||"AC?")+'</span>'
+          + '<span class="ac-st '+esc(st)+'">'+esc(stTxt)+'</span>'
+          + '<span class="ac-ev">'+esc(a.evidence || (st==="skipped" ? "lazy:其余 AC 未全绿,本轮未执行" : ""))+'</span></div>';
+      }).join("");
+      var defHtml = (p.defects&&p.defects.length)
+        ? '<div class="defects"><h4>缺陷(打回生成者)</h4><ul>'+p.defects.map(function(d){
+            return '<li>'+(d.acId?'<b>['+esc(d.acId)+']</b> ':'')+esc(d.desc||"")+'</li>';
+          }).join("")+'</ul></div>' : '';
+      addCard(key2, "hi verdict "+(isPass?"pass":"fail"),
+        '<div class="strip"><span class="s-ic">'+ICONS.flask+'</span>独立验收<span class="s-sub">· i'+esc(p.n!=null?p.n:"?")+' · '+(isPass?"PASS":"FAIL")+'</span>'
+        + '<span class="s-right">'+fileBtn(p.verdictRef,"验收原文")+'</span></div>'
+        + '<div class="acgrid">'+acHtml+'</div>' + defHtml);
+      var g = goals[key2];
+      if(g && p.acResults && p.acResults.length){
+        var passed = p.acResults.filter(function(a){ return a.status==="pass"; }).length;
+        g.climb.push({ n:p.n, passed:passed, total:p.acResults.length, verdict:p.verdict });
+        renderClimb(key2);
+      }
+      break;
+    }
+
+    case "val:tainted":
+      addCard(p.goalId || currentKey, "tainted",
+        '<div class="c-head"><span class="tag">'+ICONS.warn+' 洁净树审计不过</span>'
+        + '<span class="c-meta">i'+esc(p.n!=null?p.n:"?")+'</span></div>'
+        + '<div class="c-body">验证者改了 tracked 产品文件'
+        + ((p.files&&p.files.length)?':<code style="font-family:var(--mono)"> '+esc(p.files.join(", "))+'</code>':'')
+        + ' —— 本次 verdict 作废,已撤销改动并以 fresh 会话重验。</div>');
+      break;
+
+    case "goal:passed": {
+      var gid2 = p.goalId; if(!gid2) break;
+      setGoalStatus(gid2, "passed", "✅ 通过 · "+(p.iters!=null?p.iters+" 迭代":""));
+      goalsPassed++; setGprog();
+      break;
+    }
+    case "goal:stuck": {
+      var gid3 = p.goalId; if(!gid3) break;
+      setGoalStatus(gid3, "stuck", "⛔ 卡死 · "+(STUCK_LABEL[p.policy]||p.policy||""));
+      addCard(gid3, "tainted",
+        '<div class="c-head"><span class="tag">'+ICONS.warn+' goal 卡死</span>'
+        + '<span class="c-meta">'+esc(STUCK_LABEL[p.policy]||p.policy||"")+'</span></div>'
+        + (p.note ? '<div class="c-body">'+esc(p.note)+'</div>' : ''));
+      break;
+    }
+
+    case "human:asked": {
+      pendingHuman[p.questionId] = p.question || "(待确认)";
+      refreshBanner();
+      var card2 = addCard(currentKey, "ask",
+        '<div class="strip"><span class="s-ic">'+ICONS.pause+'</span>升级问人</div>'
+        + '<div class="ask-q">'+esc(p.question||"")+'</div>'
+        + (p.why ? '<div class="c-kv"><span class="k">为何问你</span>'+esc(p.why)+'</div>' : '')
+        + ((p.options&&p.options.length) ? '<div class="ask-opts">'+p.options.map(function(o){return '<span class="ask-opt">'+esc(o)+'</span>';}).join("")+'</div>' : '')
+        + '<div class="ask-state"><span class="dotp"></span>等待你拍板…</div>');
+      if(p.questionId!=null) askedCards[p.questionId] = card2;
+      break;
+    }
+    case "human:answered": {
+      delete pendingHuman[p.questionId]; refreshBanner();
+      var ac = (p.questionId!=null) ? askedCards[p.questionId] : null;
+      if(ac){
+        ac.classList.add("resolved");
+        var st2 = ac.querySelector(".ask-state");
+        if(st2) st2.innerHTML = '<span class="dotp"></span>已拍板 · '+esc(p.answer||"");
+        maybeFollow();
+      } else {
+        addCard(currentKey, "lite",
+          '<div class="c-head"><span class="tag">'+ICONS.check+' 人已拍板</span>'
+          + '<span class="who" style="font-weight:600">'+esc(p.answer||"")+'</span></div>');
+      }
+      break;
+    }
+
+    case "review:final": {
+      currentKey = "@closing";
+      var ok = p.verdict === "approve";
+      addCard("@closing", "hi review "+(ok?"approve":"needsfixes"),
+        '<div class="strip"><span class="s-ic">'+ICONS.shield+'</span>收官评审<span class="s-sub">· 整支 broad review · 第 '+esc(p.round!=null?p.round:"?")+' 轮 · '+(ok?"APPROVE":"NEEDS_FIXES")+'</span>'
+        + '<span class="s-right">'+fileBtn(p.reviewRef,"评审报告")+'</span></div>'
+        + (ok ? '' : '<div class="c-body">缺陷已打回生成者,修复后复评。</div>'));
+      break;
+    }
+
+    case "run:final": {
+      hideEmpty();
+      if(p.goalsPassed!=null && p.goalsTotal!=null){ goalsPassed = p.goalsPassed; goalsTotal = p.goalsTotal; setGprog(); }
+      var div = document.createElement("div"); div.className = "final enter";
+      div.addEventListener("animationend", function(){ div.classList.remove("enter"); }, {once:true});
+      div.innerHTML =
+        '<div class="final-head"><span class="f-ic">'+ICONS.check+'</span><h2>交付</h2>'+fileBtn(p.reportRef,"完整报告")+'</div>'
+        + '<div class="final-pad">'
+        + '<div class="final-line"><span class="k">结果</span>'+esc((p.goalsPassed!=null?p.goalsPassed:"?")+" / "+(p.goalsTotal!=null?p.goalsTotal:"?"))+' goals 验收通过</div>'
+        + (p.branch ? '<div class="final-branch"><span class="commit-chip">交付 branch:'+esc(p.branch)+'</span></div>' : '')
+        + '</div>';
+      elFinal.innerHTML = ""; elFinal.appendChild(div);
+      maybeFollow();
+      break;
+    }
+
+    case "run:terminated":
+      setStatus("已结束 · "+(TERM_LABEL[p.reason]||p.reason||""), (p.reason==="done")?"ended":((p.reason==="stuck"||p.reason==="error")?"halted":"ended"));
+      break;
+
+    case "viz:started":
+    case "viz:stopped":
+      break; // 观察台无需展示
+
+    default:
+      break; // 未知事件类型 → 安静忽略,不崩
+  }
+}
+
+/* ---------- 等待横幅 ---------- */
+function refreshBanner(){
+  var qs = Object.keys(pendingHuman).map(function(k){ return pendingHuman[k]; });
+  if(qs.length){
+    elBanner.hidden = false;
+    elBanner.innerHTML = '<span class="hb-ic">'+ICONS.pause+'</span>'
+      + '<div class="hb-body"><span class="hb-k">正在等你拍板</span>'
+      + qs.map(function(q){ return '<div class="hb-q">'+esc(q)+'</div>'; }).join("")
+      + '</div>';
+  } else {
+    elBanner.hidden = true; elBanner.innerHTML = "";
+  }
+}
+
+/* ---------- 头部状态 ---------- */
+function setText(id, t){ var e=document.getElementById(id); if(e) e.textContent = t; }
+function setStatus(text, kind){
+  var pill = document.getElementById("statusPill");
+  pill.className = "pill" + (kind?(" "+kind):"");
+  setText("statusText", text);
+}
+
+/* ---------- reset:清空整个视图,等新数据从头重放 ---------- */
+function resetView(){
+  seen.clear();
+  goals = {}; segs = {}; currentKey = "@intake";
+  goalsTotal = null; goalsPassed = 0;
+  pendingHuman = {}; askedCards = {}; intakeQueue = [];
+  elTimeline.innerHTML = ""; elFinal.innerHTML = "";
+  document.getElementById("modes").innerHTML = "";
+  setText("taskText", "等待 loop 开始…"); setText("gprog", "");
+  setStatus("未开始", "");
+  refreshBanner();
+  if(elEmpty) elEmpty.hidden = false;
+  pending = 0; document.getElementById("jump").hidden = true; stick = true;
+}
+
+/* ---------- 按需取旁挂全文(真实:/file?ref=;样例:内联) ---------- */
+async function fetchFile(ref){
+  if(DEMO){
+    if(Object.prototype.hasOwnProperty.call(DEMO_FILES, ref)) return DEMO_FILES[ref];
+    throw new Error("样例中无此文件");
+  }
+  var res = await fetch("/file?ref=" + encodeURIComponent(ref));
+  if(!res.ok) throw new Error("HTTP " + res.status);
+  return await res.text();
+}
+
+/* 点击展开/收起全文 */
+document.getElementById("main").addEventListener("click", async function(e){
+  var btn = e.target.closest(".filebtn"); if(!btn) return;
+  var host = btn.closest(".card, .final"); if(!host) return;
+  var slot = host.querySelector(":scope > .file-slot");
+  if(slot && slot.dataset.ref === btn.dataset.ref){ slot.remove(); btn.setAttribute("aria-expanded","false"); return; }
+  if(slot) slot.remove();
+  slot = document.createElement("div"); slot.className = "file-slot"; slot.dataset.ref = btn.dataset.ref;
+  slot.innerHTML = '<div class="file-loading">载入中…</div>';
+  host.appendChild(slot); btn.setAttribute("aria-expanded","true");
+  try{
+    var text = await fetchFile(btn.dataset.ref);
+    var prov = /^iterations\//.test(btn.dataset.ref)
+      ? '<div class="prov-note">委托 agent 原文 · 桥 textRef 字节直传 · 非主控转写</div>' : '';
+    slot.innerHTML = prov + '<div class="md-body">' + mdToHtml(text) + '</div>';
+  }catch(err){
+    slot.innerHTML = '<div class="file-error">无法载入:' + esc(btn.dataset.ref) + '</div>';
+  }
+  maybeFollow();
+});
+
+/* ---------- 极小型 · 安全 Markdown(先转义,再套受控标签,零外链) ---------- */
+function mdToHtml(src){
+  var inline = function(s){
+    return esc(s)
+      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+      .replace(/`([^`]+)`/g, "<code>$1</code>");
+  };
+  var lines = String(src).replace(/\r\n?/g, "\n").split("\n");
+  var out = "", ul = false, ol = false;
+  var closeLists = function(){ if(ul){ out+="</ul>"; ul=false; } if(ol){ out+="</ol>"; ol=false; } };
+  for(var i=0;i<lines.length;i++){
+    var line = lines[i].replace(/\s+$/,"");
+    if(!line.trim()){ closeLists(); continue; }
+    var m;
+    if(/^#{1,6}\s+/.test(line)){ closeLists(); var lvl=line.match(/^#+/)[0].length; var h=Math.min(lvl+2,6);
+      out += "<h"+h+">"+inline(line.replace(/^#+\s+/,""))+"</h"+h+">"; continue; }
+    if(/^\s*(---+|\*\*\*+)\s*$/.test(line)){ closeLists(); out += "<hr>"; continue; }
+    if((m = line.match(/^\s*[-*]\s+(.*)$/))){ if(!ul){ closeLists(); out+="<ul>"; ul=true; } out += "<li>"+inline(m[1])+"</li>"; continue; }
+    if((m = line.match(/^\s*\d+[.)]\s+(.*)$/))){ if(!ol){ closeLists(); out+="<ol>"; ol=true; } out += "<li>"+inline(m[1])+"</li>"; continue; }
+    closeLists(); out += "<p>"+inline(line)+"</p>";
+  }
+  closeLists();
+  return out;
+}
+
+/* ---------- 自动跟随 + 「↓ 有新进展」 ---------- */
+var stick = true, pending = 0;
+var elJump = document.getElementById("jump");
+function nearBottom(){ return (window.innerHeight + window.scrollY) >= (document.documentElement.scrollHeight - 140); }
+function scrollBottom(){ window.scrollTo({ top: document.documentElement.scrollHeight, behavior: "auto" }); }
+function maybeFollow(){
+  if(stick){ requestAnimationFrame(scrollBottom); }
+  else { pending++; elJump.hidden = false; setText("jumpN", pending>99 ? "99+" : String(pending)); }
+}
+window.addEventListener("scroll", function(){
+  if(nearBottom()){ stick = true; pending = 0; elJump.hidden = true; }
+  else { stick = false; }
+}, {passive:true});
+elJump.addEventListener("click", function(){ stick = true; pending = 0; elJump.hidden = true; scrollBottom(); });
+
+/* ---------- 主题切换(自动 / 浅 / 深),持久化 ---------- */
+(function(){
+  var order = ["auto","light","dark"], label = { auto:"自动", light:"浅色", dark:"深色" };
+  var cur = "auto";
+  try{ var saved = localStorage.getItem("loop-theme"); if(saved && order.indexOf(saved)>=0) cur = saved; }catch(e){}
+  function apply(){
+    if(cur==="auto") document.documentElement.removeAttribute("data-theme");
+    else document.documentElement.setAttribute("data-theme", cur);
+    setText("themeLabel", label[cur]);
+  }
+  apply();
+  document.getElementById("themeToggle").addEventListener("click", function(){
+    cur = order[(order.indexOf(cur)+1) % order.length];
+    try{ localStorage.setItem("loop-theme", cur); }catch(e){}
+    apply();
+  });
+})();
+
+/* ---------- 连接指示 ---------- */
+function setConn(state){
+  var map = { connecting:"连接中…", live:"● 实时", reconnect:"○ 重连中…", demo:"◆ 回放样例" };
+  var c = document.getElementById("conn"); c.dataset.s = state;
+  var t = document.getElementById("connText"); t.textContent = map[state] || state;
+  if(state==="demo"){
+    if(!c.querySelector(".replay")){
+      var a = document.createElement("a"); a.href="#"; a.className="replay"; a.textContent="重播";
+      a.addEventListener("click", function(ev){ ev.preventDefault(); startDemo(true); });
+      c.appendChild(a);
+    }
+  } else { var r = c.querySelector(".replay"); if(r) r.remove(); }
+}
+
+/* ============================================================
+   连接:真实 SSE 优先。
+   —— DEMO(内联样例回放)只在**确定没有真实服务器**时启用:
+      ① file:// 离线打开(根本连不到 /events),或 ② 显式 ?demo=1(哑静态服务器上预览)。
+   由真实 serve.mjs(http)吐出的页面**永不自动进 DEMO**:即使 /events 因机器负载/杀软/
+   代理/连接排队而慢几秒,也只显示"连接中/重连中",绝不关掉真实连接切假样例——否则会拿
+   离线样例冒充真实运行(最坏的数据污染)。慢连接靠 EventSource 自身重连兜底,宁可等真数据。
+   ============================================================ */
+var OFFLINE = (location.protocol === "file:") || /[?&]demo=1(?:&|$)/.test(location.search);
+var DEMO = false, everOpen = false, everMsg = false, demoStarted = false, es = null;
+
+function connect(){
+  if(OFFLINE){ startDemo(false); return; }            // 确定无服务器 → 回放内联样例
+  try{ es = new EventSource("/events"); }
+  catch(e){ setConn("reconnect"); return; }            // 环境无 EventSource:保持重连态,不伪造数据
+  es.onopen = function(){ everOpen = true; setConn("live"); };
+  es.onmessage = function(e){ everMsg = true; var ev; try{ ev = JSON.parse(e.data); }catch(_){ return; } try{ handle(ev); }catch(_){} };
+  es.addEventListener("reset", function(){ try{ resetView(); }catch(_){} });
+  // 断线/未连:交给 EventSource 自动重连,只更新指示灯,永不进 DEMO
+  es.onerror = function(){ setConn(everOpen || everMsg ? "reconnect" : "connecting"); };
+}
+
+function startDemo(force){
+  if(demoStarted && !force) return;
+  demoStarted = true; DEMO = true;
+  if(es){ try{ es.close(); }catch(_){} }
+  setConn("demo");
+  resetView();
+  // 逐条回放,模拟"实时追加"节奏
+  var i = 0;
+  (function step(){
+    if(i >= DEMO_EVENTS.length) return;
+    try{ handle(DEMO_EVENTS[i]); }catch(_){}
+    i++;
+    var gap = (i<=1) ? 260 : (i>=DEMO_EVENTS.length ? 0 : 520 + (i%3)*140);
+    if(i < DEMO_EVENTS.length) setTimeout(step, gap);
+  })();
+}
+
+/* ============================================================
+   内联样例数据(仅原型/离线回放用;真实服务器在场时永不触发)
+   —— 与 viz/sample **字节同源**:DEMO_FILES 块由同目录 regen-demo-files.mjs 从 sample/ 生成,
+      改样例后必须重跑它(fe-e2e 有逐字相等断言,漂移会被抓);覆盖全部事件类型
+   ============================================================ */
+var DEMO_EVENTS = [
+{"v":1,"seq":0,"ts":1783660000000,"event":"run:started","runId":"run-sample","payload":{"task":"给 relay-cli 增加 --json 输出模式(机器可读结果,供 CI 消费)","mode":{"human":true,"panel":"architects","workspace":"main"},"iterCap":5}},
+{"v":1,"seq":1,"ts":1783660010000,"event":"intake:asked","runId":"run-sample","payload":{"question":"--json 时人类可读的进度输出(spinner/彩色日志)是完全静默,还是仍打到 stderr?"}},
+{"v":1,"seq":2,"ts":1783660040000,"event":"intake:answered","runId":"run-sample","payload":{"answer":"进度仍打 stderr;stdout 只有 JSON——CI 按双管道分离消费"}},
+{"v":1,"seq":3,"ts":1783660050000,"event":"panel:launched","runId":"run-sample","payload":{"kind":"architects","runDir":".devdiscuss/2026-07-06-json-mode"}},
+{"v":1,"seq":4,"ts":1783660400000,"event":"panel:concluded","runId":"run-sample","payload":{"summaryRef":"panel/summary.md"}},
+{"v":1,"seq":5,"ts":1783660420000,"event":"contract:drafted","runId":"run-sample","payload":{"contractRef":"contract.md","goals":[{"id":"G1","title":"--json 输出结构化结果","acCount":4},{"id":"G2","title":"文档与帮助文本","acCount":2}]}},
+{"v":1,"seq":6,"ts":1783660500000,"event":"contract:confirmed","runId":"run-sample","payload":{"by":"user","changes":"AC 无改;用户把'错误码表'从 5 个精简为 3 个写进全局约束"}},
+{"v":1,"seq":7,"ts":1783660510000,"event":"goal:started","runId":"run-sample","payload":{"goalId":"G1","title":"--json 输出结构化结果","acCount":4}},
+{"v":1,"seq":8,"ts":1783660515000,"event":"iter:started","runId":"run-sample","payload":{"goalId":"G1","n":1}},
+{"v":1,"seq":9,"ts":1783660900000,"event":"gen:produced","runId":"run-sample","payload":{"goalId":"G1","n":1,"genRef":"iterations/g1/i1-gen.md","summary":"新增 --json 标志与 JsonReporter,12/12 单测过;自称 stdout 纯净、错误路径已覆盖。","commit":"a1b2c3d g1-i1: add --json flag + JsonReporter","filesChanged":["src/cli.ts","src/report/json.ts","test/json.test.ts"]}},
+{"v":1,"seq":10,"ts":1783661300000,"event":"val:verdict","runId":"run-sample","payload":{"goalId":"G1","n":1,"verdict":"fail","acResults":[{"acId":"AC1","status":"pass","evidence":"npm test 12/12"},{"acId":"AC2","status":"fail","evidence":"stdout 混入 spinner 转义序列,JSON.parse 失败"},{"acId":"AC3","status":"fail","evidence":"坏输入时退出码 0(应为 2)"},{"acId":"AC4","status":"skipped"}],"defects":[{"acId":"AC2","desc":"spinner 未随 --json 关闭,stdout 被 \\x1b[ 序列污染"},{"acId":"AC3","desc":"错误路径仍 process.exit(0)"}],"verdictRef":"iterations/g1/i1-verdict.md"}},
+{"v":1,"seq":11,"ts":1783661310000,"event":"iter:started","runId":"run-sample","payload":{"goalId":"G1","n":2}},
+{"v":1,"seq":12,"ts":1783661700000,"event":"gen:produced","runId":"run-sample","payload":{"goalId":"G1","n":2,"genRef":"iterations/g1/i2-gen.md","summary":"缺陷逐条回应:#1 spinner 改挂 stderr 且 --json 时禁用;#2 错误路径 exit(2);各补回归测试。","commit":"d4e5f6a g1-i2: mute spinner on --json; error exit codes","filesChanged":["src/cli.ts","src/report/json.ts","test/json.test.ts"]}},
+{"v":1,"seq":13,"ts":1783661900000,"event":"val:tainted","runId":"run-sample","payload":{"goalId":"G1","n":2,"files":["src/report/json.ts"]}},
+{"v":1,"seq":14,"ts":1783662300000,"event":"val:verdict","runId":"run-sample","payload":{"goalId":"G1","n":2,"verdict":"fail","acResults":[{"acId":"AC1","status":"pass","evidence":"npm test 14/14"},{"acId":"AC2","status":"pass","evidence":"100 次 sync --json,stdout 全部 JSON.parse 通过"},{"acId":"AC3","status":"fail","evidence":"kill -INT 后 stdout 残留未闭合 JSON 片段"},{"acId":"AC4","status":"skipped"}],"defects":[{"acId":"AC3","desc":"SIGINT 中断时 stdout 留半个 JSON,CI 消费方会解析失败;AC3 原文未写中断路径——已请主控升级澄清"}],"verdictRef":"iterations/g1/i2-verdict.md"}},
+{"v":1,"seq":15,"ts":1783662320000,"event":"human:asked","runId":"run-sample","payload":{"questionId":"q1","question":"SIGINT 中断时 --json 的合同语义:stdout 必须仍是完整 JSON(如 {\"aborted\":true}),还是允许空输出?","options":["必须完整 JSON","允许空 stdout"],"why":"AC3 原文没覆盖中断路径——这是验收标准本身的歧义,只能由你定。"}},
+{"v":1,"seq":16,"ts":1783662500000,"event":"human:answered","runId":"run-sample","payload":{"questionId":"q1","answer":"必须完整 JSON:中断时输出 {\"aborted\":true} 再退出"}},
+{"v":1,"seq":17,"ts":1783662510000,"event":"contract:amended","runId":"run-sample","payload":{"changes":"AC3 增补:SIGINT 时 stdout 先输出 {\"aborted\":true} 再退出(退出码 130)","affectedGoals":["G1"]}},
+{"v":1,"seq":18,"ts":1783662520000,"event":"iter:started","runId":"run-sample","payload":{"goalId":"G1","n":3}},
+{"v":1,"seq":19,"ts":1783662900000,"event":"gen:produced","runId":"run-sample","payload":{"goalId":"G1","n":3,"genRef":"iterations/g1/i3-gen.md","summary":"SIGINT handler 里 flush {\"aborted\":true} 后 exit(130);Windows/macOS/Linux 信号测试各一。","commit":"b7c8d9e g1-i3: SIGINT emits clean aborted JSON","filesChanged":["src/cli.ts","test/signal.test.ts"]}},
+{"v":1,"seq":20,"ts":1783663400000,"event":"val:verdict","runId":"run-sample","payload":{"goalId":"G1","n":3,"verdict":"pass","acResults":[{"acId":"AC1","status":"pass","evidence":"npm test 17/17"},{"acId":"AC2","status":"pass","evidence":"stdout 全部 JSON.parse 通过,stderr 独立"},{"acId":"AC3","status":"pass","evidence":"坏输入 exit 2 + {\"error\"};kill -INT 后 stdout={\"aborted\":true}、exit 130"},{"acId":"AC4","status":"pass","evidence":"异引擎 reviewer APPROVE(主控代执行)"}],"verdictRef":"iterations/g1/i3-verdict.md"}},
+{"v":1,"seq":21,"ts":1783663410000,"event":"goal:passed","runId":"run-sample","payload":{"goalId":"G1","iters":3}},
+{"v":1,"seq":22,"ts":1783663420000,"event":"goal:started","runId":"run-sample","payload":{"goalId":"G2","title":"文档与帮助文本","acCount":2}},
+{"v":1,"seq":23,"ts":1783663425000,"event":"iter:started","runId":"run-sample","payload":{"goalId":"G2","n":1}},
+{"v":1,"seq":24,"ts":1783663700000,"event":"gen:produced","runId":"run-sample","payload":{"goalId":"G2","n":1,"genRef":"iterations/g2/i1-gen.md","summary":"README 新增「JSON 输出」章节(schema 表 + 3 个示例);--help 文本更新。","commit":"c9d0e1f g2-i1: docs for --json","filesChanged":["README.md","src/cli.ts"]}},
+{"v":1,"seq":25,"ts":1783663900000,"event":"val:verdict","runId":"run-sample","payload":{"goalId":"G2","n":1,"verdict":"pass","acResults":[{"acId":"AC1","status":"pass","evidence":"--help 含 --json 段,示例命令逐条可跑"},{"acId":"AC2","status":"pass","evidence":"README 3 个示例逐条执行,输出与文档一致"}],"verdictRef":"iterations/g2/i1-verdict.md"}},
+{"v":1,"seq":26,"ts":1783663910000,"event":"goal:passed","runId":"run-sample","payload":{"goalId":"G2","iters":1}},
+{"v":1,"seq":27,"ts":1783664400000,"event":"review:final","runId":"run-sample","payload":{"verdict":"approve","reviewRef":"review/final-r1.md","round":1}},
+{"v":1,"seq":28,"ts":1783664420000,"event":"run:final","runId":"run-sample","payload":{"reportRef":"final.md","goalsPassed":2,"goalsTotal":2}},
+{"v":1,"seq":29,"ts":1783664430000,"event":"run:terminated","runId":"run-sample","payload":{"reason":"done"}}
+];
+
+var DEMO_FILES = {
+"panel/summary.md": "# 评审团结论(双架构师,主控综合)\n\n## 挖出的隐性需求(已转为访谈问题/合同条款)\n\n1. **stdout/stderr 分离语义**——CI 消费的关键;两位架构师一致:必须显式定死(→ 访谈 Q1 → 假设账本 A1)。\n2. **错误与中断路径**——一位架构师指出「快乐路径的 JSON 谁都会写,合同的价值在异常路径」(→ AC3)。\n3. **schema 稳定性承诺**——文档必须给出输出 schema 表,否则 CI 消费方无法演进(→ G2 AC2)。\n\n## 分歧与裁决\n\n- 是否引入 `--output=json|text` 通用参数替代布尔 `--json`:一方主张通用化,一方按 YAGNI 反对。\n  **裁决:YAGNI,先 `--json`**;将来真有第三种格式再迁移,迁移成本被评估为低。\n\n## 风险提示\n\n- spinner 库默认写 stdout——大概率是第一轮验收的雷(事后:确实是,见 g1-i1 verdict)。\n",
+"contract.md": "# 验收合同 — relay-cli --json 输出模式\n\n模式: 人在环 · 评审团: 双架构师 · 生成: 2026-07-06T09:00Z\n\n## 原始需求(用户原话,逐字)\n\n> 给 relay-cli 增加 --json 输出模式,机器可读结果,供 CI 消费。\n\n## 假设账本\n\n- A1: 进度输出(spinner/彩色日志)在 --json 下的去向 → **进 stderr,stdout 只有 JSON**(来源: 用户确认,访谈 Q1)\n- A2: SIGINT 中断语义 → **stdout 必须仍是完整 JSON(`{\"aborted\":true}`)再退出**(来源: 用户拍板 q1;AC3 据此增补)\n\n## Goal G1: --json 输出结构化结果\n\n动机: CI 需要稳定的机器可读输出;当前人类可读输出无法可靠解析。\n\n验收标准(每条可被验证者独立执行验证):\n- AC1 [test] `npm test` 全绿(含新增 JsonReporter 测试)\n- AC2 [e2e] `relay-cli sync --json` 的 stdout 是且仅是一个合法 JSON 文档(重复 100 次全部 `JSON.parse` 通过);进度噪声只许进 stderr\n- AC3 [e2e] 错误与中断路径:坏输入 → 退出码 2 且 stdout 为 `{\"error\":…}`;**(增补)** SIGINT → stdout 先输出 `{\"aborted\":true}` 再退出(退出码 130)\n- AC4 [review] 异引擎 reviewer 对 base..head 给 APPROVE(主控代执行,其余 AC 全绿才跑)\n\n边界: 不动人类可读模式的既有输出格式;不改 sync 的业务逻辑。\n\n## Goal G2: 文档与帮助文本\n\n动机: 没有文档的标志等于不存在。\n\n验收标准:\n- AC1 [e2e] `relay-cli --help` 含 --json 说明,且帮助里的示例命令逐条可跑\n- AC2 [e2e] README「JSON 输出」章节的示例逐条执行,输出与文档一致\n\n边界: 只动 README 与 --help 文本。\n\n## 全局约束\n\n- 错误码表精简为 3 个:0 成功 / 2 用户输入错误 / 130 中断(用户确认)\n- 不引入新运行时依赖\n",
+"iterations/g1/i1-gen.md": "# 生成者汇报 · G1 · 迭代 1\n\n- **Status:** DONE\n- **Commit:** a1b2c3d `g1-i1: add --json flag + JsonReporter`\n- **测试小结:** 12/12 通过,输出干净\n\n## 实现说明\n- `src/cli.ts`:新增 `--json` 布尔标志,注入 JsonReporter。\n- `src/report/json.ts`:新建 JsonReporter,聚合结果为单一 JSON 文档,结束时一次性写 stdout。\n- `test/json.test.ts`:schema 断言 + 幂等两跑。\n\n## 逐 AC 自测\n- AC1:npm test 12/12 ✅\n- AC2:手跑 `sync --json | jq .` 通过 ✅(注:只跑了 1 次)\n- AC3:坏输入返回 `{\"error\":…}` ✅(未断言退出码)\n- AC4:不归我(主控代执行)\n\n## Concerns\n- spinner 库(ora)是否在非 TTY 下自动静默,未验证。\n",
+"iterations/g1/i1-verdict.md": "VERDICT: FAIL\nAC1: PASS — `npm test` 12/12,输出干净\nAC2: FAIL — `relay-cli sync --json > out.json` 后 `node -e \"JSON.parse(...)\"` 抛错:stdout 混入 `\\x1b[2K\\x1b[1G⠙ syncing…` spinner 转义序列(TTY 下 ora 写的是 stdout)\nAC3: FAIL — `relay-cli sync --bad-flag --json; echo $?` → 退出码 0(合同要求 2);stdout 的 `{\"error\":…}` 本身合法\nAC4: SKIPPED — 其余 AC 未全绿,lazy 不执行\n\nDEFECTS:\n- [AC2] 现象:stdout 被 spinner 污染 / 证据:validation/probe-stdout.mjs 捕获的原始字节含 \\x1b[ 序列(100 次跑 100 次坏)/ 复现:任意 TTY 环境 `relay-cli sync --json`\n- [AC3] 现象:错误路径 `process.exit(0)` / 证据:echo $? → 0 / 复现:`relay-cli sync --bad-flag --json`\n\nNOTES:\n- 生成者自测「手跑 jq 通过」大概率在非 TTY 管道下跑的——TTY 差异正是雷点;我的探针脚本 validation/probe-stdout.mjs 用 pty 模拟真实终端。\n",
+"iterations/g1/i2-gen.md": "# 生成者汇报 · G1 · 迭代 2\n\n- **Status:** DONE\n- **Commit:** d4e5f6a `g1-i2: mute spinner on --json; error exit codes`\n- **测试小结:** 14/14 通过(+2 回归)\n\n## 缺陷回应表\n- #1(AC2 spinner)fixed:spinner 全部改挂 stderr,且 `--json` 时彻底禁用(不靠 TTY 探测);回归测试用 pty 断言 stdout 零转义序列。\n- #2(AC3 退出码)fixed:错误路径统一 `exit(2)`;回归测试断言 `$? === 2`。\n\n## Concerns\n- SIGINT 中断路径合同没写——我按「进程默认行为」未处理;若 CI 关心中断输出,可能需要澄清。\n",
+"iterations/g1/i2-verdict.md": "VERDICT: FAIL\nAC1: PASS — `npm test` 14/14\nAC2: PASS — validation/probe-stdout.mjs(pty)100 次跑,stdout 全部 `JSON.parse` 通过、零转义序列;stderr 独立承载进度\nAC3: FAIL — 坏输入路径已修(exit 2 ✅);但 `kill -INT` 中断时 stdout 残留未闭合 JSON 片段(`{\"items\":[{\"id\":1},` 截断)\nAC4: SKIPPED — 其余 AC 未全绿,lazy 不执行\n\nDEFECTS:\n- [AC3] 现象:SIGINT 时 stdout 留半个 JSON / 证据:validation/sigint-probe.mjs 三次中断三次截断 / 复现:`relay-cli sync --json` 运行中 Ctrl-C\n  注:AC3 原文只写了「坏输入」,未覆盖中断路径——**这可能是验收标准本身的缺口**,已在 NOTES 请主控升级澄清,本轮按「stdout 必须可解析」的合同精神判 FAIL。\n\nNOTES:\n- (本轮为洁净树审计后的 fresh 重验:上一位验证者误将调试行写进 src/report/json.ts,verdict 作废。)\n- 建议主控把「SIGINT 语义」升级给用户拍板,再决定 AC3 终稿。\n",
+"iterations/g1/i3-gen.md": "# 生成者汇报 · G1 · 迭代 3\n\n- **Status:** DONE\n- **Commit:** b7c8d9e `g1-i3: SIGINT emits clean aborted JSON`\n- **测试小结:** 17/17 通过(+3 信号测试)\n\n## 缺陷回应表\n- #1(AC3 SIGINT)fixed:装 SIGINT handler,flush `{\"aborted\":true}` 到 stdout 后 `exit(130)`;按增补后的 AC3 实现(用户已拍板 q1)。Windows(CTRL_C_EVENT)/macOS/Linux 信号测试各一。\n\n## Concerns\n- 无。\n",
+"iterations/g1/i3-verdict.md": "VERDICT: PASS\nAC1: PASS — `npm test` 17/17,输出干净\nAC2: PASS — validation/probe-stdout.mjs 100 次跑全部 `JSON.parse` 通过;stderr 独立\nAC3: PASS — 坏输入:exit 2 + `{\"error\":…}`;`kill -INT`:stdout=`{\"aborted\":true}`、exit 130(validation/sigint-probe.mjs 三平台参数各跑 3 次)\nAC4: PASS — 异引擎 reviewer 对 a1b2c3d^..b7c8d9e APPROVE(主控代执行,报告见主控存档)\n\nNOTES:\n- validation/ 探针脚本(probe-stdout.mjs / sigint-probe.mjs)已留存,G2 及收官复验可复用。\n",
+"iterations/g2/i1-gen.md": "# 生成者汇报 · G2 · 迭代 1\n\n- **Status:** DONE\n- **Commit:** c9d0e1f `g2-i1: docs for --json`\n- **测试小结:** 17/17 通过(文档改动,无新测试)\n\n## 实现说明\n- `README.md`:新增「JSON 输出」章节——输出 schema 表(字段/类型/含义)、3 个可复制示例(成功/错误/中断)、错误码表(0/2/130)、spinner 库维护注记。\n- `src/cli.ts`:--help 文本补 --json 说明与一个示例。\n\n## 逐 AC 自测\n- AC1:`relay-cli --help` 含 --json 段,示例手跑通过 ✅\n- AC2:README 3 个示例逐条手跑,输出一致 ✅\n",
+"iterations/g2/i1-verdict.md": "VERDICT: PASS\nAC1: PASS — `relay-cli --help` 输出含 --json 段;帮助示例 `relay-cli sync --json` 实跑,stdout 合法 JSON\nAC2: PASS — README「JSON 输出」3 个示例逐条执行:成功例输出与 schema 表一致;错误例 exit 2 + `{\"error\":…}`;中断例 `{\"aborted\":true}` + exit 130\n\nNOTES:\n- 复用了 G1 留存的 validation/probe-stdout.mjs 做示例输出校验,零重写。\n",
+"review/final-r1.md": "# 收官 broad review(整支,异引擎 reviewer,第 1 轮)\n\n## 规格/任务符合度\n- ✅ 符合:合同 G1/G2 逐条对照,无 Missing/Extra/Misunderstood。\n\n## 亮点\n- SIGINT 路径的 flush-before-exit 处理干净(src/cli.ts:88),信号测试三平台各一,真实行为断言。\n- JsonReporter 与人类 Reporter 共享接口,零重复。\n\n## 问题\n- Minor:test/signal.test.ts 里 130 退出码的注释可补一句「POSIX 128+SIGINT(2)」——纯文档润色。\n\n## 结论\n- **判定:APPROVE**\n- 理由:整支改动范围克制、异常路径覆盖完整,Minor 不阻塞。\n",
+"final.md": "# 收官报告 — relay-cli --json 输出模式\n\n**结果:2/2 goals 全部验收通过 · 收官评审 APPROVE(第 1 轮)**\n\n## 逐 goal 交付\n\n### G1 --json 输出结构化结果(3 迭代)\n- 交付:`--json` 标志 + JsonReporter;stdout 纯 JSON、进度走 stderr;错误 exit 2、SIGINT 输出 `{\"aborted\":true}` 后 exit 130。\n- 证据:`iterations/g1/i3-verdict.md`(AC1–AC4 全 PASS,含异引擎 reviewer APPROVE)。\n- 爬坡:AC 1/4 → 2/4 → 4/4。中途一次洁净树审计撤销(验证者误改 `src/report/json.ts`,verdict 作废重验)。\n\n### G2 文档与帮助文本(1 迭代)\n- 交付:README「JSON 输出」章节(schema 表 + 3 示例)+ --help 更新。\n- 证据:`iterations/g2/i1-verdict.md`(示例逐条实跑一致)。\n\n## 人类决策记录\n\n- q1:SIGINT 语义 → **必须完整 JSON(`{\"aborted\":true}`)**;合同 AC3 已增补(contract:amended)。\n\n## 假设账本终态\n\n- A1(stderr 分离)、A2(SIGINT 完整 JSON)均已被用户确认,无遗留推定假设。\n\n## 遗留风险\n\n- spinner 库靠环境变量禁用,若未来升级该库需回归 AC2(已写进 README 维护注记)。\n"
+};
+
+/* 启动 */
+connect();
+</script>
+</body>
+</html>
