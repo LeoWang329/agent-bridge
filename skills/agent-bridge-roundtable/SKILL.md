@@ -15,7 +15,7 @@ description: 用 agent-bridge 组织一场「agent 圆桌审议」——主 agen
 ## 前置(务必先看)
 
 1. **工具存在性守卫**:当前工具列表里**没有** `agent_bridge_*` 工具就**停下**,提示用户先安装/启用 agent-bridge MCP 服务器。
-2. **先加载桥 skill 拿完整用法**:本流程建在 agent-bridge 之上。**先加载 `agent-bridge` skill**(手动 link 态名为 `agent-bridge`,插件态 `agent-bridge:agent-bridge`,让 harness 解析),它有完整工具用法、返回 shape、并发纪律、`textRef` 关会话前读、`contextUsage` 阈值、`doctor`/`--list-models` 探测、`append_system_prompt_file` 注入角色等。本文件只在关键处**重复两条最致命纪律**。
+2. **先加载桥 skill 拿完整用法**:本流程建在 agent-bridge 之上。**先加载 `agent-bridge` skill**(手动 link 态名为 `agent-bridge`,插件态 `agent-bridge:agent-bridge`,让 harness 解析),它有完整工具用法、返回 shape、并发纪律、`textRef` 关会话前读、`contextUsage` 阈值、`doctor`/`omp models` 探测、`append_system_prompt_file` 注入角色等。本文件只在关键处**重复两条最致命纪律**。
 3. **两条致命纪律(内联,别只靠跨引用)**:
    - `agent_bridge_wait` **必须传 `timeout_ms`**(如 `300000`≈5 分钟短轮询循环),**不传默认死等 30 分钟**。
    - **别给 `send_message`/`open_session` 传 `wait:true`**——超时会 **abort 掉那轮 turn**(任务被中断)。用非阻塞 send + 短超时 `wait` 收口。
@@ -36,7 +36,7 @@ description: 用 agent-bridge 组织一场「agent 圆桌审议」——主 agen
 
 - **主席**:你。调度、策展简报、判收敛、指派红队、人在环升级、综合终稿、**写 `transcript.jsonl`**。
 - **参会席(N 席,默认 3)**:每席一个 `open_session`,注入 `panelist` 角色(见下)。**默认 `access:"read"`**(读+执行,自带 shell 可调查);只有要改工作区代码的席才 `access:"write"` + git worktree——见 §席位权限。
-- **引擎/模型多样性 = 独立性的根**:先 `agent_bridge_doctor` 看后端(omp/codex/claude),给每席分**不同引擎**;引擎数 < 席数时在同引擎内换 `model`(用你的 shell 跑 `omp --list-models <关键字>` 拿全限定 `provider/名`)。**凑不出 N 席的多样性就把 N 压到可用多样性并告知用户**——不拿同引擎同模型的克隆冒充独立视角。独立席 < 2 → 问用户是否降级(2 席都没有就不成圆桌)。
+- **引擎/模型多样性 = 独立性的根**:先 `agent_bridge_doctor` 看后端(omp/codex/claude),给每席分**不同引擎**;引擎数 < 席数时在同引擎内换 `model`(用你的 shell 跑 `omp models <关键字>` 拿全限定 `provider/名`)。**凑不出 N 席的多样性就把 N 压到可用多样性并告知用户**——不拿同引擎同模型的克隆冒充独立视角。独立席 < 2 → 问用户是否降级(2 席都没有就不成圆桌)。
 - **角色注入(铁规)**:每席开会话必须 `append_system_prompt_file=<base>/roles/panelist.md`(绝对路径、存在、非空)。`<base>` = 本 skill 加载时 harness 给出的 base directory,拼 `<base>/roles/panelist.md`。
   - **领域圆桌可换注入**:纯架构议题可换 `agent-bridge-dev/roles/architect.md`,调试议题换 `debugger.md`——圆桌是「角色无关原语」,吃一个 role 参数给每席注入对应文件。**默认 = panelist**(它自带审议纪律 + 反谄媚,architect 是单发设计者人格,缺这些)。
 
@@ -71,7 +71,7 @@ description: 用 agent-bridge 组织一场「agent 圆桌审议」——主 agen
 ## 整体流程(主席编排循环)
 
 ```
-1. 议定范围:doctor → list-models → 定 N 席 + 各自引擎/model(保多样性)。范围模糊先问用户澄清(§人在环)。
+1. 议定范围:doctor → omp models → 定 N 席 + 各自引擎/model(保多样性)。范围模糊先问用户澄清(§人在环)。
 2. [提示用户] 一次性问「要开可视化实时看进展吗?(默认否)」→ 同意才起服务(§可视化)。
    建 run-dir + 写 .gitignore 一行 + append run:started。
 3. Round 0 盲发并行:每席 open_session(`access` 按 §席位权限:默认 `read` / 改代码 `write`+worktree, 注入 panelist.md) → 逐个非阻塞 send 同一份中立框设
@@ -204,6 +204,6 @@ node <base>/viz/serve.mjs <run-dir>
 
 ## Integration / 跨引用
 
-- **依赖 `agent-bridge` skill**:完整工具用法、返回 shape、并发纪律、doctor/list-models、contextUsage 阈值都在那。跨引用用 `agent-bridge`(或 `agent-bridge:agent-bridge`)让 harness 解析。
+- **依赖 `agent-bridge` skill**:完整工具用法、返回 shape、并发纪律、doctor/omp models、contextUsage 阈值都在那。跨引用用 `agent-bridge`(或 `agent-bridge:agent-bridge`)让 harness 解析。
 - **依赖 `append_system_prompt_file`**(本仓 open_session 参数,注入角色 md)。
 - **本 skill 自带资产**:`roles/panelist.md`(评议员角色)、`viz/serve.mjs` + `viz/index.html`(可视化)、`EVENTS.md`(事件 schema 真理源)。

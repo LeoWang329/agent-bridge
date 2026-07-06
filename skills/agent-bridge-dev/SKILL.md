@@ -87,8 +87,8 @@ close_session(session_id)                 用完必关
 - **拿不准就问用户**:排除实施者后能力档无合适候选、或你无法判断怎么挑,**停下与用户确认**,不硬凑。
 - **能力分层**:机械实现用低延迟/足够能力档;集成/判断用中档;架构/最终整支评审用最强档(**不是"最便宜"**,别与
   "质量优先、不为省 token 缩水"冲突)。
-- **模型清单靠活查**:OMP 用 `omp --list-models <关键字>`(你的 shell 跑,非 MCP 工具),`model` 传全限定
-  `provider/名`;Codex/Claude 用后端默认或用户给定的有效模型(它们没有 `--list-models`)。具体模型 ID 不写死。
+- **模型清单靠活查**:OMP 用 `omp models <关键字>`(子命令,非 flag;你的 shell 跑,非 MCP 工具),`model` 传全限定
+  `provider/名`;Codex/Claude 用后端默认或用户给定的有效模型(它们没有 `models` 子命令)。具体模型 ID 不写死。
 
 ## 评审独立性(硬规则)
 
@@ -167,7 +167,7 @@ reopen 时按交接物带上下文(文件路径、规格、上一步 diff 写进
 
 ## Integration / 跨引用
 
-- **依赖 `agent-bridge` skill**:完整工具用法、返回 shape、并发纪律、doctor/list-models 探测都在那。跨引用用
+- **依赖 `agent-bridge` skill**:完整工具用法、返回 shape、并发纪律、doctor/models 探测都在那。跨引用用
   `agent-bridge` 让 harness 解析,**确保手动 link 态部署指得到桥 skill**。
 - **依赖 `append_system_prompt_file`**(本仓 open_session 参数,注入角色 md 为整会话追加 system 指令)。
 

@@ -117,7 +117,7 @@ close_session(session_id)                  →  用完必须关
 - **Codex**：`agent: "codex"`，启动 `codex app-server`（JSON-RPC，逐 token 流式）。能力档由 `access` 控制（见下），均非交互。Codex 的 `read` 是 OS 沙箱 `read-only`：能跑命令、写被沙箱硬拦——所以 codex 的 read 是**硬**只读。
 - **Claude**：`agent: "claude"` — a fresh-context Claude Code worker; good for an independent second opinion / review or an isolated write workspace.（独立 Claude Code worker；适合独立复核或调查/隔离写作业；能力档由 `access` 控制：`read` 含 Bash 可跑命令、但 Bash 能写盘=**软**（非 OS 沙箱）；默认模型为 claude 自身配置默认，思考强度默认 xhigh）
 - **模型是会话级参数**：在 `open_session` 用 `model` 指定，整个会话固定；`send_message` 不能逐条切模型，换模型就新开 session。`model` 原样传后端 `--model`。
-- ⚠️ **`model` 必须用 `provider/模型名` 全限定形式**（如 `deepseek/deepseek-v4-pro`、`minimax-code-cn/MiniMax-M3`），**不要传裸别名**（如 `deepseek-v4-pro`、`minimax-m3`）——裸名可能被路由到非预期的 provider，拿到的不是你要的模型。全限定 ID 以 `omp --list-models <关键字>` 的输出为准。
+- ⚠️ **`model` 必须用 `provider/模型名` 全限定形式**（如 `deepseek/deepseek-v4-pro`、`minimax-code-cn/MiniMax-M3`），**不要传裸别名**（如 `deepseek-v4-pro`、`minimax-m3`）——裸名可能被路由到非预期的 provider，拿到的不是你要的模型。全限定 ID 以 `omp models <关键字>` 的输出为准。
 - **`effort`（可选，推理强度）**：OMP 映射为 `--thinking`（`minimal|low|medium|high|xhigh`）；Codex 作为该轮 effort（`none|minimal|low|medium|high|xhigh`，其中 `none`/`minimal`/`low` 用于简单改动的评审，实施任务不建议）。不传则用后端默认；Claude 映射到 --effort，默认 xhigh。
 
 `open_session` 必传 `agent` + `cwd`；`access` / `model` / `effort` 按需。
@@ -133,7 +133,7 @@ close_session(session_id)                  →  用完必须关
 - ⚠️ **`read` 的写边界分后端**：**codex = 硬**只读（read-only OS 沙箱,shell 里写盘被拦）；**omp / claude = 软**（bash/Bash **能**写盘,靠角色纪律不是 OS 沙箱）——所以 omp/claude 的 `read` **不是**硬不可写。要**硬**保证不写盘 → 用 codex 的 read,或直接上 `write` + 抛弃式工作区/worktree。
 - `write`（旧布尔）是 `access` 的别名(`true`→`write`、`false`→`read`)。两者同传必须一致,否则报错。⚠️ `write:false`（=read）**也带 shell**、omp/claude 下能软写,不是"绝对只读"。**新代码优先用 `access`。**
 
-**模型以活查为准**：`omp --list-models <关键字>` 查可用模型（输出即全限定 `provider/模型名`，直接拿来当 `model`）及各自支持的 thinking 上限。**不同模型最高 thinking 级别不同**，传它不支持的级别会被忽略或报错。下表 `model` 列即应传的全限定值，只是常用举例：
+**模型以活查为准**：`omp models <关键字>`（是**子命令**不是 flag;也可 `omp models find <关键字>`、加 `--json` 拿机读）查可用模型（输出的 `selector` 即全限定 `provider/模型名`，直接拿来当 `model`）及各自支持的 thinking 上限。**不同模型最高 thinking 级别不同**，传它不支持的级别会被忽略或报错。下表 `model` 列即应传的全限定值，只是常用举例：
 
 | `model`（全限定，直接传这个） | 说明 | `effort` 上限 |
 |---|---|---|
@@ -148,10 +148,10 @@ close_session(session_id)                  →  用完必须关
 
 **不考虑 token / 成本：** 委托的取舍只看**质量与正确性**——够不够彻底、第二意见够不够独立、验证够不够充分——**不为省 token / 省钱而缩水**。该 `xhigh` 就 `xhigh`、该并行多开双评就多开、该逐项复核就复核。下面的 effort / 并行建议都是按**任务难度与时延**裁量，不是为压成本。
 
-**先探后派（doctor → list-models）：**
+**先探后派（doctor → models）：**
 
 - 派活前、尤其依赖某个特定后端时，先 `agent_bridge_doctor` 确认哪些后端可用——「有没有那个后端」靠查不靠猜。注意 `doctor` 只是 `--version` 预检，不验证登录 / 能否真启动；真能跑以 `open_session` 为准。
-- **`doctor` 之后、或第一次派 OMP 会话前，先用 `omp --list-models <关键字>` 探一下可用模型及各自 thinking 上限**（用你的 shell 执行，不是 MCP tool；`doctor` 也不列模型）。据此选 `model`/`effort`，避免传后端不认的模型或它不支持的强度。
+- **`doctor` 之后、或第一次派 OMP 会话前，先用 `omp models <关键字>` 探一下可用模型及各自 thinking 上限**（用你的 shell 执行，不是 MCP tool；`doctor` 也不列模型）。据此选 `model`/`effort`，避免传后端不认的模型或它不支持的强度。
 
 **评审独立性：** 评审者必须 ≠ 实施者（引擎或模型不同才算真第二意见）。别用同模型同会话评自己刚写的代码。选评审后端时，换一个与实施者不同的引擎 / `model` + 新开独立会话，保住「独立第二意见」。
 
