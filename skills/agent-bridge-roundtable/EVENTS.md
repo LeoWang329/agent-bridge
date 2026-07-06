@@ -27,12 +27,12 @@
 
 | `event` | 关键 `payload` 字段 | 表达什么 |
 |---|---|---|
-| `run:started` | `question`,`seats:[{seat,agent,model,role}]`,`maxRounds`,`budget`,`vizEnabled` | 圆桌开场:议题、阵容、上界 |
+| `run:started` | `question`,`seats:[{seat,agent,model,role}]`,`maxRounds`,`budget`,`vizEnabled`,`topology?` | 圆桌开场:议题、阵容、上界。`topology`(可选)= `"blind-panel"`(默认盲发圆桌)\|`"author-critics"`(熟路题 1+2 作者-批评家,见 SKILL §可选拓扑);缺省视同 `blind-panel`,viz 忽略未知值即可 |
 | `viz:started` | `url`,`pid`,`port` | 可视化服务已起(仅当用户同意开) |
 | `viz:stopped` | `reason:"final"\|"idle"\|"killed"` | 可视化服务退出 |
 | `round:started` | `mode:"parallel"\|"serial"`,`plannedSpeakers:[seat]`,`rationale` | 一轮开始 + 主席为何这样排 |
 | `turn:assigned` | `seat`,`briefRef`,`why` | 指派某席发言 + 依据(收敛轮附本轮简报路径) |
-| `turn:produced` | `seat`,`agent`,`model`,`roundRef`,`charCount`,`summary` | 某席产出;完整发言在 `roundRef`→`rounds/p<K>-r<N>.md`(**出生即匿名、字节直传**:既是审计原件又是各席收敛轮读的材料,内容无引擎/身份)。`seat`=不透明 `p<K>` + `agent`/`model` 构成 `p<K>↔引擎` 映射,**只在本 transcript**;`summary` 是主席一句话摘要 |
+| `turn:produced` | `seat`,`agent`,`model`,`roundRef`,`charCount`,`summary` | 某席产出;完整发言在 `roundRef`→`rounds/p<K>-r<N>.md`(**出生即匿名、字节直传**:既是审计原件又是各席收敛轮读的材料,内容无引擎/身份)。`seat`=不透明 `p<K>` + `agent`/`model` 构成 `p<K>↔引擎` 映射,**只在本 transcript**(`model` 可为 `null`:后端用默认模型、未显式指定时);`summary` 是主席一句话摘要 |
 | `coverage` | `entries:[{seatRef,disposition:"included"\|"parked"\|"irrelevant",reason}]` | 主席策展账:上一轮**每席**本轮被纳入索引/搁置/判无关 + 一句理由(`seatRef`=席位 id;coverage 粒度按席不按 turn)。治「主席无声漏点」,让选取可审计(红队/人可质问) |
 | `schedule:decision` | `decision:"next"\|"parallel"\|"probe"\|"converge"\|"escalate"\|"terminate"`,`nextSpeakers:[seat]`,`convergenceSignals`,`rationale` | **主席的调度决策 + 理由**(智力核心,务必写全 rationale;开 debate 轮也写这) |
 | `disagreement` | `topic`,`positions:[{label:"立场A",stance,fromSeat?}]`,`kind:"by-merit"\|"needs-human"` | 一个分歧点:立场 + 能否靠论证解决。每条立场应带 `fromSeat`(供审计 + **观察台对人类可见**:把立场映射回某席),但**对席匿名**——不写进 `briefs/`,别席永远见不到「谁持哪个立场」。匿名约束的是席位彼此、不含人类观察者。`fromSeat` 可缺省(半写行/主席未标),缺时观察台略过该来源徽标、不报错 |
