@@ -180,7 +180,10 @@ sandbox.handle({ v: 1, seq: 113, event: "goal:stuck", runId: "t", payload: { goa
 const st4 = statuses.find(s => s.gid === "GX");
 if (st4) { has(st4.label, "无人值守中止", "无 reason 时仍显示 policy"); no(st4.label, "undefined", "无 reason 时不出现 undefined"); }
 
-/* ========== ④ DEMO_FILES 与 sample/ 字节同源 ========== */
+/* ========== ④ DEMO_FILES 与 sample/ 内容同源(regen 不变式) ========== */
+// 忽略行尾差异:DEMO_FILES 内嵌 JS 字面量里的 \n 恒为 LF,而 sample/*.md 落盘行尾随各 clone 的
+// git autocrlf 而变(CRLF/LF)。本断言要守的是"内容没漂移"(改了样例忘跑 regen),行尾是环境产物、非内容。
+const normNL = s => s == null ? s : String(s).replace(/\r\n/g, "\n");
 const refKeys = ["contractRef", "genRef", "verdictRef", "summaryRef", "reviewRef", "reportRef"];
 const refs = [];
 for (const ev of events) { const p = ev.payload || {}; for (const k of refKeys) if (p[k] && !refs.includes(p[k])) refs.push(p[k]); }
@@ -190,9 +193,9 @@ for (const r of refs) {
   const inHtml = sandbox.DEMO_FILES && sandbox.DEMO_FILES[r];
   let onDisk = null;
   try { onDisk = fs.readFileSync(path.join(SAMPLE, r), "utf8"); } catch { /* 缺文件 */ }
-  if (inHtml == null || onDisk == null || inHtml !== onDisk) { drift++; console.error("  ✗ DEMO_FILES 漂移: " + r); }
+  if (inHtml == null || onDisk == null || normNL(inHtml) !== normNL(onDisk)) { drift++; console.error("  ✗ DEMO_FILES 漂移: " + r); }
 }
-ok(drift === 0, "DEMO_FILES 全部与 sample/ 字节同源(regen 不变式)");
+ok(drift === 0, "DEMO_FILES 全部与 sample/ 内容同源(regen 不变式,忽略行尾)");
 
 /* ---------- 汇总 ---------- */
 console.log(`\nfe-e2e: ${pass} passed, ${fail} failed`);
