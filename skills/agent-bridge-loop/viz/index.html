@@ -317,6 +317,10 @@ main{ max-width:var(--maxw); margin:0 auto; padding:20px 22px 120px; }
 .card.tainted{ border-left:4px solid var(--c-warn); background:color-mix(in oklab,var(--c-warn) 5%,var(--surface)); }
 .card.tainted::before{ background:var(--c-warn); border-color:var(--c-warn); }
 
+/* 尺子误判仲裁卡(主控裁决,区别于洁净树污染) */
+.card.sdefect{ border-left:4px solid var(--c-ctrl); background:color-mix(in oklab,var(--c-ctrl) 5%,var(--surface)); }
+.card.sdefect::before{ background:var(--c-ctrl); border-color:var(--c-ctrl); }
+
 /* 合同增补卡 */
 .card.amend{ border-left:3px solid var(--c-warn); }
 .card.amend::before{ border-color:var(--c-warn); }
@@ -504,6 +508,8 @@ main{ max-width:var(--maxw); margin:0 auto; padding:20px 22px 120px; }
 /* ---------- goal 固定色(浅深色下均可辨;不只靠颜色,另有 G 编号) ---------- */
 var GOAL_PALETTE = ["#0f9d8f","#7c5cff","#e24a7a","#2f9be0","#c98a17","#5b8def"];
 var STUCK_LABEL = { "halt":"无人值守中止", "user-extend":"用户:加轮", "user-amend":"用户:改合同", "user-abandon":"用户:放弃" };
+var STUCK_REASON = { "iter-cap":"达迭代上限", "script-defect-loop":"尺子仲裁反复不收敛" };
+var DISCOVER_LABEL = { "generator":"生成者", "controller":"主控", "validator":"验证者", "reviewer":"评审" };
 var TERM_LABEL = { done:"交付完成", stuck:"卡死中止", user:"用户终止", error:"异常终止" };
 
 var goals = {};            // goalId -> {sec, body, statusEl, climbEl, climb:[], color, title}
@@ -741,6 +747,16 @@ function handle(ev){
         + ' —— 本次 verdict 作废,已撤销改动并以 fresh 会话重验。</div>');
       break;
 
+    case "val:script-defect":
+      addCard(p.goalId || currentKey, "sdefect",
+        '<div class="c-head"><span class="tag">'+ICONS.shield+' 尺子误判 · 仲裁</span>'
+        + '<span class="c-meta">i'+esc(p.n!=null?p.n:"?")+(p.acId?' · '+esc(p.acId):'')
+        + (p.discoveredBy?' · 由'+esc(DISCOVER_LABEL[p.discoveredBy]||p.discoveredBy)+'发现':'')+'</span></div>'
+        + '<div class="c-body">主控复跑判定<b>验证脚本误判</b>(生成者产品无误)—— 交下轮 fresh 验证者修尺子,不消耗生成者迭代配额。</div>'
+        + (p.desc ? '<div class="c-kv"><span class="k">缺陷</span>'+esc(p.desc)+'</div>' : '')
+        + (p.evidence ? '<div class="c-kv"><span class="k">裁决证据</span>'+esc(p.evidence)+'</div>' : ''));
+      break;
+
     case "goal:passed": {
       var gid2 = p.goalId; if(!gid2) break;
       setGoalStatus(gid2, "passed", "✅ 通过 · "+(p.iters!=null?p.iters+" 迭代":""));
@@ -749,10 +765,12 @@ function handle(ev){
     }
     case "goal:stuck": {
       var gid3 = p.goalId; if(!gid3) break;
-      setGoalStatus(gid3, "stuck", "⛔ 卡死 · "+(STUCK_LABEL[p.policy]||p.policy||""));
+      var stReason = p.reason ? (STUCK_REASON[p.reason]||p.reason) : "";
+      var stPolicy = STUCK_LABEL[p.policy]||p.policy||"";
+      setGoalStatus(gid3, "stuck", "⛔ 卡死"+(stReason?" · "+stReason:"")+(stPolicy?" · "+stPolicy:""));
       addCard(gid3, "tainted",
-        '<div class="c-head"><span class="tag">'+ICONS.warn+' goal 卡死</span>'
-        + '<span class="c-meta">'+esc(STUCK_LABEL[p.policy]||p.policy||"")+'</span></div>'
+        '<div class="c-head"><span class="tag">'+ICONS.warn+' goal 卡死'+(stReason?' · '+esc(stReason):'')+'</span>'
+        + '<span class="c-meta">'+esc(stPolicy)+'</span></div>'
         + (p.note ? '<div class="c-body">'+esc(p.note)+'</div>' : ''));
       break;
     }
