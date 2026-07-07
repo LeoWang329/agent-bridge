@@ -152,7 +152,7 @@ const TOOLS = [
           type: "string",
           enum: ["read", "write"],
           description:
-            "Capability tier for the delegated agent (default read). read = read + EXECUTE: file reads, search, AND run shell commands for investigation (run tests/probes) — but NOT meant to edit files, so no Edit/Write tools. The write-boundary of read's shell varies by backend: codex hard-blocks disk writes via its read-only OS sandbox; omp/claude allow shell that CAN write (SOFT — a tool-level allow + role discipline, not an OS sandbox), so a `read` session on omp/claude is NOT a hard read-only. write = full edit/write autonomy in cwd. Prefer this over the legacy `write` boolean; the two must agree if both are passed.",
+            "Capability tier for the delegated agent (default read). read = read + EXECUTE: file reads, search, AND run shell commands for investigation (run tests/probes) — but NOT meant to edit files, so no Edit/Write tools. The write-boundary of read's shell varies by backend: codex hard-blocks disk writes via its read-only OS sandbox; omp/claude allow shell that CAN write (SOFT — a tool-level allow + role discipline, not an OS sandbox), so a `read` session on omp/claude is NOT a hard read-only. write = full edit/write autonomy in cwd — a HARD OS-sandbox boundary for codex (workspace-write) on mac/Linux, but on Windows codex's write tier drops to danger-full-access (a SOFT boundary like omp/claude) because codex's Windows sandbox breaks apply_patch; see the thread/start `sandbox` comment. Prefer this over the legacy `write` boolean; the two must agree if both are passed.",
         },
         write: {
           type: "boolean",
@@ -2091,8 +2091,23 @@ class CodexAppServerSession {
         // read tier → read-only OS sandbox: it already RUNS commands (isolates the filesystem, not
         // execution), so `read` gets its investigation shell for free — and, unlike omp/claude, codex's
         // read-tier write-boundary is HARD (the sandbox blocks disk writes at the OS level, verified
-        // enforced on Windows, not by role discipline). Only the write tier widens to workspace-write.
-        sandbox: this.access === "write" ? "workspace-write" : "read-only",
+        // enforced on Windows, not by role discipline).
+        //
+        // write tier → workspace-write, EXCEPT on Windows. codex 0.142.5's Windows sandbox (the
+        // unelevated restricted-token backend) cannot enforce the split writable roots it injects
+        // ([workdir, /tmp, $TMPDIR]), so `apply_patch` — codex's PRIMARY write path — hard-fails with
+        // "Failed to write file", even though the cwd is a declared writable root and plain shell writes
+        // (Set-Content / node fs) to that same cwd succeed. There is NO working Windows sandbox config:
+        // `unelevated` breaks apply_patch, `elevated` breaks shell (CreateProcessAsUserW 1312). This is an
+        // upstream, open, unfixed codex bug (github.com/openai/codex issues #30009, #31220; reproduced
+        // here 2026-07-07: `-s workspace-write` → write fails, `-s danger-full-access` → write succeeds).
+        // So on Windows the write tier drops to danger-full-access. This does NOT make codex uniquely
+        // unsafe: omp/claude's write tier is ALREADY a SOFT boundary (tool-level allow + role discipline,
+        // not an OS sandbox), so Windows codex-write lands at parity with them. read tier stays HARD
+        // read-only everywhere; mac/Linux keep real workspace-write (the bug is Windows-only).
+        sandbox: this.access === "write"
+          ? (IS_WINDOWS ? "danger-full-access" : "workspace-write")
+          : "read-only",
         serviceName: "agent_bridge",
         ephemeral: true,
         experimentalRawEvents: false,
@@ -2663,7 +2678,8 @@ class ClaudeCodeSession {
     if (this.model) args.push("--model", this.model); // omitted when unset -> claude uses its configured default model
     if (this.effort) args.push("--effort", this.effort); // per-session reasoning effort; defaults to xhigh (constructor)
     if (this.access === "write") {
-      // Parity with OMP --auto-approve yolo / Codex workspace-write: full autonomy in cwd.
+      // Parity with OMP --auto-approve yolo / Codex write tier (workspace-write on mac/Linux,
+      // danger-full-access on Windows): full autonomy in cwd.
       args.push("--permission-mode", "bypassPermissions");
     } else {
       // read tier = read + EXECUTE: read-only tools + Bash for investigation. Bash in the allow-list runs

@@ -10,8 +10,9 @@
 //     ⟹ a real shell ran, since no write/edit tool exists to fake it):
 //       read : all three run a shell; the WRITE-boundary is what we measure — omp/claude SOFT (writes land),
 //              codex HARD (read-only OS sandbox blocks the write).
-//       write: shell writes succeed (incl. codex under workspace-write — positive proof its shell works, so
-//              codex read's no-write is sandbox gating, not a dead shell).
+//       write: shell writes succeed (incl. codex — on mac/Linux under workspace-write, on Windows under
+//              danger-full-access since codex's Windows sandbox breaks apply_patch; positive proof its shell
+//              works, so codex read's no-write is sandbox gating, not a dead shell).
 // The codex write-boundary is DISCOVERED here (not assumed) because its OS sandbox may not enforce on Windows
 // the way it does on mac/linux — the docs must state whatever is actually true here.
 //
@@ -143,13 +144,13 @@ try {
   check("codex read: read-only sandbox blocks writes (HARD)", rCdx.wrote === false, JSON.stringify(rCdx));
 
   // ── 4. write tier: shell writes succeed. omp = regression (path unchanged); codex = positive proof its
-  //    shell WORKS when the sandbox widens to workspace-write — so codex read's no-write is sandbox gating,
-  //    not a dead shell. ──
+  //    shell WORKS when the sandbox widens to write (workspace-write on mac/Linux, danger-full-access on
+  //    Windows) — so codex read's no-write is sandbox gating, not a dead shell. ──
   const wOmp = await probe("omp", "write");
   check("omp write: summary.access=write", wOmp.summaryAccess === "write", JSON.stringify(wOmp));
   check("omp write: shell writes succeed", wOmp.wrote === true, JSON.stringify(wOmp));
   const wCdx = await probe("codex", "write");
-  check("codex write: shell writes succeed (workspace-write)", wCdx.wrote === true, JSON.stringify(wCdx));
+  check("codex write: shell writes succeed (workspace-write on mac/Linux, danger-full-access on Windows)", wCdx.wrote === true, JSON.stringify(wCdx));
 
   await call("agent_bridge_close_session", {});
   await shutdown();

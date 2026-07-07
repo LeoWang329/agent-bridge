@@ -138,7 +138,7 @@ open 生成者(write:true, cwd=工作区, 注入 roles/generator.md, 引擎按 d
 | 验证者每轮 fresh 会话 + **全量重验所有 AC** | 防「修 A 坏 B」回归 + 防「上轮我验过了」惰性锚定;其全部状态 = 合同 + validation/ 里前轮脚本(**外置复用,fresh 不返工**),冷启动成本≈0。跨迭代引擎保持同一个(判准一致) |
 | 生成者会话跨迭代复用,`contextUsage≥400k` 关旧开新 | 修复需要上下文;交接物 = 合同 + 缺陷清单 + git log,状态全外置,重开无损 |
 | 每迭代 git commit | 回滚锚点 + 验证者 `git diff` 核对改动范围没有越界 |
-| commit 由主控兜底(dogfood 实测修正 2026-07-06) | codex workspace-write 沙箱**保护 `.git/`**,codex 生成者 commit 必被拒(如实 BLOCKED)→ 洁净树基线是主控的验收前置条件,不赖委托方自觉:生成者 commit 首选,**主控代 commit 兜底** |
+| commit 由主控兜底(dogfood 实测修正 2026-07-06;Win 平台差异补注 2026-07-07) | codex 的 workspace-write 沙箱在 **mac/Linux 保护 `.git/`** → 生成者 commit 被拒(如实 BLOCKED);**Windows 上 codex 走 danger-full-access(桥的 sandbox 映射,见 agent-bridge.mjs),无此保护、可自行 commit**。无论哪种,洁净树基线是主控的验收前置条件,不赖委托方自觉:生成者 commit 首选,**主控以 `git status` 兜底代 commit** |
 | 迭代上限默认 5(调用参数可改) | 5 轮修不过大概率是合同/方案问题,不是再磨一轮的问题——该升级给人/中止,不是空转 |
 | **AC 设计铁规**:有可观察行为的 goal 不得仅靠 `[test]` 通过(职责细化 2026-07-07) | `[test]` 跑的是**生成者自己写的**产品测试(交付物,可能空断言/漏断言)——「被考者出题」的变体。凡 goal 有用户可观察行为,必配一条**验证者亲手执行**的独立验证(`[e2e]`/`[log]`)从行为轴独立确认;纯内部重构(无新行为)可 `[test]`+`[review]`。防线放规范层(合同闸),不去让验证者白盒读测试码,黑盒纯度不破 |
 | **两类"测试脚本"所有权双向锁死**(职责细化 2026-07-07) | 产品测试(unit/integration)= **生成者**写、tracked、交付物;`validation/` 里 e2e/探针/fixture = **验证者**写、gitignored、尺子执行层。互不可碰不是新规则,是既有两条铁律的副产品(验证者不动 tracked / 生成者不碰 `.loop/`) |

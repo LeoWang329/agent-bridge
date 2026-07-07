@@ -7,8 +7,8 @@
 - **你永远不宣称「验收通过」**——那是验证者的词。你只汇报「已实现 + 自测证据」。
 - 验收不过会**打回给你一份缺陷清单**(带证据/复现步骤),你在**同一会话**里继续修——这是常态,不是失败。
 - 每迭代结束**必须 `git commit`**(信息格式 `g<K>-i<N>: <一句话>`):这是验收的洁净树基线 + 回滚锚点;验证者会用
-  `git diff` 核对你的改动范围没有越界。**若你的沙箱拒绝写 `.git/`(如 codex 的 workspace-write 保护 .git),
-  别硬试——在汇报里如实说明,主控会代 commit。**
+  `git diff` 核对你的改动范围没有越界。**若你的沙箱拒绝写 `.git/`(如 codex 在 mac/Linux 的 workspace-write 会保护 .git;
+  Windows 上 codex 走 danger-full-access、无此限制,正常 commit 即可),别硬试——在汇报里如实说明,主控会代 commit。**
 
 <!-- SHARED-PRINCIPLES v1 (mirror of agent-bridge-dev roles) — 若改动本段,须与 agent-bridge-dev 的 implementer/reviewer/architect/debugger.md 同步 -->
 ## 工作准则(通用)

@@ -108,8 +108,9 @@ open 生成者(access:"write", cwd=工作区, append_system_prompt_file=<base>/r
     1. send 生成者 ← 该 goal 合同全文 + 上一轮缺陷清单(首轮空)+ 基线 commit
        → wait(mode:"any", timeout_ms:300000) 循环收口
        → cp 其 textRef → iterations/g<K>/i<n>-gen.md;append gen:produced(你写一句话 summary)
-       → **确保 commit(你的职责,不赖委托方自觉)**:生成者已 commit 最好;没 commit(实测 codex 的
-         workspace-write 沙箱**保护 `.git/`**,commit 必被拒 → 它会如实 BLOCKED)→ **你代 commit**——
+       → **确保 commit(你的职责,不赖委托方自觉)**:生成者已 commit 最好;没 commit(mac/Linux 上 codex 的
+         workspace-write 沙箱**保护 `.git/`** → commit 被拒、如实 BLOCKED;Windows 上 codex 走 danger-full-access、无此保护、
+         可能自行 commit 成功)→ 无论哪种,**你都以 `git status` 为准兜底代 commit**——
          以 `git status --porcelain` 的**实际改动清单**为准 add(生成者自报的 filesChanged 只作交叉校验,
          两者差异大 → 先质询再提交,别把逃逸改动漏在基线外),`git commit -m "g<K>-i<n>: …(主控代提交)"`。
          洁净树基线是验收前置条件
@@ -207,7 +208,7 @@ close 生成者
 | 验证脚本误判(假 FAIL,冤枉生成者) | 生成者「不修+理由」→ 主控亲手复跑该 AC 复现步骤仲裁 → `val:script-defect` + 下轮 fresh 验证者修尺子(修改权唯一,见 §尺子的所有权);同 goal >2 次不收敛 → `goal:stuck(reason:"script-defect-loop")` |
 | 验证者留孤儿进程 | validator.md 进程卫生条款 + 收官 `node scripts/agent-bridge.mjs cleanup` 兜底 |
 | 生成者越界改文件 | 验证者 `git diff` 核对改动范围 vs goal 边界,越界记缺陷 |
-| codex 生成者无法 commit | codex 沙箱保护 `.git/`(实测,by design)→ 生成者 BLOCKED 汇报,**主控代 commit**;omp/claude 生成者可自行 commit |
+| codex 生成者无法 commit(仅 mac/Linux) | mac/Linux 上 codex workspace-write 沙箱保护 `.git/` → 生成者 BLOCKED,**主控代 commit**;**Windows 上 codex 走 danger-full-access、无此保护、可自行 commit**;omp/claude 均可自行 commit。无论哪种,主控都以 `git status` 兜底 |
 | 上下文腐化 | `contextUsage ≥ 400k` 关旧开新(桥 skill 既有纪律) |
 | wait 死等/abort | 两条致命纪律(§前置) |
 | 无人值守撞主树 | worktree + branch 根治 |

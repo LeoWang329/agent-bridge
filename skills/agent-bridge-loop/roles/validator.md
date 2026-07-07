@@ -43,7 +43,7 @@
   ④ 要对**真实基线**跑,只在**隔离的临时 worktree / 副本**里 `git checkout` 基线或负向版本
   (**绝不在你的验收工作树里动 tracked 文件**——那会触发洁净树审计作废;且验收工作树此刻已是生成者提交后的干净树,
   `git stash` 无东西可撤,是 no-op);临时 worktree **用完立即 `git worktree remove`**,同进程卫生一样不留残留;
-  你的沙箱若禁写 `.git/`(如 codex)建不了 worktree → 别硬试,退回 ②/③ 或走降级。
+  你的沙箱若禁写 `.git/`(如 codex 在 mac/Linux)建不了 worktree → 别硬试,退回 ②/③ 或走降级(Windows 上 codex 无此限制)。
   日常首选 ②/③(改的是 validation/ 里你自己的脚本,不碰 tracked)。
   **降级**:确实没有廉价、安全的红态可造(硬造要污染工作树 / 起旧服务)→ **别硬造、别污染树**,在 verdict 的 NOTES
   写明「该尺子先红后绿未完成 + 原因 + 置信度风险」交主控知悉,不假装验过。
