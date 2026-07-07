@@ -55,6 +55,35 @@ omp: ok (...) omp/15.9.1
 codex: ok (...) codex-cli 0.137.0
 ```
 
+## 两种安装身份:消费者 vs 维护者(先分清)
+
+Agent Bridge「直接从 clone 运行」——MCP server 与 skill 软链都指向某个 clone，`git pull` 即更新。这对**消费者**很省事，但对**维护者**有个坑。先确认你是哪种，后面各节的 `<REPO>` 就填对应 clone：
+
+- **消费者**（只用、不改）：把 agent 指向你 clone 的仓库即可。你不编辑它，「从 clone 运行」就是安全的；升级就 `git pull`（拉的是已发布的 main）。**下面各节默认按消费者写，`<REPO>` = 你的 clone。**
+- **维护者 / 贡献者**（你要改 Agent Bridge 本身）：**不要**让日常 agent 指向你的**开发工作树**——skill 每次会话重读、MCP server 重启即重载，你**没提交、没测过**的中间改动会立刻在你所有项目里 live。用**两个 clone 分离**：
+
+  | clone | 位置（示例） | 谁指向它 | 何时前进 |
+  |---|---|---|---|
+  | **开发 clone** | `D:\code\agent-bridge` | 无（日常 agent 不指它） | 你随时改、commit/push |
+  | **稳定安装 clone** | `%USERPROFILE%\tools\agent-bridge` | 日常 agent 的 MCP 注册 + skill 软链 | 只在你**主动 `git pull`**（拉已 push/已测的 main）时 |
+
+  后面各节的 `<REPO>` **填稳定安装 clone 的绝对路径**；开发 clone 只用于开发与分发源。想 dogfood 未发布的改动时，再**刻意**在开发 clone 里测（例如用仓库自带的 project 级 `.mcp.json`，它的相对路径正好指开发工作树），而不是让它默默全局生效。
+
+## 适配不同 agent:各 agent 的要求
+
+Agent Bridge 两块东西，**适配范围不同**：
+
+- **MCP server（工具）= 通用**：任何支持 stdio MCP 的客户端都能注册 `node <REPO>/scripts/agent-bridge.mjs mcp`，拿到全部 `agent_bridge_*` 工具。
+- **skills（使用指引）= 仅 Claude Code / Codex**：`skills/*/SKILL.md` 是这两家的 skill 约定，别的客户端不会自动加载（工具照用，只是少了「何时该委托」的判断指引——可把 SKILL.md 当普通文档喂给它）。
+
+| agent | 注册 MCP（工具） | skill 目录 | 工具命名空间 | 生效 |
+|---|---|---|---|---|
+| **Claude Code** | `claude mcp add agent-bridge --scope user -- node "<MJS>" mcp`（写入用户配置） | `~/.claude/skills/<name>/`（软链，裸名、无命名空间） | `mcp__agent-bridge__agent_bridge_*` | 重启客户端 |
+| **Codex** | `codex mcp add agent-bridge -- node "<MJS>" mcp`（写入 `~/.codex/config.toml`） | `~/.codex/skills/<name>/`（软链） | `agent_bridge_*`（裸名） | 重启 Codex |
+| **其它 MCP 客户端**（Cursor / Cline / Windsurf …） | 在该客户端 MCP 配置里加一个 stdio server：命令 `node`、参数 `["<MJS>","mcp"]` | 无自动 skill 机制——按需把 `skills/agent-bridge/SKILL.md` 作为文档提供 | 由该客户端定（多为 `agent_bridge_*`） | 按该客户端方式重载 |
+
+`<MJS>` = `<REPO>/scripts/agent-bridge.mjs` 的**绝对路径**（维护者填**稳定安装 clone**，见上一节）。后端（omp/codex/claude）是否可用以 `node "<MJS>" doctor` 为准。一律用**绝对路径**，别用 `$PWD`——agent 的 shell 通常不在仓库根。
+
 ## 3. 安装到 Codex
 
 Codex 分两步：注册 MCP server（工具），再把 skill 链接进 Codex 的 skill 目录。两者都直接指向这个 clone，`git pull` 即更新，无需重装。下文 `<REPO>` = 这个 clone 的绝对路径。
@@ -178,7 +207,7 @@ Codex 使用 Agent Bridge 时应该遵循这个流程：
 }
 ```
 
-需要 Codex 时，把 `agent` 换成 `codex`（会启动 `codex app-server`，逐 token 流式返回；只读用 `sandbox: read-only`，写用 `sandbox: workspace-write`，均为非交互）：
+需要 Codex 时，把 `agent` 换成 `codex`（会启动 `codex app-server`，逐 token 流式返回；只读用 `sandbox: read-only`，写用 `sandbox: workspace-write`——**Windows 上写档改用 `danger-full-access`**，因 codex 的 Windows 沙箱会破坏 apply_patch（上游 bug），此时为软边界，同 omp/claude；均为非交互）：
 
 ```json
 {
@@ -236,7 +265,7 @@ node scripts/agent-bridge.mjs cleanup --json
 写权限模式会启用高权限参数：
 
 - OMP：`--auto-approve --approval-mode yolo`
-- Codex：`sandbox: workspace-write`（`approvalPolicy: never`）
+- Codex：`sandbox: workspace-write`（Windows 上为 `danger-full-access`，见上）（`approvalPolicy: never`）
 
 让委托代理改完后，Codex 自己仍然应该检查 git diff、运行测试，再向用户报告。
 
@@ -270,7 +299,7 @@ find "$HOME/.agent-bridge/pids" -type f -maxdepth 1 -print 2>/dev/null || true
 
 ## 10. 升级
 
-MCP server 和 skill 都直接指向这个 clone，`git pull` 即完成升级，无需重装：
+MCP server 和 skill 都直接指向这个 clone，`git pull` 即完成升级，无需重装（**维护者**：在**稳定安装 clone** 里 `git pull`——那才是日常 agent 消费的副本；开发 clone 的未提交改动不该经此上线，见「两种安装身份」）：
 
 ```sh
 cd "$HOME/projects/agent-bridge"
