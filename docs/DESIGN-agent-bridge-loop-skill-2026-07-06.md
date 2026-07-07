@@ -140,6 +140,11 @@ open 生成者(write:true, cwd=工作区, 注入 roles/generator.md, 引擎按 d
 | 每迭代 git commit | 回滚锚点 + 验证者 `git diff` 核对改动范围没有越界 |
 | commit 由主控兜底(dogfood 实测修正 2026-07-06) | codex workspace-write 沙箱**保护 `.git/`**,codex 生成者 commit 必被拒(如实 BLOCKED)→ 洁净树基线是主控的验收前置条件,不赖委托方自觉:生成者 commit 首选,**主控代 commit 兜底** |
 | 迭代上限默认 5(调用参数可改) | 5 轮修不过大概率是合同/方案问题,不是再磨一轮的问题——该升级给人/中止,不是空转 |
+| **AC 设计铁规**:有可观察行为的 goal 不得仅靠 `[test]` 通过(职责细化 2026-07-07) | `[test]` 跑的是**生成者自己写的**产品测试(交付物,可能空断言/漏断言)——「被考者出题」的变体。凡 goal 有用户可观察行为,必配一条**验证者亲手执行**的独立验证(`[e2e]`/`[log]`)从行为轴独立确认;纯内部重构(无新行为)可 `[test]`+`[review]`。防线放规范层(合同闸),不去让验证者白盒读测试码,黑盒纯度不破 |
+| **两类"测试脚本"所有权双向锁死**(职责细化 2026-07-07) | 产品测试(unit/integration)= **生成者**写、tracked、交付物;`validation/` 里 e2e/探针/fixture = **验证者**写、gitignored、尺子执行层。互不可碰不是新规则,是既有两条铁律的副产品(验证者不动 tracked / 生成者不碰 `.loop/`) |
+| **验证脚本(尺子)有 bug:发现权全开、修改权唯一 = 下轮 fresh 验证者**(职责细化 2026-07-07) | `validation/` 无洁净树审计罩着,完整性只靠**单一 writer 所有权**。生成者改=被考者改考卷(结构性禁止);主控亲手改=裁判下场兼工具作者、且两 writer 无法归因"谁改坏"。故全员只**报告**可疑,主控只把裁决证据附进下轮验证者 send,由验证者改;验证者血脉修不动 → 主控 `doctor` 换引擎重开(换人不换规则) |
+| **先红后绿**:新建/改的验证脚本先对已知应 FAIL 的状态确认能红(职责细化 2026-07-07) | 一条从没红过的脚本可能什么都没测到(空断言/选择器失效/连错服务),用它判 PASS 等于放水——把 TDD「先看测试失败」移植到尺子自检,零新增会话,堵住"脚本恒 PASS"这类最常见放水 bug |
+| **仲裁明文化**:生成者质疑缺陷不成立 → 主控亲手复跑该 AC 复现步骤裁决(职责细化 2026-07-07) | 缺陷争议不能悬空:确成立→仍打回生成者;确不成立(尺子误判)→记验证脚本缺陷交下轮验证者修尺子。裁决者=主控,修改者仍按所有权=验证者,两权分离 |
 
 **两条致命纪律(内联,同 dev/roundtable)**:`wait` 必传 `timeout_ms`(300000 短轮询循环);别给 `send_message`/`open_session` 传 `wait:true`(超时 abort 掉 turn)。
 
@@ -157,6 +162,7 @@ open 生成者(write:true, cwd=工作区, 注入 roles/generator.md, 引擎按 d
 - **全量重验**:每次验收把该 goal 所有 AC 全部重跑,不只验上轮失败项。
 - 缺陷必须带证据:命令输出/日志行/复现步骤,并标涉及哪条 AC。
 - **自建验证资产(鼓励)**:可以也应该自己写验证脚本(playwright/探针/fixture),一律放 `<cwd>/.loop/run-<id>/validation/`;需要的依赖装在 validation/ 自己的 package.json 下,**绝不碰产品树的 package.json/lock**;前轮脚本就在那,优先复用改进,别重写。
+- **先红后绿 + 尺子所有权**(职责细化 2026-07-07):新建/改的验证脚本先对已知应 FAIL 的状态确认能红再用于验收;验证脚本(尺子)是验证者专属资产,别人只报告可疑、唯一修改者是下轮 fresh 验证者(详见 SKILL.md §尺子的所有权与修改权 / `val:script-defect` 事件)。
 - **禁止**:修改产品代码(任何 tracked 文件——「要改产品码才能验」本身就是缺陷,报告它)、降低验收标准、替生成者设计具体实现(可指出方向)。
 - **进程卫生**:你为验收启动的任何进程(服务/watcher)必须在验收结束前自己停掉(记 pid、kill),不留孤儿(本仓血泪教训)。
 - 固定 verdict 格式(机器可解析,主 agent 据此写事件):`VERDICT: PASS|FAIL` + 每条 `AC<n>: PASS|FAIL — <一句证据>` + 缺陷列表。
@@ -195,8 +201,9 @@ viz.pid                     ← 开了 viz 时的服务 pid(兜底 kill)
 | `gen:produced` | `goalId`,`n`,`genRef`,`summary`,`commit`,`filesChanged` | 生成者交付 |
 | `val:verdict` | `goalId`,`n`,`verdict:"pass"\|"fail"`,`acResults:[{acId,status,evidence}]`,`defects:[…]`,`verdictRef` | 验收结果(爬坡数据源) |
 | `val:tainted` | `goalId`,`n`,`files` | 洁净树审计不过:验证者改了 tracked 产品文件 → 撤销 + 该轮 verdict 作废 + fresh 重验 |
+| `val:script-defect` | `goalId`,`n`,`acId`,`desc`,`evidence`,`discoveredBy` | 仲裁认定验证脚本(尺子)误判 → 留痕交下轮 fresh 验证者修尺子(纯争议轮不消耗生成者迭代配额、沿用同一 n 重验;详见 EVENTS.md 与 SKILL.md §尺子的所有权) |
 | `goal:passed` | `goalId`,`iters` | goal 全绿 |
-| `goal:stuck` | `goalId`,`policy:"halt"\|"user-extend"\|"user-amend"\|"user-abandon"` | 卡死 + 采取的策略(halt=无人值守中止;user-* = 人在环用户选:加轮/改合同/放弃该 goal) |
+| `goal:stuck` | `goalId`,`reason:"iter-cap"\|"script-defect-loop"`,`policy:"halt"\|"user-extend"\|"user-amend"\|"user-abandon"` | 卡死:`reason`=为何卡(iter-cap=达迭代上限;script-defect-loop=尺子仲裁 >2 次不收敛);`policy`=采取的动作(halt=无人值守中止;user-* = 人在环用户选:加轮/改合同/放弃) |
 | `review:final` | `verdict:"approve"\|"needs-fixes"`,`reviewRef`,`round` | 收官闸:整支 broad review(NEEDS_FIXES → 打回生成者,复评到 APPROVE 才 `run:final`) |
 | `human:asked` / `human:answered` | 同圆桌 | 人在环升级 |
 | `run:final` | `reportRef`,`goalsPassed`,`goalsTotal`,`branch?` | 收官(无人值守带 branch 名) |

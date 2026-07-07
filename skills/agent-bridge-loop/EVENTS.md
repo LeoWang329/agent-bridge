@@ -33,9 +33,10 @@
 | `iter:started` | `goalId`,`n` | 该 goal 第 n 迭代(从 1) |
 | `gen:produced` | `goalId`,`n`,`genRef`,`summary`,`commit?`,`filesChanged?` | 生成者交付(完整汇报在 `genRef`,字节直传;`summary`=主 agent 一句话) |
 | `val:verdict` | `goalId`,`n`,`verdict:"pass"\|"fail"`,`acResults:[{acId,status:"pass"\|"fail"\|"skipped"\|"blocked",evidence?}]`,`defects?:[{acId?,desc}]`,`verdictRef` | 验收结果(**爬坡数据源**:acResults 逐条;完整 verdict 在 `verdictRef`)。`skipped` 用于 lazy 的 `[review]` AC(其它未全绿,本轮未执行) |
-| `val:tainted` | `goalId`,`n`,`files:[…]` | 洁净树审计不过:验证者改了 tracked 产品文件 → 主 agent 撤销 + 该次 verdict 作废 + fresh 重验(重验结果另发 `val:verdict`) |
+| `val:tainted` | `goalId`,`n`,`files:[…]` | 洁净树审计不过:验证者改了 tracked 产品文件 → 主 agent 撤销 + 该次 verdict 作废 + fresh 重验(重验结果**沿用同一 n** 另发 `val:verdict`——迭代没有前进,只是重测) |
+| `val:script-defect` | `goalId`,`n`,`acId`,`desc`,`evidence`,`discoveredBy:"generator"\|"controller"\|"validator"\|"reviewer"` | 仲裁认定**验证脚本(尺子)误判**:主 agent 亲手复跑该 AC 复现步骤后确认生成者产品是对的、是尺子错了 → 留痕裁决证据,交下轮 fresh 验证者修尺子(修改权仍只在验证者,见 SKILL.md §尺子的所有权)。纯争议轮不消耗生成者迭代配额,重验**沿用同一 n** 另发 `val:verdict`(同 `val:tainted`);混合回应轮并入正常下一迭代 |
 | `goal:passed` | `goalId`,`iters` | goal 全绿(该 goal 最后一条 `val:verdict.verdict="pass"`) |
-| `goal:stuck` | `goalId`,`policy:"halt"\|"user-extend"\|"user-amend"\|"user-abandon"`,`note?` | 达迭代上限仍不过:halt=无人值守中止后续;user-* = 人在环用户选(加轮/改合同/放弃) |
+| `goal:stuck` | `goalId`,`reason:"iter-cap"\|"script-defect-loop"`,`policy:"halt"\|"user-extend"\|"user-amend"\|"user-abandon"`,`note?` | 卡死。`reason`=**为何卡**:`iter-cap`=达生成者迭代上限仍不过;`script-defect-loop`=同 goal 尺子仲裁 >2 次仍不收敛(尺子反复修不对)。`policy`=**采取的动作**:halt=无人值守中止后续;user-* = 人在环用户选(加轮/改合同/放弃) |
 | `review:final` | `verdict:"approve"\|"needs-fixes"`,`reviewRef`,`round` | 收官闸:整支 broad review(NEEDS_FIXES → 打回生成者修,复评到 APPROVE 才 `run:final`;`round` 从 1 计) |
 | `human:asked` | `questionId`,`question`,`options?`,`why` | 升级问人(仅人在环);可视化挂「⏸ 等待人类决断」 |
 | `human:answered` | `questionId`,`answer` | 人已拍板;主 agent 将其作为约束注入后续 |
