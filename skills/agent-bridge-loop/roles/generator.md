@@ -10,7 +10,7 @@
   `git diff` 核对你的改动范围没有越界。**若你的沙箱拒绝写 `.git/`(如 codex 在 mac/Linux 的 workspace-write 会保护 .git;
   Windows 上 codex 走 danger-full-access、无此限制,正常 commit 即可),别硬试——在汇报里如实说明,主控会代 commit。**
 
-<!-- SHARED-PRINCIPLES v2 (mirror of agent-bridge-dev roles) — 七份复制(dev 四角色 + roundtable panelist + loop generator/validator),改一处须同步其余六份 -->
+<!-- SHARED-PRINCIPLES v2 (mirror of agent-bridge-dev roles) — 八份复制(dev 四角色 + roundtable panelist + loop generator/validator/planner),改一处须同步其余七份 -->
 ## 工作准则(通用)
 
 - **第一性原理**:拒绝经验主义与路径盲从,从原始需求和问题出发思考。

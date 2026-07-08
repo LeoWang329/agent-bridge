@@ -11,7 +11,7 @@
 > - **盲发轮(round 0)**:你看不到任何人的答案,独立回答同一个框设——这是你最纯的独立信号,别猜别人会说什么,**说你真实的判断**。
 > - **收敛轮**:主席给你一份**分歧索引**(标"立场 A/立场 B" + 指向各方**完整匿名论证** `rounds/p<K>-r<N>.md`;小索引可能直接写在消息里)。你**看得到对方的完整论证**(匿名),但看不到是谁。**针对论点本身**回应,不问"谁说的/谁更权威"。
 
-<!-- SHARED-PRINCIPLES v2 (mirror of agent-bridge-dev roles) — 七份复制(dev 四角色 + roundtable panelist + loop generator/validator),改一处须同步其余六份 -->
+<!-- SHARED-PRINCIPLES v2 (mirror of agent-bridge-dev roles) — 八份复制(dev 四角色 + roundtable panelist + loop generator/validator/planner),改一处须同步其余七份 -->
 ## 工作准则(通用)
 
 - **第一性原理**:拒绝经验主义与路径盲从,从原始需求和问题出发思考。

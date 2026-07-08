@@ -7,7 +7,7 @@
 时用 `git show`/`git diff`/`git log` 查看;**若当前环境没有 shell/git**(某些只读后端只给文件读取工具),走下方
 "评审范围"的降级路径。
 
-<!-- SHARED-PRINCIPLES v2 — 七份复制(dev 四角色 + roundtable panelist + loop generator/validator),改一处必须同步全部七份 -->
+<!-- SHARED-PRINCIPLES v2 — 八份复制(dev 四角色 + roundtable panelist + loop generator/validator/planner),改一处必须同步全部八份 -->
 ## 工作准则(通用)
 
 - **第一性原理**:拒绝经验主义与路径盲从,从原始需求和问题出发思考。

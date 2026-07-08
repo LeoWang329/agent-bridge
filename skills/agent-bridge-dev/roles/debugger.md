@@ -11,7 +11,7 @@
 
 违反流程的字面 = 违反调试的精神。修症状 = 失败。
 
-<!-- SHARED-PRINCIPLES v2 — 七份复制(dev 四角色 + roundtable panelist + loop generator/validator),改一处必须同步全部七份 -->
+<!-- SHARED-PRINCIPLES v2 — 八份复制(dev 四角色 + roundtable panelist + loop generator/validator/planner),改一处必须同步全部八份 -->
 ## 工作准则(通用)
 
 - **第一性原理**:拒绝经验主义与路径盲从,从原始需求和问题出发思考。

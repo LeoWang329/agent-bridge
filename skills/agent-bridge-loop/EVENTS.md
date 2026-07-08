@@ -2,7 +2,7 @@
 
 一次 loop 运行的**过程真理源**是 run-dir 下的 `transcript.jsonl`——一份 **append-only、单一 writer(主 agent)** 的事件流;**需求真理源**是同目录的 `contract.md`(验收合同)。可视化只 `tail` 前者;大文本(生成者汇报/验收 verdict/终稿)**旁挂**为文件,事件里只留引用(`genRef`/`verdictRef`/…)。
 
-> **谁写**:只有主 agent(编排者)写 `transcript.jsonl`、`contract.md`、`iterations/`、`final.md`——且 `iterations/` 里的原文是 `cp` 桥落好的 `textRef`(字节直传,不转写)。生成者只写产品代码(自己的工作树);验证者只写 `validation/`(自建验证资产)。**都不写真理源。**
+> **谁写**:只有主 agent(编排者)写 `transcript.jsonl`、`contract.md`、`iterations/`、`final.md`——且 `iterations/` 里的原文是 `cp` 桥落好的 `textRef`(字节直传,不转写)。生成者只写产品代码(自己的工作树);验证者只写 `validation/`(自建验证资产);规划者只写 `planning/`(草案/建议,转正 = 主控 cp)。**都不写真理源。**
 > **桥不替你写**:agent-bridge 只写 per-session 原始 `.log` / `bridge.log` / `exit-journal`;loop 事件必须主 agent 自己 append。
 
 ## 信封(每行都有)
@@ -16,7 +16,7 @@
 | `runId` | string | 本次运行 id(= run-dir 名里的 `run-<id>`) |
 | `payload` | object | 事件专属字段(见下表;goal/迭代归属放 payload 的 `goalId`/`n`) |
 
-约定:`payload` 里凡是指向文件的字段(`contractRef`/`genRef`/`verdictRef`/`summaryRef`/`reviewRef`/`reportRef`)一律是**相对 run-dir 的相对路径**(如 `iterations/g1/i2-gen.md`),可视化 `/file?ref=` 只接受这种相对路径,拒绝绝对路径与 `..`。
+约定:`payload` 里凡是指向文件的字段(`contractRef`/`genRef`/`verdictRef`/`summaryRef`/`reviewRef`/`reportRef`/`draftRef`)一律是**相对 run-dir 的相对路径**(如 `iterations/g1/i2-gen.md`),可视化 `/file?ref=` 只接受这种相对路径,拒绝绝对路径与 `..`。
 
 ## 事件类型
 
@@ -26,6 +26,7 @@
 | `viz:started` / `viz:stopped` | `url`,`pid`,`port` / `reason` | 可视化服务起/停(仅人在环同意开时) |
 | `intake:asked` / `intake:answered` | `question` / `answer` | 需求访谈一问一答(苏格拉底式,人在环) |
 | `panel:launched` / `panel:concluded` | `kind:"architects"\|"roundtable"`,`runDir` / `summaryRef` | 评审团子运行(面板有**自己的** run-dir/事件流,这里只记引用,不复述内容) |
+| `planner:produced` | `kind:"contract"\|"amendment"\|"final"\|"advice"`,`draftRef`,`summary?` | 规划者产出草案/建议(`draftRef` 指向 `planning/` 下文件;是否转正走 `contract:*` / `run:final` 事件;主 agent append。viz 对未知事件安全忽略,渲染可后补) |
 | `contract:drafted` | `contractRef`,`goals:[{id,title,acCount}]` | 合同草案落盘 |
 | `contract:confirmed` | `by:"user"\|"panel"`,`changes?` | 合同闸通过(人在环=用户;无人值守=面板批判后定稿) |
 | `contract:amended` | `changes`,`affectedGoals` | 中途改约;受影响的已通过 goal 标记复验 |
@@ -55,6 +56,7 @@
     panel/                     ← 面板产出引用(summaryRef 指向这;面板自己的 run-dir 在别处)
     review/                    ← 收官 broad review 报告(reviewRef 指向这)
     validation/                ← 验证者自建验证资产归档处(见下)
+    planning/                  ← 规划者自留地(合同/修约/终稿草案与建议;转正靠主控 cp)
     final.md                   ← 收官报告(run:final.reportRef 指向它)
     viz.pid                    ← 开了可视化时的服务 pid(兜底 kill)
 ```
