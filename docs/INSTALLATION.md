@@ -228,7 +228,28 @@ Codex 使用 Agent Bridge 时应该遵循这个流程：
 }
 ```
 
-可以在**打开会话时**指定模型与推理强度。模型是会话级参数：在 `agent_bridge_open_session` 时用 `model` 指定，整个会话内固定，`agent_bridge_send_message` 不能逐条切换；想换模型就新开一个 session。`model` 会原样传给后端的 `--model`，取值格式由后端决定。OMP 尤其可以通过 `omp --model <name>` 触达多种模型（如 `deepseek-v4-pro`、`minimax-m3`、`claude`、`gpt`）。可选的 `effort` 在 OMP 映射为 `--thinking`（`minimal|low|medium|high|xhigh`），在 Codex 作为该轮的 effort（`none|minimal|low|medium|high|xhigh`）传入。不传 `model` / `effort` 时使用后端默认值。
+需要 Claude 时，把 `agent` 换成 `claude`（启动一个 fresh-context Claude Code worker，逐 token 流式；`read` 档 Bash 可跑命令、但能写盘=**软边界**，`write` 档用 `bypassPermissions`；思考强度默认 `xhigh`；不设 `model` 时用 claude 自身默认模型）：
+
+```json
+{
+  "agent": "claude",
+  "cwd": "/absolute/path/to/workspace",
+  "write": false
+}
+```
+
+需要 Cursor 时，把 `agent` 换成 `cursor`（**仅 Windows**；形状 B——逻辑会话=云端 `chatId`、进程按轮短驻）。几处后端特有约束：`read`/`write` 都是**软边界**（`read` 甚至保留原生 Edit/Write 工具、只靠每轮提示压制）；`model` 要带**档位后缀**的 selector（如 `gpt-5.3-codex-high`、`cursor-grok-4.5-high`，清单用 `agent --list-models` 活查）；`append_system_prompt_file` 无原生 system flag、软注入为首轮用户前缀；`effort` 被接受但忽略、`schema` 不支持；`contextUsage` 恒 `null`；无 delete-chat，`close` 只忘 `chatId`、云端 chat 留存删不掉：
+
+```json
+{
+  "agent": "cursor",
+  "cwd": "C:\\absolute\\path\\to\\workspace",
+  "write": false,
+  "model": "gpt-5.3-codex-high"
+}
+```
+
+可以在**打开会话时**指定模型与推理强度。模型是会话级参数：在 `agent_bridge_open_session` 时用 `model` 指定，整个会话内固定，`agent_bridge_send_message` 不能逐条切换；想换模型就新开一个 session。`model` 会原样传给后端的 `--model`，取值格式由后端决定。OMP 尤其可以通过 `omp --model <name>` 触达多种模型（如 `deepseek-v4-pro`、`minimax-m3`、`claude`、`gpt`）。可选的 `effort` 在 OMP 映射为 `--thinking`（`minimal|low|medium|high|xhigh`），在 Codex 作为该轮的 effort（`none|minimal|low|medium|high|xhigh`）传入，在 Claude 映射为 `--effort`（默认 `xhigh`）；**Cursor 的 `model` 必须是带档位后缀的 selector**（用 `agent --list-models` 活查），其 `effort` 被接受但忽略、`contextUsage` 恒 `null`。不传 `model` / `effort` 时使用后端默认值。
 
 ```json
 {
