@@ -634,8 +634,10 @@ function handle(ev){
 
     case "disagreement": {
       // fromSeat 对人类观察者可见(匿名约束的是席位彼此,不含观察台);pK 徽标与发言卡同色,便于把立场映射到某席
-      var kindCls = p.kind==="needs-human" ? "human" : "merit";
-      var kindTxt = p.kind==="needs-human" ? "⏸ 需人拍板" : "可论证解决";
+      // kind 三值显式映射;未知值显示原文,不回退成「可论证解决」(防把新语义误读给观察者)
+      var KIND_LABEL = {"by-merit":"可论证解决","needs-human":"⏸ 需人拍板","fork-parked":"⏸ 已停车 · 另场裁决"};
+      var kindCls = (p.kind==="needs-human"||p.kind==="fork-parked") ? "human" : "merit";
+      var kindTxt = Object.prototype.hasOwnProperty.call(KIND_LABEL, p.kind) ? KIND_LABEL[p.kind] : esc(p.kind||"未标注");
       var posHtml = (p.positions||[]).map(function(x){
         return '<div class="pos"><span class="pos-label">'
           + (x.fromSeat ? stoken(x.fromSeat,false)+'<span class="sr-only">来自 '+esc(x.fromSeat)+' · </span>' : '')

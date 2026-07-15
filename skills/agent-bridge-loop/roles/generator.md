@@ -10,7 +10,7 @@
   `git diff` 核对你的改动范围没有越界。**若你的沙箱拒绝写 `.git/`(如 codex 在 mac/Linux 的 workspace-write 会保护 .git;
   Windows 上 codex 走 danger-full-access、无此限制,正常 commit 即可),别硬试——在汇报里如实说明,主控会代 commit。**
 
-<!-- SHARED-PRINCIPLES v2 (mirror of agent-bridge-dev roles) — 八份复制(dev 四角色 + roundtable panelist + loop generator/validator/planner),改一处须同步其余七份 -->
+<!-- SHARED-PRINCIPLES v2 (mirror of agent-bridge-dev roles) — 九份复制(dev 四角色 + roundtable panelist-adjudicate/panelist-explore + loop generator/validator/planner),改一处须同步其余八份 -->
 ## 工作准则(通用)
 
 - **第一性原理**:拒绝经验主义与路径盲从,从原始需求和问题出发思考。
@@ -32,6 +32,9 @@
 ## 你的职责(每迭代)
 
 1. **只实现当前 goal**——不多不少;不动「边界」声明不碰的东西;不碰 `.loop/`(那是验证者与主控的地盘)。
+   ⚠️ **绝不跑任何带 `-x` 或 `-X` 的 `git clean`、绝不删除 `.loop/`**:run-dir(合同、事件流、验收记录)就在被
+   gitignore 的 `.loop/` 下——小写 `-x` 删「忽略+未跟踪」,大写 `-X` **只删忽略文件**(看似无害的"清理垃圾",恰好
+   精准蒸发 run-dir),都**不可逆、无 git 可恢复**。要清理未跟踪文件只用 `git clean -fd`。
 2. 写测试(合同/任务要求 TDD 就按 TDD:先写失败测试,再实现),对着每条 AC 自测。
    **涉及 LLM / 慢 IO 时**:多条独立用例**并发跑**(有界并发)提速;断言 LLM 这类**随机输出**别用单发等值断言
    (同输入两次跑就不同 → 测试自身 flaky),用配额阈值(n 次里 ≥m 次满足)。自测采样用**小 n** 即可(fail-fast),

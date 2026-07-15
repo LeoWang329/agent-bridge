@@ -87,6 +87,21 @@ const DOCTOR_PROBE_TIMEOUT_MS = envNum("AGENT_BRIDGE_DOCTOR_PROBE_TIMEOUT_MS", 1
 // (reaping our backends) once it's gone. AGENT_BRIDGE_PARENT_PID overrides which pid to watch (a
 // supervisor, or a test); default is process.ppid. Set the interval to 0 to disable.
 const PARENT_WATCHDOG_INTERVAL_MS = envNum("AGENT_BRIDGE_PARENT_WATCHDOG_MS", 15_000);
+// ── Cursor backend (Shape B: cloud chat + per-turn short-lived process) ──────────────────────────
+// create-chat runs a headless network call (auth + chat allocation); it can hang on a bad connection,
+// so bound it and tree-kill on timeout. Cold-start-to-first-shell measured ~81s in the spike, so this
+// is generous. Env-overridable for slow links.
+const CURSOR_CREATE_CHAT_TIMEOUT_MS = envNum("AGENT_BRIDGE_CURSOR_CREATE_CHAT_MS", 60_000);
+// abort() tree-kills the turn's process, then waits this long for the child's `close` (the settlement
+// boundary) to fire and settle the turn as "aborted". The scheduled SIGKILL fires at 3s, so a live tree
+// normally dies and closes well within this window; the timeout is the pathological-zombie fallback that
+// force-settles so wait() can never hang. Keep it > the 3s force-kill grace.
+const CURSOR_ABORT_SETTLE_MS = envNum("AGENT_BRIDGE_CURSOR_ABORT_SETTLE_MS", 8000);
+// The prompt rides in argv (Cursor `-p` reads no stdin prompt). Windows caps the whole command line in
+// UTF-16 code units (~32K); node/index.js/cwd/model/flags/quoting all eat into it, so reject a composed
+// command line over this conservative static ceiling with a clear error rather than letting the OS
+// truncate or fail opaquely. (A file-based prompt is a future opt-in — see design §6.1.)
+const CURSOR_CMDLINE_MAX_UNITS = envNum("AGENT_BRIDGE_CURSOR_CMDLINE_MAX", 24_000);
 
 // Backend registry — the single source of truth for "which backends exist". Holds ONLY data and pure
 // functions so it is fully initialized at module load: TOOLS (enum), agentBin, assertAgent and doctor
@@ -121,6 +136,36 @@ const AGENTS = {
     // SECURITY BOUNDARY: keep tight — too loose risks terminating an unrelated process during reclaim.
     matchesCommand: cmd => /\bclaude\b/.test(cmd) && /--input-format\s+stream-json/.test(cmd),
   },
+  cursor: {
+    label: "Cursor Agent",
+    env: "CURSOR_AGENT_BIN",
+    bin: "agent", // cursor-agent's launch command; the real target is a versioned node.exe + index.js
+    role: "cursor-stream-json",
+    versionArgs: ["--version"], // used by the resolved node+index.js launcher (see doctor() — NOT via a bare node.exe, §5.9)
+    // We spawn the internal `node index.js` directly (bypassing the .cmd/.ps1 shim, §5.5), so a
+    // bridge-spawned cursor turn/create-chat looks like `node …\cursor-agent\…\index.js …`.
+    // SECURITY BOUNDARY: keep tight. Require the cursor-agent index.js entry (its own or a versioned
+    // one), THEN one of two shapes so an unrelated `node index.js create-chat` can't be swept:
+    //   • a turn  — `--output-format stream-json` AND a `--resume` flag; or
+    //   • a start — the `create-chat` subcommand.
+    matchesCommand: cmd => {
+      // Match ONLY the flag portion before our `-- <prompt>` separator, so a user's prompt text can never
+      // false-match the shape (a prompt that happens to contain "create-chat", or "--resume … stream-json").
+      const head = String(cmd).split(/\s--\s/)[0];
+      // Require a real path-segment boundary before "cursor-agent" so `…\notcursor-agent\…` cannot match.
+      // NOTE (v1 limitation): this requires the standard cursor-agent install dir name; if CURSOR_AGENT_BIN
+      // points at a non-standard root, orphan reaping won't auto-match on Windows (env markers aren't
+      // readable via CIM). Documented in the design.
+      const isCursorEntry = /[\\/]cursor-agent[\\/](?:versions[\\/][^\\/]+[\\/])?index\.js/i.test(head);
+      if (!isCursorEntry) return false;
+      const turnBranch =
+        /(?:^|\s)-p(?:\s|$)/.test(head) &&
+        /--output-format\s+stream-json/.test(head) &&
+        /(?:^|\s)--resume(?:\s|$)/.test(head);
+      const startBranch = /(?:^|\s)create-chat(?:\s|$)/.test(head);
+      return turnBranch || startBranch;
+    },
+  },
 };
 
 const sessions = new Map();
@@ -138,7 +183,7 @@ const TOOLS = [
   {
     name: "agent_bridge_open_session",
     description:
-      "Open a persistent delegated-agent session. OMP uses its JSONL RPC mode; Codex drives a persistent codex app-server over JSON-RPC. Use this before sending messages.",
+      "Open a persistent delegated-agent session. OMP uses its JSONL RPC mode; Codex drives a persistent codex app-server over JSON-RPC; Claude runs a fresh-context Claude Code worker; Cursor drives the cursor-agent CLI (Windows-only in v1; per-turn cloud chat, so read/write are both soft, contextUsage is always null, and schema/effort are unsupported; append_system_prompt_file is injected as a SOFT first-turn user-prefix — model-dependent, not a true system prompt). Use this before sending messages.",
     inputSchema: {
       type: "object",
       properties: {
@@ -182,7 +227,7 @@ const TOOLS = [
         append_system_prompt_file: {
           type: "string",
           description:
-            "Optional ABSOLUTE path to a markdown/text file whose contents are injected as an APPENDED system prompt for the whole session (persistent per-session role/instructions). Unlike message_file this MAY live outside cwd (a shared prompt library); ≤64 KiB. omp: `--append-system-prompt=<path>`; claude: `--append-system-prompt-file <path>` (both a true appended system prompt); codex: thread developerInstructions. Reflected in the session summary's appendSystemPrompt. Note: omp honors it reliably with a capable model (e.g. deepseek-v4-pro); omp's default model may follow appended instructions only loosely.",
+            "Optional ABSOLUTE path to a markdown/text file whose contents are injected as an APPENDED system prompt for the whole session (persistent per-session role/instructions). Unlike message_file this MAY live outside cwd (a shared prompt library); ≤64 KiB. omp: `--append-system-prompt=<path>`; claude: `--append-system-prompt-file <path>` (both a true appended system prompt); codex: thread developerInstructions; cursor: prepended to the FIRST turn's message as a soft user-prefix (no native system-prompt flag — model-dependent adherence, NOT a true system prompt, and it shares cursor's ~24K argv budget with the message, so keep it concise). Reflected in the session summary's appendSystemPrompt. Note: omp honors it reliably with a capable model (e.g. deepseek-v4-pro); omp's default model may follow appended instructions only loosely.",
         },
         initial_prompt: { type: "string", description: "Optional first message to send after opening." },
         schema: {
@@ -332,7 +377,7 @@ const TOOLS = [
   },
   {
     name: "agent_bridge_doctor",
-    description: "Check whether OMP, Codex, and Node are available for Agent Bridge.",
+    description: "Check whether OMP, Codex, Claude, Cursor, and Node are available for Agent Bridge.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
 ];
@@ -342,7 +387,7 @@ function usage() {
     "Usage:",
     "  agent-bridge mcp                 Run the MCP server (stdio). Sessions live in this process.",
     "  agent-bridge doctor [--json]     Report environment / backend availability.",
-    "  agent-bridge cleanup [--json]    Reap orphaned omp/codex/claude children from dead MCP servers.",
+    "  agent-bridge cleanup [--json]    Reap orphaned omp/codex/claude/cursor children from dead MCP servers.",
     "",
     "Sessions are managed exclusively through the MCP server's tools (open/send/status/result/",
     "wait/abort/close). The CLI exposes only the server entrypoint plus doctor/cleanup helpers.",
@@ -442,6 +487,95 @@ function spawnPlan(bin, args) {
   }
   // Native executable, or an unresolved bare name (fall through so the OS reports ENOENT cleanly).
   return { command: resolved || bin, args };
+}
+
+// ── Cursor native launcher resolution (§5.5) ─────────────────────────────────────────────────────
+// Cursor's `agent` is a .cmd/.ps1 shim that internally runs `versions\<latest>\node.exe index.js`.
+// We resolve that REAL node.exe + index.js and spawn it directly, so a user prompt in argv is never
+// re-parsed by cmd.exe (the shim path). Never fall back to the shim for a prompt-bearing spawn.
+
+// Version dir name → sortable YYYYMMDDHHMMSS, or null when it isn't a version dir. Cursor uses either
+// "YYYY.MM.DD-<hash>" or the newer "YYYY.MM.DD-HH-MM-SS-<hash>" (build timestamp). We compare the FULL
+// date+time — the vendor's Parse-VersionString only compares Y.M.D, so same-day builds would tie and
+// pick a non-deterministic "latest".
+function cursorVersionKey(name) {
+  const m = /^(\d{4})\.(\d{1,2})\.(\d{1,2})(?:-(\d{2})-(\d{2})-(\d{2}))?-[a-f0-9]+$/i.exec(name);
+  if (!m) return null;
+  const [, y, mo, d, hh = "00", mi = "00", ss = "00"] = m;
+  return y + mo.padStart(2, "0") + d.padStart(2, "0") + hh + mi + ss;
+}
+
+// From a candidate directory, resolve { node, indexJs }: a direct-sibling node.exe+index.js (the shim's
+// own dir in the agent.ps1 line-38 layout, or a version dir itself), else the newest versions\<name>\
+// that has both. Returns null when neither is present (caller tries the next candidate dir).
+function cursorPickLauncherFromDir(dir) {
+  if (!dir) return null;
+  const both = d => {
+    const node = path.join(d, "node.exe");
+    const indexJs = path.join(d, "index.js");
+    try {
+      if (fs.statSync(node).isFile() && fs.statSync(indexJs).isFile()) return { node, indexJs };
+    } catch {}
+    return null;
+  };
+  const direct = both(dir);
+  if (direct) return direct;
+  const versionsDir = path.join(dir, "versions");
+  let names;
+  try {
+    names = fs.readdirSync(versionsDir, { withFileTypes: true }).filter(e => e.isDirectory()).map(e => e.name);
+  } catch {
+    return null;
+  }
+  const ranked = names
+    .map(name => ({ name, key: cursorVersionKey(name) }))
+    .filter(v => v.key !== null)
+    .sort((a, b) => (a.key < b.key ? 1 : a.key > b.key ? -1 : 0)); // newest first
+  for (const v of ranked) {
+    const found = both(path.join(versionsDir, v.name));
+    if (found) return found;
+  }
+  return null;
+}
+
+// Resolve the concrete { node, indexJs } to spawn for a Cursor turn / create-chat / doctor probe.
+// CURSOR_AGENT_BIN (default "agent") may be: a bare name, a .cmd/.ps1 shim path, an install-root dir, a
+// version dir, an index.js, or a node.exe — all reduce to a candidate directory we search. Windows-only
+// (v1). Throws a clear, actionable error when no native launcher is found (unsupported layout / not
+// installed). Callers MUST re-resolve on ENOENT (auto-update deletes old version dirs) — never cache.
+function resolveCursorLauncher() {
+  if (!IS_WINDOWS) throw new Error("cursor backend is Windows-only in v1 (no POSIX launch layout yet).");
+  const bin = process.env.CURSOR_AGENT_BIN || "agent";
+  const dirs = [];
+  const addDir = d => { if (d && !dirs.includes(d)) dirs.push(d); };
+  const looksPathy = path.isAbsolute(bin) || bin.includes("\\") || bin.includes("/");
+  if (looksPathy) {
+    let st = null;
+    try { st = fs.statSync(bin); } catch {}
+    if (st && st.isDirectory()) addDir(bin);       // install root or version dir
+    else addDir(path.dirname(bin));                // .cmd/.ps1/node.exe/index.js → its dir
+  } else {
+    // Bare name: the shim's dir is the install root. resolveWindowsExecutable finds agent.cmd (default
+    // PATHEXT); .ps1 isn't in PATHEXT, so also scan PATH for agent.ps1/agent.cmd explicitly.
+    const resolved = resolveWindowsExecutable(bin);
+    if (resolved) addDir(path.dirname(resolved));
+    for (const p of (process.env.PATH || "").split(path.delimiter).filter(Boolean)) {
+      // Try the EXACT filename first (so a bare `agent.ps1` — .ps1 isn't in PATHEXT — is found), then the
+      // shim extensions.
+      for (const cand of [bin, `${bin}.ps1`, `${bin}.cmd`]) {
+        try { if (fs.statSync(path.join(p, cand)).isFile()) addDir(p); } catch {}
+      }
+    }
+  }
+  for (const d of dirs) {
+    const found = cursorPickLauncherFromDir(d);
+    if (found) return found;
+  }
+  throw new Error(
+    `Cursor native launcher not found (CURSOR_AGENT_BIN=${JSON.stringify(bin)}). ` +
+      "Expected node.exe + index.js in the install dir or its versions\\<version>\\ subdir. " +
+      "Point CURSOR_AGENT_BIN at the cursor-agent shim (agent.cmd/agent.ps1), its install root, or a version dir.",
+  );
 }
 
 // Reject shell/CLI-hostile characters in pass-through agent arguments (OMP --model / --thinking).
@@ -619,8 +753,9 @@ function readFileAbs(input, label, maxBytes) {
 
 // Flat, content-free summary of a session's injected append-system-prompt (null when none). Content is
 // NEVER echoed back (it would pull the delegated agent's system prompt into the orchestrator's context);
-// only the path/size/mode. injectionMode: "system" (omp/claude — a true appended system prompt) vs
-// "developer" (codex — thread developerInstructions).
+// only the path/size/mode. injectionMode: "system" (omp/claude — a true appended system prompt),
+// "developer" (codex — thread developerInstructions), or "first-turn-user-prefix" (cursor — a SOFT
+// user-layer prefix on the first turn only; NOT a true system prompt).
 function appendSystemPromptSummary(sess, injectionMode) {
   const a = sess.appendSystemPrompt;
   return a ? { file: a.path, bytes: a.bytes, injectionMode } : null;
@@ -633,6 +768,9 @@ function appendSystemPromptSummary(sess, injectionMode) {
 const logBytesWritten = new Map();
 function appendLog(file, text) {
   if (!file || !text) return;
+  // Best-effort diagnostics: a logging failure (disk full, permission, a briefly-locked file) must NEVER
+  // throw into the caller's control flow — otherwise a stray log line could strand an in-flight turn.
+  try {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   if (LOG_FILE_MAX_BYTES > 0) {
     const bytes = Buffer.byteLength(text, "utf8");
@@ -652,6 +790,7 @@ function appendLog(file, text) {
     logBytesWritten.set(file, written + bytes);
   }
   fs.appendFileSync(file, text, "utf8");
+  } catch {}
 }
 
 function stripAnsi(text) {
@@ -771,12 +910,18 @@ function lastTurnOf(session) {
 function deriveHealth(session) {
   if (session.status === "closed") return "dead";
   if (session.status === "starting" || session.status === "running") return "healthy";
-  // Settled (idle/failed): it must actually still be alive to be reusable. Check signalCode too — a
-  // signal-killed backend (SIGKILL/SIGTERM) has exitCode === null but signalCode set; without this a
-  // signal-killed codex/claude (which have no OMP-style `dead` flag) would misclassify as degraded.
-  const proc = session.proc;
-  const procGone = session.dead === true || !proc || proc.exitCode != null || proc.signalCode != null;
-  if (procGone) return "dead";
+  // Settled (idle/failed): it must actually still be REUSABLE to be anything but dead. For the three
+  // long-lived-process backends "reusable" == "the held OS process is still alive" (check signalCode too
+  // — a SIGKILL/SIGTERM'd backend has exitCode === null but signalCode set). But a Shape-B backend
+  // (cursor) holds NO process between turns (this.proc === null while idle), so proc-liveness would
+  // misjudge a perfectly healthy idle session as dead. So delegate to a backend-provided isReusable()
+  // when present (cursor: still open AND has a chatId to resume); omp/codex/claude define none and fall
+  // through to the original proc-liveness test — byte-identical to the prior behavior for them.
+  const reusable =
+    typeof session.isReusable === "function"
+      ? session.isReusable()
+      : session.dead !== true && !!session.proc && session.proc.exitCode == null && session.proc.signalCode == null;
+  if (!reusable) return "dead";
   if (session.status === "failed" || session.lastTurnError === true) return "degraded";
   return "healthy";
 }
@@ -890,8 +1035,12 @@ function pidRecordPath(id) {
 
 function writePidRecord(file, record) {
   if (!file) return;
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, `${JSON.stringify({ ...record, updatedAt: nowIso() }, null, 2)}\n`, "utf8");
+  // Best-effort (parity with removePidRecord, which already swallows): a pid-record write failure must not
+  // throw into a caller's control flow — cleanup degrades gracefully without a record.
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, `${JSON.stringify({ ...record, updatedAt: nowIso() }, null, 2)}\n`, "utf8");
+  } catch {}
 }
 
 function removePidRecord(file) {
@@ -3040,6 +3189,564 @@ class ClaudeCodeSession {
   }
 }
 
+// ── Cursor Agent backend (Shape B) ───────────────────────────────────────────────────────────────
+// Unlike the other three backends (one long-lived OS process holds the whole session over stdio),
+// Cursor's `-p` is one-shot: prompt in → run → `result` → process EXITS. The logical session lives in
+// the bridge, identified by a cloud `chatId` (from `create-chat`); each turn spawns a fresh short-lived
+// `node index.js -p --resume <chatId> …` that dies when the turn ends. So `this.proc` is null BETWEEN
+// turns — deriveHealth() must gate on isReusable() (chatId), never proc-liveness (§5.3).
+//
+// TERMINAL STATE MACHINE (§2.1, uniform for success/error/abort/timeout): the stdout `result` event
+// only RECORDS the semantic outcome (finalAnswer / error flag); the child's `close` is the SOLE
+// settlement boundary — only there do we release the turn promise, null proc, and drop the pid record,
+// via one idempotent #settleTurn. A superseded/stale child's late `close` never touches current state
+// (guarded on this.proc===child and this.turnChild===child).
+//
+// Windows-only (v1): non-Windows fails fast in start()/doctor(). No token usage → contextUsage() is
+// null. effort/schema unsupported (ignored/rejected at the open/send gate); append_system_prompt_file is
+// injected as a SOFT first-turn user-prefix (#composePrompt) since Cursor has no native system-prompt flag.
+class CursorAgentSession {
+  constructor(options) {
+    this.id = makeId("cursor");
+    this.agent = "cursor";
+    this.cwd = assertCwd(options.cwd);
+    this.access = resolveAccess(options); // "read" | "write"
+    this.write = this.access === "write";
+    this.model = sanitizeAgentArg(options.model, "model"); // null when unset; flows to --model
+    this.effort = null; // Cursor has no effort knob — ignored (not errored); summary echoes null (§5.10)
+    // Cursor has no native system-prompt flag → an append_system_prompt_file is injected as a SOFT
+    // user-layer prefix on the FIRST committed turn only (the cloud chat carries it forward via --resume).
+    this.appendSystemPrompt = options.appendSystemPrompt || null; // {path,content,bytes}|null (read in openSession)
+    this.appendSystemPending = Boolean(options.appendSystemPrompt?.content); // consumed on the first begun turn
+    this.createdAt = nowIso();
+    this.updatedAt = this.createdAt;
+    this.status = "starting";
+    this.isStreaming = false;
+    this.lastAssistantText = "";
+    this.finalAnswer = "";           // unclamped final text from the `result` event
+    this.lastError = null;
+    this.lastStderr = null;
+    this.lastTurnError = false;      // did the most recently COMPLETED turn end in error? drives health
+    this.events = [];
+    this.proc = null;                // the CURRENT turn's short-lived process (null between turns)
+    this.chatId = null;              // cloud chat id from create-chat; identity of the logical session
+    this.currentTurnId = null;
+    this.lastTurnId = null;
+    this.turnStartedAt = null;
+    this.turnEndedAt = null;
+    this.turnCount = 0;
+    this.turn = null;                // { resolve, reject, promise, settled } — the in-flight turn
+    this.turnChild = null;           // the child that owns the begun turn (settlement identity, §2.1/§7)
+    // Per-turn parse state (reset in #beginTurn):
+    this.turnHadResult = false;      // did we see a terminal `result` event this turn?
+    this.turnResultError = false;    // was that result is_error / subtype!=="success"?
+    this.userAborted = false;        // set by abort() so #onChildClose settles as "aborted" (idle, not failed)
+    this.logFile = path.join(RUN_LOG_DIR, `${this.id}.log`);
+    this.answerFile = path.join(RUN_LOG_DIR, `${this.id}.answer.txt`);
+    this.pidFile = pidRecordPath(this.id);
+  }
+
+  async start() {
+    if (!IS_WINDOWS) throw new Error("cursor backend is Windows-only in v1 (no POSIX launch layout yet).");
+    // Fail fast on an unsupported install layout BEFORE any network call, so open_session reports a
+    // clear error instead of a create-chat timeout.
+    resolveCursorLauncher();
+    const chatId = await this.#createChat();
+    // A concurrent close (bulk close / shutdown) during create-chat must WIN — do not resurrect a closed
+    // session by assigning a chatId or flipping to idle over its terminal state.
+    if (this.status === "closed") return this;
+    this.chatId = chatId;
+    appendLog(this.logFile, `[agent-bridge] cursor chat created chatId=${this.chatId}\n`);
+    setSessionStatus(this, "idle", false, { source: "ready" });
+    this.proc = null;
+    return this;
+  }
+
+  // Allocate a cloud chat (`create-chat` → bare UUID). Its own lifecycle: hard timeout + tree-kill,
+  // bounded output, and a pid record for an owned child. The startup child is tracked on this.proc so
+  // close() (bulk close / shutdown) can tree-kill it, and the pid record is dropped only once the child
+  // is CONFIRMED gone (so a wedged child stays reap-able by cleanup). Command carries no prompt.
+  async #createChat() {
+    const launcher = resolveCursorLauncher();
+    const args = [launcher.indexJs, "create-chat"];
+    appendLog(this.logFile, `$ ${launcher.node} ${launcher.indexJs} create-chat\n`);
+    const child = spawn(launcher.node, args, { cwd: this.cwd, env: childEnv(this), stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    this.proc = child; // trackable + killable by close(); cleared once the child is gone (below)
+    writePidRecord(this.pidFile, {
+      id: this.id, agent: this.agent, ownerPid: process.pid, cwd: this.cwd, createdAt: this.createdAt,
+      processes: [{ role: AGENTS.cursor.role, pid: child.pid || null, command: [launcher.node, launcher.indexJs, "create-chat"], spawnedAt: nowIso() }].filter(p => p.pid),
+    });
+    let stdout = "";
+    let stderr = "";
+    let closed = false;
+    const MAX = 1 << 20;
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", d => { if (stdout.length < MAX) stdout += d; });
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", d => { if (stderr.length < MAX) stderr += d; appendLog(this.logFile, d); });
+    const outcome = await new Promise(resolve => {
+      let done = false;
+      const finish = r => { if (done) return; done = true; clearTimeout(timer); resolve(r); };
+      const timer = setTimeout(() => { terminateProcessTree(child.pid, "SIGKILL"); finish({ timedOut: true }); }, CURSOR_CREATE_CHAT_TIMEOUT_MS);
+      timer.unref?.();
+      child.on("error", err => finish({ error: err }));
+      child.on("close", (code, signal) => { closed = true; finish({ code, signal }); });
+    });
+    // Release this.proc + drop the pid record ONLY when the child is truly gone. On a timeout we SIGKILLed
+    // it but may not have observed its close yet — keep the record + a one-shot close listener so cleanup
+    // can still reap a wedged child, and clear this.proc when it finally dies.
+    if (this.proc === child) {
+      if (closed) { this.proc = null; removePidRecord(this.pidFile); }
+      else child.once("close", () => { if (this.proc === child) this.proc = null; removePidRecord(this.pidFile); });
+    }
+    if (outcome.error) throw new Error(`cursor create-chat failed to spawn: ${outcome.error.message}`);
+    if (outcome.timedOut) throw new Error(`cursor create-chat timed out after ${CURSOR_CREATE_CHAT_TIMEOUT_MS}ms (network/auth?).`);
+    if (outcome.code !== 0) {
+      const tail = stripAnsi(stderr).trim().slice(0, 400);
+      throw new Error(`cursor create-chat exited ${outcome.code}${outcome.signal ? ` (signal ${outcome.signal})` : ""}: ${tail || "(no stderr)"} — is Cursor logged in? (run \`agent login\`)`);
+    }
+    const chatId = this.#parseChatId(stdout);
+    if (!chatId) throw new Error(`cursor create-chat returned no valid chat id. stdout=${JSON.stringify(stdout.slice(0, 200))}`);
+    return chatId;
+  }
+
+  #parseChatId(out) {
+    // create-chat prints ONE bare UUID. Validate an ANCHORED line — never accept a UUID substring buried
+    // in arbitrary output (that could latch onto an id inside an error/log line).
+    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const s = String(out || "").trim();
+    if (uuid.test(s)) return s;
+    for (const line of s.split(/\r?\n/)) { const t = line.trim(); if (uuid.test(t)) return t; }
+    return null;
+  }
+
+  // Compose the argv prompt: [session instructions (first turn only)] → [read-only policy (every read
+  // turn)] → user message. Both prefixes are SOFT, user-layer policy (Windows has no OS sandbox; --force
+  // also enables Cursor's native write tools) — honest guidance, NOT a hard guarantee; the shell can
+  // still write. The append_system_prompt_file content is injected ONLY on the first committed turn (the
+  // cloud chat then carries it forward via --resume); adherence is model-dependent — it is NOT a true
+  // system prompt. Both prefixes share the ~24K argv budget with the message (§5.4/§5.5/§6.2).
+  #composePrompt(message, injectSystem) {
+    const parts = [];
+    if (injectSystem && this.appendSystemPrompt?.content) {
+      parts.push(
+        "[Session instructions — added by agent-bridge for this whole session. Follow them for every reply.]\n" +
+          this.appendSystemPrompt.content,
+      );
+    }
+    if (this.access !== "write") {
+      parts.push(
+        "[agent-bridge READ-ONLY policy] You are in read-only review/investigation mode. Do NOT create, " +
+          "modify, move, or delete any files, and do NOT run shell commands that write to disk. You MAY read " +
+          "files, search, and run read-only shell commands to investigate. Report findings only.",
+      );
+    }
+    parts.push(message);
+    return parts.join("\n\n");
+  }
+
+  #buildTurnArgs(indexJs, prompt) {
+    // read and write both use --force (YOLO); the read/write difference is the prompt policy above and
+    // the soft boundary. `--` separates flags from the positional prompt so a prompt starting with `--`
+    // or equal to a subcommand (status/resume) is never mis-parsed (§5.5).
+    const args = [indexJs, "-p", "--resume", this.chatId, "--output-format", "stream-json", "--force", "--trust", "--workspace", this.cwd];
+    if (this.model) args.push("--model", this.model);
+    args.push("--", prompt);
+    return args;
+  }
+
+  #assertCmdlineWithinLimit(node, args) {
+    for (const a of args) if (String(a).includes("\0")) throw new Error("cursor prompt/args contain a NUL character.");
+    // Estimate the ACTUAL Windows command line CreateProcess receives — NOT the raw join. Node quotes any
+    // argv entry containing space/tab/quote and escapes embedded quotes + preceding backslashes, so a
+    // quote-heavy prompt can expand well past its raw length. Over-estimate so we reject BELOW the OS
+    // ~32767 UTF-16 ceiling instead of after a synchronous spawn throw.
+    const quotedLen = value => {
+      const s = String(value);
+      const needsQuote = s === "" || /[ \t"]/.test(s);
+      let n = s.length + (needsQuote ? 2 : 0);
+      for (let i = 0; i < s.length; i++) { const c = s[i]; if (c === '"' || c === "\\") n += 1; }
+      return n + 1; // + separating space
+    };
+    const units = quotedLen(node) + args.reduce((sum, a) => sum + quotedLen(a), 0);
+    if (units > CURSOR_CMDLINE_MAX_UNITS) {
+      throw new Error(`cursor prompt too long: composed command line ~${units} UTF-16 units exceeds ${CURSOR_CMDLINE_MAX_UNITS}. Shorten the prompt (a file-based prompt is not yet supported).`);
+    }
+  }
+
+  #writePidRecord(node, args) {
+    // Strip the trailing `-- <prompt>` so the persisted record never leaks the prompt (§5.5). The live
+    // OS process list still shows it (unavoidable for argv), but the bridge's own artifact does not.
+    const sep = args.indexOf("--");
+    const safeArgs = sep >= 0 ? [...args.slice(0, sep), "--", "<prompt:redacted>"] : args;
+    writePidRecord(this.pidFile, {
+      id: this.id, agent: this.agent, ownerPid: process.pid, cwd: this.cwd, createdAt: this.createdAt,
+      processes: [{ role: AGENTS.cursor.role, pid: this.proc?.pid || null, command: [node, ...safeArgs], spawnedAt: nowIso() }].filter(p => p.pid),
+    });
+  }
+
+  #beginTurn(turnId, child) {
+    this.turnChild = child;
+    this.currentTurnId = turnId;
+    this.lastTurnId = turnId;
+    this.turnStartedAt = nowIso();
+    this.turnEndedAt = null;
+    this.finalAnswer = "";
+    this.lastAssistantText = "";
+    this.turnHadResult = false;
+    this.turnResultError = false;
+    this.userAborted = false;
+  }
+
+  // The ONE idempotent settlement point. err → failed (reusable/degraded); null → idle (success/abort).
+  #settleTurn(err, status) {
+    const turn = this.turn;
+    if (!turn) return;
+    turn.settled = { err: err || null, status: status ?? null };
+    this.lastTurnError = Boolean(err); // cleared to false on a clean turn / user abort
+    this.turn = null;
+    this.turnChild = null;
+    this.currentTurnId = null;
+    this.turnCount += 1;
+    this.turnEndedAt = nowIso();
+    this.updatedAt = nowIso();
+    removePidRecord(this.pidFile); // no live child between turns → no pid record
+    if (err) {
+      this.lastError = err.message;
+      setSessionStatus(this, "failed", false, { source: "turn_error", error: err.message });
+      turn.reject(err);
+      return;
+    }
+    setSessionStatus(this, "idle", false, { source: "turn/completed", status });
+    turn.resolve();
+  }
+
+  #wireChild(child) {
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", text => { appendLog(this.logFile, text); this.lastStderr = clampText(stripAnsi(text), 4000); });
+    child.stdout.setEncoding("utf8");
+    const rl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
+    rl.on("line", line => this.#handleLine(line, child));
+    // A spawn/runtime 'error' is diagnostic here; `close` (which also fires after 'error') is where the
+    // turn settles. send()'s spawn-await owns the pre-begin failure path.
+    child.on("error", err => { appendLog(this.logFile, `[agent-bridge] cursor process error: ${err.message}\n`); if (this.proc === child) this.lastError = err.message; });
+    child.on("close", (code, signal) => this.#onChildClose(child, code, signal));
+  }
+
+  // The settlement boundary (§2.1). Only the ACTIVE, begun child settles current state.
+  #onChildClose(child, code, signal) {
+    appendLog(this.logFile, `[agent-bridge] cursor exited code=${code} signal=${signal || ""}\n`);
+    if (this.proc !== child) return;        // a superseded/stale child — never touch current state (§7)
+    this.proc = null;
+    if (this.status === "closed") return;   // close() already drove the terminal state
+    if (this.turnChild !== child) return;   // closed before its turn began (spawn-failure window) — send() handles teardown
+    if (!this.turn) return;                 // already force-settled (abort fallback); nothing to do
+    const aborted = this.userAborted;
+    this.userAborted = false;
+    if (aborted) { this.#settleTurn(null, "aborted"); return; }
+    if (!this.turnHadResult) { this.lastError = `cursor exited without a result (code=${code}${signal ? ` signal=${signal}` : ""}).`; this.#settleTurn(new Error(this.lastError), "no_result"); return; }
+    if (this.turnResultError) { this.#settleTurn(new Error(this.lastError || "cursor turn ended in error"), "error"); return; }
+    if (code !== 0) { this.lastError = `cursor reported success but exited with code ${code}${signal ? ` signal=${signal}` : ""}.`; this.#settleTurn(new Error(this.lastError), "exit_nonzero"); return; }
+    this.#settleTurn(null, "success");
+  }
+
+  #handleLine(line, child) {
+    if (this.proc !== child) return; // ignore a stale child's late output
+    if (!line.trim()) return;
+    let msg;
+    try { msg = JSON.parse(line); } catch { appendLog(this.logFile, `${line}\n`); pushEvent(this, { type: "raw" }); return; }
+    // Don't verbatim-log high-frequency streaming (thinking deltas / assistant chunks); result carries
+    // the final text. thinking is chain-of-thought — never persisted. user echoes the prompt — dropped
+    // for privacy (§2.1/§5.5).
+    if (msg.type !== "assistant" && msg.type !== "thinking" && msg.type !== "user") appendLog(this.logFile, `${JSON.stringify(stripThinking(msg))}\n`);
+    this.updatedAt = nowIso();
+    switch (msg.type) {
+      case "system":
+        if (msg.subtype === "init" && msg.session_id && !this.chatId) this.chatId = msg.session_id;
+        pushEvent(this, compactEvent({ type: "system", subtype: msg.subtype }));
+        return;
+      case "thinking":
+        return; // reasoning stream — dropped
+      case "user":
+        return; // prompt echo — dropped (privacy)
+      case "assistant": {
+        if (this.turn && !this.isStreaming) setSessionStatus(this, "running", true, { source: "assistant" });
+        const blocks = Array.isArray(msg.message?.content) ? msg.message.content : [];
+        const text = blocks.filter(b => b && b.type === "text" && typeof b.text === "string").map(b => b.text).join("");
+        // We don't use --stream-partial-output, so each assistant event is a fairly complete block;
+        // accumulate across a multi-step turn for the progress tail (final answer comes from `result`).
+        if (text) this.lastAssistantText = clampText((this.lastAssistantText || "") + text);
+        pushEvent(this, compactEvent({ type: "assistant" }));
+        return;
+      }
+      case "tool_call": {
+        const call = msg.tool_call || {};
+        const kind = call.shellToolCall ? "shell" : call.editToolCall ? "edit" : Object.keys(call)[0] || undefined;
+        pushEvent(this, compactEvent({ type: "tool_call", subtype: msg.subtype, kind }));
+        return;
+      }
+      case "result":
+        this.#handleResult(msg);
+        return;
+      default:
+        pushEvent(this, compactEvent({ type: msg.type, subtype: msg.subtype }));
+    }
+  }
+
+  // Records the turn's semantic outcome; DOES NOT settle (close is the settlement boundary, §2.1).
+  #handleResult(msg) {
+    pushEvent(this, compactEvent({ type: "result", subtype: msg.subtype, is_error: msg.is_error }));
+    this.turnHadResult = true;
+    if (msg.is_error || msg.subtype !== "success") {
+      this.turnResultError = true;
+      this.lastError = `cursor turn ${msg.subtype || "error"}`;
+      return;
+    }
+    const text = typeof msg.result === "string" ? msg.result : "";
+    this.finalAnswer = text;
+    if (text) this.lastAssistantText = clampText(text);
+  }
+
+  async send(message, options = {}) {
+    if (!message || !String(message).trim()) throw new Error("message is required.");
+    if (this.status === "closed") throw new Error(`Cursor session ${this.id} is closed.`);
+    if (this.turn) throw new Error(`Cursor session ${this.id} already has a running turn.`);
+    // A prior turn's process may still be terminating (the pathological abort-timeout poison keeps
+    // this.proc set until the wedged child finally dies). Refuse a new turn until it's gone so we never
+    // run two turns against one chat / orphan the old process.
+    if (this.proc) throw new Error(`Cursor session ${this.id}: the previous turn's process is still terminating; retry shortly.`);
+    if (!this.chatId) throw new Error(`Cursor session ${this.id} has no chat (start failed).`);
+
+    // 1. Occupy the turn synchronously so a concurrent send is rejected by the guard above.
+    const turnId = `${this.id}-t${this.turnCount + 1}`;
+    const promise = new Promise((resolve, reject) => { this.turn = { resolve, reject }; });
+    this.turn.promise = promise;
+    const myTurn = this.turn;
+    promise.catch(() => {}); // pre-attach so an early rejection can't crash the server
+    const releaseUnbegun = err => {
+      // No process ever began the turn → release WITHOUT #settleTurn (no turnCount bump, previous result
+      // preserved), mark failed for health, and reject.
+      this.lastError = err.message;
+      if (this.turn === myTurn) {
+        this.turn = null;
+        if (this.status !== "closed") setSessionStatus(this, "failed", false, { source: "send_failed", error: err.message });
+        myTurn.reject(err);
+      }
+    };
+
+    // 2. Compose the prompt ONCE (system prefix on the first turn + read-policy prefix), then resolve+spawn
+    //    with a single ENOENT retry — Cursor auto-update can delete the resolved version dir between resolve
+    //    and spawn. `injectSystem` is consumed only after the turn actually begins (below), so a failed
+    //    first send (spawn error / too-long) re-injects on the retry.
+    const injectSystem = this.appendSystemPending;
+    const prompt = this.#composePrompt(String(message), injectSystem);
+    let child = null;
+    let winner = null; // { node, args } of the attempt that actually spawned (for the pid record)
+    let lastErr = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let launcher, args;
+      try {
+        launcher = resolveCursorLauncher();
+        args = this.#buildTurnArgs(launcher.indexJs, prompt);
+        this.#assertCmdlineWithinLimit(launcher.node, args);
+      } catch (err) {
+        releaseUnbegun(err instanceof Error ? err : new Error(String(err)));
+        throw err;
+      }
+      if (attempt === 0) appendLog(this.logFile, `$ ${launcher.node} ${launcher.indexJs} -p --resume ${this.chatId} --output-format stream-json --force --trust --workspace ${this.cwd}${this.model ? ` --model ${this.model}` : ""} -- <prompt:redacted>\n`);
+      setSessionStatus(this, "running", true, { source: "send" });
+      // spawn() can throw SYNCHRONOUSLY (e.g. E2BIG on an over-long command line) — must be inside the
+      // teardown path or the turn would stay occupied/running forever.
+      let candidate;
+      try {
+        candidate = spawn(launcher.node, args, { cwd: this.cwd, env: childEnv(this), stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+      } catch (err) {
+        const e = err instanceof Error ? err : new Error(String(err));
+        releaseUnbegun(e);
+        throw e;
+      }
+      this.proc = candidate;
+      this.#wireChild(candidate);
+      // Await the OS-level spawn so a bad launcher surfaces as a real error (not a silently-idle turn).
+      try {
+        await new Promise((resolve, reject) => { candidate.once("spawn", resolve); candidate.once("error", reject); });
+        child = candidate;
+        winner = { node: launcher.node, args };
+        break;
+      } catch (err) {
+        lastErr = err instanceof Error ? err : new Error(String(err));
+        if (this.proc === candidate) this.proc = null;
+        // The resolved version dir vanished mid-flight (auto-update) → re-resolve and retry EXACTLY once.
+        if (lastErr.code === "ENOENT" && attempt === 0) { appendLog(this.logFile, `[agent-bridge] cursor spawn ENOENT; re-resolving launcher and retrying once\n`); continue; }
+        break;
+      }
+    }
+    if (!child) { releaseUnbegun(lastErr || new Error("cursor spawn failed")); throw lastErr || new Error(this.lastError); }
+
+    // A pipelined close() (MCP requests dispatch concurrently) could have run DURING the spawn-await and
+    // set status=closed / nulled this.turn. Do NOT resurrect a closed session by beginning a turn or
+    // writing its pid record — just bail. CRUCIALLY: do NOT null this.proc or re-kill here. close() is the
+    // only op that reaches this state, and it ALREADY killed this exact child (this.proc at that instant)
+    // and scheduled a force-kill whose verifier keys on this.proc===child; nulling proc would DISABLE that
+    // backstop and orphan the child on a failed kill. The child's own close handler nulls this.proc. In the
+    // defensive not-closed case (no close() managing it) terminate the child so it can't leak.
+    if (this.status === "closed" || this.turn !== myTurn) {
+      if (this.status !== "closed" && child.exitCode === null && child.signalCode === null) {
+        try { terminateProcessTree(child.pid, "SIGKILL"); } catch {}
+      }
+      const e = new Error(`Cursor session ${this.id} was closed during send.`);
+      this.lastError = e.message;
+      throw e;
+    }
+
+    // 5. The process is live — the turn has begun. (No stdout/close can interleave before this: the
+    //    spawn-await continuation is a microtask, ahead of any 'close' macrotask.)
+    this.#beginTurn(turnId, child);
+    if (injectSystem) this.appendSystemPending = false; // system instructions delivered on this committed turn
+    this.#writePidRecord(winner.node, winner.args);
+    appendLog(this.logFile, `[agent-bridge] spawned cursor turn pid=${child.pid} chatId=${this.chatId}\n`);
+
+    if (options.wait) {
+      try {
+        return await withTimeout(promise.then(() => this.result({ maxChars: options.maxChars })), options.timeout_ms || DEFAULT_WAIT_TIMEOUT_MS, "Timed out waiting for Cursor turn.");
+      } catch (err) {
+        if (this.turn) { try { await this.abort(); } catch {} }
+        throw err;
+      }
+    }
+    promise.catch(err => { this.lastError = err.message; });
+    return { accepted: true, sessionId: this.id, status: this.status, turnId };
+  }
+
+  async result(options = {}) {
+    return buildSessionResult(this, this.finalAnswer || this.lastAssistantText || "", options);
+  }
+
+  isSettled() {
+    return this.status === "idle" && !this.turn;
+  }
+
+  refreshStatus() {} // event-driven (turn settles on the child's close); sync no-op (Codex/Claude parity)
+
+  // Tree-kill the turn's process; its `close` settles the turn as "aborted" (idle, not failed). §7 proved
+  // this safe: no ghost cloud completion, chat reusable. Invariants: do NOT null this.proc here (the
+  // scheduled force-kill's verify and the close handler depend on it); the turn promise MUST settle.
+  async abort() {
+    const turn = this.turn;
+    const child = this.proc;
+    if (!turn || !child || child.exitCode !== null || child.signalCode !== null) {
+      // Nothing actively in flight. Normalize a reusable session back to a clean idle (clear a stale
+      // lastTurnError — abort is user-initiated, not a turn error). BUT only when there is truly no
+      // lingering process: in the poisoned state (turn already settled, this.proc still holds a wedged
+      // child) we must NOT flip failed→idle/healthy — that would report health the session doesn't have,
+      // and send() is still blocked by the this.proc guard anyway.
+      if (this.status !== "closed" && !this.proc) {
+        this.lastTurnError = false;
+        if (this.turnStartedAt && !this.turnEndedAt) this.turnEndedAt = nowIso();
+        if (this.status === "failed" && this.chatId) setSessionStatus(this, "idle", false, { source: "abort" });
+      }
+      return { aborted: true, sessionId: this.id };
+    }
+    this.userAborted = true; // #onChildClose reads this → settles as "aborted"
+    const pid = child.pid;
+    terminateProcessTree(pid);
+    scheduleForceKill(pid, 3000, () => this.proc === child && child.exitCode === null && child.signalCode === null);
+    try {
+      await withTimeout(turn.promise, CURSOR_ABORT_SETTLE_MS, "cursor abort settle timeout");
+    } catch {
+      // The child did NOT `close` even after the scheduled SIGKILL (pathological wedge). Do NOT present a
+      // clean reusable idle while a process may still hold the chat — that would let a new send start a
+      // SECOND turn on the same chat and orphan this one. Poison instead: settle the turn as FAILED, KEEP
+      // this.proc + the pid record (so send()'s this.proc guard refuses a concurrent turn and cleanup can
+      // still reap the child), and let the child's own close null proc + drop the record once it dies.
+      if (this.turn === turn) {
+        this.userAborted = false;
+        const err = new Error("cursor abort: turn process did not terminate; session blocked until it exits");
+        this.lastError = err.message;
+        this.lastTurnError = true;
+        this.turn = null;
+        this.currentTurnId = null;
+        this.turnCount += 1;
+        if (this.turnStartedAt && !this.turnEndedAt) this.turnEndedAt = nowIso();
+        this.updatedAt = nowIso();
+        setSessionStatus(this, "failed", false, { source: "abort_timeout", error: err.message });
+        turn.reject(err);
+        // Keep this.proc / this.turnChild / pid record; clean them up when the wedged child finally dies.
+        child.once("close", () => { if (this.proc === child) this.proc = null; removePidRecord(this.pidFile); });
+      }
+    }
+    return { aborted: true, sessionId: this.id };
+  }
+
+  contextUsage() {
+    return null; // Cursor stream-json carries no token usage (§5.7). null ≠ 0 — "unknown".
+  }
+
+  // health hook (deriveHealth, §5.3): reusable == still open AND holding a chatId to --resume. Between
+  // turns proc is null, so proc-liveness would misjudge a healthy idle session as dead — this is why the
+  // hook exists. omp/codex/claude define none and keep proc-liveness.
+  isReusable() {
+    return this.status !== "closed" && !!this.chatId;
+  }
+
+  summary() {
+    return {
+      id: this.id,
+      agent: this.agent,
+      cwd: this.cwd,
+      access: this.access,
+      write: this.write,
+      model: this.model,
+      effort: null,
+      status: this.status,
+      pid: this.proc?.pid ?? null,
+      createdAt: this.createdAt,
+      updatedAt: this.updatedAt,
+      lastError: this.lastError,
+      lastStderr: this.lastStderr ?? null,
+      name: this.name ?? null,
+      health: deriveHealth(this),
+      contextUsage: this.contextUsage(), // always null for cursor; call the method for contract parity
+      appendSystemPrompt: appendSystemPromptSummary(this, "first-turn-user-prefix"), // soft, model-dependent
+      logFile: this.logFile,
+      lastTurn: lastTurnOf(this),
+      agentSpecific: { chatId: this.chatId, turnCount: this.turnCount },
+    };
+  }
+
+  // Synchronous (closeOne does not await; an async close would corrupt the returned shape).
+  close(options = {}) {
+    setSessionStatus(this, "closed", false, { source: "close" });
+    const child = this.proc;
+    const pid = child?.pid;
+    // Reject any in-flight turn directly (not via #settleTurn) so a close never bumps turnCount / flips
+    // to failed; wait() must not hang.
+    const turn = this.turn;
+    this.turn = null;
+    this.turnChild = null;
+    this.currentTurnId = null;
+    if (turn) {
+      if (this.turnStartedAt && !this.turnEndedAt) this.turnEndedAt = nowIso();
+      turn.reject?.(new Error("session closed"));
+    }
+    const killingLiveChild = child && child.exitCode === null && child.signalCode === null;
+    if (killingLiveChild) {
+      terminateProcessTree(pid);
+      scheduleForceKill(pid, 3000, () => this.proc === child && child.exitCode === null && child.signalCode === null);
+    }
+    if (options.removePidRecord !== false) {
+      // If we're killing a still-live child (incl. a create-chat child, or one that resists the graceful
+      // kill), DEFER the record removal to the child's actual close so a failed kill still leaves a
+      // reap-able trail — close() is synchronous and can't confirm death itself. Otherwise remove now.
+      if (killingLiveChild) child.once("close", () => removePidRecord(this.pidFile));
+      else removePidRecord(this.pidFile);
+    }
+    try { fs.rmSync(this.answerFile, { force: true }); } catch {}
+    this.chatId = null; // forget the chat (no delete-chat API; the cloud chat is left as-is, §1 non-goal)
+    return { closed: true, sessionId: this.id };
+  }
+}
+
 // Bind the session constructors onto the registry now that both classes exist. AGENTS is declared at
 // the top of the file (TOOLS/agentBin/doctor/assertAgent read it during early module load, when these
 // classes are still in the temporal dead zone), so the class refs can't live in that literal — they
@@ -3047,6 +3754,7 @@ class ClaudeCodeSession {
 AGENTS.omp.Session = OmpRpcSession;
 AGENTS.codex.Session = CodexAppServerSession;
 AGENTS.claude.Session = ClaudeCodeSession;
+AGENTS.cursor.Session = CursorAgentSession;
 
 function extractAssistantText(value) {
   if (!value || typeof value !== "object") return "";
@@ -3150,6 +3858,8 @@ async function openSession(params) {
   // Pass via a fresh object (do NOT mutate params) so the content can't leak into logging/reuse of params.
   let appendSystemPrompt = null;
   if (params.append_system_prompt_file != null) {
+    // cursor has no native system-prompt flag, so it injects this content as a SOFT first-turn user-prefix
+    // (CursorAgentSession.#composePrompt) — accepted, not rejected. All backends read the file here.
     const r = readFileAbs(params.append_system_prompt_file, "append_system_prompt_file", APPEND_SYSTEM_MAX_BYTES);
     if (!r.content.trim()) throw new Error("append_system_prompt_file is empty.");
     appendSystemPrompt = { path: r.path, content: r.content, bytes: Buffer.byteLength(r.content, "utf8") };
@@ -3488,7 +4198,22 @@ async function doctor() {
   const agents = [];
   for (const [agent, config] of Object.entries(AGENTS)) {
     const bin = agentBin(agent);
-    const plan = spawnPlan(bin, config.versionArgs);
+    let plan;
+    if (agent === "cursor") {
+      // Cursor: version the RESOLVED node+index.js launcher, never `<bin> --version` — if CURSOR_AGENT_BIN
+      // is a bare node.exe, `node.exe --version` would report Node's version AS Cursor's (§5.9). Also
+      // doubles as a native-layout check: a resolvable launcher is required for open/send to work at all,
+      // so an unresolved layout (or non-Windows) is reported unavailable here instead of failing later.
+      try {
+        const l = resolveCursorLauncher();
+        plan = { command: l.node, args: [l.indexJs, ...config.versionArgs] };
+      } catch (err) {
+        agents.push({ agent, label: config.label, bin, available: false, version: null, error: stripAnsi(err.message) });
+        continue;
+      }
+    } else {
+      plan = spawnPlan(bin, config.versionArgs);
+    }
     const probe = await probeVersion(plan.command, plan.args);
     const ok = probe.status === 0;
     agents.push({
@@ -3590,7 +4315,7 @@ async function runCli(argv) {
       return;
     }
     case "cleanup":
-      // Reap orphaned backend child processes (omp/codex/claude) left behind by an MCP server that
+      // Reap orphaned backend child processes (omp/codex/claude/cursor) left behind by an MCP server that
       // was SIGKILLed before it could clean up its own sessions (matched by pid records whose
       // owner MCP is gone), and remove abandoned logs/<runId>/ dirs from those dead servers.
       printCliResult({ childProcesses: cleanupStalePidRecords(), staleLogs: reclaimStaleLogs() }, args);

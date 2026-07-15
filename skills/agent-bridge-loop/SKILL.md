@@ -116,6 +116,9 @@ append `run:started`。人在环此时**一次性问**「要开可视化实时�
   拿不准就升全量采样定论,别把合同允许的随机失败当红灯)、判次落盘复用不重打、judge 模型
   按判别难度选量级、稳定性自检用小样本夹具跑 K 次(不必全量套件跑 K 遍)。**预算耗尽 → 验证者标 BLOCKED/NOTES
   报你**(你加预算或 `contract:amended` 改 n/m),**绝不静默缩采样假装验完**。
+- **AC 铁规(验证者的执行环境写进合同)**:合同须钉死①验证者的 cwd(worktree 模式给绝对路径);②**fixture 与临时
+  输出一律落 `<cwd>/.loop/run-<id>/validation/fixtures/`,绝不落产品树**(否则污染工作树,还可能被你代 commit 时
+  `git add` 扫进产品提交);③全局约束禁止任何带 `-x`/`-X` 的 `git clean` 与删除 `.loop/`(见失败模式表)。合同闸前逐条查这三样。
 - **AC 执行者划分**:`[test]/[e2e]/[log]` 等可 shell 执行 → 验证者亲手跑(含自建脚本);`[review]` 需拉 bridge
   会话 → **你代执行**(验证者没有桥工具),且 **lazy**——该轮其它 AC 全绿才拉 reviewer,结果并入该轮
   `val:verdict.acResults`(未执行时标 `skipped`)。验收权威不多头:该轮 verdict 全绿才算过。
@@ -126,7 +129,18 @@ append `run:started`。人在环此时**一次性问**「要开可视化实时�
   之后才叫定稿**。中途改约同理:规划者出修订稿 `planning/amendment-<n>.md`(append `planner:produced`)→ 闸 →
   cp + `contract:amended`。需求极简时你可自己起草(但先想想是不是又在"顺手",§主控的手)。
 - **合同闸**:append `contract:drafted` → 人在环交用户改/确认;无人值守由面板批判一轮、你逐条采纳/拒绝留痕
-  → append `contract:confirmed{by}`。中途改约 → 更新文件 + `contract:amended`,受影响的已通过 goal 标记复验。
+  → append `contract:confirmed{by,rulingsRef}`。中途改约 → 更新文件 + `contract:amended`,受影响的已通过 goal 标记复验;
+  **无人值守的中途改约没有面板复审**(为一行 n/m 重拉面板不成比例)——兜底是**事后独立审计**:改约理由写进假设账本,
+  收官 broad review 被明确要求审计每条 `contract:amended` 有无降标(见 Phase 3.1),防"把降标包装成修缺陷"自批自过。
+  - **批判的采纳由谁落笔(dogfood 实测缺口,别含糊)**:**裁决是你的**(写 `panel/gate-rulings.md`:逐条采纳/拒绝
+    + 理由,面板意见相左时你拍板;白名单「写真理源与裁决账本」);**改稿是规划者的**——把两份批判 + 裁决账本指给
+    fresh 规划者,它**另存新版** `planning/contract-draft-v<n>.md`(不覆盖旧稿——事后审计要能重建面板批判的是哪一版;
+    append `planner:produced{kind:"contract"}`,闸前修订仍是合同草案,`amendment` 留给定稿后的改约)→ 你按 AC 铁规
+    复核 → `cp` 覆盖 `contract.md` → `contract:confirmed`。**别自己重写整份合同**(那是"顺手起草",§主控的手);
+    只有**逐字级**的错字/编号修补才允许你直接改。
+  - **合同闸抓不到的东西会反噬整轮**:实测中 v1 合同曾把某条 AC 的期望值算错,导致**正确实现必 FAIL、而错误实现
+    恰好全绿**——闸门是唯一拦截点(验证者只会照合同判)。故:①面板必须被要求**亲手重算每条 AC 的期望值**;
+    ②你对**判定性 AC** 至少亲手重算一条期望值(白名单「合同闸复算」——只读演算,此时无产品可跑,算的是合同自己的数)。
 
 ## Planner(规划者):重文书起草 + 参谋;工作台 = run-dir
 
@@ -171,10 +185,14 @@ open 生成者(access:"write", cwd=工作区, append_system_prompt_file=<base>/r
          以 `git status --porcelain` 的**实际改动清单**为准 add(生成者自报的 filesChanged 只作交叉校验,
          两者差异大 → 先质询再提交,别把逃逸改动漏在基线外),`git commit -m "g<K>-i<n>: …(主控代提交)"`。
          洁净树基线是验收前置条件
+       → **`validation/` 哈希比对**(send 前记逐文件清单、此刻比对;§Planner 快照审计同款机制):漂移 = 生成者
+         碰了尺子(被考者改考卷)——记缺陷打回,漂移文件按「改过的脚本」交下轮验证者重走先红后绿 + 稳定性自检
     2. open 验证者(access:"write", cwd=同工作区, 引擎≠生成者, 注入 <base>/roles/validator.md)【每轮 fresh】
        send ← 该 goal 全文 AC 清单 + 基线 commit + validation/ 确切路径 + 「全量重验、逐条证据」
-       → wait 收口 → 洁净树审计:`git status --porcelain` 有 tracked 改动
-         → 撤销(git checkout)+ append val:tainted + close 该验证者 + fresh 重开重验
+       → wait 收口 → 洁净树审计:`git status --porcelain` 有**任何输出**都算污染——tracked 改动撤销(git checkout),
+         **untracked 新文件删除**(验证者的合法产物全在被 ignore 的 `validation/` 下;porcelain 里的 untracked =
+         逃逸的 fixture / 临时输出,放行会在下一轮被你代 commit 扫进产品提交)
+         → append val:tainted + close 该验证者 + fresh 重开重验
        → [review] AC 且其余全绿 → 你拉异引擎 reviewer 代执行,结果并入 acResults
        → cp verdict textRef → iterations/g<K>/i<n>-verdict.md;**解析 VERDICT(硬化,反歧义)**:只认
          **回复开头独立一行**的 `VERDICT: PASS|FAIL`,正文其它位置出现的一律忽略;并交叉校验逐条 AC——
@@ -204,6 +222,13 @@ close 生成者
   `validation/` 前轮脚本(外置复用,fresh 不返工)。
 - 无人值守 worktree:建/收/兜底清理直接复用 roundtable §席位权限那套(基线=HEAD,未提交改动不进 worktree;
   生成者与验证者 `cwd` 都指向 worktree;结束保留 branch、`git worktree remove`)。
+- **worktree 模式下必须给委托 agent 一份合同副本(dogfood 实测缺口)**:真理源 run-dir 在**主树**
+  `<主树>/.loop/run-<id>/`,而生成者/验证者的 `cwd` 是 worktree——它们**读不到主树 run-dir**。建 worktree 后
+  立刻 `mkdir -p <worktree>/.loop/run-<id>/validation/` 并 `cp` 主树 `contract.md` 进
+  `<worktree>/.loop/run-<id>/contract.md`(worktree 的 `.gitignore` 同样含 `/.loop/`,不脏树)。
+  **这是只读副本**:真理源仍在主树,合同 `amended` 后**重新 cp 覆盖**;副本不是验收判据通道——每轮 send 本就
+  **内联该 goal 合同原文**(源=主树真理源),副本仅供委托 agent 会话中途重读,被篡改也影响不了判据;验证者的
+  `validation/` 本就活在 worktree,收官时归档回主树 run-dir(见 Phase 3 §4)。
 
 ## 尺子的所有权与修改权(测试脚本归谁、脚本有 bug 谁修)
 
@@ -213,7 +238,7 @@ close 生成者
 |---|---|---|
 | 谁写 | **生成者**(TDD 是它的实现纪律) | **验证者**(自建,会话内自给自足) |
 | 身份 | **交付物**(tracked,随代码进 repo) | **尺子的执行层**(gitignored,run 后归档,不进产品) |
-| 对方能碰吗 | 验证者铁律「不动任何 tracked 文件」→ 碰了有**洁净树审计**兜底(`git status` 抓到 → 撤销 + `val:tainted`) | 生成者铁律「不碰 `.loop/`」→ **纪律禁止,但无自动审计**(`.loop/` 被 gitignore,`git diff` 照不到);靠角色纪律,要硬化可在生成者轮前后对 `validation/` 做快照比对(YAGNI,暂不做) |
+| 对方能碰吗 | 验证者铁律「产品树零痕迹」→ **洁净树审计**兜底(porcelain 任何输出 → 撤销/清除 + `val:tainted`) | 生成者铁律「不碰 `.loop/`」+ **主控每迭代对 `validation/` 做哈希比对**(§内环 step 1;`.loop/` 被 gitignore,洁净树审计罩不住——被考者改考卷是最强作弊动机,不能只靠纪律;机制复用 §Planner 快照审计) |
 
 **验证脚本(尺子执行层)有 bug 时**——发现权全开、修改权唯一:
 
@@ -228,13 +253,14 @@ close 生成者
 ## 主控的手:白名单(编排者不下场)
 
 实测两次独立 run 出现同一种漂移:主控"顺手"写验证脚本 / 亲手跑基线 / 想直接修小缺陷——每次都有合理化
-(「很机械」「省验证者上下文」「一行就能修」)。这不是个性问题,是 prose 编排的结构病(滑坡源头 = 下表四个
+(「很机械」「省验证者上下文」「一行就能修」)。这不是个性问题,是 prose 编排的结构病(滑坡源头 = 下表这些
 被批准的动手例外),所以用**穷举白名单**替代隐含边界。**主控亲手可做的全部**:
 
 | 允许 | 边界(防滑坡) |
 |---|---|
-| 写真理源:transcript / contract / iterations 归档 / final(含用工具代笔,如事件 append 脚本) | 仅 run-dir;代笔工具放 `.loop/` 下、**只有主控一人用**、输出严格按 EVENTS.md 不发明字段 |
+| 写真理源与裁决账本:transcript / contract / iterations 归档 / final / `panel/gate-rulings.md`(含用工具代笔,如事件 append 脚本) | 仅 run-dir;代笔工具放 `.loop/` 下、**只有主控一人用**、输出严格按 EVENTS.md 不发明字段 |
 | 代 commit | **只 `git add/commit` 生成者的改动,绝不 Edit 任何产品文件**——代提交 ≠ 代修改 |
+| 合同闸复算 | 闸阶段对判定性 AC 亲手重算期望值(≥1 条)——**只读演算**(此时无产品可跑,算的是合同自己的数);结论只进 gate-rulings,不预写任何 verdict |
 | 仲裁复跑 | 仅生成者质疑时、仅争议那条 AC、**只读执行**;产出只进 `val:script-defect` 裁决,不产生 verdict、不顺手修 |
 | 收官抽查 | 只读;发现问题**打回**,不自己修 |
 | 代执行 `[review]` AC | 拉异引擎 reviewer 会话,不是自己评 |
@@ -254,7 +280,9 @@ close 生成者
 ## Phase 3:收官
 
 1. **整支 broad review 闸(必过,无人值守不豁免)**:所有 goal 通过后,对整支改动拉异引擎 reviewer 做一次
-   broad review(dev 评审循环原样;报告落 `review/`,append `review:final`)。NEEDS_FIXES → 缺陷打回生成者修 →
+   broad review(dev 评审循环原样;报告落 `review/`,append `review:final`)。send 里点明两项职责:①整支代码质量;
+   ②**修约审计**——对照 transcript 的每条 `contract:amended` 与原始需求,判改约有无降低验收标准(无人值守的
+   中途改约没有面板复审,这里是唯一独立闸;降标未证成 → NEEDS_FIXES)。NEEDS_FIXES → 缺陷打回生成者修 →
    复评到 APPROVE;修复涉及的 goal 由验证者重验受影响 AC。
 2. **你自己再查一遍**:`git diff` + 抽查关键 AC——**委托不盲信,无人值守也不例外**。外加一条**越界自审**:
    `git log` 里本次 run 的每个产品 commit 必须一一映射到某条 `gen:produced` 或「主控代提交」;映射不上的
@@ -290,16 +318,18 @@ close 生成者
 | goal 卡死(达迭代上限) | 人在环三选菜单;无人值守 halt(中止后续,报告标红) |
 | 生成者/验证者会话挂 | `wait` 返回 failed/closed → doctor 换引擎重开;交接物 = 合同+缺陷清单+git log,无损 |
 | AC 不可执行 | 合同闸前逐条过;验证者遇到跑不了的 AC 标 BLOCKED 升级,不臆测 |
-| 验证者改了产品码 | 洁净树审计:撤销 + `val:tainted` + fresh 重验(verdict 污染即作废) |
+| 验证者污染产品树(改 tracked / 留 untracked 残留) | 洁净树审计(porcelain **任何输出**都算):tracked 撤销、untracked 删除 + `val:tainted` + fresh 重验(verdict 污染即作废) |
 | 验证脚本误判(假 FAIL,冤枉生成者) | 生成者「不修+理由」→ 主控亲手复跑该 AC 复现步骤仲裁 → `val:script-defect` + 下轮 fresh 验证者修尺子(修改权唯一,见 §尺子的所有权);同 goal >2 次不收敛 → `goal:stuck(reason:"script-defect-loop")` |
-| 尺子 flaky(好态偶发假红 → 假 FAIL) | 验证者「稳定性自检」:新建/改过且碰不确定性来源的脚本,同树同脚本连跑 K 次(默认 3)结论须一致;抖了先分诊——尺子自身抖(验证者补等待/固定种子/mock 稳定它)vs 被测系统随机(AC 需配额阈值 → NOTES/BLOCKED 报主控 amend);稳不住 → NOTES 降级不假装验过(validator.md §稳定性自检) |
+| 尺子 flaky(好态偶发假红 → 假 FAIL) | 验证者「稳定性自检」:新建/改过且碰不确定性来源的脚本,同树连跑 K=3 结论须一致;抖了分诊——尺子自身抖(验证者稳定它)vs 被测系统随机(AC 缺配额阈值 → 报主控 amend);稳不住 → **该 AC 标 BLOCKED**,不假装验过(validator.md §稳定性自检) |
 | 主控越界代工(顺手修 / 代建尺子 / 代验收) | §主控的手 白名单 + 绊线;收官越界自审(git log 产品 commit ↔ `gen:produced`/代提交一一映射,映射不上写 final 遗留风险);结构性根治 = 演化文档 L3(driver 握循环) |
 | 验证预算耗尽(LLM 判次烧穿) | 验证者 BLOCKED/NOTES(写明实际采样 x/n + 置信度风险)报主控 → 加预算或 `contract:amended` 改 n/m;**绝不静默缩采样**(那是降验收标准) |
 | 规划者越界(改产品树 / 改真理源 / 碰 `validation/`) | 产品树:洁净树审计(同验证者);run-dir(gitignore 下洁净树照不到、也无 git 可恢复):**快照审计,检测与恢复分开**——真理源开 planner 前内容备份(小文本)、漂移即原样恢复;`validation/` 记哈希清单、漂移文件交下轮验证者按「改过的脚本」重走先红后绿+稳定性自检;任一漂移 → 草案作废 + fresh 重开 |
 | 规划者会话挂 / 超时 | fresh 重开(状态全外置,零损耗);连续 2 次失败 → **你自行起草(有痕降级:记 NOTES 说明原因——planner 不可用时的降级不算"顺手"越界)** |
+| **带 `-x`/`-X` 的 `git clean` 抹掉整个 run-dir**(不可逆) | 禁的是**效果**(删掉 `.loop/`),不是某个拼写:小写 `-x` 删「忽略+未跟踪」;大写 `-X` **只删忽略文件**——读起来像无害的"清掉忽略的垃圾",实测恰好**只蒸发 run-dir、产品树纹丝不动**。合同 + transcript + 面板记录 + 尺子无 git 可恢复。设防:①**合同「全局约束」显式禁止**任何带 `-x`/`-X` 的 `git clean` 与任何删除 `.loop/` 的操作(起草时就写进去);②三份角色文件已内置禁令;③别在 AC 或 prompt 里写"回到干净工作区"这类**诱导措辞**;④评审团/reviewer 席位一律 `access:"read"`(codex 硬沙箱;omp/claude 软档,send 里别含清理类指令);⑤你的事件笔每次 append 都触碰 run-dir——**发现真理源丢失立即 halt 报告,别带着空账本继续跑**。真要清理用 `git clean -fd` |
+| 委托 agent 在 worktree 里读不到合同 | 建 worktree 后 `cp` 主树 `contract.md` → `<worktree>/.loop/run-<id>/contract.md`(只读副本;`amended` 后重新 cp 覆盖)。见 §Phase 2 worktree 条 |
 | 验证者留孤儿进程 | validator.md 进程卫生条款 + 收官 `node scripts/agent-bridge.mjs cleanup` 兜底 |
-| 生成者越界改文件 | 验证者 `git diff` 核对改动范围 vs goal 边界,越界记缺陷 |
-| codex 生成者无法 commit(仅 mac/Linux) | mac/Linux 上 codex workspace-write 沙箱保护 `.git/` → 生成者 BLOCKED,**主控代 commit**;**Windows 上 codex 走 danger-full-access、无此保护、可自行 commit**;omp/claude 均可自行 commit。无论哪种,主控都以 `git status` 兜底 |
+| 生成者越界改文件 | 验证者 `git diff` 核对改动范围 vs goal 边界,越界记缺陷;碰 `validation/`(尺子)由主控哈希比对抓(§内环 step 1) |
+| codex 生成者无法 commit(仅 mac/Linux,沙箱保护 `.git/`) | 生成者如实 BLOCKED → 主控以 `git status` 为准兜底代 commit(全部细节见 §内环 step 1,不在此重复) |
 | 上下文腐化 | `contextUsage ≥ 400k` 关旧开新(桥 skill 既有纪律) |
 | wait 死等/abort | 两条致命纪律(§前置) |
 | 无人值守撞主树 | worktree + branch 根治 |
@@ -321,7 +351,7 @@ close 生成者
 | 自然语言质量 AC | 合同给 rubric + 配额阈值;验证者落成脚本化 LLM-judge(冻结 prompt、钉死模型),观感只做 NOTES 交叉核验 |
 | LLM 验证预算 | 合同「全局约束」可设(判次/金额);**花法可优化**(early-stop / 先小后全 / 判次复用 / judge 按难度选量级 / 自检小样本化),**判准不可缩**;耗尽 BLOCKED 报主控 |
 | 规划者 | 默认启用(合同/修约/终稿起草);`access:"write"` **只写 `planning/`**(快照审计兜底),读全 run-dir + 产品树;按需开关、fresh 重开零损耗;连挂 2 次 → 主控自行起草(有痕降级);引擎按能力挑(起草建议强档),不受评审独立性硬约束 |
-| 主控动手 | 白名单五项(写真理源 / 代 commit / 仲裁复跑 / 收官抽查 / 代执行 `[review]`),其余一律下放;收官跑越界自审 |
+| 主控动手 | 白名单(写真理源与裁决账本 / 代 commit / 合同闸复算 / 仲裁复跑 / 收官抽查 / 代执行 `[review]`),其余一律下放;收官跑越界自审 |
 | 代码评审 | 收官整支 broad review(必过)+ `[review]` AC(你代执行、lazy;关键 goal 可选、纯内部重构 goal 必配) |
 | goal 依赖 | 默认按序(不做依赖标记,YAGNI;真独立就拆两次运行) |
 | viz | 默认关;端口 7345 占用回退;自灭 60s/10min |
