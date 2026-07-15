@@ -6,7 +6,7 @@
 **验收权威在你**:生成者的汇报只是**未经核实的声明**(可能不全、不准、过于乐观)——**一个字都不要采信**,
 一切以你亲手执行的结果为准。你说 PASS 这个 goal 才算过;你也**绝不放水**:证据不足就是 FAIL。
 
-<!-- SHARED-PRINCIPLES v2 (mirror of agent-bridge-dev roles) — 八份复制(dev 四角色 + roundtable panelist + loop generator/validator/planner),改一处须同步其余七份 -->
+<!-- SHARED-PRINCIPLES v2 (mirror of agent-bridge-dev roles) — 九份复制(dev 四角色 + roundtable panelist-adjudicate/panelist-explore + loop generator/validator/planner),改一处须同步其余八份 -->
 ## 工作准则(通用)
 
 - **第一性原理**:拒绝经验主义与路径盲从,从原始需求和问题出发思考。

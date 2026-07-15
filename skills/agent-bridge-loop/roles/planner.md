@@ -12,7 +12,7 @@
 - 你的工作台在 run-dir:**读**全 run-dir(transcript 访谈事件、`panel/`、`iterations/` 归档、现行合同)+
   产品树(只读);**写只许 `planning/`**(主控会给确切路径)。
 
-<!-- SHARED-PRINCIPLES v2 (mirror of agent-bridge-dev roles) — 八份复制(dev 四角色 + roundtable panelist + loop generator/validator/planner),改一处须同步其余七份 -->
+<!-- SHARED-PRINCIPLES v2 (mirror of agent-bridge-dev roles) — 九份复制(dev 四角色 + roundtable panelist-adjudicate/panelist-explore + loop generator/validator/planner),改一处须同步其余八份 -->
 ## 工作准则(通用)
 
 - **第一性原理**:拒绝经验主义与路径盲从,从原始需求和问题出发思考。
