@@ -1,6 +1,6 @@
 # Agent Bridge
 
-A persistent session bridge that lets **Claude Code** and **Codex** delegate work to local **OMP** and **Codex** agents over MCP.
+A persistent session bridge that lets **Claude Code** and **Codex** delegate work to local **OMP**, **Codex**, **Claude**, and **Cursor** agents over MCP.
 
 It is not a one-shot wrapper: you open a delegated-agent session, send one or more messages into it, read the result, reuse it, and close it. Sessions live **inside the MCP server process** — there is no background daemon, no web UI, and no network listener. Each client launches its own server; when the client exits, its sessions are cleaned up with it.
 
@@ -10,15 +10,15 @@ Works on macOS, Linux, and Windows.
 
 - **Node.js 20+**
 - An MCP client: **Claude Code** or **Codex**
-- The backend(s) you delegate to, launchable on `PATH`: **`omp`**, **`codex`**, and/or **`claude`**
+- The backend(s) you delegate to, launchable on `PATH`: **`omp`**, **`codex`**, **`claude`**, and/or **`cursor`** (the `agent` CLI; **Windows only**)
 
-Agent Bridge only bridges to OMP, Codex, and Claude — it does not install them. Install at least the backend you plan to use, then confirm it is detected:
+Agent Bridge only bridges to OMP, Codex, Claude, and Cursor — it does not install them. Install at least the backend you plan to use, then confirm it is detected:
 
 ```sh
 node scripts/agent-bridge.mjs doctor
 ```
 
-`doctor` prints `ok` for each backend it finds and flags anything missing. Override a binary path with `OMP_BIN` / `CODEX_BIN` / `CLAUDE_BIN` if it lives somewhere unusual.
+`doctor` prints `ok` for each backend it finds and flags anything missing. Override a binary path with `OMP_BIN` / `CODEX_BIN` / `CLAUDE_BIN` / `CURSOR_AGENT_BIN` if it lives somewhere unusual.
 
 ## Install
 
@@ -89,7 +89,7 @@ Then **restart the client** so it reloads the running MCP server (the skills are
 
 If a user asks an AI agent (Claude Code, Codex, …) to set Agent Bridge up, follow this exactly. Use **absolute paths** — the agent's shell is usually not at the repo root, so `$PWD` is unreliable. Below, `<REPO>` = the absolute path to the cloned repo and `<MJS>` = `<REPO>/scripts/agent-bridge.mjs`.
 
-1. **Prerequisites:** Node 20+, plus the backend(s) the user wants — `omp`, `codex`, and/or `claude` — launchable on `PATH` (Agent Bridge does not install them).
+1. **Prerequisites:** Node 20+, plus the backend(s) the user wants — `omp`, `codex`, `claude`, and/or `cursor` (Windows only) — launchable on `PATH` (Agent Bridge does not install them).
 2. **Get the code:** `git clone https://github.com/LeoWang329/agent-bridge.git`; record the clone's absolute path.
 3. **Register the MCP server** for the user's client:
    ```sh
@@ -116,7 +116,7 @@ If a user asks an AI agent (Claude Code, Codex, …) to set Agent Bridge up, fol
 
 ## Usage
 
-1. **`open_session`** with `agent: "omp"`, `"codex"`, or `"claude"`. Pick a capability tier with `access`: `"read"` (read + **execute** — file reads, search, and running shell commands to investigate, but no Edit/Write tools; the default) or `"write"` (full file edits). `write: false`/`true` still works as a legacy alias for `read`/`write`. Note that `read` includes a shell, and its write-boundary differs by backend: codex hard-blocks writes via its read-only OS sandbox, while omp/claude allow shell that *can* write (soft — role discipline, not a sandbox), so `read` on omp/claude is not a hard no-write guarantee.
+1. **`open_session`** with `agent: "omp"`, `"codex"`, `"claude"`, or `"cursor"`. Pick a capability tier with `access`: `"read"` (read + **execute** — file reads, search, and running shell commands to investigate, but no Edit/Write tools — cursor excepted, its read keeps the native write tool (see Backends); the default) or `"write"` (full file edits). `write: false`/`true` still works as a legacy alias for `read`/`write`. Note that `read` includes a shell, and its write-boundary differs by backend: codex hard-blocks writes via its read-only OS sandbox, while omp/claude/cursor allow shell that *can* write (soft — role discipline, not a sandbox), so `read` on omp/claude/cursor is not a hard no-write guarantee.
 2. **`send_message`** with the returned `session_id` — non-blocking by default (pass `wait: true` for a quick inline turn).
 3. **`wait`** to join results — `mode: "all"` blocks until every session finishes, `mode: "any"` returns on the first; always pass a `timeout_ms` so you can do other work and wait again instead of dead-waiting. On timeout it returns `pendingSnapshots` (per still-running session: `status`, `charCount`, a `tail` of the live partial output — capped by `tail_chars`, default 240 — and the latest lifecycle event) so progress is visible without a separate `status` call. This is how you fan out across parallel sessions.
 4. Reuse the same `session_id` for follow-ups.
@@ -126,11 +126,12 @@ You can pin `model` and `effort` per session at open time (they cannot change mi
 
 ## Backends
 
-Each backend maps the `access` tier (`read`/`write`) to its own capability controls. `read` = read + execute (a shell for investigation, no Edit/Write tools); its write-boundary is HARD on codex (OS sandbox) but SOFT on omp/claude (shell can write):
+Each backend maps the `access` tier (`read`/`write`) to its own capability controls. `read` = read + execute (a shell for investigation, no Edit/Write tools — except cursor, see its bullet); its write-boundary is HARD on codex (OS sandbox) but SOFT on omp/claude/cursor (shell can write):
 
 - **`omp`** — persistent `omp --mode rpc` over JSONL stdio. `read` → `--tools read,bash,grep,find,lsp,web_search --approval-mode yolo` — a real shell for investigation, but writes are **not** fenced (`--approval-mode write` classifies bash wholesale as write-class and blocks even read-only commands non-interactively, and the bridge has no approval responder, so `read` uses yolo and is a *soft* boundary). `write` → `--auto-approve --approval-mode yolo`.
-- **`codex`** — persistent `codex app-server` over JSON-RPC. `read` → `sandbox: read-only` — codex's read-only sandbox already runs commands (it isolates the filesystem, not execution) and **hard-blocks disk writes at the OS level** (verified enforced on Windows), so `read` is a *hard* boundary that still has a shell. `write` → `sandbox: workspace-write` on macOS/Linux, but `danger-full-access` on **Windows** (a SOFT boundary like omp/claude — codex's Windows sandbox breaks `apply_patch`, an upstream bug; see `scripts/agent-bridge.mjs`). All non-interactive (`approvalPolicy: never`).
+- **`codex`** — persistent `codex app-server` over JSON-RPC. `read` → `sandbox: read-only` — codex's read-only sandbox already runs commands (it isolates the filesystem, not execution) and **hard-blocks disk writes at the OS level** (verified enforced on Windows), so `read` is a *hard* boundary that still has a shell. `write` → `sandbox: workspace-write` on macOS/Linux, but `danger-full-access` on **Windows** (a SOFT boundary like omp/claude/cursor — codex's Windows sandbox breaks `apply_patch`, an upstream bug; see `scripts/agent-bridge.mjs`). All non-interactive (`approvalPolicy: never`).
 - **`claude`** — persistent Claude Code headless stream-json (`claude --print --input-format stream-json --output-format stream-json`). `read` → `--permission-mode default` with allowlist `Read,Glob,Grep,WebFetch,WebSearch,Bash` — Bash runs without prompts for investigation, but *can* write to disk (a *soft* boundary; Edit/Write stay out of the allowlist). This is a tool-level boundary, not an OS/hook sandbox — project hooks, if configured, still run. `write` uses `--permission-mode bypassPermissions`. Always launched with `--strict-mcp-config` so a delegated Claude loads project context (CLAUDE.md/skills) but **no MCP servers** — preventing nested delegation. `effort` maps to Claude Code's per-session `--effort` and defaults to `xhigh` (override per session). With no `model` set, claude uses its own configured default model. Override the binary with `CLAUDE_BIN`.
+- **`cursor`** — **Windows-only (v1).** Drives the cursor-agent CLI as a per-turn cloud chat: the logical session is a cloud `chatId`, and each turn spawns a short-lived `node index.js -p --resume <chatId> --output-format stream-json` that exits when the turn ends (no process is held between turns). Both `read` and `write` are *soft* (no OS sandbox). Specifics: `model` needs a tier-suffixed selector (e.g. `gpt-5.3-codex-high`, `cursor-grok-4.5-high` — list them with `agent --list-models` and use the exact selector it prints); `append_system_prompt_file` has no native system flag, so it is injected as a *soft first-turn user prefix* (adherence is model-dependent, and it shares the ~24K argv budget with the message); `effort` is accepted but ignored (echoed back as `null`) and `schema` is rejected before spawn; `read` and `write` share the same `--force` launch, so cursor's `read` keeps the native Edit/Write tool (a *softer* boundary than omp/claude — held back only by a per-turn "don't edit" instruction, with no clean per-session way to remove it); `contextUsage` is always `null` (stream-json carries no token usage); and there is **no delete-chat**, so `close_session` only forgets the id while the cloud chat — and any repo content it read — stays in Cursor's retention. Override the binary with `CURSOR_AGENT_BIN`.
 
 ## CLI
 
@@ -148,7 +149,7 @@ node scripts/agent-bridge.mjs cleanup    # reap orphaned backends + stale logs l
 
 - Read-oriented by default. Always close sessions so no backend keeps running.
 - No network listener — MCP over stdio only.
-- Spawned backends carry `AGENT_BRIDGE_SESSION_ID` / `AGENT_BRIDGE_OWNER_PID` / `AGENT_BRIDGE_AGENT` in their environment, so a bridge-launched `omp`/`codex` is attributable to a session at the OS level (read via `/proc/<pid>/environ` or `ps e` on POSIX) instead of guessed from command-line side signatures.
+- Spawned backends carry `AGENT_BRIDGE_SESSION_ID` / `AGENT_BRIDGE_OWNER_PID` / `AGENT_BRIDGE_AGENT` in their environment, so a bridge-launched `omp`/`codex`/`claude`/`cursor` is attributable to a session at the OS level (read via `/proc/<pid>/environ` or `ps e` on POSIX) instead of guessed from command-line side signatures. Cursor's short-lived per-turn child is tracked the same way while a turn runs, but between turns there is no process and no pid record.
 - Child PIDs are tracked under `~/.agent-bridge/pids/`; records whose owning server is still alive are skipped, and orphans are reaped on the next startup or via `cleanup` (POSIX uses `pgrep`/signals, Windows uses `taskkill`/CIM). Before terminating a matched orphan, cleanup confirms identity — by the env marker (POSIX) or the process start time vs the recorded spawn time — so a recycled PID that merely matches `omp --mode rpc` / `codex app-server` is never killed by mistake.
 - Don't commit secrets or machine-specific absolute paths.
 

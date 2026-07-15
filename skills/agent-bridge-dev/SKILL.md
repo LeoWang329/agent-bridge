@@ -81,14 +81,15 @@ close_session(session_id)                 用完必关
 **不点名具体后端/模型**——它们会变,写死会失效。按能力挑,具体名靠活查:
 
 - **默认偏好**:给每个角色一个默认(按能力档 + 评审者≠实施者),不绑产品名。
-- **缺了自行挑**:派活前 `agent_bridge_doctor` 看哪些后端在(当前 omp/codex/claude;将来新增 CLI 同理按 doctor 走)。
+- **缺了自行挑**:派活前 `agent_bridge_doctor` 看哪些后端在(当前 omp/codex/claude/cursor;新增 CLI 同理按 doctor 走)。
   默认不可用时,按**同样的能力标准自行挑一个合适替代**——但**必须遵守评审独立性**(见下):与实施者相同的
   引擎/模型候选直接排除,不能因"能力档最高可用"就悄悄挑到同一个。
 - **拿不准就问用户**:排除实施者后能力档无合适候选、或你无法判断怎么挑,**停下与用户确认**,不硬凑。
 - **能力分层**:机械实现用低延迟/足够能力档;集成/判断用中档;架构/最终整支评审用最强档(**不是"最便宜"**,别与
   "质量优先、不为省 token 缩水"冲突)。
 - **模型清单靠活查**:OMP 用 `omp models <关键字>`(子命令,非 flag;你的 shell 跑,非 MCP 工具),`model` 传全限定
-  `provider/名`;Codex/Claude 用后端默认或用户给定的有效模型(它们没有 `models` 子命令)。具体模型 ID 不写死。
+  `provider/名`;Codex/Claude 用后端默认或用户给定的有效模型(它们没有 `models` 子命令);cursor 用 `agent --list-models`,selector 带档位后缀(如 `gpt-5.3-codex-high`)。具体模型 ID 不写死。
+- **cursor 特例(见桥 skill 的 Cursor 条目)**:可担任一角色,但角色注入是**首轮软注入**——架构讨论是**多轮长会话**,cursor 的角色纪律长程未验证、经压缩可能漂,**要长程稳守角色的关键位优先真 system 提示后端(omp/codex/claude)**;另 cursor `contextUsage` 恒 `null`、云端 chat 删不掉、仅 Windows。
 
 ## 评审独立性(硬规则)
 
@@ -101,7 +102,7 @@ close_session(session_id)                 用完必关
    → 读产出。
 2. **独立评审**:open reviewer(`access:"read"`,**异于 implementer 的引擎/模型**)→ 给**冻结的评审范围**(明确 `base..head` + 路径,并要求
    "评审期间该范围不得变更";未提交改动先让实现者 commit/stash 定住,或你保证工作区静止)。read 档**自带 shell**,reviewer
-   能自己 `git diff` 拉取范围(三后端 read 档都有 shell)→ `wait(mode:"any", timeout_ms:300000)` → 读 verdict。
+   能自己 `git diff` 拉取范围(各后端 read 档都有 shell)→ `wait(mode:"any", timeout_ms:300000)` → 读 verdict。
 3. **修 → 复评**:按 Critical/Important 让实现者修(同会话追问)→ 重新 open/送 reviewer 复评,直到 `APPROVE`。
 4. **整支 broad review**:全部任务完成后,做一次覆盖整分支的评审(最强档模型)。
 5. **主 agent 自查**:委托方收口后,**你(主 agent)仍须自己 `git diff` + 跑必要测试再向用户报告,不盲信委托 agent**

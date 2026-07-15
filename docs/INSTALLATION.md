@@ -1,6 +1,6 @@
 # Agent Bridge 安装与使用
 
-这份文档面向想把 Agent Bridge 装进 Codex 或 Claude Code 并实际调用 OMP/Codex 的用户。
+这份文档面向想把 Agent Bridge 装进 Codex 或 Claude Code 并实际调用 OMP/Codex/Claude/Cursor 的用户。
 
 Agent Bridge 是一个 session-first 的 MCP 桥接器，注册到 Codex 或 Claude Code 后使用。它不是一次性命令封装，而是让客户端先打开一个持久会话，再向同一个会话连续发送消息，最后显式关闭会话。
 
@@ -12,6 +12,8 @@ Agent Bridge 是一个 session-first 的 MCP 桥接器，注册到 Codex 或 Cla
 node --version
 codex --version
 omp --version
+claude --version   # 如果要委托给 Claude
+agent --version    # 如果要委托给 Cursor（仅 Windows）
 ```
 
 最低要求：
@@ -20,14 +22,23 @@ omp --version
 - 一个 MCP 客户端：Codex（CLI 或 app）或 Claude Code
 - OMP 已安装，并且 `omp` 在 PATH 中（如果要委托给 OMP）
 - Codex 已安装，并且 `codex` 在 PATH 中（如果要委托给 Codex）
+- Claude Code 已安装，并且 `claude` 在 PATH 中（如果要委托给 Claude）
+- Cursor Agent CLI（`agent`）已安装，**仅 Windows**（如果要委托给 Cursor）
 
-**必须先装好要委托的 coding agent。** Agent Bridge 只是桥接到 OMP / Codex，本身不包含也不会自动安装它们。如果对应后端没装，session 根本无法启动。请先把你打算委托的后端装好，再用 `node scripts/agent-bridge.mjs doctor` 确认每个后端都被检测到。
+**必须先装好要委托的 coding agent。** Agent Bridge 只是桥接到 OMP / Codex / Claude / Cursor（cursor 仅 Windows），本身不包含也不会自动安装它们。如果对应后端没装，session 根本无法启动。请先把你打算委托的后端装好，再用 `node scripts/agent-bridge.mjs doctor` 确认每个后端都被检测到。
 
-如果 OMP 或 Codex 不在 PATH 中，可以用环境变量覆盖：
+如果后端不在 PATH 中，可以用环境变量覆盖（omp/codex/claude，POSIX shell）：
 
 ```sh
 export OMP_BIN="$HOME/.local/bin/omp"
 export CODEX_BIN="$(command -v codex)"
+export CLAUDE_BIN="$(command -v claude)"
+```
+
+Cursor 仅 Windows，用 PowerShell 覆盖（通常无需——`agent` 在 PATH 即可；`agent` 是 `.cmd`/`.ps1` shim）：
+
+```powershell
+$env:CURSOR_AGENT_BIN = (Get-Command agent).Source
 ```
 
 ## 2. 获取项目
@@ -82,7 +93,7 @@ Agent Bridge 两块东西，**适配范围不同**：
 | **Codex** | `codex mcp add agent-bridge -- node "<MJS>" mcp`（写入 `~/.codex/config.toml`） | `~/.codex/skills/<name>/`（软链） | `agent_bridge_*`（裸名） | 重启 Codex |
 | **其它 MCP 客户端**（Cursor / Cline / Windsurf …） | 在该客户端 MCP 配置里加一个 stdio server：命令 `node`、参数 `["<MJS>","mcp"]` | 无自动 skill 机制——按需把 `skills/agent-bridge/SKILL.md` 作为文档提供 | 由该客户端定（多为 `agent_bridge_*`） | 按该客户端方式重载 |
 
-`<MJS>` = `<REPO>/scripts/agent-bridge.mjs` 的**绝对路径**（维护者填**稳定安装 clone**，见上一节）。后端（omp/codex/claude）是否可用以 `node "<MJS>" doctor` 为准。一律用**绝对路径**，别用 `$PWD`——agent 的 shell 通常不在仓库根。
+`<MJS>` = `<REPO>/scripts/agent-bridge.mjs` 的**绝对路径**（维护者填**稳定安装 clone**，见上一节）。后端（omp/codex/claude/cursor）是否可用以 `node "<MJS>" doctor` 为准。一律用**绝对路径**，别用 `$PWD`——agent 的 shell 通常不在仓库根。
 
 ## 3. 安装到 Codex
 
@@ -175,7 +186,7 @@ ln -sfn "$PWD/skills/agent-bridge-loop"       ~/.claude/skills/agent-bridge-loop
 
 ## 6. 使用方式
 
-会话**只能**通过 MCP 工具管理。会话活在你这个客户端启动的 `agent-bridge mcp` 进程内：该进程直接 spawn 并持有你打开的 OMP/Codex 后端。没有共享后台 daemon，也没有 Web UI——客户端退出，这个 MCP 进程随之退出，它持有的所有后端会话被一并清理（v0.7.0，详见 [docs/ARCHITECTURE.md](ARCHITECTURE.md)）。
+会话**只能**通过 MCP 工具管理。会话活在你这个客户端启动的 `agent-bridge mcp` 进程内：该进程直接 spawn 并持有你打开的 OMP/Codex/Claude 后端（**cursor 例外**：只持有逻辑云端 chat，进程按轮短驻）。没有共享后台 daemon，也没有 Web UI——客户端退出，这个 MCP 进程随之退出，它持有的所有后端进程被一并清理（cursor 的云端 chat 因无 delete-chat 不受影响、仍留存）（v0.7.0，详见 [docs/ARCHITECTURE.md](ARCHITECTURE.md)）。
 
 Codex 使用 Agent Bridge 时应该遵循这个流程：
 
@@ -235,8 +246,8 @@ Codex 使用 Agent Bridge 时应该遵循这个流程：
 
 ```sh
 node scripts/agent-bridge.mjs mcp        # 运行 MCP server（stdio）——会话活在这个进程里
-node scripts/agent-bridge.mjs doctor     # 报告后端可用性（omp/codex）
-node scripts/agent-bridge.mjs cleanup    # 回收被 kill 的 MCP server 残留的 omp/codex 孤儿子进程
+node scripts/agent-bridge.mjs doctor     # 报告后端可用性（omp/codex/claude/cursor）
+node scripts/agent-bridge.mjs cleanup    # 回收被 kill 的 MCP server 残留的孤儿子进程（omp/codex/claude 长驻进程、cursor 的 create-chat / 活跃轮短进程）
 ```
 
 `mcp` 由 MCP 客户端自动拉起，不用手动跑。`cleanup` 是安全网：只终止那些「owning MCP server 已经不在了」（例如被 `kill -9`）的后端子进程，并清理它们的 pid record；仍由活着的 `agent-bridge mcp` 进程持有的子进程不会被动到。
@@ -283,12 +294,14 @@ node scripts/agent-bridge.mjs cleanup --json
 
 - OMP 的 `omp --mode rpc` 会退出
 - Codex 的 `codex app-server` 会退出
+- Claude 的 headless 进程会退出
+- Cursor 无长驻进程可退（形状 B：进程按轮短驻）——但 `close` 若逢**活跃的 create-chat / turn 短进程**会整树终止它，再忘掉云端 `chatId`；**因 cursor 无 delete-chat，云端 chat 及其读入的仓库内容仍留在 Cursor 的留存边界，删不掉**
 
-MCP server 进程**直接持有**它打开的会话（不再代理给任何 daemon）。当它退出时（客户端退出 / stdin 关闭 / `SIGTERM`、`SIGINT`、`SIGHUP` / stdout `EPIPE` / 未捕获异常），会清理自己持有的所有 OMP/Codex 子进程。stdin 关闭时它会先等 pending MCP 响应写完再退出。优雅退出（code 0）还会删除本次 run 的日志目录 `~/.agent-bridge/logs/<runId>/`；崩溃（code≠0）保留以便排查。仍然建议在任务完成后显式调用 `agent_bridge_close_session`。
+MCP server 进程**直接持有**它打开的会话（不再代理给任何 daemon）。当它退出时（客户端退出 / stdin 关闭 / `SIGTERM`、`SIGINT`、`SIGHUP` / stdout `EPIPE` / 未捕获异常），会清理自己持有的所有后端子进程（omp/codex/claude 长驻，及 cursor 活跃轮 / create-chat 短进程）。stdin 关闭时它会先等 pending MCP 响应写完再退出。优雅退出（code 0）还会删除本次 run 的日志目录 `~/.agent-bridge/logs/<runId>/`；崩溃（code≠0）保留以便排查。仍然建议在任务完成后显式调用 `agent_bridge_close_session`。
 
-如果 Agent Bridge 被 `kill -9` 硬杀，清理逻辑来不及执行。此时它会依赖 `~/.agent-bridge/pids/` 里的 pid record，在下一次 MCP server 启动（或手动 `cleanup`）时回收上次残留的 OMP/Codex 子进程。
+如果 Agent Bridge 被 `kill -9` 硬杀，清理逻辑来不及执行。此时它会依赖 `~/.agent-bridge/pids/` 里的 pid record，在下一次 MCP server 启动（或手动 `cleanup`）时回收上次残留的后端子进程（四后端同理）。
 
-只有活着的 `agent-bridge mcp` 进程会被识别为 pid record owner，`cleanup` 不会误杀它仍在使用的 OMP/Codex 子进程；只回收 owner 已经死掉的孤儿子进程。
+只有活着的 `agent-bridge mcp` 进程会被识别为 pid record owner，`cleanup` 不会误杀它仍在使用的后端子进程；只回收 owner 已经死掉的孤儿子进程。
 
 检查是否有残留：
 

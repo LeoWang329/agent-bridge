@@ -3,7 +3,7 @@
 一场圆桌的**唯一真理源**是运行目录下的 `transcript.jsonl`——一份 **append-only、单一 writer(主席)** 的事件流。
 可视化只 `tail` 这一份;事后复盘也**从这一份入口**、再按 `roundRef`/`briefRef`/`decisionRef` 拉旁挂全文。某席一轮的完整发言**旁挂**到 `rounds/p<K>-r<N>.md`(**出生即匿名、字节直传**:主席关席前 `cp` 桥的 `textRef`,既是审计原件又是别席收敛轮读的材料),事件里只留引用(`roundRef`)。
 
-> **谁写**:只有主席(主 agent)写 `transcript.jsonl`、`rounds/`、`briefs/`——且 `rounds/` 是 `cp` 桥落好的 `textRef`(字节直传,不转写)。参会席默认 `access:"read"`(读+执行,无 Edit/Write),改代码的 write 席只在自己的 git worktree `.roundtable/wt/<rtId>/seat-<x>/` 里改(写硬隔离,读非硬:桥无 OS 沙箱,靠角色纪律不去遍历真相源),**都不写真理源**。
+> **谁写**:只有主席(主 agent)写 `transcript.jsonl`、`rounds/`、`briefs/`——且 `rounds/` 是 `cp` 桥落好的 `textRef`(字节直传,不转写)。参会席默认 `access:"read"`(读+执行,无 Edit/Write;**cursor 例外**——原生写工具仍在、靠角色纪律不写),改代码的 write 席只在自己的 git worktree `.roundtable/wt/<rtId>/seat-<x>/` 里改(写硬隔离,读非硬:桥无 OS 沙箱,靠角色纪律不去遍历真相源),**都不写真理源**。
 > **桥不替你写**:agent-bridge 只写 per-session 原始 `.log` / `bridge.log` / `exit-journal`;圆桌事件必须主席自己 append。
 
 ## 信封(每行都有)

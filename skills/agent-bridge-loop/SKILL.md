@@ -218,6 +218,7 @@ close 生成者
 
 - **上下文卫生**:生成者会话跨迭代复用;`contextUsage.tokens ≥ 400k` → 关旧开新(交接物 = 合同 + 缺陷清单 +
   git log,状态全外置,无损)。验证者本就每轮 fresh。**主控自身同理**(§Planner 末条)。
+- **cursor 生成者/验证者例外(非禁令,见桥 skill 的 Cursor 条目)**:①`contextUsage` 恒 `null`,上面 400k 阈值判据对它失效——跨迭代复用的**生成者无法靠 token 阈值判轮换**,改按遗忘约束/质量下降/新任务等通用信号重开(桥 skill 既有);把 `null` 当**未知**、别当 0(验证者本就每轮 fresh、不受此影响);②角色注入是**首轮软注入**,几十轮迭代经压缩可能漂,强角色纪律的 loop 优先真 system 提示后端(omp/codex/claude);③**云端后端、chat 删不掉**,loop 多迭代 = 往 Cursor 云刷一堆含仓库内容的 chat,数据敏感任务慎用;④仅 Windows。
 - **验证者 fresh + 全量重验的为什么**:防「修 A 坏 B」回归 + 防「上轮验过了」惰性锚定;其状态 = 合同 +
   `validation/` 前轮脚本(外置复用,fresh 不返工)。
 - 无人值守 worktree:建/收/兜底清理直接复用 roundtable §席位权限那套(基线=HEAD,未提交改动不进 worktree;
@@ -325,12 +326,12 @@ close 生成者
 | 验证预算耗尽(LLM 判次烧穿) | 验证者 BLOCKED/NOTES(写明实际采样 x/n + 置信度风险)报主控 → 加预算或 `contract:amended` 改 n/m;**绝不静默缩采样**(那是降验收标准) |
 | 规划者越界(改产品树 / 改真理源 / 碰 `validation/`) | 产品树:洁净树审计(同验证者);run-dir(gitignore 下洁净树照不到、也无 git 可恢复):**快照审计,检测与恢复分开**——真理源开 planner 前内容备份(小文本)、漂移即原样恢复;`validation/` 记哈希清单、漂移文件交下轮验证者按「改过的脚本」重走先红后绿+稳定性自检;任一漂移 → 草案作废 + fresh 重开 |
 | 规划者会话挂 / 超时 | fresh 重开(状态全外置,零损耗);连续 2 次失败 → **你自行起草(有痕降级:记 NOTES 说明原因——planner 不可用时的降级不算"顺手"越界)** |
-| **带 `-x`/`-X` 的 `git clean` 抹掉整个 run-dir**(不可逆) | 禁的是**效果**(删掉 `.loop/`),不是某个拼写:小写 `-x` 删「忽略+未跟踪」;大写 `-X` **只删忽略文件**——读起来像无害的"清掉忽略的垃圾",实测恰好**只蒸发 run-dir、产品树纹丝不动**。合同 + transcript + 面板记录 + 尺子无 git 可恢复。设防:①**合同「全局约束」显式禁止**任何带 `-x`/`-X` 的 `git clean` 与任何删除 `.loop/` 的操作(起草时就写进去);②三份角色文件已内置禁令;③别在 AC 或 prompt 里写"回到干净工作区"这类**诱导措辞**;④评审团/reviewer 席位一律 `access:"read"`(codex 硬沙箱;omp/claude 软档,send 里别含清理类指令);⑤你的事件笔每次 append 都触碰 run-dir——**发现真理源丢失立即 halt 报告,别带着空账本继续跑**。真要清理用 `git clean -fd` |
+| **带 `-x`/`-X` 的 `git clean` 抹掉整个 run-dir**(不可逆) | 禁的是**效果**(删掉 `.loop/`),不是某个拼写:小写 `-x` 删「忽略+未跟踪」;大写 `-X` **只删忽略文件**——读起来像无害的"清掉忽略的垃圾",实测恰好**只蒸发 run-dir、产品树纹丝不动**。合同 + transcript + 面板记录 + 尺子无 git 可恢复。设防:①**合同「全局约束」显式禁止**任何带 `-x`/`-X` 的 `git clean` 与任何删除 `.loop/` 的操作(起草时就写进去);②三份角色文件已内置禁令;③别在 AC 或 prompt 里写"回到干净工作区"这类**诱导措辞**;④评审团/reviewer 席位一律 `access:"read"`(codex 硬沙箱;omp/claude/cursor 软档,send 里别含清理类指令);⑤你的事件笔每次 append 都触碰 run-dir——**发现真理源丢失立即 halt 报告,别带着空账本继续跑**。真要清理用 `git clean -fd` |
 | 委托 agent 在 worktree 里读不到合同 | 建 worktree 后 `cp` 主树 `contract.md` → `<worktree>/.loop/run-<id>/contract.md`(只读副本;`amended` 后重新 cp 覆盖)。见 §Phase 2 worktree 条 |
 | 验证者留孤儿进程 | validator.md 进程卫生条款 + 收官 `node scripts/agent-bridge.mjs cleanup` 兜底 |
 | 生成者越界改文件 | 验证者 `git diff` 核对改动范围 vs goal 边界,越界记缺陷;碰 `validation/`(尺子)由主控哈希比对抓(§内环 step 1) |
 | codex 生成者无法 commit(仅 mac/Linux,沙箱保护 `.git/`) | 生成者如实 BLOCKED → 主控以 `git status` 为准兜底代 commit(全部细节见 §内环 step 1,不在此重复) |
-| 上下文腐化 | `contextUsage ≥ 400k` 关旧开新(桥 skill 既有纪律) |
+| 上下文腐化 | `contextUsage ≥ 400k` 关旧开新(桥 skill 既有纪律);**cursor 恒 `null` → 当 unknown 不当 0**,复用的生成者改按遗忘/质量下降等通用信号重开 |
 | wait 死等/abort | 两条致命纪律(§前置) |
 | 无人值守撞主树 | worktree + branch 根治 |
 | 孤儿 viz | 看门狗 + viz.pid + 显式 kill |
@@ -344,7 +345,7 @@ close 生成者
 | 无人值守评审团 | 双架构师(prompt 可点名圆桌);人在环用户开局选 |
 | 卡死 | 人在环三选菜单;无人值守中止后续 goal |
 | 工作区 | 人在环主树;无人值守 worktree+branch(交付 = branch + 报告) |
-| 生成者 | `access:"write"`,会话跨迭代复用,400k 关旧开新 |
+| 生成者 | `access:"write"`,会话跨迭代复用,400k 关旧开新(**cursor 例外**:无 token 读数→按遗忘/质量下降等信号重开) |
 | 验证者 | `access:"write"`(自建测试脚本自给自足),引擎≠生成者,每轮 fresh,全量重验;产品码零改动靠洁净树审计 |
 | 尺子稳定性自检 | 新建/改过且碰不确定性来源(网络/时序/并发/随机/LLM)的脚本:同树连跑 K=3 须结论一致;纯确定性脚本免跑 |
 | LLM / 慢 IO 测试 | 多个独立调用**并发**跑(有界并发池 + 样本独立);随机输出的 AC 用配额阈值(≥m/n)不用单发断言 |

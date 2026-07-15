@@ -21,7 +21,8 @@ node <base>/tools/seat-turn.mjs <run-dir> \
 ```
 
 - `--seat` 须形如 `p<数字>`(如 `p1`);`--round` 非负整数(二者拼进文件路径,已校验挡穿越)。
-- `--agent` 取本场后端(当前:`omp` / `codex` / `claude`);`--model` **可选**——省略时 `turn:produced.payload.model` 记为 `null`(后端用默认模型)。
+- `--agent` 取本场后端(当前:`omp` / `codex` / `claude` / `cursor`);`--model` **可选**——省略时 `turn:produced.payload.model` 记为 `null`(后端用默认模型)。
+  - **cursor 席**:内置黑名单只放家族/厂商级名(已含 `grok`/`xai`/`gemini`/`gpt`/`claude`…);该席实际在跑的模型/家族若不在表内(如 Google 系的 `google`/`deepmind`、或某具体模型名),用 `--extra-names` 逐席带上,别往全局黑名单塞高频词。
 - **先扫源、再落盘**:先对 `--text-ref` 做泄漏扫描,**干净才** `cp` 字节直传 → `<run-dir>/rounds/<seat>-r<round>.md`(0 改写);阻断级命中 → **`exit 2` 且不写 `rounds/`**(源文件也不动,主席让该席重述或点状遮盖后重跑)。
 - **泄漏扫描分两类**(治「厂商名出现 ≠ 席位自我指认」的混淆):
   - **自我指认(self-ID)**:点名(`作为 codex`/`我是 gpt`/`as a claude`)+ **不点名**(`作为一个语言模型`/`我的知识截止`/`as an AI`)——这才是打穿匿名的真信号;不点名那类是整词厂商黑名单**挡不住**的漏网(dogfood 2026-07-15 发现)。

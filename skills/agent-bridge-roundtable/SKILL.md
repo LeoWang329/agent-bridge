@@ -63,13 +63,14 @@ description: 用 agent-bridge 组织一场「agent 圆桌审议」——主 agen
 - **主席**:你。调度、策展简报、判收敛、人在环升级、综合终稿、**写 `transcript.jsonl`**。
   - **收敛性亲自判、终稿亲自写(纪律重申,非新规)**:判收敛(写 `schedule:decision`)本就是主席职责——你有全场最全上下文、终稿也是你写的。把终裁**外包给某席**并不增加中立性(综合权仍在你手),只多一个重轮次、还常落在高占用席上(本场终裁落在 317k→464k 的席)。主席「中立」指**不下场持某方案立场**,不是放弃裁判职能;席位的职责是论证与互攻/互启,不是替你判收敛。
 - **参会席(N 席,默认 3)**:每席一个 `open_session`,注入**对应模式的 panelist 角色**(见下)。**默认 `access:"read"`**(读+执行,自带 shell 可调查);只有要改工作区代码的席才 `access:"write"` + git worktree——见 §席位权限。
-- **引擎/模型多样性 = 独立性的根**:先 `agent_bridge_doctor` 看后端(omp/codex/claude),给每席分**不同引擎**;引擎数 < 席数时在同引擎内换 `model`(用你的 shell 跑 `omp models <关键字>` 拿全限定 `provider/名`)。**凑不出 N 席的多样性就把 N 压到可用多样性并告知用户**——不拿同引擎同模型的克隆冒充独立视角。独立席 < 2 → 问用户是否降级(2 席都没有就不成圆桌)。
+- **引擎/模型多样性 = 独立性的根**:先 `agent_bridge_doctor` 看后端(omp/codex/claude/cursor),给每席分**不同引擎**;引擎数 < 席数时在同引擎内换 `model`(用你的 shell 跑 `omp models <关键字>` 拿全限定 `provider/名`;cursor 用 `agent --list-models`,selector 带档位后缀如 `gpt-5.3-codex-high`)。**凑不出 N 席的多样性就把 N 压到可用多样性并告知用户**——不拿同引擎同模型的克隆冒充独立视角。独立席 < 2 → 问用户是否降级(2 席都没有就不成圆桌)。
+  - **cursor 席可用但带三条如实注意(非禁令,见桥 skill 的 Cursor 条目)**:①角色注入是**首轮软注入**,故**出生匿名/模式纪律/反谄媚**在 cursor 席是软保证——短会话实证 OK,长多轮经压缩可能漂;泄漏另有 `seat-turn` 扫描器兜底(与后端无关),但要严格长程匿名的关键席优先 omp/codex/claude。②cursor 是**云端后端、chat 删不掉**,圆桌批量开席 = 一次往 Cursor 云刷一堆含仓库内容的 chat,数据敏感议题慎用。③`contextUsage` 恒 `null`,收敛/收尾里别按它给 cursor 席排序(当 unknown,别当 0)。
 - **角色注入(铁规)**:每席开会话必须 `append_system_prompt_file=<base>/roles/panelist-<mode>.md`(裁决=`panelist-adjudicate.md`,探索=`panelist-explore.md`;绝对路径、存在、非空)。`<base>` = 本 skill 加载时 harness 给出的 base directory。
   - **领域侧重走框设与任务书,不换角色文件**:纯架构/调试类议题,把领域视角写进 `r0-framing.md` 与各轮任务书(如「从架构取舍视角审议」)。**不要**把角色文件换成 dev 的 `architect.md`/`debugger.md`——`append_system_prompt_file` 只有一个,换掉 = 该席同时失去**出生匿名、模式纪律与反谄媚**(它们只在 panelist 角色文件里),等于打穿模式硬分离与匿名圆桌的根基。
 
 ## 席位权限:默认 `read`(读+执行),改代码才 `write`+worktree
 
-参会席默认 `access:"read"`——**读文件 + 搜索 + 跑 shell 命令**(read 档自带 shell,见桥 skill)。这一档够绝大多数圆桌:审议席读文档 + 推理;要调查的席还能**跑测试/复现/探针命令**——不必为"跑个命令"就开写。`read` **无 Edit/Write 工具**,意图是"不改文件";其写边界因后端而异——**codex 硬**(read-only OS 沙箱,shell 里写盘被拦)、**omp/claude 软**(shell 能写盘,靠角色纪律)。
+参会席默认 `access:"read"`——**读文件 + 搜索 + 跑 shell 命令**(read 档自带 shell,见桥 skill)。这一档够绝大多数圆桌:审议席读文档 + 推理;要调查的席还能**跑测试/复现/探针命令**——不必为"跑个命令"就开写。`read` **无 Edit/Write 工具**（**cursor 例外**:其 read 与 write 同用 `--force`,**原生写工具仍在**、只靠每轮提示压制,见桥 skill Cursor 条目）,意图是"不改文件";其写边界因后端而异——**codex 硬**(read-only OS 沙箱,shell 里写盘被拦)、**omp/claude/cursor 软**(能写盘,靠角色纪律;cursor 最宽——连原生写工具都在)。
 
 **只有要真正改工作区代码的席才 `access:"write"`**(改源码做实验、写要保留的复现脚本/失败测试)。write 席用 **git worktree 硬隔离**(而非软纪律):`write` 在工具层是整个 cwd 可写、并发写会互相踩;每个 write 席在**自己的 worktree** 里跑,写代码互不碰撞、主工作区不脏。
 
@@ -177,14 +178,14 @@ node <base>/viz/serve.mjs <run-dir>
 | 后端**挂/被关** | `wait` 返回 `failed/closed` → 当掉线席;**存活独立席 < 2** → 降级问用户 |
 | **不收敛** | 命中轮上限 → 强制综合 + 显式「未决:X」+ 残余升级问人 |
 | **成本失控** | 预算触顶 → 停 + 综合部分结果 |
-| **并发写腐蚀** | 单 writer=主席写 JSONL;各席默认 `read`(无 Edit/Write 工具);要改代码的 write 席**各在自己的 git worktree**(写硬隔离:互不碰撞、主工作区不受影响;读非硬——无 OS 沙箱,详见 §席位权限);结束 remove 或 merge |
+| **并发写腐蚀** | 单 writer=主席写 JSONL;各席默认 `read`(无 Edit/Write 工具;**cursor read 例外——原生写工具仍在、只靠提示压制**,故 cursor read 席落地在共享工作区时更需盯改动);要改代码的 write 席**各在自己的 git worktree**(写硬隔离:互不碰撞、主工作区不受影响;读非硬——无 OS 沙箱,详见 §席位权限);结束 remove 或 merge |
 | **孤儿 viz** | 自灭看门狗 + viz.pid + close 时显式 kill(见上) |
 | **假共识 / 谄媚退化** | 盲发 round0 + 引擎多样性(两模式通用);裁决=红队探针 + steelman-翻转,探索=甄别逐条给独立理由 + 零质疑触发主席复核任务(见各模式手册;**不设拒绝配额**) |
-| **上下文腐化** | 收敛轮**分派前**先看各席 `contextUsage.tokens`:**≥300k 的席不派重读任务**(读多份全文这类;终裁本就不派席——主席亲自判,见 §阵容),重任务给**最低占用席**;某席 **≥400k** → 关旧开新、交接摘要塞进新会话 initial_prompt(见桥 skill)。「反正是最后一轮」不是豁免理由。(跨后端读数口径**已对齐**——claude 于 `12c3bfd` 修为末次 per-call input 侧、不再虚高;仍有分词器 10–30% 差异,当粗粒度触发器足够,直接按 `tokens` 比,**不要再对半折算**。) |
+| **上下文腐化** | 收敛轮**分派前**先看各席 `contextUsage.tokens`:**≥300k 的席不派重读任务**(读多份全文这类;终裁本就不派席——主席亲自判,见 §阵容),重任务给**最低占用席**;某席 **≥400k** → 关旧开新、交接摘要塞进新会话 initial_prompt(见桥 skill)。「反正是最后一轮」不是豁免理由。**cursor 席 `tokens`=`null`(恒无读数)**:跳过所有数值比较——不判 ≥300k/≥400k、也不参与"最低占用席"选择(`null` 不是 0),对它只按遗忘约束/质量下降等非 token 信号另判是否重开。(跨后端读数口径**已对齐**——claude 于 `12c3bfd` 修为末次 per-call input 侧、不再虚高;仍有分词器 10–30% 差异,当粗粒度触发器足够,直接按 `tokens` 比,**不要再对半折算**。) |
 
 ## 主席自查(委托后不盲信)
 
-各席默认 `read`(自带 shell 可调查、但无 Edit/Write);改代码的 write 席在**各自的 git worktree**里改(结束 remove/merge,§席位权限)。**席位代码事实断言抽查**:席位发言里的**代码事实断言**(「我 grep 过无 X」「该函数会校验 Y」)进 `final.md` 前,主席至少抽查关键的 1–2 条;未核实的要么当场验证、要么在终稿标注「席位断言,未复核」——别让「查了鉴权却无人查 CSRF」那类运气进终稿。**标「未复核/需真机验证」前先查手边现成证据**:本场各席的桥 `.log`、run-dir 已落盘产物里往往就有答案(如后端事件的字段形状),一条命令能验证的别留成终稿开放项。**主席级锚定自查**:终稿的组织框架是否不成比例放大了某一席的框架、把别席框架降成注脚?防退化机制盯的是席位级锚定(见模式手册),主席自己的放大只有这条自查看住。圆桌产出若进入实现,**仍走 `agent-bridge-dev` 的评审循环 + 你自己 `git diff` + 跑测试**再向用户报告。圆桌只负责「审议出方案(可含主动调查)」,落地交 dev。**收尾务必确认 `wt/` 下无残留 worktree**(`git worktree list` 核对)。
+各席默认 `read`(自带 shell 可调查、但无 Edit/Write;**cursor 例外——原生写工具仍在,靠纪律**);改代码的 write 席在**各自的 git worktree**里改(结束 remove/merge,§席位权限)。**席位代码事实断言抽查**:席位发言里的**代码事实断言**(「我 grep 过无 X」「该函数会校验 Y」)进 `final.md` 前,主席至少抽查关键的 1–2 条;未核实的要么当场验证、要么在终稿标注「席位断言,未复核」——别让「查了鉴权却无人查 CSRF」那类运气进终稿。**标「未复核/需真机验证」前先查手边现成证据**:本场各席的桥 `.log`、run-dir 已落盘产物里往往就有答案(如后端事件的字段形状),一条命令能验证的别留成终稿开放项。**主席级锚定自查**:终稿的组织框架是否不成比例放大了某一席的框架、把别席框架降成注脚?防退化机制盯的是席位级锚定(见模式手册),主席自己的放大只有这条自查看住。圆桌产出若进入实现,**仍走 `agent-bridge-dev` 的评审循环 + 你自己 `git diff` + 跑测试**再向用户报告。圆桌只负责「审议出方案(可含主动调查)」,落地交 dev。**收尾务必确认 `wt/` 下无残留 worktree**(`git worktree list` 核对)。
 
 ## 主席执行卫生(本场踩过的小坑,保持极短)
 
@@ -199,7 +200,7 @@ node <base>/viz/serve.mjs <run-dir>
 | 模式 | 主席按产出形态判(怕选错=`adjudicate` / 怕漏点=`explore`,§何时开圆桌 第二道闸);**判不准 `AskUserQuestion` 问用户**;写进 `run:started.payload.mode`+`modeRationale`;R0 后错配**不切换**,升级问人(换模式=全新重开含重跑 R0,R0 产物不跨模式复用) |
 | run-dir | `<cwd>/.roundtable/rt-<时间戳-短随机>/` + `.gitignore` 一行 `/.roundtable/` |
 | 席位数 N | 3(独立引擎不足降到实际可用并告知;< 2 问用户) |
-| 席位权限 | 默认 `access:"read"`(读+执行,自带 shell 可调查、无 Edit/Write;codex 硬只读、omp/claude 软);只有改工作区代码的席才 `access:"write"`,**每写席一个 git worktree** `<cwd>/.roundtable/wt/<rtId>/seat-<x>/`(写硬隔离/读非硬),结束 remove(默认)或 merge |
+| 席位权限 | 默认 `access:"read"`(读+执行,自带 shell 可调查、无 Edit/Write〔cursor 例外见上〕;codex 硬只读、omp/claude/cursor 软);只有改工作区代码的席才 `access:"write"`,**每写席一个 git worktree** `<cwd>/.roundtable/wt/<rtId>/seat-<x>/`(写硬隔离/读非硬),结束 remove(默认)或 merge |
 | 席位可见性 | **一律「匿名全文」**——收敛轮各席读 `rounds/` 匿名全文(出生即匿名)+ 主席索引;不设有损档位(不退回主席摘要),调度变体(裁决模式 debate 轮)见模式手册;**不设用户必填档位**,用户强先验时可给可选 `visibilityHint` |
 | coverage | 每收敛轮 append `coverage` 事件(上轮每条 included/parked/irrelevant + 理由),治主席无声漏点 |
 | 轮次 | round0 盲发 + 实质轮上限 3;连续 2 轮无新论点即停 |
