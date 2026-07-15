@@ -39,6 +39,12 @@ import { appendEvents } from "./rt-event.mjs";
 const VENDOR_BLACKLIST = [
   "claude", "opus", "sonnet", "gpt", "chatgpt", "deepseek", "gemini", "qwen",
   "anthropic", "openai", "minimax", "kimi", "codex", "glm", "zhipu",
+  // cursor 后端可托管的厂商/家族级名(grok=xAI 的 Grok)——补齐这些才让匿名扫描的**全局兜底**覆盖 cursor 席。
+  // 只放**家族/厂商级、且非高频英文词**的名(与既有 qwen/kimi/glm/gemini 同粒度);产品/模式名(如 Cursor 的
+  // "composer")、以及某席具体在跑的模型名,走**每席 `--extra-names`**(见 tools/README.md),不进全局表——
+  // 否则整词匹配会大量误伤正文(如 PHP Composer / music composer)。
+  // 故意**不含 "cursor" 本身**(同被排除的 "omp":常用词,英文正文 "move the cursor / DB cursor" 会误伤)。
+  "grok", "xai",
 ];
 const VENDOR_ALT = VENDOR_BLACKLIST.join("|");
 
@@ -119,7 +125,7 @@ function main(argv) {
   if (!seat) die("缺少 --seat(如 p1)");
   if (round === undefined) die("缺少 --round(如 0)");
   if (!textRef) die("缺少 --text-ref(桥返回的 textRef 绝对路径)");
-  if (!agent) die("缺少 --agent(如 omp/codex/claude)");
+  if (!agent) die("缺少 --agent(如 omp/codex/claude/cursor)");
   // 校验 seat/round:二者直接拼进文件路径与 roundRef,必须挡目录穿越/非法名(如 ../x、p1/sub)
   if (!/^p\d+$/.test(seat)) die(`--seat 必须形如 p<数字>(如 p1),收到: ${seat}`);
   const roundNum = Number(round);
