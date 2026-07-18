@@ -135,20 +135,29 @@ try {
   // Four lines with prefixes differing by one byte, so the cut lands mid-character on at least three.
   const emojiLines = truncated.filter(l => l.startsWith("fake-codex emoji"));
   check("S1b all four emoji-padded lines are present and truncated", emojiLines.length === 4, `${emojiLines.length}/4`);
-  let backedOff = 0, cleanCuts = 0;
+  let backedOff = 0, cleanCuts = 0, wholeAll = true;
+  const backOffBytes = [];
   for (const l of emojiLines) {
     const kept = l.slice(0, l.indexOf("…[+"));
     const keptBytes = Buffer.byteLength(kept, "utf8");
-    const prefixBytes = keptBytes - (kept.match(/🙂/gu) || []).length * 4;
     // Whole characters only: strip the emoji and what remains must be the pure-ASCII prefix.
-    const wholeChars = /^fake-codex emoji!* (🙂)*$/u.test(kept);
-    if (!wholeChars) { check(`S1b line(prefix ${prefixBytes}B) cut a character in half`, false, kept.slice(-8)); break; }
-    const emojiReserve = Buffer.byteLength(`…[+${Buffer.byteLength(l, "utf8") + 1}B truncated]\n`, "utf8");
-    if (keptBytes < LINE_CAP - emojiReserve) backedOff++; else cleanCuts++;
+    if (!/^fake-codex emoji!* (🙂)*$/u.test(kept)) { wholeAll = false; continue; }
+    // Reserve is derived from the ORIGINAL write size, which the marker lets us reconstruct exactly:
+    // original = kept + dropped. (Using the TRUNCATED line's size here understates the reserve by a byte
+    // and miscounts a clean boundary cut as a back-off.)
+    const droppedHere = Number(l.match(/\+(\d+)B truncated/)[1]);
+    const originalBytes = keptBytes + droppedHere;
+    const emojiReserve = Buffer.byteLength(`…[+${originalBytes}B truncated]\n`, "utf8");
+    const backOff = LINE_CAP - emojiReserve - keptBytes; // 0 when the cap already landed on a boundary
+    backOffBytes.push(backOff);
+    if (backOff > 0) backedOff++; else cleanCuts++;
   }
-  check("S1b every kept prefix is a WHOLE number of characters (nothing cut in half)",
-    emojiLines.length === 4, `${backedOff} needed back-off, ${cleanCuts} landed on a boundary`);
-  check("S1b the back-off path actually ran (not just lucky alignment)", backedOff >= 3, `${backedOff}/4 lines backed off`);
+  check("S1b every kept prefix is a WHOLE number of characters (nothing cut in half)", wholeAll,
+    `back-off per line: [${backOffBytes.join(", ")}] bytes`);
+  check("S1b the back-off path actually ran (not just lucky alignment)", backedOff >= 3,
+    `${backedOff}/4 lines backed off, ${cleanCuts}/4 landed on a boundary`);
+  check("S1b back-off never exceeds 3 bytes (one UTF-8 sequence)", backOffBytes.every(b => b >= 0 && b <= 3),
+    `[${backOffBytes.join(", ")}]`);
   check("S1b no replacement character anywhere in the log", !raw.toString("utf8").includes("�"));
 
   // S2 — redaction: skeleton kept, bodies gone
@@ -281,34 +290,105 @@ try {
   // ---------- S8: exit journal stays PARSEABLE JSON when sessions overflow the write budget ----------
   // A small line cap reproduces the >45-session overflow without spawning 45 backends: the property
   // under test ("the producer trims whole elements so the line parses") is cap-independent.
-  const s5 = makeServer({ AGENT_BRIDGE_STATE_DIR: STATE_E, OMP_BIN: FAKE_OMP, FAKE_OMP_MODE: "okturn", AGENT_BRIDGE_LOG_LINE_MAX_BYTES: "420" });
+  const S8_CAP = 512; // the floor — the smallest cap we accept, so the smallest that still forces trimming
+  const s5 = makeServer({ AGENT_BRIDGE_STATE_DIR: STATE_E, OMP_BIN: FAKE_OMP, FAKE_OMP_MODE: "okturn", AGENT_BRIDGE_LOG_LINE_MAX_BYTES: String(S8_CAP) });
   await s5.init();
   const opened = [];
-  for (let i = 0; i < 5; i++) {
+  for (let i = 0; i < 8; i++) {
     const oid2 = (await s5.call("agent_bridge_open_session", { agent: "omp", cwd: CWD }, 60000))?.session?.id;
     if (oid2) opened.push(oid2);
   }
-  check("S8 opened 5 concurrent sessions", opened.length === 5, `${opened.length}/5`);
+  check("S8 opened 8 concurrent sessions", opened.length === 8, `${opened.length}/8`);
   s5.srv.stdin.end(); // stdin EOF -> clean shutdown -> exit journal
   await sleep(2500);
   const journal = path.join(STATE_E, "exit-journal.jsonl");
   const jlines = fs.readFileSync(journal, "utf8").trim().split("\n").filter(Boolean);
   let parsedAll = true, rec = null;
   for (const l of jlines) { try { rec = JSON.parse(l); } catch { parsedAll = false; } }
-  console.log(`[evidence] exit-journal line = ${Buffer.byteLength(jlines[jlines.length - 1], "utf8")}B under a 420B write cap; ` +
+  console.log(`[evidence] exit-journal line = ${Buffer.byteLength(jlines[jlines.length - 1], "utf8")}B under a ${S8_CAP}B write cap; ` +
     `sessionCount=${rec?.sessionCount} kept=${rec?.sessions?.length} omitted=${rec?.sessionsOmitted}`);
   check("S8 every exit-journal line is parseable JSON", parsedAll && Boolean(rec), `${jlines.length} line(s)`);
   check("S8 no line carries a truncation marker", !jlines.some(l => l.includes("truncated")));
-  check("S8 the record fits the write budget", jlines.every(l => Buffer.byteLength(l, "utf8") + 1 <= 420));
+  check("S8 the record fits the write budget", jlines.every(l => Buffer.byteLength(l, "utf8") + 1 <= S8_CAP));
   check("S8 trimming actually engaged (this is not a vacuous pass)", rec?.sessionsOmitted > 0, `omitted=${rec?.sessionsOmitted}`);
-  check("S8 the total session count is reported honestly despite trimming", rec?.sessionCount === 5, `sessionCount=${rec?.sessionCount}`);
-  check("S8 kept + omitted == total", rec?.sessions?.length + rec?.sessionsOmitted === 5,
+  check("S8 the total session count is reported honestly despite trimming", rec?.sessionCount === 8, `sessionCount=${rec?.sessionCount}`);
+  check("S8 kept + omitted == total", rec?.sessions?.length + rec?.sessionsOmitted === 8,
     `${rec?.sessions?.length} + ${rec?.sessionsOmitted}`);
   check("S8 kept session entries are whole objects, not fragments",
     Array.isArray(rec?.sessions) && rec.sessions.length > 0 && rec.sessions.every(x => x && typeof x === "object" && "id" in x && "status" in x),
     JSON.stringify(rec?.sessions)?.slice(0, 80));
   s5.kill();
   await sleep(200);
+
+  // ---------- S9: a cap we cannot keep our promises at is REFUSED, not half-honoured ----------
+  // A cap below the floor (or a fractional one) silently broke two guarantees: the exit-journal record
+  // stopped parsing, and at a very small cap the marker alone exceeded the "max bytes" it was named for.
+  // Both are now rejected at the config boundary with a warning + fallback to the default.
+  for (const [label, value, ] of [["below the floor", "200"], ["fractional", "4096.5"], ["marker-sized", "10"]]) {
+    const st = fs.mkdtempSync(path.join(os.tmpdir(), "ab-logbounds-cap-"));
+    const s6 = makeServer({ AGENT_BRIDGE_STATE_DIR: st, OMP_BIN: FAKE_OMP, FAKE_OMP_MODE: "okturn", AGENT_BRIDGE_LOG_LINE_MAX_BYTES: value });
+    let warned = "";
+    s6.srv.stderr.on("data", d => { warned += d; });
+    await s6.init();
+    const wid = (await s6.call("agent_bridge_open_session", { agent: "omp", cwd: CWD }, 60000))?.session?.id;
+    check(`S9 (${label}: ${value}) rejected with a warning naming the constraint`,
+      /must be 0 or an integer >= 512/.test(warned) && warned.includes(value), warned.trim().split("\n")[0]?.slice(0, 110) || "(no warning)");
+    s6.srv.stdin.end();
+    await sleep(2000);
+    const jl = fs.readFileSync(path.join(st, "exit-journal.jsonl"), "utf8").trim().split("\n").filter(Boolean);
+    let ok = jl.length > 0;
+    for (const l of jl) { try { JSON.parse(l); } catch { ok = false; } }
+    check(`S9 (${label}) exit journal still parses after the fallback`, ok, `${jl.length} line(s), ${Buffer.byteLength(jl[0] || "", "utf8")}B`);
+    check(`S9 (${label}) the session still opened normally`, Boolean(wid), String(wid));
+    s6.kill();
+    await sleep(200);
+    try { fs.rmSync(st, { recursive: true, force: true }); } catch {}
+  }
+
+  // ---------- S10: a valid cap AT the floor keeps the exit-journal promise ----------
+  const st10 = fs.mkdtempSync(path.join(os.tmpdir(), "ab-logbounds-floor-"));
+  const s7 = makeServer({ AGENT_BRIDGE_STATE_DIR: st10, OMP_BIN: FAKE_OMP, FAKE_OMP_MODE: "okturn", AGENT_BRIDGE_LOG_LINE_MAX_BYTES: "512" });
+  let warned10 = "";
+  s7.srv.stderr.on("data", d => { warned10 += d; });
+  await s7.init();
+  for (let i = 0; i < 4; i++) await s7.call("agent_bridge_open_session", { agent: "omp", cwd: CWD }, 60000);
+  check("S10 the floor value itself is accepted (no warning)", !warned10.includes("must be 0 or an integer"), warned10.trim().slice(0, 80) || "(clean)");
+  s7.srv.stdin.end();
+  await sleep(2500);
+  const jl10 = fs.readFileSync(path.join(st10, "exit-journal.jsonl"), "utf8").trim().split("\n").filter(Boolean);
+  let rec10 = null, ok10 = jl10.length > 0;
+  for (const l of jl10) { try { rec10 = JSON.parse(l); } catch { ok10 = false; } }
+  check("S10 exit journal parses at the floor cap", ok10 && Boolean(rec10),
+    `${Buffer.byteLength(jl10[0] || "", "utf8")}B, kept=${rec10?.sessions?.length}/${rec10?.sessionCount}`);
+  check("S10 the reason survives (skeleton was not over-trimmed)", typeof rec10?.reason === "string" && rec10.reason.length > 0, JSON.stringify(rec10?.reason));
+  s7.kill();
+  await sleep(200);
+  try { fs.rmSync(st10, { recursive: true, force: true }); } catch {}
+
+  // ---------- S11: the "no raw Buffer into appendLog" invariant, enforced by code not comment ----------
+  // NOTE ON COVERAGE: the runtime branch cannot be reached through any product path — that is precisely
+  // the invariant (every child stream setEncoding("utf8"), so appendLog only ever sees strings). So this
+  // asserts the two halves that CAN be checked: the guard is wired into appendLog, and no stream feeding
+  // appendLog is left un-decoded. The second half is the regression that actually bites: a future backend
+  // adding `stderr.on("data", buf => appendLog(...))` without setEncoding is what resurrected mojibake.
+  const src = fs.readFileSync(BRIDGE, "utf8");
+  check("S11 appendLog routes every write through the Buffer guard", /const payload = clampLogWrite\(normalizeLogPayload\(text\)\)/.test(src));
+  check("S11 the guard validates with isUtf8 and does not throw",
+    /import \{ isUtf8 \} from "node:buffer"/.test(src) && /if \(isUtf8\(text\)\) return text\.toString\("utf8"\)/.test(src));
+  const srcLines = src.split("\n");
+  const undecoded = [];
+  srcLines.forEach((line, i) => {
+    const m = line.match(/(\w+(?:\.\w+)*\.std(?:err|out))\.on\("data"/);
+    if (!m) return;
+    const stream = m[1];
+    const feedsAppendLog = /appendLog/.test(srcLines.slice(i, i + 6).join("\n"));
+    if (!feedsAppendLog) return;
+    // setEncoding for this stream must appear within the surrounding setup block.
+    const window = srcLines.slice(Math.max(0, i - 8), i + 2).join("\n");
+    if (!window.includes(`${stream}.setEncoding("utf8")`)) undecoded.push(`${i + 1}: ${stream}`);
+  });
+  check("S11 every stream feeding appendLog is setEncoding(\"utf8\") — no raw Buffer path",
+    undecoded.length === 0, undecoded.length ? undecoded.join("; ") : "all decoded at the stream");
 } finally {
   for (const d of [STATE_A, STATE_B, STATE_C, STATE_D, STATE_E]) { try { fs.rmSync(d, { recursive: true, force: true }); } catch {} }
 }

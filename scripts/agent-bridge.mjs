@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { isUtf8 } from "node:buffer";
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -19,6 +20,23 @@ function envNum(name, fallback) {
   const n = Number(raw);
   if (!Number.isFinite(n)) {
     process.stderr.write(`[agent-bridge] ignoring non-numeric ${name}=${JSON.stringify(raw)}; using default ${fallback}\n`);
+    return fallback;
+  }
+  return n;
+}
+
+// envNum for a BYTE CAP that other invariants depend on. A cap is only meaningful as a positive integer
+// at or above `min`; a fractional one (4096.5 → a 4097-byte write and a marker reporting "926.5B") or one
+// too small to hold the smallest record we promise stays parseable silently breaks those promises. Same
+// contract as envNum: warn loudly, fall back to the default — never honour a value we cannot keep.
+// 0 stays meaningful (explicitly disables the cap) and is passed through.
+function envByteCap(name, fallback, min) {
+  const n = envNum(name, fallback);
+  if (n === 0) return 0;
+  if (!Number.isInteger(n) || n < min) {
+    process.stderr.write(
+      `[agent-bridge] ignoring ${name}=${JSON.stringify(process.env[name])}; must be 0 or an integer >= ${min} (using default ${fallback})\n`,
+    );
     return fallback;
   }
   return n;
@@ -59,7 +77,12 @@ const LOG_FILE_MAX_BYTES = envNum("AGENT_BRIDGE_LOG_FILE_MAX_MB", 200) * 1024 * 
 // measured at 1,583,143 bytes on a single line. Type exclusions are whack-a-mole; this is the floor
 // underneath them. Applies ONLY to *.log/exit-journal diagnostics — never to answerFile/textRef/MCP text,
 // which stay complete by product contract.
-const LOG_LINE_MAX_BYTES = envNum("AGENT_BRIDGE_LOG_LINE_MAX_BYTES", 4096);
+// The floor is what the smallest record we promise to keep PARSEABLE needs: a zero-session exit-journal
+// skeleton is ~192 B empty-reason / ~260 B with a long reason, and the truncation marker costs ~25 B.
+// 512 leaves that comfortably intact. Below it we could still write bounded diagnostics, but the
+// exit-journal guarantee would quietly stop holding — so refuse the value instead of half-keeping it.
+const LOG_LINE_MIN_BYTES = 512;
+const LOG_LINE_MAX_BYTES = envByteCap("AGENT_BRIDGE_LOG_LINE_MAX_BYTES", 4096, LOG_LINE_MIN_BYTES);
 // Per-string ceiling inside a logged JSON event (redactForLog). Bounds unknown/future bulk fields before
 // they reach the line cap, so a huge field truncates just itself instead of eating the rest of the event.
 const LOG_FIELD_MAX_CHARS = envNum("AGENT_BRIDGE_LOG_FIELD_MAX_CHARS", 512);
@@ -911,9 +934,8 @@ const logBytesWritten = new Map();
 // Head-keeping: the start of a line carries the identity of the event (method/type/ids); the tail is the
 // payload we can afford to lose. The marker ends with \n so the log stays line-oriented and a truncated
 // line is self-describing rather than silently short.
-// UTF-8: we back off over continuation bytes so a multi-byte character is never cut in half. That is
-// sound only because every caller hands us a STRING, or a Buffer that is whole on its own — child
-// streams all setEncoding("utf8") so no character ever straddles two appendLog calls.
+// UTF-8: we back off over continuation bytes so a multi-byte character is never cut in half. That holds
+// only for input that is valid UTF-8 ON ITS OWN — normalizeLogPayload enforces exactly that.
 function clampLogWrite(text) {
   const buf = Buffer.isBuffer(text) ? text : Buffer.from(String(text), "utf8");
   if (LOG_LINE_MAX_BYTES <= 0 || buf.length <= LOG_LINE_MAX_BYTES) return buf;
@@ -925,6 +947,28 @@ function clampLogWrite(text) {
   while (end > 0 && (buf[end] & 0xc0) === 0x80) end--;
   return Buffer.concat([buf.subarray(0, end), Buffer.from(`…[+${buf.length - end}B truncated]\n`, "utf8")]);
 }
+// Every child stream setEncoding("utf8"), so appendLog receives strings and a character can never
+// straddle two calls. That invariant used to live only in a comment — and a comment cannot stop the next
+// backend from adding a raw `stderr.on("data", buf => appendLog(...))` path and silently resurrecting the
+// mojibake bug. Enforce it here instead. We cannot repair a split character at this layer (we do not know
+// which stream a Buffer came from, and string writes interleave between chunks), so: a Buffer that is
+// valid UTF-8 on its own is accepted; one that is not is DROPPED for a diagnostic naming the real fix.
+// Non-throwing by construction — a log write must never become an exception in the caller's control flow.
+let warnedInvalidLogBuffer = false;
+function normalizeLogPayload(text) {
+  if (!Buffer.isBuffer(text)) return text;
+  if (isUtf8(text)) return text.toString("utf8");
+  if (!warnedInvalidLogBuffer) {
+    warnedInvalidLogBuffer = true;
+    process.stderr.write(
+      "[agent-bridge] a log write passed a Buffer that is not valid UTF-8 on its own; dropping it. " +
+        'The source stream needs setEncoding("utf8") so multi-byte characters are not split across chunks. ' +
+        "(warned once; later occurrences are still marked in the log)\n",
+    );
+  }
+  return `[agent-bridge] dropped ${text.length}B log write: invalid UTF-8 buffer (source stream needs setEncoding)\n`;
+}
+
 function appendLog(file, text) {
   if (!file || !text) return;
   // Best-effort diagnostics: a logging failure (disk full, permission, a briefly-locked file) must NEVER
@@ -932,7 +976,7 @@ function appendLog(file, text) {
   try {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   // Clamp BEFORE the rotation bookkeeping so the counter tracks bytes actually written to disk.
-  const payload = clampLogWrite(text);
+  const payload = clampLogWrite(normalizeLogPayload(text));
   if (LOG_FILE_MAX_BYTES > 0) {
     const bytes = payload.length;
     let written = logBytesWritten.get(file) || 0;
@@ -5302,15 +5346,24 @@ function fitExitJournalRecord(base, sessionStates) {
   const total = sessionStates.length;
   if (LOG_LINE_MAX_BYTES <= 0) return { ...base, sessions: sessionStates, sessionCount: total, sessionsOmitted: 0 };
   const budget = LOG_LINE_MAX_BYTES - 1; // the trailing "\n" is part of the write
+  // Start from the SKELETON — zero sessions — and make sure even that fits before trying to add any.
+  // Trimming sessions cannot rescue a record whose fixed part is already over budget. Every field here is
+  // bounded by construction except `reason` (it can carry an exception message), so that is the one we
+  // shorten. A record with a clipped reason still parses; a byte-truncated one does not. LOG_LINE_MIN_BYTES
+  // keeps this from firing in practice — it is the backstop for the pathological-reason case.
+  const skeleton = { ...base, sessions: [], sessionCount: total, sessionsOmitted: total };
+  while (Buffer.byteLength(JSON.stringify(skeleton), "utf8") > budget && String(skeleton.reason || "").length > 0) {
+    skeleton.reason = String(skeleton.reason).slice(0, -1);
+  }
   const kept = [];
   let omitted = total;
   for (const s of sessionStates) {
-    const probe = { ...base, sessions: [...kept, s], sessionCount: total, sessionsOmitted: omitted - 1 };
+    const probe = { ...skeleton, sessions: [...kept, s], sessionsOmitted: omitted - 1 };
     if (Buffer.byteLength(JSON.stringify(probe), "utf8") > budget) break;
     kept.push(s);
     omitted--;
   }
-  return { ...base, sessions: kept, sessionCount: total, sessionsOmitted: omitted };
+  return { ...skeleton, sessions: kept, sessionsOmitted: omitted };
 }
 
 // Bound the durable exit journal across process lifetimes: it gains one line per shutdown and (unlike
