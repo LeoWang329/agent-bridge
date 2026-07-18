@@ -112,6 +112,34 @@ const KIMI_ABORT_SETTLE_MS = envNum("AGENT_BRIDGE_KIMI_ABORT_SETTLE_MS", 8000);
 // with a clear error rather than letting the OS truncate/fail opaquely. Mirrors CURSOR_CMDLINE_MAX_UNITS.
 const KIMI_CMDLINE_MAX_UNITS = envNum("AGENT_BRIDGE_KIMI_CMDLINE_MAX", 24_000);
 
+// Split a Windows command line into argv following CommandLineToArgvW's quoting rules (double-quote
+// grouping + backslash-before-quote escaping). Used by the kimi cleanup matcher — a SECURITY BOUNDARY —
+// so a `-p` (or `--output-format stream-json`) sitting INSIDE a quoted argument is never mistaken for a
+// top-level flag ([review M1]). This is the ONLY correct way to tell a real flag from prompt text.
+function tokenizeWindowsCommandLine(s) {
+  const tokens = [];
+  let i = 0, n = s.length, cur = "", inQuotes = false, hasToken = false;
+  while (i < n) {
+    const c = s[i];
+    if (c === "\\") {
+      let bs = 0;
+      while (i < n && s[i] === "\\") { bs++; i++; }
+      if (i < n && s[i] === '"') {
+        cur += "\\".repeat(bs >> 1);            // 2N backslashes → N literal backslashes
+        if (bs & 1) { cur += '"'; i++; }        // odd → the quote is escaped/literal
+        else { inQuotes = !inQuotes; i++; }     // even → the quote toggles quoting
+        hasToken = true;
+      } else { cur += "\\".repeat(bs); hasToken = true; } // backslashes not before a quote are literal
+      continue;
+    }
+    if (c === '"') { inQuotes = !inQuotes; hasToken = true; i++; continue; }
+    if (!inQuotes && (c === " " || c === "\t")) { if (hasToken) { tokens.push(cur); cur = ""; hasToken = false; } i++; continue; }
+    cur += c; hasToken = true; i++;
+  }
+  if (hasToken) tokens.push(cur);
+  return tokens;
+}
+
 // Backend registry — the single source of truth for "which backends exist". Holds ONLY data and pure
 // functions so it is fully initialized at module load: TOOLS (enum), agentBin, assertAgent and doctor
 // all read it before the session classes below are defined. The Session constructor is bound LATER,
@@ -183,19 +211,20 @@ const AGENTS = {
     versionArgs: ["--version"], // existing kimi.exe), PATH is a last resort (kimi.exe only). NEVER resolved at registry init.
     // A bridge-spawned kimi turn command line =
     //   <…\kimi.exe> --output-format stream-json [-S session_<uuid>] [-m <model>] -p <prompt>
-    // argv0's basename is strictly kimi.exe (any install dir; not fooled by model/cwd args); the prompt
-    // is always the tail (-p value) and never participates in the match.
+    // SECURITY BOUNDARY ([review M1]): tokenize with Windows quoting rules, then match on TOKENS so a `-p`
+    // or `--output-format stream-json` sitting INSIDE a quoted argument (e.g. the prompt, or an unrelated
+    // process's args) can never false-match. Require: argv0 basename strictly kimi.exe (any install dir;
+    // not fooled by model/cwd args), an independent `-p` token WITH an argument after it, and the two
+    // consecutive tokens `--output-format` `stream-json` BEFORE that `-p`. The prompt never participates.
     matchesCommand: cmd => {
-      const s = String(cmd).trim();
-      const m = s.match(/^(?:"([^"]+)"|(\S+))(?=\s|$)/); // command-line first token (optionally quoted), then whitespace/EOL
-      const argv0 = m && (m[1] ?? m[2]); // [R2-M1] ?? not || — an empty capture must read as empty
-      if (!argv0) return false;
-      if (argv0.split(/[\\/]/).pop().toLowerCase() !== "kimi.exe") return false; // SECURITY BOUNDARY: strict argv0 basename
-      const rest = s.slice(m[0].length); // [R3-M1] search for -p ONLY after argv0, so a ` -p ` inside the install path can't cause a miss
-      const i = rest.search(/(?:^|\s)-p\s+(?=\S)/); // a real -p flag WITH a prompt argument after it (reject a dangling -p)
-      if (i < 0) return false; // every turn has -p <prompt>; without it, not one of our spawned turns
-      const head = rest.slice(0, i); // the flag region between argv0 and -p
-      return /(?:^|\s)--output-format\s+stream-json(?:\s|$)/.test(head);
+      const tokens = tokenizeWindowsCommandLine(String(cmd));
+      if (tokens.length < 2) return false;
+      if (tokens[0].split(/[\\/]/).pop().toLowerCase() !== "kimi.exe") return false;
+      let pIdx = -1;
+      for (let i = 1; i < tokens.length - 1; i++) { if (tokens[i] === "-p") { pIdx = i; break; } } // real -p with a following prompt token
+      if (pIdx < 0) return false; // no top-level -p <prompt> → not one of our spawned turns
+      for (let i = 1; i + 1 < pIdx; i++) { if (tokens[i] === "--output-format" && tokens[i + 1] === "stream-json") return true; }
+      return false;
     },
   },
 };
@@ -229,14 +258,14 @@ const TOOLS = [
           type: "string",
           enum: ["read", "write"],
           description:
-            "Capability tier for the delegated agent (default read). read = read + EXECUTE: file reads, search, AND run shell commands for investigation (run tests/probes) — but NOT meant to edit files, so no Edit/Write tools. The write-boundary of read's shell varies by backend: codex hard-blocks disk writes via its read-only OS sandbox; omp/claude allow shell that CAN write (SOFT — a tool-level allow + role discipline, not an OS sandbox), so a `read` session on omp/claude is NOT a hard read-only. write = full edit/write autonomy in cwd — a HARD OS-sandbox boundary for codex (workspace-write) on mac/Linux, but on Windows codex's write tier drops to danger-full-access (a SOFT boundary like omp/claude) because codex's Windows sandbox breaks apply_patch; see the thread/start `sandbox` comment. Prefer this over the legacy `write` boolean; the two must agree if both are passed.",
+            "Capability tier for the delegated agent (default read). read = read + EXECUTE: file reads, search, AND run shell commands for investigation (run tests/probes) — but NOT meant to edit files, so no Edit/Write tools. The write-boundary of read's shell varies by backend: codex hard-blocks disk writes via its read-only OS sandbox; omp/claude/cursor/kimi allow shell that CAN write (SOFT — a tool-level allow + role discipline, not an OS sandbox; cursor/kimi have no headless read-only mode, so read is a prompt-level policy prefix), so a `read` session on omp/claude/cursor/kimi is NOT a hard read-only. write = full edit/write autonomy in cwd — a HARD OS-sandbox boundary for codex (workspace-write) on mac/Linux, but on Windows codex's write tier drops to danger-full-access (a SOFT boundary like omp/claude) because codex's Windows sandbox breaks apply_patch; see the thread/start `sandbox` comment. Prefer this over the legacy `write` boolean; the two must agree if both are passed.",
         },
         write: {
           type: "boolean",
           // No JSON-schema `default`: if a client materialized default:false, it would collide with an
           // explicit access:"write" and assertAccess would reject the call. Omitting both simply defaults
           // to read (assertAccess), so the alias never fights an explicit access.
-          description: "Legacy alias for `access`: true→write, false→read. Kept for back-compat; if both `write` and `access` are given they must be consistent or the call is rejected. NOTE: `write:false` (read) still grants a shell for investigation — on omp/claude that shell can write to disk (soft), so `write:false` is not a hard no-write guarantee. Enable write only when the user explicitly wants file edits.",
+          description: "Legacy alias for `access`: true→write, false→read. Kept for back-compat; if both `write` and `access` are given they must be consistent or the call is rejected. NOTE: `write:false` (read) still grants a shell for investigation — on omp/claude/cursor/kimi that shell can write to disk (soft), so `write:false` is not a hard no-write guarantee. Enable write only when the user explicitly wants file edits.",
         },
         model: { type: "string", description: "Optional model selector for the delegated agent." },
         name: {
@@ -254,12 +283,12 @@ const TOOLS = [
         effort: {
           type: "string",
           description:
-            "Optional reasoning effort. OMP maps it to --thinking (minimal|low|medium|high|xhigh). Codex sends it as the turn effort (none|minimal|low|medium|high|xhigh). Claude maps it to --effort (minimal|low|medium|high|xhigh) and defaults to xhigh.",
+            "Optional reasoning effort. OMP maps it to --thinking (minimal|low|medium|high|xhigh). Codex sends it as the turn effort (none|minimal|low|medium|high|xhigh). Claude maps it to --effort (minimal|low|medium|high|xhigh) and defaults to xhigh. Cursor and Kimi have no effort knob (headless has no per-invocation flag) — effort is ignored and echoed back as null.",
         },
         append_system_prompt_file: {
           type: "string",
           description:
-            "Optional ABSOLUTE path to a markdown/text file whose contents are injected as an APPENDED system prompt for the whole session (persistent per-session role/instructions). Unlike message_file this MAY live outside cwd (a shared prompt library); ≤64 KiB. omp: `--append-system-prompt=<path>`; claude: `--append-system-prompt-file <path>` (both a true appended system prompt); codex: thread developerInstructions; cursor: prepended to the FIRST turn's message as a soft user-prefix (no native system-prompt flag — model-dependent adherence, NOT a true system prompt, and it shares cursor's ~24K argv budget with the message, so keep it concise). Reflected in the session summary's appendSystemPrompt. Note: omp honors it reliably with a capable model (e.g. deepseek-v4-pro); omp's default model may follow appended instructions only loosely.",
+            "Optional ABSOLUTE path to a markdown/text file whose contents are injected as an APPENDED system prompt for the whole session (persistent per-session role/instructions). Unlike message_file this MAY live outside cwd (a shared prompt library); ≤64 KiB. omp: `--append-system-prompt=<path>`; claude: `--append-system-prompt-file <path>` (both a true appended system prompt); codex: thread developerInstructions; cursor/kimi: prepended to the FIRST turn's message as a soft user-prefix (no native system-prompt flag — model-dependent adherence, NOT a true system prompt, and it shares the ~24K argv budget with the message, so keep it concise). Reflected in the session summary's appendSystemPrompt. Note: omp honors it reliably with a capable model (e.g. deepseek-v4-pro); omp's default model may follow appended instructions only loosely.",
         },
         initial_prompt: { type: "string", description: "Optional first message to send after opening." },
         schema: {
@@ -619,7 +648,11 @@ function resolveCursorLauncher() {
 // [R2-B1]) so an uninstalled kimi surfaces as a doctor "unavailable", not a module-load crash.
 function resolveKimiBin() {
   if (!IS_WINDOWS) throw new Error("kimi backend is Windows-only in v1 (no POSIX launch layout yet).");
-  const asFile = p => { try { return fs.statSync(p).isFile() ? p : null; } catch { return null; } };
+  // Return an ABSOLUTE path ([review M2]): resolveKimiBin() runs in the MCP-server process (validating
+  // against ITS cwd), but send() spawns with {cwd: session.cwd} — a relative KIMI_BIN or a "." PATH entry
+  // would validate here yet resolve to a different (or missing) file at spawn. path.resolve() anchors every
+  // candidate to the server cwd once, so the cached resolvedBin is stable regardless of the session cwd.
+  const asFile = p => { try { const abs = path.resolve(p); return fs.statSync(abs).isFile() ? abs : null; } catch { return null; } };
   const isKimiExe = p => path.basename(p).toLowerCase() === "kimi.exe"; // strict basename (reject kimi/kimi.cmd/…)
   // 1. KIMI_BIN override: must be a PATH to an existing native kimi.exe file (reject .cmd/.bat, a bare
   //    name, a directory). No PATH search / no fallthrough — an explicit override that is wrong is an error.
@@ -3968,7 +4001,10 @@ class KimiCodeSession {
     this.lastAssistantText = "";
     this.turnHadMeta = false;
     this.turnProtocolError = false; // [R2-M2] reset each turn begin; only-increase within the turn
-    this.userAborted = false;
+    // NOTE: do NOT reset userAborted here ([review M3]). A concurrent abort() during send()'s spawn-await
+    // window (this.turn/this.proc set, turnChild not yet) sets userAborted BEFORE #beginTurn runs; clearing
+    // it here would LOSE that abort and mis-settle the killed child as a failure. userAborted is reset once
+    // per turn at send()'s synchronous turn-claim instead (before any await opens the race window).
   }
 
   // The ONE idempotent settlement point. err → failed (reusable/degraded); null → idle (success/abort).
@@ -4094,14 +4130,19 @@ class KimiCodeSession {
     // v1 requires a fresh session (honest limitation, §5.2). A first turn on an empty session still runs.
     if (!this.#canRun()) throw new Error(`Kimi session ${this.id} has no chat to resume; reopen a new session (a first-turn abort/failure needs a fresh session in v1).`);
 
-    // 1. Occupy the turn synchronously so a concurrent send is rejected by the guard above.
+    // 1. Occupy the turn synchronously so a concurrent send is rejected by the guard above. Reset
+    //    userAborted HERE ([review M3]) — synchronously, before the first await opens the spawn-await race
+    //    window — so a fresh turn starts with no pending abort, yet an abort() that lands DURING the window
+    //    survives to #beginTurn (which no longer clears it) and settles the killed child as aborted.
     const turnId = `${this.id}-t${this.turnCount + 1}`;
     const promise = new Promise((resolve, reject) => { this.turn = { resolve, reject }; });
     this.turn.promise = promise;
     const myTurn = this.turn;
+    this.userAborted = false;
     promise.catch(() => {}); // pre-attach so an early rejection can't crash the server
     const releaseUnbegun = err => {
       this.lastError = err.message;
+      this.userAborted = false; // [review M3] clear any pending abort so it can't leak into the next turn
       if (this.turn === myTurn) {
         this.turn = null;
         if (this.status !== "closed") setSessionStatus(this, "failed", false, { source: "send_failed", error: err.message });
@@ -4172,6 +4213,14 @@ class KimiCodeSession {
     if (injectSystem) this.appendSystemPending = false; // system instructions delivered on this committed turn
     this.#writePidRecord(winner.bin, winner.args);
     appendLog(this.logFile, `[agent-bridge] spawned kimi turn pid=${child.pid} chatId=${this.chatId || "(first turn)"}\n`);
+    // [review M3] A concurrent abort() may have landed DURING the spawn-await (before turnChild was set),
+    // setting userAborted + killing this.proc at that instant. Now that the turn is begun (turnChild set),
+    // ensure THIS child is terminated so its close settles the turn as "aborted" through #settleTurn — the
+    // sole settlement point — instead of being read as a nonzero-exit failure. Idempotent with abort's kill.
+    if (this.userAborted && child.exitCode === null && child.signalCode === null) {
+      terminateProcessTree(child.pid);
+      scheduleForceKill(child.pid, 3000, () => this.proc === child && child.exitCode === null && child.signalCode === null);
+    }
 
     if (options.wait) {
       try {

@@ -45,6 +45,10 @@ function main() {
         // Echo the EXACT received prompt (the -p value) as assistant content, so a test can assert what the
         // bridge composed (first-turn append_system injection + read policy prefix).
         asst(prompt); meta(myId); exit(0); return;
+      case "userecho":
+        // Emit a `{role:"user"}` prompt-echo line (some OpenAI-style streams do) carrying the full prompt,
+        // so a test can assert the bridge NEVER logs/surfaces it (privacy, §5.5).
+        say({ role: "user", content: prompt }); asst("ack"); meta(myId); exit(0); return;
       case "multiline":
         asst("part one "); toolCall("Bash"); toolResult(); asst("part two"); meta(myId); exit(0); return;
       case "nometa":

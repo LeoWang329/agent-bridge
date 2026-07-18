@@ -74,9 +74,9 @@ class KimiStub {
 const FAKE_ENV = { FAKE_KIMI_SCRIPT: FAKE_KIMI, FAKE_KIMI_NODE: process.execPath };
 
 // ── Minimal MCP client over one bridge server ────────────────────────────────────────────────────────
-function makeServer(mode, extraEnv = {}) {
+function makeServer(mode, extraEnv = {}, spawnOpts = {}) {
   const srv = spawn("node", [BRIDGE, "mcp"], {
-    stdio: ["pipe", "pipe", "pipe"], windowsHide: true,
+    stdio: ["pipe", "pipe", "pipe"], windowsHide: true, ...spawnOpts,
     env: { ...process.env, KIMI_BIN: stubExe, FAKE_KIMI_MODE: mode, AGENT_BRIDGE_STATE_DIR: stateDir, ...FAKE_ENV, ...extraEnv },
   });
   let exited = null;
@@ -107,13 +107,18 @@ function makeServer(mode, extraEnv = {}) {
     if (!t) return null;
     try { return JSON.parse(t); } catch { return t; } // doctor renders plain text, not JSON
   };
+  // Fire-and-forget a tool call WITHOUT awaiting its response — used to race a `send` and an `abort`
+  // (M3): the bridge dispatches each MCP line as it arrives, and a `send` handler runs synchronously to
+  // its spawn-await before the next line is read, so an abort written right after lands in the pre-begin
+  // window deterministically.
+  const fire = (name, args) => { const id = nextId++; rpc({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } }); return id; };
   const init = async () => {
     const id = nextId++;
     rpc({ jsonrpc: "2.0", id, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "repro-kimi", version: "0" } } });
     if (!await waitResp(id, 10000)) return fail(`no init (mode ${mode})`);
     rpc({ jsonrpc: "2.0", method: "notifications/initialized" });
   };
-  return { srv, call, init, kill: () => { try { srv.kill("SIGKILL"); } catch {} } };
+  return { srv, call, fire, init, kill: () => { try { srv.kill("SIGKILL"); } catch {} } };
 }
 
 const SESSION_ID_RE = /^session_[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/;
@@ -123,19 +128,33 @@ function cimCommandLine(pid) {
   const r = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CommandLine`], { encoding: "utf8", windowsHide: true });
   return (r.stdout || "").trim();
 }
-// MUST mirror AGENTS.kimi.matchesCommand in scripts/agent-bridge.mjs (kept in sync by review). S-cleanup
-// also exercises the REAL registry matcher (cleanupStalePidRecords) against a live spawned turn.
+// MUST mirror AGENTS.kimi.matchesCommand in scripts/agent-bridge.mjs (kept in sync by review). This is a
+// QUICK replica for documentation only — the AUTHORITATIVE checks (positive + the M1 quoted-`-p` false
+// positive) go through the REAL registry matcher via the live `cleanup` path in S17.
+function tokenizeWin(s) {
+  const tokens = [];
+  let i = 0, n = s.length, cur = "", inQ = false, has = false;
+  while (i < n) {
+    const c = s[i];
+    if (c === "\\") { let bs = 0; while (i < n && s[i] === "\\") { bs++; i++; }
+      if (i < n && s[i] === '"') { cur += "\\".repeat(bs >> 1); if (bs & 1) { cur += '"'; i++; } else { inQ = !inQ; i++; } has = true; }
+      else { cur += "\\".repeat(bs); has = true; } continue; }
+    if (c === '"') { inQ = !inQ; has = true; i++; continue; }
+    if (!inQ && (c === " " || c === "\t")) { if (has) { tokens.push(cur); cur = ""; has = false; } i++; continue; }
+    cur += c; has = true; i++;
+  }
+  if (has) tokens.push(cur);
+  return tokens;
+}
 function matcherReplica(cmd) {
-  const s = String(cmd).trim();
-  const m = s.match(/^(?:"([^"]+)"|(\S+))(?=\s|$)/);
-  const argv0 = m && (m[1] ?? m[2]);
-  if (!argv0) return false;
-  if (argv0.split(/[\\/]/).pop().toLowerCase() !== "kimi.exe") return false;
-  const rest = s.slice(m[0].length);
-  const i = rest.search(/(?:^|\s)-p\s+(?=\S)/);
-  if (i < 0) return false;
-  const head = rest.slice(0, i);
-  return /(?:^|\s)--output-format\s+stream-json(?:\s|$)/.test(head);
+  const tokens = tokenizeWin(String(cmd));
+  if (tokens.length < 2) return false;
+  if (tokens[0].split(/[\\/]/).pop().toLowerCase() !== "kimi.exe") return false;
+  let pIdx = -1;
+  for (let i = 1; i < tokens.length - 1; i++) { if (tokens[i] === "-p") { pIdx = i; break; } }
+  if (pIdx < 0) return false;
+  for (let i = 1; i + 1 < pIdx; i++) { if (tokens[i] === "--output-format" && tokens[i + 1] === "stream-json") return true; }
+  return false;
 }
 
 // Drive one turn to completion and return the wait result.
@@ -454,47 +473,159 @@ async function main() {
     console.log("[harness] S16 OK — resolveKimiBin resolves via default %USERPROFILE%\\.kimi-code\\bin and via PATH (kimi.exe only)");
   }
 
-  // ── S17: cleanup matcher — replica negatives + REAL cleanup path reaps a live kimi-shaped orphan ────
+  // ── S17: cleanup matcher — replica negatives + REAL cleanup path (positive reap + M1 quoted-`-p` NOT reaped) ──
   {
-    // Replica against the REAL captured turn command line (from S7) + synthetic negatives.
+    // Quick replica checks (documentation; the REAL matcher is exercised below via live cleanup).
     if (!matcherReplica(capturedTurnCmd)) return fail(`matcher must match a REAL spawned turn command line, did not: ${JSON.stringify(capturedTurnCmd)}`);
     const notKimi = `"C:\\other\\node.exe" fake.js --output-format stream-json -S session_x -p "hi"`; // argv0 not kimi.exe
     if (matcherReplica(notKimi)) return fail("matcher must NOT match a non-kimi.exe argv0 even with the right flags");
-    const promptHasFlags = `"C:\\tools\\kimi.exe" -p "please run --output-format stream-json -p foo now"`; // flags only inside the prompt
-    if (matcherReplica(promptHasFlags)) return fail("matcher must NOT match when --output-format lives only in the prompt (no real flag before -p)");
+    const m1False = `"C:\\tools\\kimi.exe" --output-format stream-json --note "hello -p world"`; // ` -p ` only INSIDE a quoted arg — no top-level -p
+    if (matcherReplica(m1False)) return fail("matcher must NOT match when the only `-p` is inside a quoted argument (M1 false positive)");
     const bareP = `"C:\\tools\\kimi.exe" --output-format stream-json -p`; // trailing -p, no prompt arg
     if (matcherReplica(bareP)) return fail("matcher must NOT match a dangling -p with no prompt");
     const realTurn = `"C:\\tools\\kimi.exe" --output-format stream-json -S session_11111111-2222-4333-8444-555555555555 -m kimi-code/k3 -p "do work"`;
     if (!matcherReplica(realTurn)) return fail("matcher must match a well-formed kimi turn command line");
 
-    // REAL cleanup path: spawn a live kimi-shaped orphan (the stub, hang mode), register a stale pid
-    // record, and run the one-shot `cleanup` CLI — the REAL registry matcher must identify it.
-    const turnArgs = ["--output-format", "stream-json", "-S", "session_22222222-3333-4444-8555-666666666666", "-m", "kimi-code/k3", "-p", "orphan work"];
-    const orphan = spawn(stubExe, turnArgs, { windowsHide: true, env: { ...process.env, FAKE_KIMI_MODE: "hang", ...FAKE_ENV }, stdio: "ignore" });
-    await sleep(700);
-    if (!orphan.pid || !pidAlive(orphan.pid)) return fail("S17: could not start a live kimi-shaped orphan");
-    const orphanCmd = cimCommandLine(orphan.pid);
-    if (!matcherReplica(orphanCmd)) { try { orphan.kill("SIGKILL"); } catch {}; return fail(`S17: the spawned orphan's real command line does not match the replica: ${JSON.stringify(orphanCmd)}`); }
+    // Run a REAL cleanup over TWO live orphans: (P) a genuine turn shape that MUST be reaped, and (N) the
+    // M1 false-positive shape (argv0=kimi.exe, --output-format stream-json, but `-p` only inside a quoted
+    // arg) that MUST NOT be reaped. This drives the REAL registry matcher (M4 — the replica alone hid M1).
+    const pArgs = ["--output-format", "stream-json", "-S", "session_22222222-3333-4444-8555-666666666666", "-m", "kimi-code/k3", "-p", "orphan work"];
+    const nArgs = ["--output-format", "stream-json", "--note", "hello -p world"]; // no top-level -p
+    const spawnOrphan = args => spawn(stubExe, args, { windowsHide: true, env: { ...process.env, FAKE_KIMI_MODE: "hang", ...FAKE_ENV }, stdio: "ignore" });
+    const pOrphan = spawnOrphan(pArgs);
+    const nOrphan = spawnOrphan(nArgs);
+    await sleep(800);
+    if (!pOrphan.pid || !pidAlive(pOrphan.pid) || !nOrphan.pid || !pidAlive(nOrphan.pid)) { for (const o of [pOrphan, nOrphan]) try { o.kill("SIGKILL"); } catch {}; return fail("S17: could not start both live orphans"); }
+    if (!matcherReplica(cimCommandLine(pOrphan.pid))) { for (const o of [pOrphan, nOrphan]) try { o.kill("SIGKILL"); } catch {}; return fail(`S17: positive orphan's real cmdline should match replica: ${JSON.stringify(cimCommandLine(pOrphan.pid))}`); }
     const pidsDir = path.join(stateDir, "pids"); fs.mkdirSync(pidsDir, { recursive: true });
-    const recFile = path.join(pidsDir, "kimi-orphan-test.json");
-    fs.writeFileSync(recFile, JSON.stringify({
-      id: "kimi-orphan-test", agent: "kimi", ownerPid: 999999, cwd: CWD, createdAt: new Date().toISOString(),
-      processes: [{ role: "kimi-stream-json", pid: orphan.pid, command: [stubExe, ...turnArgs.slice(0, -1), "<prompt:redacted>"], spawnedAt: new Date().toISOString() }],
-    }, null, 2));
+    const mkRec = (id, pid, args) => { const f = path.join(pidsDir, `${id}.json`); fs.writeFileSync(f, JSON.stringify({ id, agent: "kimi", ownerPid: 999999, cwd: CWD, createdAt: new Date().toISOString(), processes: [{ role: "kimi-stream-json", pid, command: [stubExe, ...args.slice(0, -1), "<prompt:redacted>"], spawnedAt: new Date().toISOString() }] }, null, 2)); return f; };
+    const pRec = mkRec("kimi-orphan-pos", pOrphan.pid, pArgs);
+    const nRec = mkRec("kimi-orphan-neg", nOrphan.pid, nArgs);
     const out = spawnSync("node", [BRIDGE, "cleanup", "--json"], { encoding: "utf8", windowsHide: true, env: { ...process.env, AGENT_BRIDGE_STATE_DIR: stateDir } });
     let summary = null;
-    try { summary = JSON.parse(out.stdout).childProcesses; } catch { try { orphan.kill("SIGKILL"); } catch {}; return fail(`S17: cleanup --json did not return JSON: ${out.stdout}\n${out.stderr}`); }
-    const reaped = (summary?.terminated || []).some(t => t.role === "kimi-stream-json");
-    const recGone = !fs.existsSync(recFile);
-    try { orphan.kill("SIGKILL"); } catch {}
-    for (let i = 0; i < 20 && pidAlive(orphan.pid); i++) await sleep(100);
-    if (!reaped) return fail(`S17: real cleanup path did not identify the kimi orphan (matcher miss?). summary=${JSON.stringify(summary)}`);
-    if (!recGone) return fail("S17: cleanup should remove the stale kimi pid record after acting on it");
-    console.log("[harness] S17 OK — matcher replica negatives hold; REAL cleanupStalePidRecords identifies+acts on a kimi orphan (argv0=kimi.exe), record removed");
+    try { summary = JSON.parse(out.stdout).childProcesses; } catch { for (const o of [pOrphan, nOrphan]) try { o.kill("SIGKILL"); } catch {}; return fail(`S17: cleanup --json did not return JSON: ${out.stdout}\n${out.stderr}`); }
+    const terminated = summary?.terminated || [];
+    const reapedPos = terminated.some(t => t.pid === pOrphan.pid);
+    const reapedNeg = terminated.some(t => t.pid === nOrphan.pid);
+    const negAlive = pidAlive(nOrphan.pid); // the M1-shape process must be UNTOUCHED (security boundary)
+    for (const o of [pOrphan, nOrphan]) { try { o.kill("SIGKILL"); } catch {} }
+    for (let i = 0; i < 20 && (pidAlive(pOrphan.pid) || pidAlive(nOrphan.pid)); i++) await sleep(100);
+    if (!reapedPos) return fail(`S17: real cleanup must identify the genuine kimi turn orphan (matcher miss?). summary=${JSON.stringify(summary)}`);
+    if (reapedNeg) return fail(`S17: real cleanup must NOT terminate the M1 false-positive shape (quoted -p) — SECURITY BOUNDARY. summary=${JSON.stringify(summary)}`);
+    if (!negAlive) return fail("S17: the M1 false-positive process was killed by cleanup — matcher over-matched (M1 regression)");
+    if (fs.existsSync(pRec)) return fail("S17: cleanup should remove the reaped positive pid record");
+    console.log("[harness] S17 OK — REAL matcher reaps a genuine turn AND leaves the M1 quoted-`-p` false-positive UNTOUCHED (security boundary); replica negatives hold");
+  }
+
+  // ── S18: concurrent abort DURING send's spawn-await (pre-begin) must not be lost (M3) ──────────────
+  {
+    // The bridge processes each MCP line as it arrives, and a `send` handler runs synchronously to its
+    // spawn-await before the next line is read — so firing `abort` right after `send` lands the abort in
+    // the pre-begin window (this.turn/this.proc set, turnChild not yet). Before the M3 fix, #beginTurn
+    // reset userAborted → the killed child settled as a phantom FAILED turn; after the fix it settles as
+    // aborted/idle. Repeat to be robust.
+    const s = makeServer("hang"); await s.init();
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const sess = (await openKimi(s))?.session;
+      if (!sess?.id) return fail(`S18 attempt ${attempt}: open failed`);
+      s.fire("agent_bridge_send_message", { session_id: sess.id, message: `race ${attempt}` });
+      s.fire("agent_bridge_abort", { session_id: sess.id });
+      let post = null;
+      for (let i = 0; i < 80; i++) { await sleep(100); post = (await s.call("agent_bridge_status", { session_id: sess.id }))?.session; if (post && post.status !== "running" && post.status !== "starting") break; }
+      if (!post) return fail(`S18 attempt ${attempt}: no settled status`);
+      if (post.status === "failed") return fail(`S18 attempt ${attempt}: a concurrent abort during send was LOST → turn settled FAILED (lastError=${JSON.stringify(post.lastError)}); must settle aborted/idle (M3)`);
+      if (post.status !== "idle") return fail(`S18 attempt ${attempt}: expected idle (aborted) after the race, got ${post.status}`);
+      if (post.pid) return fail(`S18 attempt ${attempt}: backend pid ${post.pid} should be dead after the aborted turn`);
+      if (post.agentSpecific?.turnCount !== 1) return fail(`S18 attempt ${attempt}: aborted first turn should bump turnCount to 1, got ${JSON.stringify(post.agentSpecific?.turnCount)}`);
+      await s.call("agent_bridge_close_session", { session_id: sess.id });
+    }
+    s.kill(); await sleep(150);
+    console.log("[harness] S18 OK — concurrent abort during send's spawn-await settles aborted/idle, never a phantom-failed turn (M3) ×10");
+  }
+
+  // ── S19: real OS spawn ENOENT (binary removed after start) → send fails, re-resolves, reusable ──────
+  {
+    // A dedicated kimi.exe we can delete mid-session (KIMI_BIN pins it). start() resolves+caches it; then
+    // we delete it so the NEXT send's spawn hits a REAL ENOENT (not a resolver-at-start rejection). The
+    // send must fail cleanly and the session must stay reusable; restoring the file lets a later send work.
+    const delDir = path.join(tmpRoot, "delbin"); fs.mkdirSync(delDir, { recursive: true });
+    const delKimi = path.join(delDir, "kimi.exe"); fs.copyFileSync(stubExe, delKimi);
+    const s = makeServer("ok", { KIMI_BIN: delKimi }); await s.init();
+    const sess = (await openKimi(s))?.session;
+    if (!sess?.id) return fail("S19: open failed");
+    fs.rmSync(delKimi, { force: true }); // vanish between turns (proc is null → deletable on Windows)
+    const bad = await s.call("agent_bridge_send_message", { session_id: sess.id, message: "will ENOENT" });
+    if (!bad?.__error || !/exist|enoent|not found|kimi\.exe/i.test(bad.__error)) return fail(`S19: send should fail with a clear spawn/resolve error, got ${JSON.stringify(bad)}`);
+    const midHealth = (await s.call("agent_bridge_status", { session_id: sess.id }))?.session?.health;
+    if (midHealth === "dead") return fail(`S19: a spawn-failed first turn must stay reusable (no turnCount bump), got health ${JSON.stringify(midHealth)}`);
+    fs.copyFileSync(stubExe, delKimi); // restore → the session re-resolves and works
+    const rc = await runTurn(s, sess.id, "now works");
+    if (rc?.text !== "hello from kimi") return fail(`S19: after restoring the binary the session should work, got ${JSON.stringify(rc?.text)}`);
+    await s.call("agent_bridge_close_session", { session_id: sess.id });
+    s.kill(); await sleep(150);
+    console.log("[harness] S19 OK — real spawn ENOENT fails the send cleanly, session stays reusable, re-resolves after the binary returns");
+  }
+
+  // ── S20: cmdline over-limit + NUL prompts rejected; session stays reusable ──────────────────────────
+  {
+    const s = makeServer("ok"); await s.init();
+    const sess = (await openKimi(s))?.session;
+    const nul = await s.call("agent_bridge_send_message", { session_id: sess.id, message: "bad prompt" });
+    if (!nul?.__error || !/NUL/i.test(nul.__error)) return fail(`S20: a prompt containing NUL should be rejected, got ${JSON.stringify(nul)}`);
+    const huge = await s.call("agent_bridge_send_message", { session_id: sess.id, message: "x".repeat(40000) });
+    if (!huge?.__error || !/too long/i.test(huge.__error)) return fail(`S20: an over-limit prompt should be rejected, got ${JSON.stringify(huge)}`);
+    const rc = await runTurn(s, sess.id, "ok now");
+    if (rc?.text !== "hello from kimi") return fail(`S20: session should still work after rejected sends, got ${JSON.stringify(rc?.text)}`);
+    await s.call("agent_bridge_close_session", { session_id: sess.id });
+    s.kill(); await sleep(150);
+    console.log("[harness] S20 OK — NUL + over-limit prompts rejected pre-spawn (turn released, no bump); session still usable");
+  }
+
+  // ── S21: a `role:"user"` prompt-echo line must never reach the log or events (privacy, Min1) ────────
+  {
+    const marker = "SECRET_USER_ECHO_MARKER_5e2d";
+    const s = makeServer("userecho"); await s.init();
+    const sess = (await openKimi(s))?.session;
+    const rc = await runTurn(s, sess.id, `investigate ${marker} thoroughly`);
+    if (rc?.text !== "ack") return fail(`S21: turn should complete with "ack", got ${JSON.stringify(rc?.text)}`);
+    const evJson = JSON.stringify((await s.call("agent_bridge_status", { session_id: sess.id }))?.recentEvents || []);
+    if (evJson.includes(marker)) return fail(`S21: the user prompt-echo leaked into events: ${evJson}`);
+    const logText = fs.existsSync(sess.logFile) ? fs.readFileSync(sess.logFile, "utf8") : "";
+    if (logText.includes(marker)) return fail(`S21: the user prompt-echo leaked into the log file ${sess.logFile}`);
+    await s.call("agent_bridge_close_session", { session_id: sess.id });
+    s.kill(); await sleep(150);
+    console.log("[harness] S21 OK — a role:\"user\" echo line is dropped: no marker in events or the log (privacy)");
+  }
+
+  // ── S22: resolvedBin is ABSOLUTE — a RELATIVE KIMI_BIN works even when the session cwd ≠ server cwd (M2) ──
+  {
+    // Server cwd = tmpRoot; KIMI_BIN = "bin/kimi.exe" (relative to tmpRoot). The session cwd is CWD (the
+    // repo, a DIFFERENT dir). If resolveKimiBin returned the relative string, send()'s spawn({cwd:session})
+    // would resolve it against CWD and ENOENT. With absolutization it spawns correctly regardless.
+    const s = makeServer("ok", { KIMI_BIN: path.join("bin", "kimi.exe") }, { cwd: tmpRoot }); await s.init();
+    const sess = (await openKimi(s))?.session; // session cwd defaults to CWD (openKimi passes cwd: CWD)
+    if (!sess?.id) return fail("S22: open with a relative KIMI_BIN failed at start (resolver)");
+    const rc = await runTurn(s, sess.id, "relative bin");
+    if (rc?.text !== "hello from kimi") return fail(`S22: a relative KIMI_BIN must resolve to an ABSOLUTE path so send works under a different session cwd; got ${JSON.stringify(rc?.text)} (M2)`);
+    await s.call("agent_bridge_close_session", { session_id: sess.id });
+    s.kill(); await sleep(150);
+    console.log("[harness] S22 OK — resolvedBin is absolutized: a relative KIMI_BIN works even when session cwd ≠ server cwd (M2)");
+  }
+
+  // ── S23: a closed session is removed (closed → dead/gone from the caller's view) ────────────────────
+  {
+    const s = makeServer("ok"); await s.init();
+    const sess = (await openKimi(s))?.session;
+    await runTurn(s, sess.id, "hi");
+    await s.call("agent_bridge_close_session", { session_id: sess.id });
+    const after = await s.call("agent_bridge_status", { session_id: sess.id });
+    if (!after?.__error || !/unknown session/i.test(after.__error)) return fail(`S23: a closed session should be gone (Unknown session), got ${JSON.stringify(after)}`);
+    s.kill(); await sleep(150);
+    console.log("[harness] S23 OK — closed session is removed (status → Unknown session): closed = dead/gone to the caller");
   }
 
   cleanupTmp();
-  console.log("[harness] >>> PASS: Kimi backend — Shape B local-id/turn lifecycle, meta state machine, close-settlement, abort tree-kill, concurrency guard, contextUsage null, health five-state, resolveKimiBin native-only, doctor, cleanup matcher");
+  console.log("[harness] >>> PASS: Kimi backend — Shape B local-id/turn lifecycle, meta state machine, close-settlement, abort tree-kill (incl. pre-begin race), spawn-ENOENT reuse, cmdline limits, user-echo privacy, absolute bin resolution, concurrency guard, contextUsage null, health states, doctor, cleanup matcher (real M1 negative)");
   await sleep(150);
   process.exit(0);
 }

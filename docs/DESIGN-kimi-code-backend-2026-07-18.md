@@ -1,7 +1,17 @@
 # DESIGN — Kimi Code CLI 作为 agent-bridge 第 5 后端（`kimi`）
 
-状态：**v3.1 — Codex 复审收敛至 APPROVE（未实现）。** 日期 2026-07-18。作者：主 agent（Claude Opus）。
-真理源：本文件。落地后回填 commit。
+状态：**v4 — 已实现并双评修订（core + hermetic）。** 日期 2026-07-18。作者：主 agent（Claude Opus）。
+真理源：本文件。落地 commit `d88c633`（初版）+ 复审修订（本轮）。
+
+> **v4 实现 + 代码复审修订（实现后另一独立引擎 Codex 复审 diff = NEEDS_FIXES：0 blocker + 6 major + 2 minor，全部已修 + 补测试 + 回填本文档）**：
+> - [M1] §5.1 matcher 纯正则不懂引号 → 引号内的 ` -p ` 造成假阳性（cleanup 杀进程的安全边界）。**改为引号感知的 token 扫描**（`tokenizeWindowsCommandLine`，遵 CommandLineToArgvW 反斜杠/引号规则）：argv0 basename 严格 kimi.exe + 存在独立 `-p` token 且其后有参数 + 其前存在连续 `--output-format` `stream-json` 两 token。见 §5.1。
+> - [M2] §5.9 `resolveKimiBin()` 可能返回相对路径（相对 KIMI_BIN 或 `.` PATH 项在 MCP-server cwd 校验，但 send() 以会话 cwd spawn）→ 验 A 起 B / ENOENT。**三类候选一律 `path.resolve()` 绝对化后再校验/返回**。见 §5.9。
+> - [M3] send() 的 spawn-await 窗口内并发 `abort()`（`this.turn`/`this.proc` 已置、`turnChild` 未置）设 `userAborted=true` 后，`#beginTurn` 原会重置 `userAborted=false` → abort 丢失、被杀 child 误结算为 nonzero 失败。**改：`userAborted` 只在 send() 同步占位（首个 await 前）重置一次、`#beginTurn` 不再重置、releaseUnbegun 清除、begin 后若 userAborted 则显式 kill 该 child**，使其 close 经唯一结算点 `#settleTurn` 结算为 aborted/idle。见 §2.1/§5.2。
+> - [M4] hermetic 负例原走手抄 replica（正因此放过 M1）→ **M1 假阳性负例改走真实注册表 matcher**（repro-kimi S17：真 `cleanup` 对一个引号内含 `-p` 的活进程断言"不得终止"+仍存活）。
+> - [M5] 补设计 §8 明列但缺的场景：S18 pre-begin abort 竞态（覆盖 M3）/ S19 真 OS spawn ENOENT + 重解析 + 可复用 / S7 stale-close 复用 / S23 closed→gone / S20 cmdline 上限+NUL 真拒。
+> - [Min1] repro-kimi S21：`role:"user"` echo 行含 secret marker → 断言 log/events 均无泄漏。
+> - [Min2] open_session 字段级描述（access/write/effort/append_system_prompt_file）补 kimi 的 soft-read / effort ignored / first-turn-prefix 语义。
+> 复审同时确认：`deriveHealth`/`spawnPlan` 字节级未动、状态机/#canRun/resolver-lazy/三处主动决定 sound、C# forwarder stub 走真实路径、无空断言。
 
 > **最终复审结论**：Codex（gpt-5 系，reviewer 角色，read 档）三轮 → APPROVE。R1（2 blocker+5 major+2 minor）→ R2（M1/M5/Min1/Min2 闭合；余 1 blocker+5 major：doctor lazy-resolve/matcher/turnProtocolError/summary 泄露/statSync/artifact）→ R3（余项闭合，仅 matcher 1 major：`-p` 搜索范围）→ **R3b：APPROVE**。纯文档+代码核对（评审者 read 沙箱无法跑 kimi，§2 实测事实由作者本机真跑提供）。**本文件仅为设计，尚未实现**。
 
@@ -82,6 +92,7 @@
   4. 否则（`exitCode===0 && turnHadMeta && !turnProtocolError`）→ **成功**（`meta` 合法时**空 assistant 文本可接受**，与 cursor 接受空 `result` 一致）。
 - **abort / timeout / error 同样只在 child `close` 后清 turn/proc**（同 cursor，防新轮在旧 child 退出前启动）。
 - **单一幂等 `#settleTurn`**：竞争下 promise 只 resolve/reject 一次；close handler 先判 `this.proc === child`。
+- **pre-begin abort 竞态（[M3]）**：MCP 请求并发派发；`send()` 在 `await spawn` 期间 `this.turn`/`this.proc` 已置而 `turnChild` 未置——此窗口内并发 `abort()` 会设 `userAborted=true` 并 kill child。规则：`userAborted` **只在 `send()` 同步占位（首个 await 前）重置一次**、`#beginTurn` **不得重置**（否则丢 abort → 被杀 child 误判 nonzero 失败）、`releaseUnbegun` 清除、`#beginTurn` 后若 `userAborted` 仍真则**显式 kill 该 begun child**——该 child 的 `close` 仍经唯一 `#settleTurn` 结算为 aborted/idle。回归：repro-kimi S18（发 send 后立刻 fire abort，确定性命中窗口，断言结算为 aborted/idle 而非 phantom-failed）。
 
 ---
 
@@ -120,23 +131,24 @@ kimi: {
   role: "kimi-stream-json",
   versionArgs: ["--version"],
   // bridge-spawn 的 kimi turn 命令行 = <...\kimi.exe> --output-format stream-json [-S session_<uuid>] [-m <model>] -p <prompt>
-  // argv0 严格锚定 kimi.exe（支持任意安装目录，不被 model/cwd 参数误导）；prompt 恒在尾部(-p 值)，不参与匹配。
+  // [M1] 纯正则不懂引号：引号内的 ` -p `/`--output-format stream-json` 会假阳性（cleanup 杀进程的安全边界，
+  // 假阳性不可接受）。故先按 Windows 引号规则 tokenize，再在 TOKEN 上判定；prompt(=-p 值)永不参与匹配。
   matchesCommand: cmd => {
-    const s = String(cmd).trim();
-    const m = s.match(/^(?:"([^"]+)"|(\S+))(?=\s|$)/);   // 命令行首 token（可带引号），后须空白或结尾
-    const argv0 = m && (m[1] ?? m[2]);                   // [R2-M1] ?? 而非 ||，空串也判空
-    if (!argv0) return false;
-    if (argv0.split(/[\\/]/).pop().toLowerCase() !== "kimi.exe") return false;  // argv0 basename 严格 = kimi.exe（安全边界）
-    const rest = s.slice(m[0].length);                  // [R3-M1] 只在 argv0 之后找 -p，避免安装路径里的 ` -p ` 落在 argv0 内致漏匹配
-    const i = rest.search(/(?:^|\s)-p\s+(?=\S)/);       // 真 -p flag 且其后确有 prompt 参数（拒裸 -p 结尾）
-    if (i < 0) return false;                             // 每轮 turn 恒有 -p <prompt>；无则不是我们 spawn 的 turn
-    const head = rest.slice(0, i);                       // argv0 之后、-p 之前的 flag 区
-    return /(?:^|\s)--output-format\s+stream-json(?:\s|$)/.test(head);
+    const tokens = tokenizeWindowsCommandLine(String(cmd));   // 遵 CommandLineToArgvW：双引号分组 + 反斜杠转义
+    if (tokens.length < 2) return false;
+    if (tokens[0].split(/[\\/]/).pop().toLowerCase() !== "kimi.exe") return false;  // argv0 basename 严格 = kimi.exe
+    let pIdx = -1;
+    for (let i = 1; i < tokens.length - 1; i++) { if (tokens[i] === "-p") { pIdx = i; break; } }  // 独立 -p token 且其后有 prompt token
+    if (pIdx < 0) return false;                              // 无顶层 -p <prompt> → 不是我们 spawn 的 turn
+    for (let i = 1; i + 1 < pIdx; i++) { if (tokens[i] === "--output-format" && tokens[i + 1] === "stream-json") return true; }  // -p 之前存在连续两 token
+    return false;
   },
 }
+// 顶层新增 helper（函数声明，hoist，供 matcher 用）：
+function tokenizeWindowsCommandLine(s) { /* 双引号分组 + 2N/2N+1 反斜杠-引号转义；见 scripts 实现 */ }
 ```
 
-- **安全边界（[M2]）**：cleanup 的 matcher 是安全边界（cursor 先例先验真实入口再验参数形状）。此处**锚 argv0 的 basename 严格 `kimi.exe`**——无关进程即便某参数是 `foo/kimi` 也不命中；同时不锁死 `.kimi-code` 目录，故 `KIMI_BIN` 指向的任意安装目录仍可被 cleanup 扫到。
+- **安全边界（[M1]）**：cleanup 的 matcher 是安全边界（cursor 先例先验真实入口再验参数形状）。此处**锚 argv0 的 basename 严格 `kimi.exe`** + **引号感知 token 扫描**——无关进程即便某参数含 `foo/kimi` 或引号内的 ` -p ` 也不命中；同时不锁死 `.kimi-code` 目录，故 `KIMI_BIN` 指向的任意安装目录仍可被 cleanup 扫到。回归：repro-kimi S17 用**真实注册表 matcher**（真 cleanup 路径）对引号内 `-p` 的活进程断言「不得终止」。
 
 ### 5.2 `KimiCodeSession` 类（以 `CursorAgentSession` :3208 为骨架）
 
@@ -246,6 +258,7 @@ isReusable() { return this.#canRun(); }         // deriveHealth 钩子调用
   1. `KIMI_BIN` 若设：basename 严格 `kimi.exe` 且 `statSync().isFile()`；否则报错（不接受 `.cmd/.bat`/目录/裸名）。
   2. 标准安装绝对路径 `%USERPROFILE%\.kimi-code\bin\kimi.exe`，`isFile` 即用（**不依赖 PATH**——native 安装器只改 User PATH、新终端才生效，bridge 的 MCP server 进程可能持旧 PATH，调研时 codex 子进程即因 `kimi` 不在其 PATH 而 command-not-found）。
   3. PATH 兜底：**仅搜 `kimi.exe`**（PATHEXT 限定 `.exe`），绝不接受 shim。
+  - **返回值必须绝对（[M2]）**：三类候选一律先 `path.resolve()`（对 MCP-server cwd 绝对化）再 `statSync().isFile()` 校验、返回绝对路径。否则相对 `KIMI_BIN` 或 `.` PATH 项会在 server cwd 校验通过、却在 `send()` 的 `spawn({cwd: session.cwd})` 下解释成另一路径（验 A 起 B / ENOENT）。绝对化后 `resolvedBin` 与会话 cwd 无关、稳定。
   - 全部落空 → 抛"未找到原生 kimi.exe"。
 - **绝不在 AGENTS 注册表初始化时跑 resolver（[R2-B1]）**：否则 kimi 未安装会在**模块加载阶段**直接抛、doctor 无从报 missing。`AGENTS.kimi.bin` 保持名义值 `"kimi.exe"`（仅供展示/日志）；解析一律 **lazy**：
   - `doctor`：**kimi-aware 分支（照 cursor 的 doctor 分支，非通用分支）**——内部 `try { resolveKimiBin() } catch { → 报 unavailable }`；成功则跑 `<abs kimi.exe> --version`（返 `0.27.0`；kimi 自有二进制，**无** cursor 的 node.exe 冒充陷阱）。**不能走通用分支**（通用分支只搜旧 PATH、绕过标准安装路径解析，正是调研时 codex 撞的坑）。
