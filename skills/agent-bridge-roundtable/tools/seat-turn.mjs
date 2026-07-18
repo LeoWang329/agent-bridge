@@ -45,6 +45,10 @@ const VENDOR_BLACKLIST = [
   // 否则整词匹配会大量误伤正文(如 PHP Composer / music composer)。
   // 故意**不含 "cursor" 本身**(同被排除的 "omp":常用词,英文正文 "move the cursor / DB cursor" 会误伤)。
   "grok", "xai",
+  // kimi 后端的厂商级名(`kimi` 本身已在上面)。"moonshot" 作英文习语("这是个 moonshot")偶有正文误伤,但
+  // 远不到 cursor/omp 那种高频,按同粒度收进全局表;真撞上议题就用 `--vendor-topic` 降为 WARN。
+  // **不放** "k2"/"k3":太短、易在正文/版本号里误伤,要扫用每席 `--extra-names`。
+  "moonshot",
 ];
 const VENDOR_ALT = VENDOR_BLACKLIST.join("|");
 

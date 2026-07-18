@@ -1,6 +1,6 @@
 # Agent Bridge 安装与使用
 
-这份文档面向想把 Agent Bridge 装进 Codex 或 Claude Code 并实际调用 OMP/Codex/Claude/Cursor 的用户。
+这份文档面向想把 Agent Bridge 装进 Codex 或 Claude Code 并实际调用 OMP/Codex/Claude/Cursor/Kimi 的用户。
 
 Agent Bridge 是一个 session-first 的 MCP 桥接器，注册到 Codex 或 Claude Code 后使用。它不是一次性命令封装，而是让客户端先打开一个持久会话，再向同一个会话连续发送消息，最后显式关闭会话。
 
@@ -14,6 +14,7 @@ codex --version
 omp --version
 claude --version   # 如果要委托给 Claude
 agent --version    # 如果要委托给 Cursor（仅 Windows）
+kimi --version     # 如果要委托给 Kimi（仅 Windows）
 ```
 
 最低要求：
@@ -24,8 +25,9 @@ agent --version    # 如果要委托给 Cursor（仅 Windows）
 - Codex 已安装，并且 `codex` 在 PATH 中（如果要委托给 Codex）
 - Claude Code 已安装，并且 `claude` 在 PATH 中（如果要委托给 Claude）
 - Cursor Agent CLI（`agent`）已安装，**仅 Windows**（如果要委托给 Cursor）
+- Kimi Code CLI（原生 `kimi.exe`）已安装，**仅 Windows**（如果要委托给 Kimi）
 
-**必须先装好要委托的 coding agent。** Agent Bridge 只是桥接到 OMP / Codex / Claude / Cursor（cursor 仅 Windows），本身不包含也不会自动安装它们。如果对应后端没装，session 根本无法启动。请先把你打算委托的后端装好，再用 `node scripts/agent-bridge.mjs doctor` 确认每个后端都被检测到。
+**必须先装好要委托的 coding agent。** Agent Bridge 只是桥接到 OMP / Codex / Claude / Cursor / Kimi（cursor、kimi 仅 Windows），本身不包含也不会自动安装它们。如果对应后端没装，session 根本无法启动。请先把你打算委托的后端装好，再用 `node scripts/agent-bridge.mjs doctor` 确认每个后端都被检测到。
 
 如果后端不在 PATH 中，可以用环境变量覆盖（omp/codex/claude，POSIX shell）：
 
@@ -39,6 +41,18 @@ Cursor 仅 Windows，用 PowerShell 覆盖（通常无需——`agent` 在 PATH 
 
 ```powershell
 $env:CURSOR_AGENT_BIN = (Get-Command agent).Source
+```
+
+Kimi 仅 Windows，用官方 native 安装器安装（装的是原生 `kimi.exe`，落在 `%USERPROFILE%\.kimi-code\bin`，不碰 Python）：
+
+```powershell
+irm https://code.kimi.com/kimi-code/install.ps1 | iex
+```
+
+装完先跑一次 `kimi`，在里面用 `/login` 完成登录，之后 `node scripts/agent-bridge.mjs doctor` 应列出 `kimi: ok (kimi.exe) 0.27.0`。桥按 `KIMI_BIN` → `%USERPROFILE%\.kimi-code\bin\kimi.exe` → PATH 的顺序找二进制，装在别处才需要覆盖（**必须指向原生 `kimi.exe`，`.cmd`/`.bat` shim 一律拒绝**——prompt 走 argv，经 shim 会丢掉元字符安全边界）：
+
+```powershell
+$env:KIMI_BIN = "$env:USERPROFILE\.kimi-code\bin\kimi.exe"
 ```
 
 ## 2. 获取项目
@@ -93,7 +107,7 @@ Agent Bridge 两块东西，**适配范围不同**：
 | **Codex** | `codex mcp add agent-bridge -- node "<MJS>" mcp`（写入 `~/.codex/config.toml`） | `~/.codex/skills/<name>/`（软链） | `agent_bridge_*`（裸名） | 重启 Codex |
 | **其它 MCP 客户端**（Cursor / Cline / Windsurf …） | 在该客户端 MCP 配置里加一个 stdio server：命令 `node`、参数 `["<MJS>","mcp"]` | 无自动 skill 机制——按需把 `skills/agent-bridge/SKILL.md` 作为文档提供 | 由该客户端定（多为 `agent_bridge_*`） | 按该客户端方式重载 |
 
-`<MJS>` = `<REPO>/scripts/agent-bridge.mjs` 的**绝对路径**（维护者填**稳定安装 clone**，见上一节）。后端（omp/codex/claude/cursor）是否可用以 `node "<MJS>" doctor` 为准。一律用**绝对路径**，别用 `$PWD`——agent 的 shell 通常不在仓库根。
+`<MJS>` = `<REPO>/scripts/agent-bridge.mjs` 的**绝对路径**（维护者填**稳定安装 clone**，见上一节）。后端（omp/codex/claude/cursor/kimi）是否可用以 `node "<MJS>" doctor` 为准。一律用**绝对路径**，别用 `$PWD`——agent 的 shell 通常不在仓库根。
 
 ## 3. 安装到 Codex
 
@@ -186,7 +200,7 @@ ln -sfn "$PWD/skills/agent-bridge-loop"       ~/.claude/skills/agent-bridge-loop
 
 ## 6. 使用方式
 
-会话**只能**通过 MCP 工具管理。会话活在你这个客户端启动的 `agent-bridge mcp` 进程内：该进程直接 spawn 并持有你打开的 OMP/Codex/Claude 后端（**cursor 例外**：只持有逻辑云端 chat，进程按轮短驻）。没有共享后台 daemon，也没有 Web UI——客户端退出，这个 MCP 进程随之退出，它持有的所有后端进程被一并清理（cursor 的云端 chat 因无 delete-chat 不受影响、仍留存）（v0.7.0，详见 [docs/ARCHITECTURE.md](ARCHITECTURE.md)）。
+会话**只能**通过 MCP 工具管理。会话活在你这个客户端启动的 `agent-bridge mcp` 进程内：该进程直接 spawn 并持有你打开的 OMP/Codex/Claude 后端（**cursor / kimi 例外**：只持有逻辑会话——cursor 是云端 `chatId`、kimi 是本地 session id，两者进程都按轮短驻）。没有共享后台 daemon，也没有 Web UI——客户端退出，这个 MCP 进程随之退出，它持有的所有后端进程被一并清理（cursor 的云端 chat 因无 delete-chat 不受影响、仍留存；kimi 无云端 chat 存储，但已发出的 prompt 仍到过 Moonshot 云端）（v0.7.0，详见 [docs/ARCHITECTURE.md](ARCHITECTURE.md)）。
 
 Codex 使用 Agent Bridge 时应该遵循这个流程：
 
@@ -249,7 +263,18 @@ Codex 使用 Agent Bridge 时应该遵循这个流程：
 }
 ```
 
-可以在**打开会话时**指定模型与推理强度。模型是会话级参数：在 `agent_bridge_open_session` 时用 `model` 指定，整个会话内固定，`agent_bridge_send_message` 不能逐条切换；想换模型就新开一个 session。`model` 会原样传给后端的 `--model`，取值格式由后端决定。OMP 尤其可以通过 `omp --model <name>` 触达多种模型（如 `deepseek-v4-pro`、`minimax-m3`、`claude`、`gpt`）。可选的 `effort` 在 OMP 映射为 `--thinking`（`minimal|low|medium|high|xhigh`），在 Codex 作为该轮的 effort（`none|minimal|low|medium|high|xhigh`）传入，在 Claude 映射为 `--effort`（默认 `xhigh`）；**Cursor 的 `model` 必须是带档位后缀的 selector**（用 `agent --list-models` 活查），其 `effort` 被接受但忽略、`contextUsage` 恒 `null`。不传 `model` / `effort` 时使用后端默认值。
+需要 Kimi 时，把 `agent` 换成 `kimi`（**仅 Windows**；Kimi Code CLI，Moonshot 的 K2/K3 系；形状 B——逻辑会话=kimi 首轮自己在**本地**铸的 session id、进程按轮短驻，比 cursor 简单：无 create-chat 往返、无云端 chat 存储）。几处后端特有约束：`read`/`write` 都是**软边界**（Windows 无 OS 沙箱；`read` 保留原生写工具、只靠每轮注入的「仅只读调查」策略压制，**不是真只读**——shell 仍能写盘）；`model` 用 `kimi-code/…` 别名（`kimi-code/k3` 为默认，另有 `kimi-code/kimi-for-coding`、`kimi-code/kimi-for-coding-highspeed`，清单用 `kimi provider list` 活查）；`append_system_prompt_file` 无原生 system flag、软注入为首轮用户前缀；`effort` 被接受但忽略（回显 `null`）、`schema` 不支持；`contextUsage` 恒 `null`。**隐私口径**：session 状态在本地、无云端 chat 存储，但**推理仍走 Moonshot 云端 API**——prompt 和 agent 读进去的仓库内容一样离开本机，别当成"数据不出本地"：
+
+```json
+{
+  "agent": "kimi",
+  "cwd": "C:\\absolute\\path\\to\\workspace",
+  "write": false,
+  "model": "kimi-code/k3"
+}
+```
+
+可以在**打开会话时**指定模型与推理强度。模型是会话级参数：在 `agent_bridge_open_session` 时用 `model` 指定，整个会话内固定，`agent_bridge_send_message` 不能逐条切换；想换模型就新开一个 session。`model` 会原样传给后端的 `--model`，取值格式由后端决定。OMP 尤其可以通过 `omp --model <name>` 触达多种模型（如 `deepseek-v4-pro`、`minimax-m3`、`claude`、`gpt`）。可选的 `effort` 在 OMP 映射为 `--thinking`（`minimal|low|medium|high|xhigh`），在 Codex 作为该轮的 effort（`none|minimal|low|medium|high|xhigh`）传入，在 Claude 映射为 `--effort`（默认 `xhigh`）；**Cursor 的 `model` 必须是带档位后缀的 selector**（用 `agent --list-models` 活查），其 `effort` 被接受但忽略、`contextUsage` 恒 `null`；**Kimi 的 `model` 是 `kimi-code/…` 别名**（用 `kimi provider list` 活查，默认 `kimi-code/k3`），其 `effort` 同样被接受但忽略、`contextUsage` 也恒 `null`。不传 `model` / `effort` 时使用后端默认值。
 
 ```json
 {
@@ -267,8 +292,8 @@ Codex 使用 Agent Bridge 时应该遵循这个流程：
 
 ```sh
 node scripts/agent-bridge.mjs mcp        # 运行 MCP server（stdio）——会话活在这个进程里
-node scripts/agent-bridge.mjs doctor     # 报告后端可用性（omp/codex/claude/cursor）
-node scripts/agent-bridge.mjs cleanup    # 回收被 kill 的 MCP server 残留的孤儿子进程（omp/codex/claude 长驻进程、cursor 的 create-chat / 活跃轮短进程）
+node scripts/agent-bridge.mjs doctor     # 报告后端可用性（omp/codex/claude/cursor/kimi）
+node scripts/agent-bridge.mjs cleanup    # 回收被 kill 的 MCP server 残留的孤儿子进程（omp/codex/claude 长驻进程、cursor 的 create-chat / 活跃轮短进程、kimi 的活跃轮短进程）
 ```
 
 `mcp` 由 MCP 客户端自动拉起，不用手动跑。`cleanup` 是安全网：只终止那些「owning MCP server 已经不在了」（例如被 `kill -9`）的后端子进程，并清理它们的 pid record；仍由活着的 `agent-bridge mcp` 进程持有的子进程不会被动到。
@@ -317,10 +342,11 @@ node scripts/agent-bridge.mjs cleanup --json
 - Codex 的 `codex app-server` 会退出
 - Claude 的 headless 进程会退出
 - Cursor 无长驻进程可退（形状 B：进程按轮短驻）——但 `close` 若逢**活跃的 create-chat / turn 短进程**会整树终止它，再忘掉云端 `chatId`；**因 cursor 无 delete-chat，云端 chat 及其读入的仓库内容仍留在 Cursor 的留存边界，删不掉**
+- Kimi 同样无长驻进程可退（形状 B）——`close` 若逢**活跃的轮短进程**会整树终止它，再忘掉本地 session id；kimi 无云端 chat 存储可删，但**已发出的 prompt 早已到过 Moonshot 云端 API**，close 追不回来
 
-MCP server 进程**直接持有**它打开的会话（不再代理给任何 daemon）。当它退出时（客户端退出 / stdin 关闭 / `SIGTERM`、`SIGINT`、`SIGHUP` / stdout `EPIPE` / 未捕获异常），会清理自己持有的所有后端子进程（omp/codex/claude 长驻，及 cursor 活跃轮 / create-chat 短进程）。stdin 关闭时它会先等 pending MCP 响应写完再退出。优雅退出（code 0）还会删除本次 run 的日志目录 `~/.agent-bridge/logs/<runId>/`；崩溃（code≠0）保留以便排查。仍然建议在任务完成后显式调用 `agent_bridge_close_session`。
+MCP server 进程**直接持有**它打开的会话（不再代理给任何 daemon）。当它退出时（客户端退出 / stdin 关闭 / `SIGTERM`、`SIGINT`、`SIGHUP` / stdout `EPIPE` / 未捕获异常），会清理自己持有的所有后端子进程（omp/codex/claude 长驻，及 cursor 活跃轮 / create-chat 短进程、kimi 活跃轮短进程）。stdin 关闭时它会先等 pending MCP 响应写完再退出。优雅退出（code 0）还会删除本次 run 的日志目录 `~/.agent-bridge/logs/<runId>/`；崩溃（code≠0）保留以便排查。仍然建议在任务完成后显式调用 `agent_bridge_close_session`。
 
-如果 Agent Bridge 被 `kill -9` 硬杀，清理逻辑来不及执行。此时它会依赖 `~/.agent-bridge/pids/` 里的 pid record，在下一次 MCP server 启动（或手动 `cleanup`）时回收上次残留的后端子进程（四后端同理）。
+如果 Agent Bridge 被 `kill -9` 硬杀，清理逻辑来不及执行。此时它会依赖 `~/.agent-bridge/pids/` 里的 pid record，在下一次 MCP server 启动（或手动 `cleanup`）时回收上次残留的后端子进程（五后端同理）。
 
 只有活着的 `agent-bridge mcp` 进程会被识别为 pid record owner，`cleanup` 不会误杀它仍在使用的后端子进程；只回收 owner 已经死掉的孤儿子进程。
 

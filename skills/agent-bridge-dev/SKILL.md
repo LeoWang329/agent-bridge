@@ -81,15 +81,15 @@ close_session(session_id)                 用完必关
 **不点名具体后端/模型**——它们会变,写死会失效。按能力挑,具体名靠活查:
 
 - **默认偏好**:给每个角色一个默认(按能力档 + 评审者≠实施者),不绑产品名。
-- **缺了自行挑**:派活前 `agent_bridge_doctor` 看哪些后端在(当前 omp/codex/claude/cursor;新增 CLI 同理按 doctor 走)。
+- **缺了自行挑**:派活前 `agent_bridge_doctor` 看哪些后端在(当前 omp/codex/claude/cursor/kimi;新增 CLI 同理按 doctor 走)。
   默认不可用时,按**同样的能力标准自行挑一个合适替代**——但**必须遵守评审独立性**(见下):与实施者相同的
   引擎/模型候选直接排除,不能因"能力档最高可用"就悄悄挑到同一个。
 - **拿不准就问用户**:排除实施者后能力档无合适候选、或你无法判断怎么挑,**停下与用户确认**,不硬凑。
 - **能力分层**:机械实现用低延迟/足够能力档;集成/判断用中档;架构/最终整支评审用最强档(**不是"最便宜"**,别与
   "质量优先、不为省 token 缩水"冲突)。
 - **模型清单靠活查**:OMP 用 `omp models <关键字>`(子命令,非 flag;你的 shell 跑,非 MCP 工具),`model` 传全限定
-  `provider/名`;Codex/Claude 用后端默认或用户给定的有效模型(它们没有 `models` 子命令);cursor 用 `agent --list-models`,selector 带档位后缀(如 `gpt-5.3-codex-high`)。具体模型 ID 不写死。
-- **cursor 特例(见桥 skill 的 Cursor 条目)**:可担任一角色,但角色注入是**首轮软注入**——架构讨论是**多轮长会话**,cursor 的角色纪律长程未验证、经压缩可能漂,**要长程稳守角色的关键位优先真 system 提示后端(omp/codex/claude)**;另 cursor `contextUsage` 恒 `null`、云端 chat 删不掉、仅 Windows。
+  `provider/名`;Codex/Claude 用后端默认或用户给定的有效模型(它们没有 `models` 子命令);cursor 用 `agent --list-models`,selector 带档位后缀(如 `gpt-5.3-codex-high`);kimi 用 `kimi provider list`,`model` 传 `kimi-code/…` 别名。具体模型 ID 不写死。
+- **cursor / kimi 特例(见桥 skill 的对应条目)**:两者都可担任一角色,但角色注入是**首轮软注入**——架构讨论是**多轮长会话**,它们的角色纪律长程未验证、经压缩可能漂,**要长程稳守角色的关键位优先真 system 提示后端(omp/codex/claude)**;另两者 `contextUsage` 都恒 `null`(按 token 判轮换失效,把 `null` 当未知、别当 0)、都仅 Windows;cursor 另有云端 chat 删不掉,kimi 无云端 chat 存储但**推理仍走 Moonshot 云端**(prompt 出本机)。
 
 ## 评审独立性(硬规则)
 

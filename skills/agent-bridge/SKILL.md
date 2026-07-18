@@ -1,11 +1,11 @@
 ---
 name: agent-bridge
-description: Agent Bridge 的使用说明——通过 MCP 把任务委托给本地 OMP / Codex / Claude / Cursor（或经 OMP 调用 deepseek 等模型）执行。仅当用户明确要求使用 agent-bridge、唤起其他 agent / LLM、要独立第二意见 / 复核 / 并行多开时使用（delegate / second opinion / review / parallel；OMP / Codex / Claude / Cursor / deepseek）。普通编码、小修小补、自己能做的只读评审不要触发。
+description: Agent Bridge 的使用说明——通过 MCP 把任务委托给本地 OMP / Codex / Claude / Cursor / Kimi（或经 OMP 调用 deepseek 等模型）执行。仅当用户明确要求使用 agent-bridge、唤起其他 agent / LLM、要独立第二意见 / 复核 / 并行多开时使用（delegate / second opinion / review / parallel；OMP / Codex / Claude / Cursor / Kimi / deepseek）。普通编码、小修小补、自己能做的只读评审不要触发。
 ---
 
 # Agent Bridge
 
-**仅当用户明确要求**使用 agent-bridge、唤起其他 agent（OMP / Codex / Claude / Cursor / deepseek）、或要独立第二意见 / 复核 / 并行多开时，才用 Agent Bridge。普通编码、小修小补、自己读几个文件就能做的评审，**不要**委托。
+**仅当用户明确要求**使用 agent-bridge、唤起其他 agent（OMP / Codex / Claude / Cursor / Kimi / deepseek）、或要独立第二意见 / 复核 / 并行多开时，才用 Agent Bridge。普通编码、小修小补、自己读几个文件就能做的评审，**不要**委托。
 
 它是 session-first 的桥接器，不是一次性命令运行器：开一个持久会话、往里发消息、读结果、复用、关闭。执行委托任务**只用** `agent_bridge_*` MCP tools。
 
@@ -25,7 +25,7 @@ close_session(session_id)                  →  用完必须关
 
 ## 核心机制
 
-- 会话**活在 MCP server 进程内**：你所在的客户端启动了一个 `agent-bridge mcp` 进程，它直接 spawn 并持有你 open 的 OMP/Codex/Claude 后端（**cursor 例外**：只持有逻辑会话，进程按轮短驻）。**没有共享 daemon、没有 UI、不跨客户端共享**；客户端退出，这些会话随之被清理。
+- 会话**活在 MCP server 进程内**：你所在的客户端启动了一个 `agent-bridge mcp` 进程，它直接 spawn 并持有你 open 的 OMP/Codex/Claude 后端（**cursor / kimi 例外**：只持有逻辑会话，进程按轮短驻）。**没有共享 daemon、没有 UI、不跨客户端共享**；客户端退出，这些会话随之被清理。
 - CLI 只剩三条：`mcp`（由 MCP 客户端拉起，你一般不手动跑）、`doctor`（查后端可用性）、`cleanup`（回收被 kill 的 server 残留的子进程）。**没有 CLI 会话命令，也没有 daemon/ui 命令**。
 
 ## 工作流：非阻塞 + 短超时 wait（看进展，不死等）
@@ -85,7 +85,7 @@ close_session(session_id)                  →  用完必须关
 | `agent_bridge_result` | 读**最近一轮** assistant 文本 + 最近事件（非全历史） | 想看目前为止的产出（含中途） |
 | `agent_bridge_abort` | 中断当前 turn（会话仍可复用） | 要**真正停掉**正在跑的一轮（打断主 agent ≠ 停任务） |
 | `agent_bridge_close_session` | 关会话、回收后端进程。单关返回 `{closed, sessionId}`；省略 `id` 批量关返回 `{closedAll, count, sessionIds, failed}` | 常规**显式传 `id`**；省略 `id` 仅作崩溃兜底，且要查 `closedAll`/`failed` |
-| `agent_bridge_doctor` | 检查 omp/codex/claude/cursor/node 是否可用 | 排查「后端起不来」 |
+| `agent_bridge_doctor` | 检查 omp/codex/claude/cursor/kimi/node 是否可用 | 排查「后端起不来」 |
 
 **典型场景：**
 
@@ -117,6 +117,7 @@ close_session(session_id)                  →  用完必须关
 - **Codex**：`agent: "codex"`，启动 `codex app-server`（JSON-RPC，逐 token 流式）。能力档由 `access` 控制（见下），均非交互。Codex 的 `read` 是 OS 沙箱 `read-only`：能跑命令、写被沙箱硬拦——所以 codex 的 read 是**硬**只读。
 - **Claude**：`agent: "claude"` — a fresh-context Claude Code worker; good for an independent second opinion / review or an isolated write workspace.（独立 Claude Code worker；适合独立复核或调查/隔离写作业；能力档由 `access` 控制：`read` 含 Bash 可跑命令、但 Bash 能写盘=**软**（非 OS 沙箱）；默认模型为 claude 自身配置默认，思考强度默认 xhigh）
 - **Cursor**：`agent: "cursor"` — 驱动 cursor-agent CLI（**仅 Windows，v1**）。形状不同于前三个：逻辑会话＝云端 `chatId`，**每轮短进程**跑完即退（轮间不持有进程），靠 `--resume` 续。几处后端特有约束：①`model` 要带**档位后缀**的 selector（如 `gpt-5.3-codex-high`、`cursor-grok-4.5-high`；裸家族名如 `gpt-5.3` 未必被接受），清单靠 `agent --list-models` 活查、直接拿输出里的 selector（用你的 shell 跑，非 MCP 工具）；②`append_system_prompt_file` 无原生 system flag，**软注入为首轮用户前缀**（遵从看模型、与消息挤 ~24K argv、长会话经压缩可能漂移）；③`contextUsage` **恒 `null`**（stream-json 无用量字段）；④`read` 写边界＝**软，且比 omp/claude 更宽**：cursor 的 `read` 与 `write` 用同一 `--force`，**原生 Edit/Write 工具仍在**（无干净的 per-session 禁写途径），只靠每轮"别改文件"提示压着——不是"没有写工具"，是"被提示压着别写"；⑤**云端后端**：内容上 Cursor 云、进你账户 chat 历史，且**无 delete-chat**——`close_session` 只忘 ID，云端 chat + 读入的仓库内容留在 Cursor 留存边界删不掉（数据敏感场景慎用，尤其批量开会话的 roundtable/loop）。
+- **Kimi**：`agent: "kimi"` — 驱动 Kimi Code CLI（Moonshot，K2/K3 系；原生 `kimi.exe`，**仅 Windows，v1**）。与 cursor 同为**形状 B**（每轮短进程跑完即退、轮间不持有进程），但比 cursor 简单：session id 由 kimi **首轮在本地铸**、`-S` 续，**无 create-chat 往返、无云端 chat 存储**。几处后端特有约束：①`model` 用 `kimi-code/…` 别名（`kimi-code/k3` 默认，另有 `kimi-code/kimi-for-coding`、`kimi-code/kimi-for-coding-highspeed`），清单靠 `kimi provider list` 活查（用你的 shell 跑，非 MCP 工具）；②`append_system_prompt_file` 无原生 system flag，**软注入为首轮用户前缀**（遵从看模型，同 cursor 粒度）；③`contextUsage` **恒 `null`**（stream-json 无用量字段）——同 cursor，绝对-token 腐化判据对它失效；④`read`/`write` **都是软边界**（Windows 无 OS 沙箱）：`read` 与 `write` 同一条启动，**原生写工具仍在**，只靠每轮注入的「仅只读调查」策略压着——**不是真只读**，shell 仍能写盘；⑤`effort` 被接受但忽略（回显 `null`）、`schema` 不支持。⚠️ **隐私口径别搞反**：session 状态在本地、无云端 chat 可删 ≠ 数据不出本机——**推理仍走 Moonshot 云端 API**，prompt 与 agent 读进去的仓库内容一样发往远端；敏感场景按"内容出境"对待。
 - **模型是会话级参数**：在 `open_session` 用 `model` 指定，整个会话固定；`send_message` 不能逐条切模型，换模型就新开 session。`model` 原样传后端 `--model`。
 - ⚠️ **OMP 的 `model` 必须用 `provider/模型名` 全限定形式，不要传裸别名**——OMP 是多 provider 路由，裸名可能被路由到非预期的 provider，拿到的不是你要的模型；全限定 ID 以 `omp models <关键字>` 的输出为准。**Codex/Claude 传各自后端认的模型名即可**（不用 `provider/` 前缀）。
 - **`effort`（可选，推理强度）**：OMP 映射为 `--thinking`（`minimal|low|medium|high|xhigh`）；Codex 作为该轮 effort（`none|minimal|low|medium|high|xhigh`，其中 `none`/`minimal`/`low` 用于简单改动的评审，实施任务不建议）。不传则用后端默认；Claude 映射到 --effort，默认 xhigh。
@@ -127,12 +128,12 @@ close_session(session_id)                  →  用完必须关
 
 | 档 | 能力 | 用于 |
 |---|---|---|
-| `read` | **读+执行**：读文件、搜索、**跑 shell 命令**（跑测试/探针）——一般无 Edit/Write 工具，不打算改文件（**cursor 例外**：原生写工具仍在、只靠提示压制，见 Cursor 条目）| 审议 + 调查:代码审查、方案设计、读文档、跑测试、只读分析 |
+| `read` | **读+执行**：读文件、搜索、**跑 shell 命令**（跑测试/探针）——一般无 Edit/Write 工具，不打算改文件（**cursor / kimi 例外**：原生写工具仍在、只靠提示压制，见各自条目）| 审议 + 调查:代码审查、方案设计、读文档、跑测试、只读分析 |
 | `write` | 完整改文件/写盘 | 用户明确要改文件，或场景编排 skill 为某角色明确规定（见「安全规则」） |
 
 - **`read` 含 shell**（=读+执行）：想调查就用 shell 跑命令、不想用就纯读，不用为此单开一档。
-- ⚠️ **`read` 的写边界分后端**：**codex = 硬**只读（read-only OS 沙箱,shell 里写盘被拦）；**omp / claude / cursor = 软**（bash/Bash **能**写盘,靠角色纪律不是 OS 沙箱）——所以 omp/claude/cursor 的 `read` **不是**硬不可写。要**硬**保证不写盘 → 用 codex 的 read,或直接上 `write` + 抛弃式工作区/worktree。
-- `write`（旧布尔）是 `access` 的别名(`true`→`write`、`false`→`read`)。两者同传必须一致,否则报错。⚠️ `write:false`（=read）**也带 shell**、omp/claude/cursor 下能软写,不是"绝对只读"。**新代码优先用 `access`。**
+- ⚠️ **`read` 的写边界分后端**：**codex = 硬**只读（read-only OS 沙箱,shell 里写盘被拦）；**omp / claude / cursor / kimi = 软**（bash/Bash **能**写盘,靠角色纪律不是 OS 沙箱；cursor/kimi 连原生写工具都还在）——所以 omp/claude/cursor/kimi 的 `read` **不是**硬不可写。要**硬**保证不写盘 → 用 codex 的 read,或直接上 `write` + 抛弃式工作区/worktree。
+- `write`（旧布尔）是 `access` 的别名(`true`→`write`、`false`→`read`)。两者同传必须一致,否则报错。⚠️ `write:false`（=read）**也带 shell**、omp/claude/cursor/kimi 下能软写,不是"绝对只读"。**新代码优先用 `access`。**
 
 **模型以活查为准（本 skill 是机制层，不推荐、不点名具体模型——模型会变，写死会失效）**：`omp models <关键字>`（是**子命令**不是 flag;也可 `omp models find <关键字>`、加 `--json` 拿机读）查可用模型（输出的 `selector` 即全限定 `provider/模型名`，直接拿来当 `model`）及各自支持的 thinking 上限。**不同模型最高 thinking 级别不同**，传它不支持的级别会被忽略或报错。选哪个模型由调用方按任务性质自行判断，或遵用户点名 / 场景编排 skill（dev / roundtable / loop）的偏好。
 
@@ -174,7 +175,7 @@ contextUsage: { tokens, live, isCompacting?, autoCompactionEnabled? } | null
   （依据：多数模型在 ~64–128k 就开始退化；这里取 400k 是对 1M 窗口模型**偏晚、偏保守**的触发线，跟窗口多大无关。三家分词器不同、同文本 token 数差 10–30%，当粗粒度触发器足够。）
 - **`live`**：`true`＝OMP 实时读数（`get_state`）；`false`＝Codex/Claude 上一轮结束的快照（下一轮从这里附近起步）。
 - **`isCompacting: true`**（仅 OMP）＝此刻正在压缩、正在丢上下文，收尾即可；`autoCompactionEnabled: false`（仅 OMP）＝到顶会硬失败而非自动压缩，更要盯 `tokens`。
-- **`null`**＝尚未测到（首轮前）或该轮没吐用量，**不等于 0、不代表安全**。**cursor 恒为 `null`**（stream-json 无用量字段）——无法套用上面的绝对-token 腐化判据；cursor 由服务端自管上下文，任何按 `tokens` 排序 / 判重开的逻辑都要把 `null` 当**未知**处理，别当 0（当 0 会让 cursor 永远排成「最新鲜」、永不触发重开）。
+- **`null`**＝尚未测到（首轮前）或该轮没吐用量，**不等于 0、不代表安全**。**cursor 与 kimi 恒为 `null`**（两者 stream-json 都无用量字段）——上面的绝对-token 腐化判据对它们失效；cursor 由服务端自管上下文，kimi 侧桥不作任何自压缩假设。任何按 `tokens` 排序 / 判重开的逻辑都要把 `null` 当**未知**处理，别当 0（当 0 会让它们永远排成「最新鲜」、永不触发重开）。**"不能按 token 判重开" ≠ "永不重开"**：这类会话改按遗忘约束 / 质量下降 / 换任务等通用信号判断轮换。
 - **实时性注意**：`status` 不传 `session_id`（列全部）给的是**上次已知**读数、不刷新；空闲会话的读数本就是当前值（不发消息上下文不变），但要 OMP **正在跑**会话的实时用量，用 `status(session_id)` 或 `wait`（它们会刷新）。
 - **桥永不自动重开**：它只吐数据，重开与否由你判断，且 reopen 必带「交接物」。
 
@@ -185,7 +186,7 @@ contextUsage: { tokens, live, isCompacting?, autoCompactionEnabled? } | null
 ## 安全规则
 
 - `cwd` 必须是当前工作区的绝对路径——桥不校验 workspace root，主 agent 自己负责别传 home / 父目录 / 临时目录。
-- 能力档就低不就高（见「Agent 与模型 → `access` 能力档」）：代码审查、方案设计、只读复核、跑测试/命令做调查 → `access:"read"`（read 自带 shell,够调查用；注意 omp/claude/cursor 的 read 能软写、只有 codex 硬只读）；只有用户明确要改文件才 `access:"write"`。
+- 能力档就低不就高（见「Agent 与模型 → `access` 能力档」）：代码审查、方案设计、只读复核、跑测试/命令做调查 → `access:"read"`（read 自带 shell,够调查用；注意 omp/claude/cursor/kimi 的 read 能软写、只有 codex 硬只读）；只有用户明确要改文件才 `access:"write"`。
 - **场景编排 skill 的权限模型优先**：agent-bridge-dev / -roundtable / -loop 对特定角色/席位的能力档与工作区形态另有明确规定时（如 loop 验证者 `access:"write"` 自建验证脚本、圆桌 write 席 + git worktree），按该 skill 执行——用户调用该 skill 即视为对其权限模型的授权，不必再逐会话套用上一条的通用默认。
 - 委托方与被委托 agent **共享 `cwd`**：审查/实现让对方自己 `git diff`、自己读文件，别把整坨 diff/代码塞进 `message`（省 token）。
 - 委托 agent 改了文件，调用方仍需检查 diff、跑必要测试，再向用户报告。
