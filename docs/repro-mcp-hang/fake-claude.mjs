@@ -52,6 +52,16 @@ rl.on("line", line => {
   let msg;
   try { msg = JSON.parse(line); } catch { return; }
 
+  // bigresult — one clean turn whose `result` is a LONG answer. `result` on a result event is the answer
+  // VERBATIM: the generic per-string log clamp would otherwise leave its first 512 characters on disk,
+  // which is exactly where a summary/credential/user data sits. [repro-log-bounds S7]
+  if (CMODE === "bigresult" && msg.type === "user") {
+    const answer = `CLAUDE_SECRET_ANSWER_HEAD ${"w".repeat(5000)}`;
+    say({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: answer }] } });
+    say({ type: "result", subtype: "success", is_error: false, result: answer, session_id: "fake-claude-bigresult" });
+    return;
+  }
+
   if (CMODE.startsWith("ctx") && msg.type === "user") {
     ctxTurns += 1;
     // Each assistant message carries ONE call's per-call usage (input + cache_read + cache_creation),

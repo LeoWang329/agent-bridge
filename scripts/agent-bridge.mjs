@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { isUtf8 } from "node:buffer";
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -13,12 +14,55 @@ const IS_WINDOWS = process.platform === "win32";
 // value would SILENTLY DISABLE the thing it configures (RPC timeout, watchdog, log caps) with no
 // trace. Fail loud to the default instead. (Callers needing a non-numeric default — e.g. a pid that
 // falls back to process.ppid — pass it through: an absent var returns the fallback verbatim.)
+// WHITESPACE is the same failure mode by a different route: Number(" ") is 0, not NaN, so a value of
+// " " sailed past the guard below and every "0 disables this" consumer read it as a deliberate OFF —
+// silently uncapping log size, or setting retention to keep-forever, with no trace. Blank values fall
+// out of .env files, templates and deployment systems routinely, so treat pure whitespace as MALFORMED
+// (warn + default), not as an explicit zero. A truly empty string keeps its long-standing "unset"
+// meaning (the shell's own `FOO=` idiom) and stays silent; only 0 written as a NUMBER disables anything.
 function envNum(name, fallback) {
   const raw = process.env[name];
   if (raw === undefined || raw === "") return fallback;
-  const n = Number(raw);
+  const trimmed = raw.trim();
+  if (trimmed === "") {
+    process.stderr.write(`[agent-bridge] ignoring blank ${name}=${JSON.stringify(raw)}; using default ${fallback}\n`);
+    return fallback;
+  }
+  const n = Number(trimmed);
   if (!Number.isFinite(n)) {
     process.stderr.write(`[agent-bridge] ignoring non-numeric ${name}=${JSON.stringify(raw)}; using default ${fallback}\n`);
+    return fallback;
+  }
+  return n;
+}
+
+// envNum for a BYTE CAP that other invariants depend on. A cap is only meaningful as a positive integer
+// at or above `min`; a fractional one (4096.5 → a 4097-byte write and a marker reporting "926.5B") or one
+// too small to hold the smallest record we promise stays parseable silently breaks those promises.
+// Two rejection paths, split by whether the value carries an INTENT we can honour:
+//   - a positive integer below `min` (200, 10): the intent is "cap it TIGHTER", and that direction is
+//     legitimate. CLAMP to `min` — the tightest value we can actually keep our promises at. Falling back
+//     to the default here would inverted the request, handing someone who asked for 200 a cap of 4096.
+//   - anything else (fractional, negative, non-numeric): no coherent direction to honour, so fall back to
+//     the default.
+// Either way we warn loudly and never silently honour a value we cannot keep. 0 stays meaningful
+// (explicitly disables the cap) and is passed through untouched.
+function envByteCap(name, fallback, min) {
+  const n = envNum(name, fallback);
+  if (n === 0) return 0;
+  // isSafeInteger, not isInteger: Number("9007199254740993") silently rounds to ...992 and
+  // Number("1e20") is an "integer" too. A cap we cannot represent faithfully is a malformed cap.
+  if (Number.isSafeInteger(n) && n > 0 && n < min) {
+    process.stderr.write(
+      `[agent-bridge] ${name}=${n} is below the minimum ${min}; clamped to ${min} ` +
+        `(a smaller cap cannot keep an exit-journal record parseable)\n`,
+    );
+    return min;
+  }
+  if (!Number.isSafeInteger(n) || n < 0) {
+    process.stderr.write(
+      `[agent-bridge] ignoring ${name}=${JSON.stringify(process.env[name])}; must be 0 or an integer >= ${min} (using default ${fallback})\n`,
+    );
     return fallback;
   }
   return n;
@@ -51,6 +95,23 @@ const PID_DIR = path.join(STATE_ROOT, "pids");
 const LOG_RETENTION_DAYS = envNum("AGENT_BRIDGE_LOG_RETENTION_DAYS", 7);
 const LOG_MAX_BYTES = envNum("AGENT_BRIDGE_LOG_MAX_MB", 500) * 1024 * 1024;
 const LOG_FILE_MAX_BYTES = envNum("AGENT_BRIDGE_LOG_FILE_MAX_MB", 200) * 1024 * 1024;
+// Hard ceiling on a SINGLE appendLog write. appendLog is the sole funnel for every diagnostic write, so
+// this bounds line length for every backend — including ones added later. Without it the only defence was
+// a per-backend "don't log event type X" list, which has already had to be extended twice after the fact
+// (message_update's O(n^2) re-serialization; get_state/get_last_assistant_text at ~1GB per log, issue #1)
+// and was still wide open on codex, where one item/completed carrying a command's aggregatedOutput was
+// measured at 1,583,143 bytes on a single line. Type exclusions are whack-a-mole; this is the floor
+// underneath them. Applies ONLY to *.log/exit-journal diagnostics — never to answerFile/textRef/MCP text,
+// which stay complete by product contract.
+// The floor is what the smallest record we promise to keep PARSEABLE needs: a zero-session exit-journal
+// skeleton is ~192 B empty-reason / ~260 B with a long reason, and the truncation marker costs ~25 B.
+// 512 leaves that comfortably intact. Below it we could still write bounded diagnostics, but the
+// exit-journal guarantee would quietly stop holding — so refuse the value instead of half-keeping it.
+const LOG_LINE_MIN_BYTES = 512;
+const LOG_LINE_MAX_BYTES = envByteCap("AGENT_BRIDGE_LOG_LINE_MAX_BYTES", 4096, LOG_LINE_MIN_BYTES);
+// Per-string ceiling inside a logged JSON event (redactForLog). Bounds unknown/future bulk fields before
+// they reach the line cap, so a huge field truncates just itself instead of eating the rest of the event.
+const LOG_FIELD_MAX_CHARS = envNum("AGENT_BRIDGE_LOG_FIELD_MAX_CHARS", 512);
 // Durable exit journal: one JSONL line per server shutdown (clean OR crash), written to STATE_ROOT so
 // it survives the run dir being deleted on clean exit (that deletion takes bridge.log — the only record
 // of WHY we exited — with it). Bounded across process lifetimes by pruneExitJournal() at startup, which
@@ -893,14 +954,57 @@ function appendSystemPromptSummary(sess, injectionMode) {
 // session's .log would grow unbounded. Rotation keeps at most the current file plus one ".1"
 // generation (still a *.log name, so pruneLogs reaps it under the age/total caps).
 const logBytesWritten = new Map();
+// Enforce LOG_LINE_MAX_BYTES on one write; returns the Buffer actually written.
+// LOG_LINE_MAX_BYTES is the TOTAL write budget, marker included — the marker is paid for out of the
+// budget, not added on top, so "max bytes" means what it says and callers can assert `<= cap` exactly.
+// Head-keeping: the start of a line carries the identity of the event (method/type/ids); the tail is the
+// payload we can afford to lose. The marker ends with \n so the log stays line-oriented and a truncated
+// line is self-describing rather than silently short.
+// UTF-8: we back off over continuation bytes so a multi-byte character is never cut in half. That holds
+// only for input that is valid UTF-8 ON ITS OWN — normalizeLogPayload enforces exactly that.
+function clampLogWrite(text) {
+  const buf = Buffer.isBuffer(text) ? text : Buffer.from(String(text), "utf8");
+  if (LOG_LINE_MAX_BYTES <= 0 || buf.length <= LOG_LINE_MAX_BYTES) return buf;
+  // Reserve the marker's WORST-CASE width (the dropped count can never have more digits than the total
+  // length), so end + actual marker is always <= the cap.
+  const reserve = Buffer.byteLength(`…[+${buf.length}B truncated]\n`, "utf8");
+  let end = Math.max(0, LOG_LINE_MAX_BYTES - reserve);
+  // Never cut a multi-byte UTF-8 sequence in half: back off over continuation bytes (10xxxxxx).
+  while (end > 0 && (buf[end] & 0xc0) === 0x80) end--;
+  return Buffer.concat([buf.subarray(0, end), Buffer.from(`…[+${buf.length - end}B truncated]\n`, "utf8")]);
+}
+// Every child stream setEncoding("utf8"), so appendLog receives strings and a character can never
+// straddle two calls. That invariant used to live only in a comment — and a comment cannot stop the next
+// backend from adding a raw `stderr.on("data", buf => appendLog(...))` path and silently resurrecting the
+// mojibake bug. Enforce it here instead. We cannot repair a split character at this layer (we do not know
+// which stream a Buffer came from, and string writes interleave between chunks), so: a Buffer that is
+// valid UTF-8 on its own is accepted; one that is not is DROPPED for a diagnostic naming the real fix.
+// Non-throwing by construction — a log write must never become an exception in the caller's control flow.
+let warnedInvalidLogBuffer = false;
+function normalizeLogPayload(text) {
+  if (!Buffer.isBuffer(text)) return text;
+  if (isUtf8(text)) return text.toString("utf8");
+  if (!warnedInvalidLogBuffer) {
+    warnedInvalidLogBuffer = true;
+    process.stderr.write(
+      "[agent-bridge] a log write passed a Buffer that is not valid UTF-8 on its own; dropping it. " +
+        'The source stream needs setEncoding("utf8") so multi-byte characters are not split across chunks. ' +
+        "(warned once; later occurrences are still marked in the log)\n",
+    );
+  }
+  return `[agent-bridge] dropped ${text.length}B log write: invalid UTF-8 buffer (source stream needs setEncoding)\n`;
+}
+
 function appendLog(file, text) {
   if (!file || !text) return;
   // Best-effort diagnostics: a logging failure (disk full, permission, a briefly-locked file) must NEVER
   // throw into the caller's control flow — otherwise a stray log line could strand an in-flight turn.
   try {
   fs.mkdirSync(path.dirname(file), { recursive: true });
+  // Clamp BEFORE the rotation bookkeeping so the counter tracks bytes actually written to disk.
+  const payload = clampLogWrite(normalizeLogPayload(text));
   if (LOG_FILE_MAX_BYTES > 0) {
-    const bytes = Buffer.byteLength(text, "utf8");
+    const bytes = payload.length;
     let written = logBytesWritten.get(file) || 0;
     if (written > 0 && written + bytes > LOG_FILE_MAX_BYTES) {
       // Reset the counter ONLY when the rename actually happened. On failure (file briefly locked
@@ -916,7 +1020,7 @@ function appendLog(file, text) {
     }
     logBytesWritten.set(file, written + bytes);
   }
-  fs.appendFileSync(file, text, "utf8");
+  fs.appendFileSync(file, payload);
   } catch {}
 }
 
@@ -1133,19 +1237,56 @@ function buildSessionResult(session, fullText, options = {}) {
   return result;
 }
 
-// Remove model thinking/reasoning content before logging an event (keeps the answer, tool calls,
-// and structure; drops the chain-of-thought from disk).
-function stripThinking(value, depth = 0) {
-  if (!value || typeof value !== "object" || depth >= 10) return value;
+// Keys whose value is BODY content — model prose, chain-of-thought, or a tool/command's output. These
+// are the fields that carry both the bulk and the sensitive full text (a command's stdout can be an
+// entire file). Elided to a size marker, never recorded verbatim. This is what already kept the
+// claude/cursor/kimi logs small by skipping assistant/tool/user lines wholesale; codex and omp log every
+// non-delta event, so they need it at the field level instead.
+const LOG_BODY_KEYS = new Set([
+  "thinking", "reasoning_content", "thinkingSignature", // chain-of-thought
+  "aggregatedOutput", "aggregated_output", // codex commandExecution: the command's stdout+stderr
+  "text", "delta", "output", // assistant / tool-result message bodies — always leaves, always prose
+]);
+
+// Keys that are a body ONLY when they hold a bare string. When they hold a structure we recurse instead,
+// because the structure carries the diagnostics: OMP's `content: [{type,name,...}]` on a tool_execution
+// event is where the TOOL NAME lives, and eliding the array wholesale threw away "which tool ran" along
+// with the payload. Recursing keeps type/name/id/status and still elides the `text`/`output` leaves
+// inside, since those are in LOG_BODY_KEYS.
+const LOG_BODY_CONTAINER_KEYS = new Set(["content", "displayContent"]);
+
+function elidedMarker(value) {
+  if (typeof value === "string") return `<elided ${value.length}c>`;
+  if (Array.isArray(value)) return `<elided ${value.length} items>`;
+  return "<elided>";
+}
+
+// Shape an event for the diagnostic log: keep the SKELETON (method, ids, item type, cwd, status,
+// exitCode, durationMs, and the command itself — short and high-value), drop the bodies. Every other
+// string is clamped to LOG_FIELD_MAX_CHARS, so a bulk field we have never seen (a new backend's schema,
+// a renamed one) is bounded too instead of needing a new entry in a list — and appendLog's line cap
+// backstops whatever still gets through.
+function redactForLog(value, depth = 0) {
+  if (typeof value === "string") {
+    return value.length > LOG_FIELD_MAX_CHARS
+      ? `${value.slice(0, LOG_FIELD_MAX_CHARS)}…<+${value.length - LOG_FIELD_MAX_CHARS}c>`
+      : value;
+  }
+  if (value === null || typeof value !== "object") return value; // numbers, booleans, null
+  // Depth guard. Returning the raw object here would hand back an UNREDACTED subtree — a body nested
+  // past the limit (or any unknown long string down there) would land on disk verbatim. The size cap
+  // would still bound it, but the "no bodies on disk" promise would not hold, so elide instead.
+  if (depth >= 10) return "<elided deep object>";
   if (Array.isArray(value)) {
     return value
       .filter(item => !(item && typeof item === "object" && item.type === "thinking"))
-      .map(item => stripThinking(item, depth + 1));
+      .map(item => redactForLog(item, depth + 1));
   }
   const out = {};
   for (const [key, child] of Object.entries(value)) {
-    if (key === "thinking" || key === "reasoning_content" || key === "thinkingSignature") continue;
-    out[key] = stripThinking(child, depth + 1);
+    if (LOG_BODY_KEYS.has(key)) out[key] = elidedMarker(child);
+    else if (LOG_BODY_CONTAINER_KEYS.has(key) && typeof child === "string") out[key] = elidedMarker(child);
+    else out[key] = redactForLog(child, depth + 1);
   }
   return out;
 }
@@ -1777,8 +1918,13 @@ class OmpRpcSession {
     this.proc.stdout.on("close", () => appendLog(this.logFile, "[agent-bridge] OMP stdout closed\n"));
     this.proc.stderr.on("close", () => appendLog(this.logFile, "[agent-bridge] OMP stderr closed\n"));
 
-    this.proc.stderr.on("data", chunk => {
-      const text = chunk.toString("utf8");
+    // Decode on the STREAM, not per chunk. `chunk.toString("utf8")` decoded each Buffer in isolation, so a
+    // multi-byte character straddling a chunk boundary became two replacement characters (the lead bytes
+    // died with chunk N, the continuation bytes were decoded alone in chunk N+1). setEncoding runs one
+    // StringDecoder across the whole stream, which holds a partial sequence until its continuation
+    // arrives. Every other backend already does this; omp was the last Buffer path into appendLog.
+    this.proc.stderr.setEncoding("utf8");
+    this.proc.stderr.on("data", text => {
       appendLog(this.logFile, text);
       // stderr is NOT an error channel: these CLIs write progress/info to it routinely (e.g. codex's
       // "failed to refresh available models" line). Route it to lastStderr (diagnostics), not lastError,
@@ -1863,10 +2009,14 @@ class OmpRpcSession {
     //   every call; the answer already lands via turn_end/agent_end and in answerFile, so logging
     //   the response too is redundant and re-bloats on repeated result() polling.
     // Live state is still available via the get_state response object itself.
+    // These two exclusions are frequency/redundancy filters and are kept, but they are no longer what
+    // bounds the log: redactForLog elides message bodies (the nested content[].text blobs that dominated
+    // turn_end/agent_end/tool_execution_end here) and appendLog caps the write. Adding a third exclusion
+    // for the next chatty event type should NOT be the fix.
     const isMessageUpdate = message.type === "message_update";
     const isBulkResponse =
       message.type === "response" && (message.command === "get_state" || message.command === "get_last_assistant_text");
-    if (!isMessageUpdate && !isBulkResponse) appendLog(this.logFile, `${JSON.stringify(stripThinking(message))}\n`);
+    if (!isMessageUpdate && !isBulkResponse) appendLog(this.logFile, `${JSON.stringify(redactForLog(message))}\n`);
 
     this.updatedAt = nowIso();
     if (message.type === "ready") {
@@ -2467,9 +2617,12 @@ class CodexAppServerSession {
       pushEvent(this, { type: "raw", line });
       return;
     }
-    // Skip logging the high-frequency streaming delta notifications verbatim; the final
-    // item/turn events (logged below) still capture the assembled output.
-    if (msg.method !== "item/agentMessage/delta") appendLog(this.logFile, `${JSON.stringify(stripThinking(msg))}\n`);
+    // Skip the high-frequency streaming delta notifications entirely (frequency, not size). Everything
+    // else is logged through redactForLog: the event skeleton survives — for a commandExecution that
+    // means item type, the command itself, cwd, status, exitCode, durationMs — while the bodies
+    // (aggregatedOutput, agentMessage/reasoning text) are elided to a size marker. Before this, one
+    // item/completed carrying a command's output was measured at 1.5 MB on a single line.
+    if (msg.method !== "item/agentMessage/delta") appendLog(this.logFile, `${JSON.stringify(redactForLog(msg))}\n`);
     this.updatedAt = nowIso();
     if (msg.id !== undefined && msg.method) {
       // Server-initiated request: we do not implement any, so reject. #write throws if stdin
@@ -3080,7 +3233,14 @@ class ClaudeCodeSession {
     let msg;
     try { msg = JSON.parse(line); } catch { appendLog(this.logFile, `${line}\n`); pushEvent(this, { type: "raw", line }); return; }
     // Skip verbatim-logging high-frequency streaming chunks; the result event still carries final text.
-    if (msg.type !== "assistant" && msg.type !== "stream_event") appendLog(this.logFile, `${JSON.stringify(stripThinking(msg))}\n`);
+    // On a `result` event, `result` IS the answer verbatim — the one field the generic string clamp would
+    // otherwise leave 512 characters of on disk, and the OPENING of an answer is exactly where a summary,
+    // a credential, or the user's data sits. Elided here, on the claude event path, deliberately NOT via
+    // LOG_BODY_KEYS: the bare key `result` is also the codex JSON-RPC envelope's structured payload
+    // (thread ids and friends), and eliding that globally would gut the skeleton we log codex events for.
+    // The answer itself is never lost — it lives in answerFile/textRef in full.
+    const forLog = msg.type === "result" && typeof msg.result === "string" ? { ...msg, result: elidedMarker(msg.result) } : msg;
+    if (msg.type !== "assistant" && msg.type !== "stream_event") appendLog(this.logFile, `${JSON.stringify(redactForLog(forLog))}\n`);
     this.updatedAt = nowIso();
     if (msg.type === "control_response") { this.#handleControlResponse(msg); return; } // method added in Task 4
     if (msg.type === "system" && msg.subtype === "init" && msg.session_id) this.claudeSessionId = msg.session_id;
@@ -3585,7 +3745,7 @@ class CursorAgentSession {
     // Don't verbatim-log high-frequency streaming (thinking deltas / assistant chunks); result carries
     // the final text. thinking is chain-of-thought — never persisted. user echoes the prompt — dropped
     // for privacy (§2.1/§5.5).
-    if (msg.type !== "assistant" && msg.type !== "thinking" && msg.type !== "user") appendLog(this.logFile, `${JSON.stringify(stripThinking(msg))}\n`);
+    if (msg.type !== "assistant" && msg.type !== "thinking" && msg.type !== "user") appendLog(this.logFile, `${JSON.stringify(redactForLog(msg))}\n`);
     this.updatedAt = nowIso();
     switch (msg.type) {
       case "system":
@@ -4098,7 +4258,7 @@ class KimiCodeSession {
     try { msg = JSON.parse(line); } catch { appendLog(this.logFile, `${line}\n`); pushEvent(this, { type: "raw" }); return; }
     // Don't verbatim-log high-frequency assistant chunks or tool results (may carry sensitive full text,
     // §2.1), nor a `user` prompt-echo line (privacy, §5.5); log meta/other lines (ids/structure only).
-    if (msg.role !== "assistant" && msg.role !== "tool" && msg.role !== "user") appendLog(this.logFile, `${JSON.stringify(stripThinking(msg))}\n`);
+    if (msg.role !== "assistant" && msg.role !== "tool" && msg.role !== "user") appendLog(this.logFile, `${JSON.stringify(redactForLog(msg))}\n`);
     this.updatedAt = nowIso();
     switch (msg.role) {
       case "user":
@@ -5200,6 +5360,38 @@ function cleanupSessions(options = {}) {
   sessions.clear();
 }
 
+// Fit one exit-journal record inside a single appendLog write, so the line stays PARSEABLE JSON.
+// appendLog caps every write and gets no exemption — a byte-level truncation there would leave a
+// half-written object that JSON.parse rejects, losing the whole shutdown record. Everything in the base
+// record is bounded by construction; `sessions` is the only part that grows with load, so trim THAT, in
+// whole elements, and say how many were dropped. The cut point floats with the real serialized size
+// (session ids and status strings vary in length) — never a hard-coded session count.
+// Note the loop probes with the same `sessionsOmitted` value the final record will carry, so the record
+// returned is byte-identical to the last probe that fit.
+function fitExitJournalRecord(base, sessionStates) {
+  const total = sessionStates.length;
+  if (LOG_LINE_MAX_BYTES <= 0) return { ...base, sessions: sessionStates, sessionCount: total, sessionsOmitted: 0 };
+  const budget = LOG_LINE_MAX_BYTES - 1; // the trailing "\n" is part of the write
+  // Start from the SKELETON — zero sessions — and make sure even that fits before trying to add any.
+  // Trimming sessions cannot rescue a record whose fixed part is already over budget. Every field here is
+  // bounded by construction except `reason` (it can carry an exception message), so that is the one we
+  // shorten. A record with a clipped reason still parses; a byte-truncated one does not. LOG_LINE_MIN_BYTES
+  // keeps this from firing in practice — it is the backstop for the pathological-reason case.
+  const skeleton = { ...base, sessions: [], sessionCount: total, sessionsOmitted: total };
+  while (Buffer.byteLength(JSON.stringify(skeleton), "utf8") > budget && String(skeleton.reason || "").length > 0) {
+    skeleton.reason = String(skeleton.reason).slice(0, -1);
+  }
+  const kept = [];
+  let omitted = total;
+  for (const s of sessionStates) {
+    const probe = { ...skeleton, sessions: [...kept, s], sessionsOmitted: omitted - 1 };
+    if (Buffer.byteLength(JSON.stringify(probe), "utf8") > budget) break;
+    kept.push(s);
+    omitted--;
+  }
+  return { ...skeleton, sessions: kept, sessionsOmitted: omitted };
+}
+
 // Bound the durable exit journal across process lifetimes: it gains one line per shutdown and (unlike
 // run dirs) is never swept, so cap it. When it exceeds EXIT_JOURNAL_MAX_BYTES, rotate to a single .1
 // sibling — keeps the most recent ~cap of history. Best-effort; called once at server startup.
@@ -5224,7 +5416,7 @@ function cleanupAndExit(code = 0, reason = "shutdown", error = null) {
     for (const s of sessions.values()) {
       try { sessionStates.push({ id: s.id, status: s.status, access: s.access ?? null, backendPid: s.proc?.pid ?? null }); } catch {}
     }
-    appendLog(EXIT_JOURNAL, `${JSON.stringify({
+    appendLog(EXIT_JOURNAL, `${JSON.stringify(fitExitJournalRecord({
       ts: nowIso(),
       runId: path.basename(RUN_LOG_DIR),
       code,
@@ -5233,8 +5425,7 @@ function cleanupAndExit(code = 0, reason = "shutdown", error = null) {
       ppid: process.ppid,
       uptimeSec: Math.round(process.uptime()),
       activeRequests,
-      sessions: sessionStates,
-    })}\n`);
+    }, sessionStates))}\n`);
   } catch {}
   appendLog(path.join(RUN_LOG_DIR, "bridge.log"), `[${nowIso()}] Agent Bridge shutdown code=${code} reason=${reason}\n`);
   if (error) {
