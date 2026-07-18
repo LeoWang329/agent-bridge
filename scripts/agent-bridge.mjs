@@ -27,13 +27,26 @@ function envNum(name, fallback) {
 
 // envNum for a BYTE CAP that other invariants depend on. A cap is only meaningful as a positive integer
 // at or above `min`; a fractional one (4096.5 → a 4097-byte write and a marker reporting "926.5B") or one
-// too small to hold the smallest record we promise stays parseable silently breaks those promises. Same
-// contract as envNum: warn loudly, fall back to the default — never honour a value we cannot keep.
-// 0 stays meaningful (explicitly disables the cap) and is passed through.
+// too small to hold the smallest record we promise stays parseable silently breaks those promises.
+// Two rejection paths, split by whether the value carries an INTENT we can honour:
+//   - a positive integer below `min` (200, 10): the intent is "cap it TIGHTER", and that direction is
+//     legitimate. CLAMP to `min` — the tightest value we can actually keep our promises at. Falling back
+//     to the default here would inverted the request, handing someone who asked for 200 a cap of 4096.
+//   - anything else (fractional, negative, non-numeric): no coherent direction to honour, so fall back to
+//     the default.
+// Either way we warn loudly and never silently honour a value we cannot keep. 0 stays meaningful
+// (explicitly disables the cap) and is passed through untouched.
 function envByteCap(name, fallback, min) {
   const n = envNum(name, fallback);
   if (n === 0) return 0;
-  if (!Number.isInteger(n) || n < min) {
+  if (Number.isInteger(n) && n > 0 && n < min) {
+    process.stderr.write(
+      `[agent-bridge] ${name}=${n} is below the minimum ${min}; clamped to ${min} ` +
+        `(a smaller cap cannot keep an exit-journal record parseable)\n`,
+    );
+    return min;
+  }
+  if (!Number.isInteger(n) || n < 0) {
     process.stderr.write(
       `[agent-bridge] ignoring ${name}=${JSON.stringify(process.env[name])}; must be 0 or an integer >= ${min} (using default ${fallback})\n`,
     );

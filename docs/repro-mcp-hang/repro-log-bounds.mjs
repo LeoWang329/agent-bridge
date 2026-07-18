@@ -320,30 +320,50 @@ try {
   s5.kill();
   await sleep(200);
 
-  // ---------- S9: a cap we cannot keep our promises at is REFUSED, not half-honoured ----------
+  // ---------- S9: an unusable cap is refused by INTENT DIRECTION, not one-size-fits-all ----------
   // A cap below the floor (or a fractional one) silently broke two guarantees: the exit-journal record
   // stopped parsing, and at a very small cap the marker alone exceeded the "max bytes" it was named for.
-  // Both are now rejected at the config boundary with a warning + fallback to the default.
-  for (const [label, value, ] of [["below the floor", "200"], ["fractional", "4096.5"], ["marker-sized", "10"]]) {
+  // Both are refused at the config boundary — but NOT identically:
+  //   - a positive integer below the floor means "cap it TIGHTER", a direction we can honour → CLAMP to
+  //     the floor. Falling back to the default would invert the request (ask for 200, receive 4096).
+  //   - a malformed value (fractional, negative) has no direction to honour → fall back to the default.
+  // The two branches are asserted SEPARATELY: different warning wording AND a different effective cap,
+  // observed behaviourally via whether 8 sessions overflow the exit-journal record (they do at 512, they
+  // do not at 4096). Asserting only the warning text would not prove the cap actually took effect.
+  const capCase = async (label, value, expect) => {
     const st = fs.mkdtempSync(path.join(os.tmpdir(), "ab-logbounds-cap-"));
     const s6 = makeServer({ AGENT_BRIDGE_STATE_DIR: st, OMP_BIN: FAKE_OMP, FAKE_OMP_MODE: "okturn", AGENT_BRIDGE_LOG_LINE_MAX_BYTES: value });
     let warned = "";
     s6.srv.stderr.on("data", d => { warned += d; });
     await s6.init();
-    const wid = (await s6.call("agent_bridge_open_session", { agent: "omp", cwd: CWD }, 60000))?.session?.id;
-    check(`S9 (${label}: ${value}) rejected with a warning naming the constraint`,
-      /must be 0 or an integer >= 512/.test(warned) && warned.includes(value), warned.trim().split("\n")[0]?.slice(0, 110) || "(no warning)");
-    s6.srv.stdin.end();
-    await sleep(2000);
-    const jl = fs.readFileSync(path.join(st, "exit-journal.jsonl"), "utf8").trim().split("\n").filter(Boolean);
-    let ok = jl.length > 0;
-    for (const l of jl) { try { JSON.parse(l); } catch { ok = false; } }
-    check(`S9 (${label}) exit journal still parses after the fallback`, ok, `${jl.length} line(s), ${Buffer.byteLength(jl[0] || "", "utf8")}B`);
+    let wid = null;
+    for (let i = 0; i < 8; i++) wid = (await s6.call("agent_bridge_open_session", { agent: "omp", cwd: CWD }, 60000))?.session?.id || wid;
+    check(`S9 (${label}: ${value}) warns with the ${expect.kind} wording`,
+      expect.warn.test(warned) && !expect.notWarn.test(warned), warned.trim().split("\n")[0]?.slice(0, 120) || "(no warning)");
     check(`S9 (${label}) the session still opened normally`, Boolean(wid), String(wid));
+    s6.srv.stdin.end();
+    await sleep(2500);
+    const jl = fs.readFileSync(path.join(st, "exit-journal.jsonl"), "utf8").trim().split("\n").filter(Boolean);
+    let ok = jl.length > 0, r = null;
+    for (const l of jl) { try { r = JSON.parse(l); } catch { ok = false; } }
+    const bytes = Buffer.byteLength(jl[0] || "", "utf8");
+    check(`S9 (${label}) exit journal still parses`, ok && Boolean(r), `${jl.length} line(s), ${bytes}B`);
+    // The discriminating half: WHICH cap actually took effect.
+    check(`S9 (${label}) the EFFECTIVE cap is ${expect.cap}, not the other branch's value`,
+      bytes + 1 <= expect.cap && r?.sessionsOmitted === expect.omitted && r?.sessionCount === 8,
+      `record ${bytes}B, kept ${r?.sessions?.length}/${r?.sessionCount}, omitted ${r?.sessionsOmitted} (expected omitted ${expect.omitted})`);
     s6.kill();
     await sleep(200);
     try { fs.rmSync(st, { recursive: true, force: true }); } catch {}
-  }
+  };
+  // Below the floor → clamped to 512: 8 sessions cannot fit, so the record must show trimming.
+  const CLAMP = { kind: "clamp", warn: /is below the minimum 512; clamped to 512/, notWarn: /using default/, cap: 512, omitted: 5 };
+  // Malformed → default 4096: 8 sessions fit comfortably, so nothing is trimmed.
+  const FALLBACK = { kind: "fallback", warn: /must be 0 or an integer >= 512 \(using default 4096\)/, notWarn: /clamped to/, cap: 4096, omitted: 0 };
+  await capCase("below the floor", "200", CLAMP);
+  await capCase("marker-sized", "10", CLAMP);
+  await capCase("fractional", "4096.5", FALLBACK);
+  await capCase("negative", "-1", FALLBACK);
 
   // ---------- S10: a valid cap AT the floor keeps the exit-journal promise ----------
   const st10 = fs.mkdtempSync(path.join(os.tmpdir(), "ab-logbounds-floor-"));
