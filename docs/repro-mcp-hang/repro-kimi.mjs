@@ -128,33 +128,17 @@ function cimCommandLine(pid) {
   const r = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CommandLine`], { encoding: "utf8", windowsHide: true });
   return (r.stdout || "").trim();
 }
-// MUST mirror AGENTS.kimi.matchesCommand in scripts/agent-bridge.mjs (kept in sync by review). This is a
-// QUICK replica for documentation only — the AUTHORITATIVE checks (positive + the M1 quoted-`-p` false
-// positive) go through the REAL registry matcher via the live `cleanup` path in S17.
-function tokenizeWin(s) {
-  const tokens = [];
-  let i = 0, n = s.length, cur = "", inQ = false, has = false;
-  while (i < n) {
-    const c = s[i];
-    if (c === "\\") { let bs = 0; while (i < n && s[i] === "\\") { bs++; i++; }
-      if (i < n && s[i] === '"') { cur += "\\".repeat(bs >> 1); if (bs & 1) { cur += '"'; i++; } else { inQ = !inQ; i++; } has = true; }
-      else { cur += "\\".repeat(bs); has = true; } continue; }
-    if (c === '"') { inQ = !inQ; has = true; i++; continue; }
-    if (!inQ && (c === " " || c === "\t")) { if (has) { tokens.push(cur); cur = ""; has = false; } i++; continue; }
-    cur += c; has = true; i++;
-  }
-  if (has) tokens.push(cur);
-  return tokens;
+// Exercise the REAL registry matcher / health derivation via the bridge's read-only `diag` entry — NOT a
+// hand-copied replica (a replica hid M1). `diag match` returns the booleans AGENTS.kimi.matchesCommand
+// (the exact function cleanup uses) yields for each command-line string; `diag health` returns
+// deriveHealth() for a synthetic session object.
+function realMatch(cmds) {
+  const r = spawnSync("node", [BRIDGE, "diag", "match", "kimi-stream-json"], { input: JSON.stringify(cmds), encoding: "utf8", windowsHide: true });
+  try { return JSON.parse(r.stdout); } catch { return fail(`diag match did not return JSON: ${r.stdout}\n${r.stderr}`); }
 }
-function matcherReplica(cmd) {
-  const tokens = tokenizeWin(String(cmd));
-  if (tokens.length < 2) return false;
-  if (tokens[0].split(/[\\/]/).pop().toLowerCase() !== "kimi.exe") return false;
-  let pIdx = -1;
-  for (let i = 1; i < tokens.length - 1; i++) { if (tokens[i] === "-p") { pIdx = i; break; } }
-  if (pIdx < 0) return false;
-  for (let i = 1; i + 1 < pIdx; i++) { if (tokens[i] === "--output-format" && tokens[i + 1] === "stream-json") return true; }
-  return false;
+function realHealth(obj) {
+  const r = spawnSync("node", [BRIDGE, "diag", "health"], { input: JSON.stringify(obj), encoding: "utf8", windowsHide: true });
+  try { return JSON.parse(r.stdout); } catch { return fail(`diag health did not return JSON: ${r.stdout}\n${r.stderr}`); }
 }
 
 // Drive one turn to completion and return the wait result.
@@ -279,7 +263,10 @@ async function main() {
     console.log("[harness] S6 OK — continuation id mismatch → failed, chatId preserved (never overwritten), degraded");
   }
 
-  // ── S7: abort tree-kills a resumable turn → healthy idle + reusable; stale close doesn't clobber ───
+  // ── S7: abort tree-kills a resumable turn → healthy idle + reusable ─────────────────────────────────
+  // (Honest scope: abort() settles ONLY on the killed child's close, so the old child is fully gone before
+  // the follow-up send — this is abort+reuse, NOT a late stale-close race. The genuine late stale-close
+  // where an old child's close arrives AFTER a new turn began is exercised in S26 via the ENOENT-retry.)
   let capturedTurnCmd = "";
   {
     const s = makeServer("okthenhang"); await s.init();
@@ -309,7 +296,7 @@ async function main() {
     await s.call("agent_bridge_abort", { session_id: sess.id });
     await s.call("agent_bridge_close_session", { session_id: sess.id });
     s.kill(); await sleep(150);
-    console.log("[harness] S7 OK — abort tree-kills a resumable turn → healthy idle; session reusable; stale close doesn't clobber the new turn");
+    console.log("[harness] S7 OK — abort tree-kills a resumable turn → healthy idle; session reusable (real late stale-close is S26)");
   }
 
   // ── S8: FIRST-turn abort (before any meta) → idle but dead (chatId null) + send throws ─────────────
@@ -473,22 +460,26 @@ async function main() {
     console.log("[harness] S16 OK — resolveKimiBin resolves via default %USERPROFILE%\\.kimi-code\\bin and via PATH (kimi.exe only)");
   }
 
-  // ── S17: cleanup matcher — replica negatives + REAL cleanup path (positive reap + M1 quoted-`-p` NOT reaped) ──
+  // ── S17: cleanup matcher — REAL matcher (diag) incl. argv0 edge cases + REAL cleanup path (reap vs NOT-reap) ──
   {
-    // Quick replica checks (documentation; the REAL matcher is exercised below via live cleanup).
-    if (!matcherReplica(capturedTurnCmd)) return fail(`matcher must match a REAL spawned turn command line, did not: ${JSON.stringify(capturedTurnCmd)}`);
-    const notKimi = `"C:\\other\\node.exe" fake.js --output-format stream-json -S session_x -p "hi"`; // argv0 not kimi.exe
-    if (matcherReplica(notKimi)) return fail("matcher must NOT match a non-kimi.exe argv0 even with the right flags");
-    const m1False = `"C:\\tools\\kimi.exe" --output-format stream-json --note "hello -p world"`; // ` -p ` only INSIDE a quoted arg — no top-level -p
-    if (matcherReplica(m1False)) return fail("matcher must NOT match when the only `-p` is inside a quoted argument (M1 false positive)");
-    const bareP = `"C:\\tools\\kimi.exe" --output-format stream-json -p`; // trailing -p, no prompt arg
-    if (matcherReplica(bareP)) return fail("matcher must NOT match a dangling -p with no prompt");
-    const realTurn = `"C:\\tools\\kimi.exe" --output-format stream-json -S session_11111111-2222-4333-8444-555555555555 -m kimi-code/k3 -p "do work"`;
-    if (!matcherReplica(realTurn)) return fail("matcher must match a well-formed kimi turn command line");
+    // Assert the REAL registry matcher (via `diag match`, NOT a replica — M4) on a matrix including the M1
+    // argv0-faithfulness cases that no LIVE process can reproduce (embedded quote / leading whitespace).
+    const matrix = [
+      [capturedTurnCmd, true, "a REAL spawned turn command line (from S7)"],
+      [`"C:\\other\\node.exe" fake.js --output-format stream-json -S session_x -p "hi"`, false, "argv0 not kimi.exe"],
+      [`"C:\\tools\\kimi.exe" --output-format stream-json --note "hello -p world"`, false, "only `-p` is inside a quoted arg (M1)"],
+      [`"C:\\tools\\kimi.exe" --output-format stream-json -p`, false, "dangling -p with no prompt"],
+      [`C:\\Tmp\\ki"mi.exe" --output-format stream-json -p x`, false, "embedded `\"` in an UNQUOTED argv0 is literal → basename ki\"mi.exe\" (M1 argv0)"],
+      [`   "C:\\tools\\kimi.exe" --output-format stream-json -p x`, false, "leading whitespace → empty argv0 (M1 argv0)"],
+      [`C:\\tools\\kimi.exe --output-format stream-json -p realprompt`, true, "unquoted argv0, well-formed turn"],
+      [`"C:\\tools\\kimi.exe" --output-format stream-json -S session_11111111-2222-4333-8444-555555555555 -m kimi-code/k3 -p "do work"`, true, "quoted argv0, well-formed turn"],
+    ];
+    const got = realMatch(matrix.map(m => m[0]));
+    for (let i = 0; i < matrix.length; i++) if (got[i] !== matrix[i][1]) return fail(`S17: real matcher on «${matrix[i][2]}» → ${got[i]}, expected ${matrix[i][1]} (cmd=${JSON.stringify(matrix[i][0])})`);
 
     // Run a REAL cleanup over TWO live orphans: (P) a genuine turn shape that MUST be reaped, and (N) the
     // M1 false-positive shape (argv0=kimi.exe, --output-format stream-json, but `-p` only inside a quoted
-    // arg) that MUST NOT be reaped. This drives the REAL registry matcher (M4 — the replica alone hid M1).
+    // arg) that MUST NOT be reaped. This drives the REAL registry matcher end-to-end (M4).
     const pArgs = ["--output-format", "stream-json", "-S", "session_22222222-3333-4444-8555-666666666666", "-m", "kimi-code/k3", "-p", "orphan work"];
     const nArgs = ["--output-format", "stream-json", "--note", "hello -p world"]; // no top-level -p
     const spawnOrphan = args => spawn(stubExe, args, { windowsHide: true, env: { ...process.env, FAKE_KIMI_MODE: "hang", ...FAKE_ENV }, stdio: "ignore" });
@@ -496,7 +487,7 @@ async function main() {
     const nOrphan = spawnOrphan(nArgs);
     await sleep(800);
     if (!pOrphan.pid || !pidAlive(pOrphan.pid) || !nOrphan.pid || !pidAlive(nOrphan.pid)) { for (const o of [pOrphan, nOrphan]) try { o.kill("SIGKILL"); } catch {}; return fail("S17: could not start both live orphans"); }
-    if (!matcherReplica(cimCommandLine(pOrphan.pid))) { for (const o of [pOrphan, nOrphan]) try { o.kill("SIGKILL"); } catch {}; return fail(`S17: positive orphan's real cmdline should match replica: ${JSON.stringify(cimCommandLine(pOrphan.pid))}`); }
+    if (!realMatch([cimCommandLine(pOrphan.pid)])[0]) { for (const o of [pOrphan, nOrphan]) try { o.kill("SIGKILL"); } catch {}; return fail(`S17: positive orphan's real cmdline should match: ${JSON.stringify(cimCommandLine(pOrphan.pid))}`); }
     const pidsDir = path.join(stateDir, "pids"); fs.mkdirSync(pidsDir, { recursive: true });
     const mkRec = (id, pid, args) => { const f = path.join(pidsDir, `${id}.json`); fs.writeFileSync(f, JSON.stringify({ id, agent: "kimi", ownerPid: 999999, cwd: CWD, createdAt: new Date().toISOString(), processes: [{ role: "kimi-stream-json", pid, command: [stubExe, ...args.slice(0, -1), "<prompt:redacted>"], spawnedAt: new Date().toISOString() }] }, null, 2)); return f; };
     const pRec = mkRec("kimi-orphan-pos", pOrphan.pid, pArgs);
@@ -514,7 +505,7 @@ async function main() {
     if (reapedNeg) return fail(`S17: real cleanup must NOT terminate the M1 false-positive shape (quoted -p) — SECURITY BOUNDARY. summary=${JSON.stringify(summary)}`);
     if (!negAlive) return fail("S17: the M1 false-positive process was killed by cleanup — matcher over-matched (M1 regression)");
     if (fs.existsSync(pRec)) return fail("S17: cleanup should remove the reaped positive pid record");
-    console.log("[harness] S17 OK — REAL matcher reaps a genuine turn AND leaves the M1 quoted-`-p` false-positive UNTOUCHED (security boundary); replica negatives hold");
+    console.log("[harness] S17 OK — REAL matcher (diag) correct on the full matrix incl. argv0 edge cases (embedded quote / leading ws); live cleanup reaps a genuine turn AND leaves the M1 quoted-`-p` shape UNTOUCHED");
   }
 
   // ── S18: concurrent abort DURING send's spawn-await (pre-begin) must not be lost (M3) ──────────────
@@ -612,8 +603,11 @@ async function main() {
     console.log("[harness] S22 OK — resolvedBin is absolutized: a relative KIMI_BIN works even when session cwd ≠ server cwd (M2)");
   }
 
-  // ── S23: a closed session is removed (closed → dead/gone from the caller's view) ────────────────────
+  // ── S23: closed → dead — deriveHealth(closed)="dead" AND the session is removed (gone to the caller) ──
   {
+    // Assert the design's health invariant directly against the REAL deriveHealth (a closed session is
+    // removed from the map, so it can't be observed via status — use the read-only diag entry).
+    if (realHealth({ status: "closed", chatId: "session_x", turnCount: 2 }) !== "dead") return fail(`S23: deriveHealth(closed) must be "dead", got ${JSON.stringify(realHealth({ status: "closed" }))}`);
     const s = makeServer("ok"); await s.init();
     const sess = (await openKimi(s))?.session;
     await runTurn(s, sess.id, "hi");
@@ -621,11 +615,72 @@ async function main() {
     const after = await s.call("agent_bridge_status", { session_id: sess.id });
     if (!after?.__error || !/unknown session/i.test(after.__error)) return fail(`S23: a closed session should be gone (Unknown session), got ${JSON.stringify(after)}`);
     s.kill(); await sleep(150);
-    console.log("[harness] S23 OK — closed session is removed (status → Unknown session): closed = dead/gone to the caller");
+    console.log("[harness] S23 OK — deriveHealth(closed)=\"dead\"; a closed session is removed (status → Unknown session)");
+  }
+
+  // ── S24: send(wait:true) with a short timeout → the turn is aborted (not left running) ──────────────
+  {
+    const s = makeServer("hang"); await s.init();
+    const sess = (await openKimi(s))?.session;
+    // wait:true blocks inline; on timeout send() aborts its own turn and throws the timeout error.
+    const r = await s.call("agent_bridge_send_message", { session_id: sess.id, message: "will hang", wait: true, timeout_ms: 1200 }, 15000);
+    if (!r?.__error || !/tim(e|ed) ?out/i.test(r.__error)) return fail(`S24: a wait:true send that times out should error with a timeout, got ${JSON.stringify(r)}`);
+    let post = null;
+    for (let i = 0; i < 50; i++) { await sleep(120); post = (await s.call("agent_bridge_status", { session_id: sess.id }))?.session; if (post && post.status !== "running" && post.status !== "starting") break; }
+    if (post?.status !== "idle") return fail(`S24: after a wait timeout the turn must be aborted (idle), got ${post?.status}`);
+    if (post?.pid) return fail(`S24: the timed-out turn's process should be tree-killed, pid ${post.pid} still set`);
+    s.kill(); await sleep(150);
+    console.log("[harness] S24 OK — send(wait:true) timeout aborts the turn (idle, process tree-killed), never left running");
+  }
+
+  // ── S25: concurrent close() DURING send's spawn-await (pre-begin) settles cleanly, no double-settle ─
+  {
+    const s = makeServer("hang"); await s.init();
+    const sess = (await openKimi(s))?.session;
+    // Fire send + close back-to-back → close lands in the spawn-await window (status=closed, turn nulled),
+    // send bails without beginning the turn; the child's close hits the status===closed guard. No revival,
+    // no double-settle. Verify the session is gone AND the server stays healthy (a fresh turn still works).
+    s.fire("agent_bridge_send_message", { session_id: sess.id, message: "pre-begin close" });
+    s.fire("agent_bridge_close_session", { session_id: sess.id });
+    await sleep(1500);
+    const after = await s.call("agent_bridge_status", { session_id: sess.id });
+    if (!after?.__error || !/unknown session/i.test(after.__error)) return fail(`S25: after a pre-begin close the session should be gone, got ${JSON.stringify(after)}`);
+    // The SAME server must not be wedged/crashed by the race: a brand-new session opens cleanly on it.
+    const reopened = await openKimi(s);
+    if (!reopened?.session?.id) return fail(`S25: server should stay responsive after a pre-begin close race (reopen failed): ${JSON.stringify(reopened)}`);
+    await s.call("agent_bridge_close_session", { session_id: reopened.session.id });
+    s.kill(); await sleep(150);
+    console.log("[harness] S25 OK — pre-begin close (during spawn-await) settles cleanly: session gone, no double-settle/revival, server responsive");
+  }
+
+  // ── S26: REAL late stale-close — an old child's close arrives AFTER a new turn began; identity gate holds ─
+  {
+    // Force a genuine stale close: start() caches the default-path binary (binHome); we then DELETE binHome
+    // so the first turn's cached-bin spawn ENOENTs → the ENOENT retry re-resolves and finds a DIFFERENT
+    // valid binary on PATH (binPath) → a SECOND child (candidateB) actually begins the turn. candidateA's
+    // late `close` (from the ENOENT) fires AFTER candidateB began; `this.proc===child` must ignore it so it
+    // never pollutes candidateB's turn (no phantom failure / double-settle).
+    const homeC = path.join(tmpRoot, "homeC");
+    const kimiHomeC = path.join(homeC, ".kimi-code", "bin"); fs.mkdirSync(kimiHomeC, { recursive: true });
+    const binHome = path.join(kimiHomeC, "kimi.exe"); fs.copyFileSync(stubExe, binHome);
+    const pathDir = path.join(tmpRoot, "pathbin"); fs.mkdirSync(pathDir, { recursive: true });
+    fs.copyFileSync(stubExe, path.join(pathDir, "kimi.exe")); // the PATH fallback (binPath)
+    const s = makeServer("ok", { KIMI_BIN: "", USERPROFILE: homeC, PATH: `${process.env.PATH}${path.delimiter}${pathDir}` }); await s.init();
+    const sess = (await openKimi(s))?.session; // start() caches binHome (default path wins over PATH)
+    if (!sess?.id) return fail("S26: open failed");
+    fs.rmSync(binHome, { force: true }); // cached bin vanishes → first turn's spawn ENOENTs → retry finds binPath
+    const rc = await runTurn(s, sess.id, "stale close please");
+    if (rc?.text !== "hello from kimi") return fail(`S26: the re-resolved turn must complete cleanly despite the old child's late close, got ${JSON.stringify(rc?.text)}`);
+    const st = (await s.call("agent_bridge_status", { session_id: sess.id }))?.session;
+    if (st?.status !== "idle" || st?.health !== "healthy") return fail(`S26: a stale late close must not pollute the new turn (expected idle/healthy), got status=${st?.status} health=${JSON.stringify(st?.health)}`);
+    if (st?.agentSpecific?.turnCount !== 1) return fail(`S26: exactly one turn should have settled, got turnCount ${JSON.stringify(st?.agentSpecific?.turnCount)}`);
+    await s.call("agent_bridge_close_session", { session_id: sess.id });
+    s.kill(); await sleep(150);
+    console.log("[harness] S26 OK — REAL late stale-close (ENOENT-retry → new child begins): old child's late close ignored (this.proc===child), new turn clean");
   }
 
   cleanupTmp();
-  console.log("[harness] >>> PASS: Kimi backend — Shape B local-id/turn lifecycle, meta state machine, close-settlement, abort tree-kill (incl. pre-begin race), spawn-ENOENT reuse, cmdline limits, user-echo privacy, absolute bin resolution, concurrency guard, contextUsage null, health states, doctor, cleanup matcher (real M1 negative)");
+  console.log("[harness] >>> PASS: Kimi backend — Shape B lifecycle, meta state machine, close-settlement, abort tree-kill (pre-begin race + wait-timeout), spawn-ENOENT reuse, late stale-close, pre-begin close, cmdline limits, user-echo privacy, absolute bin resolution, health incl. closed→dead, doctor, cleanup matcher (REAL matcher incl. argv0 edge cases + live reap/not-reap)");
   await sleep(150);
   process.exit(0);
 }

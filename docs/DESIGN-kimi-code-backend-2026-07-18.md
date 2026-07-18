@@ -3,17 +3,18 @@
 状态：**v4 — 已实现并双评修订（core + hermetic）。** 日期 2026-07-18。作者：主 agent（Claude Opus）。
 真理源：本文件。落地 commit `d88c633`（初版）+ 复审修订（本轮）。
 
-> **v4 实现 + 代码复审修订（实现后另一独立引擎 Codex 复审 diff = NEEDS_FIXES：0 blocker + 6 major + 2 minor，全部已修 + 补测试 + 回填本文档）**：
-> - [M1] §5.1 matcher 纯正则不懂引号 → 引号内的 ` -p ` 造成假阳性（cleanup 杀进程的安全边界）。**改为引号感知的 token 扫描**（`tokenizeWindowsCommandLine`，遵 CommandLineToArgvW 反斜杠/引号规则）：argv0 basename 严格 kimi.exe + 存在独立 `-p` token 且其后有参数 + 其前存在连续 `--output-format` `stream-json` 两 token。见 §5.1。
+> **v4 实现 + 代码复审修订（实现后另一独立引擎 Codex 复审 diff，R1 = 0B/6M/2m 全修 → R2 收敛：5 项闭合，余 M1-argv0/M5-真覆盖/1 Minor 已修 = 下条）**：
+> - [M1] §5.1 matcher 纯正则不懂引号 → 引号内的 ` -p ` 造成假阳性（cleanup 杀进程的安全边界）。**改为引号感知的 token 扫描**（`tokenizeWindowsCommandLine`，遵 CommandLineToArgvW 反斜杠/引号规则）。**R2 追加**：argv0 有 CommandLineToArgvW **特殊规则**（首 token 未加引号时其内 `"`/`\` 字面、命令行前导空白则 argv0 为空串），通用规则会误剥引号致 `C:\Tmp\ki"mi.exe"` 假命中 → 拆出 `parseWindowsArgv0` 专解 argv0，再对其后用通用规则 tokenize。见 §5.1。
 > - [M2] §5.9 `resolveKimiBin()` 可能返回相对路径（相对 KIMI_BIN 或 `.` PATH 项在 MCP-server cwd 校验，但 send() 以会话 cwd spawn）→ 验 A 起 B / ENOENT。**三类候选一律 `path.resolve()` 绝对化后再校验/返回**。见 §5.9。
 > - [M3] send() 的 spawn-await 窗口内并发 `abort()`（`this.turn`/`this.proc` 已置、`turnChild` 未置）设 `userAborted=true` 后，`#beginTurn` 原会重置 `userAborted=false` → abort 丢失、被杀 child 误结算为 nonzero 失败。**改：`userAborted` 只在 send() 同步占位（首个 await 前）重置一次、`#beginTurn` 不再重置、releaseUnbegun 清除、begin 后若 userAborted 则显式 kill 该 child**，使其 close 经唯一结算点 `#settleTurn` 结算为 aborted/idle。见 §2.1/§5.2。
-> - [M4] hermetic 负例原走手抄 replica（正因此放过 M1）→ **M1 假阳性负例改走真实注册表 matcher**（repro-kimi S17：真 `cleanup` 对一个引号内含 `-p` 的活进程断言"不得终止"+仍存活）。
-> - [M5] 补设计 §8 明列但缺的场景：S18 pre-begin abort 竞态（覆盖 M3）/ S19 真 OS spawn ENOENT + 重解析 + 可复用 / S7 stale-close 复用 / S23 closed→gone / S20 cmdline 上限+NUL 真拒。
+> - [M4] hermetic 负例原走手抄 replica（正因此放过 M1）→ 改走**真实注册表 matcher**：新增只读诊断入口 `agent-bridge diag match <role>`（stdin JSON 命令行数组 → 真 `roleMatchesCommand` 布尔数组）+ `diag health`（真 `deriveHealth`）。repro-kimi S17 用它断言全矩阵（含活进程无法复现的 argv0 边缘形状），再叠加真 `cleanup` 对活进程「reap 真 turn / 不杀引号内 `-p`」。
+> - [M5] 补设计 §8 场景（R1+R2）：S18 pre-begin abort 竞态 / S19 真 spawn ENOENT+重解析+可复用 / **S24 `send(wait:true)` timeout→abort** / **S25 pre-begin close（spawn-await 窗口内并发 close，断言干净结算不双结算不复活）** / **S26 真 late stale-close（ENOENT-retry 令新 child 已 begin、旧 child close 迟到，`this.proc===child` 身份门不污染新轮）** / S23 closed→gone + `deriveHealth(closed)="dead"` / S20 cmdline 上限+NUL 真拒。（**R2 澄清**：单会话对象内「新轮已 begin 而旧 child close 未到」仅经 ENOENT-retry 可达=S26；原 S7 不制造迟到 close，已改述为诚实的 abort+reuse。）
 > - [Min1] repro-kimi S21：`role:"user"` echo 行含 secret marker → 断言 log/events 均无泄漏。
 > - [Min2] open_session 字段级描述（access/write/effort/append_system_prompt_file）补 kimi 的 soft-read / effort ignored / first-turn-prefix 语义。
-> 复审同时确认：`deriveHealth`/`spawnPlan` 字节级未动、状态机/#canRun/resolver-lazy/三处主动决定 sound、C# forwarder stub 走真实路径、无空断言。
+> - [Minor-R2] 文档状态自相矛盾（顶部 v4「已实现」vs §16 旧 R3b banner「尚未实现」）→ R3b 那句改注为设计期历史记录。
+> 复审同时确认：`deriveHealth`/`spawnPlan` 字节级未动、状态机/#canRun/resolver-lazy/三处主动决定 sound、C# forwarder stub 走真实路径、无空断言（R2 复评 M2/M3/M4/Min1/Min2 闭合、M6 rollout 延期不扣分）。
 
-> **最终复审结论**：Codex（gpt-5 系，reviewer 角色，read 档）三轮 → APPROVE。R1（2 blocker+5 major+2 minor）→ R2（M1/M5/Min1/Min2 闭合；余 1 blocker+5 major：doctor lazy-resolve/matcher/turnProtocolError/summary 泄露/statSync/artifact）→ R3（余项闭合，仅 matcher 1 major：`-p` 搜索范围）→ **R3b：APPROVE**。纯文档+代码核对（评审者 read 沙箱无法跑 kimi，§2 实测事实由作者本机真跑提供）。**本文件仅为设计，尚未实现**。
+> **最终复审结论**：Codex（gpt-5 系，reviewer 角色，read 档）三轮 → APPROVE。R1（2 blocker+5 major+2 minor）→ R2（M1/M5/Min1/Min2 闭合；余 1 blocker+5 major：doctor lazy-resolve/matcher/turnProtocolError/summary 泄露/statSync/artifact）→ R3（余项闭合，仅 matcher 1 major：`-p` 搜索范围）→ **R3b：APPROVE**。纯文档+代码核对（评审者 read 沙箱无法跑 kimi，§2 实测事实由作者本机真跑提供）。**（此为设计期结论的历史记录；实现 + 实现后代码复审见顶部 v4 banner。）**
 
 > **v3.1（Codex R3 = NEEDS_FIXES，仅剩 1 major，已修）**：R3 判 R2 六项闭合 5 项；唯一残留 = §5.1 matcher 的 `-p` 仍从整串开头搜（安装路径含 ` -p ` 会落在 argv0 内致真 bridge 进程漏匹配，且未验 -p 后有 prompt）→ 改为在 `rest = s.slice(argv0)` 上搜 `/(?:^|\s)-p\s+(?=\S)/`。
 
@@ -134,21 +135,22 @@ kimi: {
   // [M1] 纯正则不懂引号：引号内的 ` -p `/`--output-format stream-json` 会假阳性（cleanup 杀进程的安全边界，
   // 假阳性不可接受）。故先按 Windows 引号规则 tokenize，再在 TOKEN 上判定；prompt(=-p 值)永不参与匹配。
   matchesCommand: cmd => {
-    const tokens = tokenizeWindowsCommandLine(String(cmd));   // 遵 CommandLineToArgvW：双引号分组 + 反斜杠转义
-    if (tokens.length < 2) return false;
-    if (tokens[0].split(/[\\/]/).pop().toLowerCase() !== "kimi.exe") return false;  // argv0 basename 严格 = kimi.exe
+    const { argv0, rest } = parseWindowsArgv0(String(cmd));  // argv0 有 CommandLineToArgvW 特殊规则（见下）
+    if (argv0.split(/[\\/]/).pop().toLowerCase() !== "kimi.exe") return false;  // argv0 basename 严格 = kimi.exe
+    const tokens = tokenizeWindowsCommandLine(rest);          // argv0 之后的参数走通用规则（双引号分组 + 反斜杠转义）
     let pIdx = -1;
-    for (let i = 1; i < tokens.length - 1; i++) { if (tokens[i] === "-p") { pIdx = i; break; } }  // 独立 -p token 且其后有 prompt token
+    for (let i = 0; i < tokens.length - 1; i++) { if (tokens[i] === "-p") { pIdx = i; break; } }  // 独立 -p token 且其后有 prompt token
     if (pIdx < 0) return false;                              // 无顶层 -p <prompt> → 不是我们 spawn 的 turn
-    for (let i = 1; i + 1 < pIdx; i++) { if (tokens[i] === "--output-format" && tokens[i + 1] === "stream-json") return true; }  // -p 之前存在连续两 token
+    for (let i = 0; i + 1 < pIdx; i++) { if (tokens[i] === "--output-format" && tokens[i + 1] === "stream-json") return true; }  // -p 之前存在连续两 token
     return false;
   },
 }
-// 顶层新增 helper（函数声明，hoist，供 matcher 用）：
-function tokenizeWindowsCommandLine(s) { /* 双引号分组 + 2N/2N+1 反斜杠-引号转义；见 scripts 实现 */ }
+// 顶层新增两 helper（函数声明，hoist，供 matcher 用；见 scripts 实现）：
+// tokenizeWindowsCommandLine(s)：通用参数 tokenize（双引号分组 + 2N/2N+1 反斜杠-引号转义）。
+// parseWindowsArgv0(s)：[M1-R2] argv0 专解——① 前导空白 ⇒ argv0="" ；② 以 " 开头 ⇒ 取到下一个 "（去引号、内部空白/反斜杠字面）；③ 否则取到首个空白（内部 "、\ 一律字面，不转义）。
 ```
 
-- **安全边界（[M1]）**：cleanup 的 matcher 是安全边界（cursor 先例先验真实入口再验参数形状）。此处**锚 argv0 的 basename 严格 `kimi.exe`** + **引号感知 token 扫描**——无关进程即便某参数含 `foo/kimi` 或引号内的 ` -p ` 也不命中；同时不锁死 `.kimi-code` 目录，故 `KIMI_BIN` 指向的任意安装目录仍可被 cleanup 扫到。回归：repro-kimi S17 用**真实注册表 matcher**（真 cleanup 路径）对引号内 `-p` 的活进程断言「不得终止」。
+- **安全边界（[M1]）**：cleanup 的 matcher 是安全边界。**argv0 专解（`parseWindowsArgv0`）+ 其后通用 token 扫描**——无关进程即便含 `foo/kimi`、引号内的 ` -p `、未加引号的内嵌引号 argv0（`C:\Tmp\ki"mi.exe"` basename ≠ kimi.exe）、或前导空白（argv0 为空）都不命中；同时不锁死 `.kimi-code` 目录，故 `KIMI_BIN` 指向的任意安装目录仍可被 cleanup 扫到。回归：repro-kimi S17 经只读 `diag match` 断言全矩阵（含 argv0 边缘）+ 真 `cleanup` 对引号内 `-p` 活进程断言「不得终止」。
 
 ### 5.2 `KimiCodeSession` 类（以 `CursorAgentSession` :3208 为骨架）
 

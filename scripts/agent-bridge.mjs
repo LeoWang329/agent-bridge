@@ -140,6 +140,26 @@ function tokenizeWindowsCommandLine(s) {
   return tokens;
 }
 
+// Parse ONLY the program-name (argv0) token — which CommandLineToArgvW parses with SPECIAL rules distinct
+// from the general argument rules ([review M1] — using the general rules here false-matched an embedded
+// quote / leading whitespace):
+//   • a command line that STARTS WITH WHITESPACE has an EMPTY argv0 (do NOT skip ahead to the next token);
+//   • if argv0 starts with `"`, it runs to the NEXT `"` (quotes removed; `\` and spaces are literal inside);
+//   • otherwise argv0 runs to the FIRST whitespace, and `"` and `\` inside it are LITERAL (no escaping).
+// Returns { argv0, rest } — the general tokenizer (above) then applies to `rest` (the args after argv0).
+function parseWindowsArgv0(s) {
+  const n = s.length;
+  if (n > 0 && s[0] === '"') {
+    let i = 1, argv0 = "";
+    while (i < n && s[i] !== '"') { argv0 += s[i]; i++; }
+    if (i < n) i++; // consume the closing quote
+    return { argv0, rest: s.slice(i) };
+  }
+  let i = 0, argv0 = "";
+  while (i < n && s[i] !== " " && s[i] !== "\t") { argv0 += s[i]; i++; } // ", \ are LITERAL until whitespace
+  return { argv0, rest: s.slice(i) };
+}
+
 // Backend registry — the single source of truth for "which backends exist". Holds ONLY data and pure
 // functions so it is fully initialized at module load: TOOLS (enum), agentBin, assertAgent and doctor
 // all read it before the session classes below are defined. The Session constructor is bound LATER,
@@ -211,19 +231,21 @@ const AGENTS = {
     versionArgs: ["--version"], // existing kimi.exe), PATH is a last resort (kimi.exe only). NEVER resolved at registry init.
     // A bridge-spawned kimi turn command line =
     //   <…\kimi.exe> --output-format stream-json [-S session_<uuid>] [-m <model>] -p <prompt>
-    // SECURITY BOUNDARY ([review M1]): tokenize with Windows quoting rules, then match on TOKENS so a `-p`
-    // or `--output-format stream-json` sitting INSIDE a quoted argument (e.g. the prompt, or an unrelated
-    // process's args) can never false-match. Require: argv0 basename strictly kimi.exe (any install dir;
-    // not fooled by model/cwd args), an independent `-p` token WITH an argument after it, and the two
-    // consecutive tokens `--output-format` `stream-json` BEFORE that `-p`. The prompt never participates.
+    // SECURITY BOUNDARY ([review M1]): parse argv0 with CommandLineToArgvW's SPECIAL program-name rules
+    // (parseWindowsArgv0 — an embedded `"` in the exe path is LITERAL, a leading-whitespace command line has
+    // an empty argv0), THEN tokenize the REST with the general rules and match on TOKENS so a `-p` or
+    // `--output-format stream-json` sitting INSIDE a quoted argument (the prompt, or an unrelated process's
+    // args) can never false-match. Require: argv0 basename strictly kimi.exe (any install dir; not fooled by
+    // model/cwd args), an independent `-p` token WITH an argument after it, and the two consecutive tokens
+    // `--output-format` `stream-json` BEFORE that `-p`. The prompt never participates.
     matchesCommand: cmd => {
-      const tokens = tokenizeWindowsCommandLine(String(cmd));
-      if (tokens.length < 2) return false;
-      if (tokens[0].split(/[\\/]/).pop().toLowerCase() !== "kimi.exe") return false;
+      const { argv0, rest } = parseWindowsArgv0(String(cmd));
+      if (argv0.split(/[\\/]/).pop().toLowerCase() !== "kimi.exe") return false;
+      const tokens = tokenizeWindowsCommandLine(rest); // general rules for the args AFTER argv0
       let pIdx = -1;
-      for (let i = 1; i < tokens.length - 1; i++) { if (tokens[i] === "-p") { pIdx = i; break; } } // real -p with a following prompt token
+      for (let i = 0; i < tokens.length - 1; i++) { if (tokens[i] === "-p") { pIdx = i; break; } } // real -p with a following prompt token
       if (pIdx < 0) return false; // no top-level -p <prompt> → not one of our spawned turns
-      for (let i = 1; i + 1 < pIdx; i++) { if (tokens[i] === "--output-format" && tokens[i + 1] === "stream-json") return true; }
+      for (let i = 0; i + 1 < pIdx; i++) { if (tokens[i] === "--output-format" && tokens[i + 1] === "stream-json") return true; }
       return false;
     },
   },
@@ -449,9 +471,11 @@ function usage() {
     "  agent-bridge mcp                 Run the MCP server (stdio). Sessions live in this process.",
     "  agent-bridge doctor [--json]     Report environment / backend availability.",
     "  agent-bridge cleanup [--json]    Reap orphaned omp/codex/claude/cursor/kimi children from dead MCP servers.",
+    "  agent-bridge diag <match|health> Read-only diagnostics (stdin/stdout JSON): `match <role>` runs the",
+    "                                   cleanup command-line matcher; `health` runs deriveHealth. For tests/debugging.",
     "",
     "Sessions are managed exclusively through the MCP server's tools (open/send/status/result/",
-    "wait/abort/close). The CLI exposes only the server entrypoint plus doctor/cleanup helpers.",
+    "wait/abort/close). The CLI exposes only the server entrypoint plus doctor/cleanup/diag helpers.",
   ].join("\n");
 }
 
@@ -4932,6 +4956,25 @@ async function runCli(argv) {
       // owner MCP is gone), and remove abandoned logs/<runId>/ dirs from those dead servers.
       printCliResult({ childProcesses: cleanupStalePidRecords(), staleLogs: reclaimStaleLogs() }, args);
       return;
+    case "diag": {
+      // READ-ONLY diagnostic entry (no sessions, no processes touched) for exercising two pure security/
+      // correctness surfaces DIRECTLY — the ones that no live process can reproduce and that a hand-copied
+      // test replica must not be trusted to mirror ([review M1/M4]):
+      //   diag match <role>   stdin = JSON array of command-line strings → stdout = JSON array of booleans
+      //                       from the REAL registry matcher (roleMatchesCommand — the one cleanup uses).
+      //   diag health         stdin = a JSON session-shaped object → stdout = JSON string of deriveHealth(it).
+      const sub = rest[0];
+      const input = fs.readFileSync(0, "utf8");
+      if (sub === "match") {
+        const cmds = JSON.parse(input);
+        process.stdout.write(`${JSON.stringify(cmds.map(c => roleMatchesCommand(String(rest[1]), c)))}\n`);
+      } else if (sub === "health") {
+        process.stdout.write(`${JSON.stringify(deriveHealth(JSON.parse(input)))}\n`);
+      } else {
+        throw new Error(`Unknown diag subcommand: ${sub} (use "match <role>" or "health")`);
+      }
+      return;
+    }
     case undefined:
     case "help":
     case "--help":
