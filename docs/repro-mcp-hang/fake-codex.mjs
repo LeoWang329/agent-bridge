@@ -96,6 +96,10 @@ function driveTurn(tid, schema) {
     // (a) A 2 MB NON-JSON stdout line. The bridge's JSON.parse catch logs raw lines verbatim on every
     // backend — a path no redaction/type-exclusion touches, so only appendLog's byte cap can bound it.
     process.stdout.write(`fake-codex banner ${"z".repeat(2_000_000)}\n`);
+    // (a2) The same, but padded with 4-byte characters. Four lines whose ASCII prefix grows by one byte
+    // each, so whatever the cap lands on, at least three of the four cut MID-CHARACTER and the boundary
+    // back-off is actually exercised (an all-ASCII payload can never prove it).
+    for (let pad = 0; pad < 4; pad++) process.stdout.write(`fake-codex emoji${"!".repeat(pad)} ${"🙂".repeat(20_000)}\n`);
     // (b) The exact field layout observed in a real codex session log (keys: type,id,command,cwd,processId,
     // source,status,commandActions,aggregatedOutput,exitCode,durationMs).
     say({

@@ -905,14 +905,22 @@ function appendSystemPromptSummary(sess, injectionMode) {
 // session's .log would grow unbounded. Rotation keeps at most the current file plus one ".1"
 // generation (still a *.log name, so pruneLogs reaps it under the age/total caps).
 const logBytesWritten = new Map();
-// Enforce LOG_LINE_MAX_BYTES on one write. Returns a Buffer (callers pass strings AND raw stderr Buffers).
+// Enforce LOG_LINE_MAX_BYTES on one write; returns the Buffer actually written.
+// LOG_LINE_MAX_BYTES is the TOTAL write budget, marker included — the marker is paid for out of the
+// budget, not added on top, so "max bytes" means what it says and callers can assert `<= cap` exactly.
 // Head-keeping: the start of a line carries the identity of the event (method/type/ids); the tail is the
 // payload we can afford to lose. The marker ends with \n so the log stays line-oriented and a truncated
 // line is self-describing rather than silently short.
+// UTF-8: we back off over continuation bytes so a multi-byte character is never cut in half. That is
+// sound only because every caller hands us a STRING, or a Buffer that is whole on its own — child
+// streams all setEncoding("utf8") so no character ever straddles two appendLog calls.
 function clampLogWrite(text) {
   const buf = Buffer.isBuffer(text) ? text : Buffer.from(String(text), "utf8");
   if (LOG_LINE_MAX_BYTES <= 0 || buf.length <= LOG_LINE_MAX_BYTES) return buf;
-  let end = LOG_LINE_MAX_BYTES;
+  // Reserve the marker's WORST-CASE width (the dropped count can never have more digits than the total
+  // length), so end + actual marker is always <= the cap.
+  const reserve = Buffer.byteLength(`…[+${buf.length}B truncated]\n`, "utf8");
+  let end = Math.max(0, LOG_LINE_MAX_BYTES - reserve);
   // Never cut a multi-byte UTF-8 sequence in half: back off over continuation bytes (10xxxxxx).
   while (end > 0 && (buf[end] & 0xc0) === 0x80) end--;
   return Buffer.concat([buf.subarray(0, end), Buffer.from(`…[+${buf.length - end}B truncated]\n`, "utf8")]);
@@ -1167,8 +1175,15 @@ function buildSessionResult(session, fullText, options = {}) {
 const LOG_BODY_KEYS = new Set([
   "thinking", "reasoning_content", "thinkingSignature", // chain-of-thought
   "aggregatedOutput", "aggregated_output", // codex commandExecution: the command's stdout+stderr
-  "text", "content", "delta", "displayContent", // assistant / tool-result / user message bodies
+  "text", "delta", "output", // assistant / tool-result message bodies — always leaves, always prose
 ]);
+
+// Keys that are a body ONLY when they hold a bare string. When they hold a structure we recurse instead,
+// because the structure carries the diagnostics: OMP's `content: [{type,name,...}]` on a tool_execution
+// event is where the TOOL NAME lives, and eliding the array wholesale threw away "which tool ran" along
+// with the payload. Recursing keeps type/name/id/status and still elides the `text`/`output` leaves
+// inside, since those are in LOG_BODY_KEYS.
+const LOG_BODY_CONTAINER_KEYS = new Set(["content", "displayContent"]);
 
 function elidedMarker(value) {
   if (typeof value === "string") return `<elided ${value.length}c>`;
@@ -1187,7 +1202,11 @@ function redactForLog(value, depth = 0) {
       ? `${value.slice(0, LOG_FIELD_MAX_CHARS)}…<+${value.length - LOG_FIELD_MAX_CHARS}c>`
       : value;
   }
-  if (!value || typeof value !== "object" || depth >= 10) return value;
+  if (value === null || typeof value !== "object") return value; // numbers, booleans, null
+  // Depth guard. Returning the raw object here would hand back an UNREDACTED subtree — a body nested
+  // past the limit (or any unknown long string down there) would land on disk verbatim. The size cap
+  // would still bound it, but the "no bodies on disk" promise would not hold, so elide instead.
+  if (depth >= 10) return "<elided deep object>";
   if (Array.isArray(value)) {
     return value
       .filter(item => !(item && typeof item === "object" && item.type === "thinking"))
@@ -1195,7 +1214,9 @@ function redactForLog(value, depth = 0) {
   }
   const out = {};
   for (const [key, child] of Object.entries(value)) {
-    out[key] = LOG_BODY_KEYS.has(key) ? elidedMarker(child) : redactForLog(child, depth + 1);
+    if (LOG_BODY_KEYS.has(key)) out[key] = elidedMarker(child);
+    else if (LOG_BODY_CONTAINER_KEYS.has(key) && typeof child === "string") out[key] = elidedMarker(child);
+    else out[key] = redactForLog(child, depth + 1);
   }
   return out;
 }
@@ -1827,8 +1848,13 @@ class OmpRpcSession {
     this.proc.stdout.on("close", () => appendLog(this.logFile, "[agent-bridge] OMP stdout closed\n"));
     this.proc.stderr.on("close", () => appendLog(this.logFile, "[agent-bridge] OMP stderr closed\n"));
 
-    this.proc.stderr.on("data", chunk => {
-      const text = chunk.toString("utf8");
+    // Decode on the STREAM, not per chunk. `chunk.toString("utf8")` decoded each Buffer in isolation, so a
+    // multi-byte character straddling a chunk boundary became two replacement characters (the lead bytes
+    // died with chunk N, the continuation bytes were decoded alone in chunk N+1). setEncoding runs one
+    // StringDecoder across the whole stream, which holds a partial sequence until its continuation
+    // arrives. Every other backend already does this; omp was the last Buffer path into appendLog.
+    this.proc.stderr.setEncoding("utf8");
+    this.proc.stderr.on("data", text => {
       appendLog(this.logFile, text);
       // stderr is NOT an error channel: these CLIs write progress/info to it routinely (e.g. codex's
       // "failed to refresh available models" line). Route it to lastStderr (diagnostics), not lastError,
@@ -3137,7 +3163,14 @@ class ClaudeCodeSession {
     let msg;
     try { msg = JSON.parse(line); } catch { appendLog(this.logFile, `${line}\n`); pushEvent(this, { type: "raw", line }); return; }
     // Skip verbatim-logging high-frequency streaming chunks; the result event still carries final text.
-    if (msg.type !== "assistant" && msg.type !== "stream_event") appendLog(this.logFile, `${JSON.stringify(redactForLog(msg))}\n`);
+    // On a `result` event, `result` IS the answer verbatim — the one field the generic string clamp would
+    // otherwise leave 512 characters of on disk, and the OPENING of an answer is exactly where a summary,
+    // a credential, or the user's data sits. Elided here, on the claude event path, deliberately NOT via
+    // LOG_BODY_KEYS: the bare key `result` is also the codex JSON-RPC envelope's structured payload
+    // (thread ids and friends), and eliding that globally would gut the skeleton we log codex events for.
+    // The answer itself is never lost — it lives in answerFile/textRef in full.
+    const forLog = msg.type === "result" && typeof msg.result === "string" ? { ...msg, result: elidedMarker(msg.result) } : msg;
+    if (msg.type !== "assistant" && msg.type !== "stream_event") appendLog(this.logFile, `${JSON.stringify(redactForLog(forLog))}\n`);
     this.updatedAt = nowIso();
     if (msg.type === "control_response") { this.#handleControlResponse(msg); return; } // method added in Task 4
     if (msg.type === "system" && msg.subtype === "init" && msg.session_id) this.claudeSessionId = msg.session_id;
@@ -5257,6 +5290,29 @@ function cleanupSessions(options = {}) {
   sessions.clear();
 }
 
+// Fit one exit-journal record inside a single appendLog write, so the line stays PARSEABLE JSON.
+// appendLog caps every write and gets no exemption — a byte-level truncation there would leave a
+// half-written object that JSON.parse rejects, losing the whole shutdown record. Everything in the base
+// record is bounded by construction; `sessions` is the only part that grows with load, so trim THAT, in
+// whole elements, and say how many were dropped. The cut point floats with the real serialized size
+// (session ids and status strings vary in length) — never a hard-coded session count.
+// Note the loop probes with the same `sessionsOmitted` value the final record will carry, so the record
+// returned is byte-identical to the last probe that fit.
+function fitExitJournalRecord(base, sessionStates) {
+  const total = sessionStates.length;
+  if (LOG_LINE_MAX_BYTES <= 0) return { ...base, sessions: sessionStates, sessionCount: total, sessionsOmitted: 0 };
+  const budget = LOG_LINE_MAX_BYTES - 1; // the trailing "\n" is part of the write
+  const kept = [];
+  let omitted = total;
+  for (const s of sessionStates) {
+    const probe = { ...base, sessions: [...kept, s], sessionCount: total, sessionsOmitted: omitted - 1 };
+    if (Buffer.byteLength(JSON.stringify(probe), "utf8") > budget) break;
+    kept.push(s);
+    omitted--;
+  }
+  return { ...base, sessions: kept, sessionCount: total, sessionsOmitted: omitted };
+}
+
 // Bound the durable exit journal across process lifetimes: it gains one line per shutdown and (unlike
 // run dirs) is never swept, so cap it. When it exceeds EXIT_JOURNAL_MAX_BYTES, rotate to a single .1
 // sibling — keeps the most recent ~cap of history. Best-effort; called once at server startup.
@@ -5281,7 +5337,7 @@ function cleanupAndExit(code = 0, reason = "shutdown", error = null) {
     for (const s of sessions.values()) {
       try { sessionStates.push({ id: s.id, status: s.status, access: s.access ?? null, backendPid: s.proc?.pid ?? null }); } catch {}
     }
-    appendLog(EXIT_JOURNAL, `${JSON.stringify({
+    appendLog(EXIT_JOURNAL, `${JSON.stringify(fitExitJournalRecord({
       ts: nowIso(),
       runId: path.basename(RUN_LOG_DIR),
       code,
@@ -5290,8 +5346,7 @@ function cleanupAndExit(code = 0, reason = "shutdown", error = null) {
       ppid: process.ppid,
       uptimeSec: Math.round(process.uptime()),
       activeRequests,
-      sessions: sessionStates,
-    })}\n`);
+    }, sessionStates))}\n`);
   } catch {}
   appendLog(path.join(RUN_LOG_DIR, "bridge.log"), `[${nowIso()}] Agent Bridge shutdown code=${code} reason=${reason}\n`);
   if (error) {

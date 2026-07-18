@@ -21,6 +21,14 @@
 //                      cap and a 100 KB line cap until rotation fires: the rotated .1.log must be ~1 MB.
 //                      If the counter had used pre-truncation sizes (2 MB/turn) it would have rotated
 //                      after the FIRST turn, leaving a ~100 KB .1.log — the discriminating assertion.
+//   S6 omp hazards   — a multi-byte character split across two STDERR writes survives (stream-level
+//                      decode, not per-chunk); a structured `content` keeps tool type/name/id while its
+//                      text/output leaves are elided; a body nested past the depth guard never lands.
+//   S7 claude result — `{type:"result", result:"<answer>"}` carries the answer VERBATIM. It must be
+//                      elided outright, not left at 512 characters by the generic string clamp.
+//   S8 exit journal  — the shutdown record must stay PARSEABLE JSON. appendLog gets no exemption, so the
+//                      producer trims whole `sessions[]` entries to the write budget and reports
+//                      sessionCount/sessionsOmitted. A byte-truncated record would fail JSON.parse.
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -32,6 +40,8 @@ const BRIDGE = path.resolve(HERE, "../../scripts/agent-bridge.mjs");
 const CWD = path.resolve(HERE, "../..");
 const win = process.platform === "win32";
 const FAKE_CODEX = path.join(HERE, win ? "fake-codex.cmd" : "fake-codex.sh");
+const FAKE_OMP = path.join(HERE, win ? "fake-omp.cmd" : "fake-omp.sh");
+const FAKE_CLAUDE = path.join(HERE, win ? "fake-claude.cmd" : "fake-claude.sh");
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 let pass = 0, fail = 0;
@@ -82,8 +92,8 @@ async function oneTurn(s, sessionId) {
 }
 
 const LINE_CAP = 4096; // AGENT_BRIDGE_LOG_LINE_MAX_BYTES default
-const STATE_A = fs.mkdtempSync(path.join(os.tmpdir(), "ab-logbounds-a-"));
-const STATE_B = fs.mkdtempSync(path.join(os.tmpdir(), "ab-logbounds-b-"));
+const [STATE_A, STATE_B, STATE_C, STATE_D, STATE_E] =
+  ["a", "b", "c", "d", "e"].map(x => fs.mkdtempSync(path.join(os.tmpdir(), `ab-logbounds-${x}-`)));
 
 try {
   // ---------- S1-S4: default caps ----------
@@ -104,16 +114,42 @@ try {
   const beforeBytes = 2_000_000 + "fake-codex banner ".length;
   console.log(`[evidence] log=${raw.length}B lines=${lines.length} maxLine=${maxLine}B (pre-fix: one raw line alone was ${beforeBytes}B)`);
 
-  // S1 — line cap
-  check("S1 no line exceeds the cap (+marker slack)", maxLine <= LINE_CAP + 64, `maxLine=${maxLine}B cap=${LINE_CAP}B`);
+  // S1 — line cap. The cap is the TOTAL write budget, marker included: every write is <= cap, so each
+  // line (which is the write minus its trailing "\n") is <= cap - 1. No slack.
+  check("S1 no write exceeds the cap — exactly, no slack", maxLine <= LINE_CAP - 1, `maxLine=${maxLine}B cap=${LINE_CAP}B`);
   const truncated = lines.filter(l => /…\[\+\d+B truncated\]$/.test(l));
-  check("S1 the 2MB raw line is present and marked truncated", truncated.length >= 1, `${truncated.length} truncated line(s)`);
+  check("S1 both oversized raw lines are present and marked truncated", truncated.length >= 2, `${truncated.length} truncated line(s)`);
   const bannerLine = truncated.find(l => l.startsWith("fake-codex banner"));
   check("S1 truncation keeps the HEAD (event identity survives)", Boolean(bannerLine), bannerLine ? bannerLine.slice(0, 40) : "missing");
+  // EXACT arithmetic, no tolerance: the write is `<banner>\n` (beforeBytes+1 bytes); the marker's
+  // worst-case width is reserved out of the budget, so kept = cap - reserve and dropped = total - kept.
+  const reserve = Buffer.byteLength(`…[+${beforeBytes + 1}B truncated]\n`, "utf8");
+  const expectKept = LINE_CAP - reserve;
+  const expectDropped = beforeBytes + 1 - expectKept;
   const dropped = bannerLine && Number(bannerLine.match(/\+(\d+)B truncated/)[1]);
-  check("S1 marker reports the dropped byte count honestly",
-    Boolean(dropped) && Math.abs(dropped + LINE_CAP - (beforeBytes + 1)) <= 8, `dropped=${dropped}B`);
-  check("S1 log is valid UTF-8 (no split multi-byte sequence)", !raw.toString("utf8").includes("�"));
+  check("S1 marker reports the dropped byte count EXACTLY", dropped === expectDropped, `dropped=${dropped}B expected=${expectDropped}B`);
+  const bannerWrite = Buffer.byteLength(bannerLine || "", "utf8") + 1;
+  check("S1 the truncated write is exactly the cap", bannerWrite === LINE_CAP, `${bannerWrite}B vs cap ${LINE_CAP}B`);
+
+  // S1b — the boundary back-off, proven on 4-byte characters (m4: an all-ASCII payload cannot prove it).
+  // Four lines with prefixes differing by one byte, so the cut lands mid-character on at least three.
+  const emojiLines = truncated.filter(l => l.startsWith("fake-codex emoji"));
+  check("S1b all four emoji-padded lines are present and truncated", emojiLines.length === 4, `${emojiLines.length}/4`);
+  let backedOff = 0, cleanCuts = 0;
+  for (const l of emojiLines) {
+    const kept = l.slice(0, l.indexOf("…[+"));
+    const keptBytes = Buffer.byteLength(kept, "utf8");
+    const prefixBytes = keptBytes - (kept.match(/🙂/gu) || []).length * 4;
+    // Whole characters only: strip the emoji and what remains must be the pure-ASCII prefix.
+    const wholeChars = /^fake-codex emoji!* (🙂)*$/u.test(kept);
+    if (!wholeChars) { check(`S1b line(prefix ${prefixBytes}B) cut a character in half`, false, kept.slice(-8)); break; }
+    const emojiReserve = Buffer.byteLength(`…[+${Buffer.byteLength(l, "utf8") + 1}B truncated]\n`, "utf8");
+    if (keptBytes < LINE_CAP - emojiReserve) backedOff++; else cleanCuts++;
+  }
+  check("S1b every kept prefix is a WHOLE number of characters (nothing cut in half)",
+    emojiLines.length === 4, `${backedOff} needed back-off, ${cleanCuts} landed on a boundary`);
+  check("S1b the back-off path actually ran (not just lucky alignment)", backedOff >= 3, `${backedOff}/4 lines backed off`);
+  check("S1b no replacement character anywhere in the log", !raw.toString("utf8").includes("�"));
 
   // S2 — redaction: skeleton kept, bodies gone
   const cmdLine = lines.find(l => l.includes('"commandExecution"'));
@@ -172,8 +208,109 @@ try {
   await s2.call("agent_bridge_close_session", { session_id: sid });
   s2.kill();
   await sleep(300);
+
+  // ---------- S6: omp — cross-chunk UTF-8, structured `content`, past-depth bodies ----------
+  const s3 = makeServer({ AGENT_BRIDGE_STATE_DIR: STATE_C, OMP_BIN: FAKE_OMP, FAKE_OMP_MODE: "logstress" });
+  await s3.init();
+  const oid = (await s3.call("agent_bridge_open_session", { agent: "omp", cwd: CWD }, 60000))?.session?.id;
+  if (!oid) die("open omp failed");
+  await s3.call("agent_bridge_send_message", { session_id: oid, message: "stress the log", wait: "all" }, 60000);
+  await sleep(400);
+  const ost = await s3.call("agent_bridge_status", { session_id: oid });
+  const oraw = fs.readFileSync(ost?.session?.logFile, "utf8");
+  const olines = oraw.split("\n").filter(Boolean);
+
+  // M3 — the emoji was split across two stderr writes; a per-chunk decode yields two U+FFFD.
+  // The two stderr writes are ~80ms apart, so unrelated log lines land BETWEEN them — assert on the two
+  // halves, not on a contiguous string. The character itself is emitted whole with the SECOND write
+  // (the stream decoder held the lead bytes); pre-fix this read "��:end".
+  const splitHead = oraw.includes("[fake-omp] split:");
+  const splitTail = oraw.includes("🙂:end");
+  check("S6 cross-chunk stderr character reassembled whole", splitHead && splitTail,
+    splitHead && splitTail ? "lead bytes held by the stream decoder, emitted with the next chunk"
+      : oraw.includes("�") ? "found replacement characters (per-chunk decode)" : `head=${splitHead} tail=${splitTail}`);
+  check("S6 no replacement character in the omp log", !oraw.includes("�"));
+
+  // m2 — structured `content` recurses: tool identity survives, leaf bodies do not.
+  const toolLine = olines.find(l => l.includes("tool_execution_end"));
+  if (!toolLine) die("no tool_execution_end line in the omp log");
+  const tool = JSON.parse(toolLine);
+  check("S6 tool identity kept: toolName", tool.toolName === "Bash", String(tool.toolName));
+  check("S6 structured content kept as a structure (not elided wholesale)", Array.isArray(tool.result?.content),
+    JSON.stringify(tool.result?.content)?.slice(0, 60));
+  check("S6 content block keeps type/name/id", tool.result.content[0]?.type === "tool_use" && tool.result.content[0]?.name === "Bash" && tool.result.content[0]?.id === "tu_1",
+    JSON.stringify(tool.result.content[0])?.slice(0, 80));
+  check("S6 content leaf bodies elided", tool.result.content.every(b => String(b.text).startsWith("<elided ")),
+    JSON.stringify(tool.result.content.map(b => b.text)));
+  check("S6 sibling `output` leaf elided, sibling structure kept",
+    String(tool.result.details?.output).startsWith("<elided ") && tool.result.details?.resolvedPath === "/tmp/x",
+    JSON.stringify(tool.result.details));
+
+  // m1 — a body nested past the depth guard must not reach disk verbatim.
+  const deepClean = !oraw.includes("DEEP_SECRET_BODY") && !oraw.includes("DEEP_SECRET_SCALAR");
+  check("S6 body nested past the depth guard never reaches disk", deepClean,
+    deepClean ? "no past-depth body on disk" : "found a past-depth body in the log");
+  check("S6 past-depth subtree is elided, not passed through", oraw.includes("<elided deep object>"));
+  check("S6 no tool payload anywhere in the omp log", !oraw.includes("LEAK_BODY"));
+  await s3.call("agent_bridge_close_session", { session_id: oid });
+  s3.kill();
+  await sleep(300);
+
+  // ---------- S7: claude `result` is the answer verbatim — must not land on disk ----------
+  const s4 = makeServer({ AGENT_BRIDGE_STATE_DIR: STATE_D, CLAUDE_BIN: FAKE_CLAUDE, FAKE_CLAUDE_MODE: "bigresult" });
+  await s4.init();
+  const cid = (await s4.call("agent_bridge_open_session", { agent: "claude", cwd: CWD }, 60000))?.session?.id;
+  if (!cid) die("open claude failed");
+  const cres = await s4.call("agent_bridge_send_message", { session_id: cid, message: "answer me", wait: "all" }, 60000);
+  await sleep(300);
+  const cst = await s4.call("agent_bridge_status", { session_id: cid });
+  const craw = fs.readFileSync(cst?.session?.logFile, "utf8");
+  const resultLine = craw.split("\n").filter(Boolean).find(l => l.includes('"type":"result"'));
+  if (!resultLine) die("no claude result line in the log");
+  const rmsg = JSON.parse(resultLine);
+  check("S7 claude result event is still logged (skeleton kept)", rmsg.type === "result" && "subtype" in rmsg, JSON.stringify(rmsg).slice(0, 90));
+  check("S7 claude `result` answer elided (not 512 chars of it)", String(rmsg.result).startsWith("<elided "), String(rmsg.result).slice(0, 60));
+  const cansw = cres?.text || "";
+  check("S7 the answer itself is intact in the MCP result", cansw.length > 0, `${cansw.length} chars`);
+  check("S7 no leading fragment of the answer on disk",
+    cansw.length < 24 || !craw.includes(cansw.slice(0, 24)), `answer head: ${JSON.stringify(cansw.slice(0, 24))}`);
+  await s4.call("agent_bridge_close_session", { session_id: cid });
+  s4.kill();
+  await sleep(300);
+
+  // ---------- S8: exit journal stays PARSEABLE JSON when sessions overflow the write budget ----------
+  // A small line cap reproduces the >45-session overflow without spawning 45 backends: the property
+  // under test ("the producer trims whole elements so the line parses") is cap-independent.
+  const s5 = makeServer({ AGENT_BRIDGE_STATE_DIR: STATE_E, OMP_BIN: FAKE_OMP, FAKE_OMP_MODE: "okturn", AGENT_BRIDGE_LOG_LINE_MAX_BYTES: "420" });
+  await s5.init();
+  const opened = [];
+  for (let i = 0; i < 5; i++) {
+    const oid2 = (await s5.call("agent_bridge_open_session", { agent: "omp", cwd: CWD }, 60000))?.session?.id;
+    if (oid2) opened.push(oid2);
+  }
+  check("S8 opened 5 concurrent sessions", opened.length === 5, `${opened.length}/5`);
+  s5.srv.stdin.end(); // stdin EOF -> clean shutdown -> exit journal
+  await sleep(2500);
+  const journal = path.join(STATE_E, "exit-journal.jsonl");
+  const jlines = fs.readFileSync(journal, "utf8").trim().split("\n").filter(Boolean);
+  let parsedAll = true, rec = null;
+  for (const l of jlines) { try { rec = JSON.parse(l); } catch { parsedAll = false; } }
+  console.log(`[evidence] exit-journal line = ${Buffer.byteLength(jlines[jlines.length - 1], "utf8")}B under a 420B write cap; ` +
+    `sessionCount=${rec?.sessionCount} kept=${rec?.sessions?.length} omitted=${rec?.sessionsOmitted}`);
+  check("S8 every exit-journal line is parseable JSON", parsedAll && Boolean(rec), `${jlines.length} line(s)`);
+  check("S8 no line carries a truncation marker", !jlines.some(l => l.includes("truncated")));
+  check("S8 the record fits the write budget", jlines.every(l => Buffer.byteLength(l, "utf8") + 1 <= 420));
+  check("S8 trimming actually engaged (this is not a vacuous pass)", rec?.sessionsOmitted > 0, `omitted=${rec?.sessionsOmitted}`);
+  check("S8 the total session count is reported honestly despite trimming", rec?.sessionCount === 5, `sessionCount=${rec?.sessionCount}`);
+  check("S8 kept + omitted == total", rec?.sessions?.length + rec?.sessionsOmitted === 5,
+    `${rec?.sessions?.length} + ${rec?.sessionsOmitted}`);
+  check("S8 kept session entries are whole objects, not fragments",
+    Array.isArray(rec?.sessions) && rec.sessions.length > 0 && rec.sessions.every(x => x && typeof x === "object" && "id" in x && "status" in x),
+    JSON.stringify(rec?.sessions)?.slice(0, 80));
+  s5.kill();
+  await sleep(200);
 } finally {
-  for (const d of [STATE_A, STATE_B]) { try { fs.rmSync(d, { recursive: true, force: true }); } catch {} }
+  for (const d of [STATE_A, STATE_B, STATE_C, STATE_D, STATE_E]) { try { fs.rmSync(d, { recursive: true, force: true }); } catch {} }
 }
 
 console.log(`\n[harness] ${pass} passed, ${fail} failed`);

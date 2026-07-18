@@ -23,6 +23,10 @@
 //   ctxturn   — like okturn (settles clean) but get_state ALSO reports contextUsage{tokens,contextWindow}
 //               + isCompacting/autoCompactionEnabled, so the bridge's normalized top-level contextUsage
 //               (live:true) can be asserted through result()/wait()/status(). [repro-context-usage]
+//   logstress — a clean turn that also exercises every diagnostic-log hazard: a multi-byte character
+//               split across two STDERR writes (cross-chunk UTF-8), a tool_execution_end whose `content`
+//               is a structure carrying both a tool name and big text/output leaves, and a body nested
+//               past the redaction depth guard. [repro-log-bounds]
 //   ctxslow   — like slowturn (stays running ~2.5s) with the SAME contextUsage in get_state, so a
 //               short-timeout wait times out with the session still running and the OMP reading is LIVE
 //               in pendingSnapshots[].contextUsage (mid-wait watch of a long session). [repro-context-usage]
@@ -42,9 +46,9 @@ process.stdin.on("data", d => {
       const msg = JSON.parse(line);
       if (msg.type === "get_state") {
         if (MODE === "silent") continue; // half-dead: swallow the poll, never respond
-        // Turns that settle idle (okturn/errturn/echoturn/ctxturn) must report NOT streaming, else state()
-        // would flip status back to running after turn_end and the session would never settle for wait().
-        const isStreaming = !(MODE === "okturn" || MODE === "errturn" || MODE === "echoturn" || MODE === "ctxturn");
+        // Turns that settle idle (okturn/errturn/echoturn/ctxturn/logstress) must report NOT streaming, else
+        // state() would flip status back to running after turn_end and the session would never settle for wait().
+        const isStreaming = !(MODE === "okturn" || MODE === "errturn" || MODE === "echoturn" || MODE === "ctxturn" || MODE === "logstress");
         const data = { isStreaming, queuedMessageCount: 0, sessionId: "fake", messageCount: 1 };
         // ctx* modes: real omp reports current-context occupancy in get_state.data (contextUsage sub-object
         // + isCompacting/autoCompactionEnabled siblings — see the probe dump). The bridge normalizes this to
@@ -96,6 +100,37 @@ process.stdin.on("data", d => {
             say({ type: "message_update", message: { type: "text_delta", delta: "SLOW_DONE" } });
             say({ type: "turn_end" });
           }, 2500);
+        } else if (MODE === "logstress") {
+          // Drive the diagnostic-log redaction/cap paths [repro-log-bounds]:
+          // (a) a multi-byte character SPLIT ACROSS TWO stderr writes. Decoding each Buffer on its own
+          //     turns this into two replacement characters; only a stream-level decoder survives it.
+          const smile = Buffer.from("🙂", "utf8"); // f0 9f 99 82
+          process.stderr.write(Buffer.concat([Buffer.from("[fake-omp] split:"), smile.subarray(0, 2)]));
+          setTimeout(() => process.stderr.write(Buffer.concat([smile.subarray(2), Buffer.from(":end\n")])), 80);
+          say({ type: "agent_start" });
+          setTimeout(() => {
+            // (b) a tool event whose `content` is a STRUCTURE: the tool name/id/type must survive, the
+            //     text/output leaves inside must not.
+            say({
+              type: "tool_execution_end",
+              toolCallId: "tc_1",
+              toolName: "Bash",
+              result: {
+                content: [
+                  { type: "tool_use", name: "Bash", id: "tu_1", text: `LEAK_BODY_${"q".repeat(3000)}` },
+                  { type: "text", text: `LEAK_BODY_${"r".repeat(3000)}` },
+                ],
+                details: { isDirectory: false, resolvedPath: "/tmp/x", output: `LEAK_BODY_${"s".repeat(3000)}` },
+              },
+              isError: false,
+            });
+            // (c) a body buried PAST the recursion depth guard — must not reach disk verbatim.
+            let deep = { text: "DEEP_SECRET_BODY", note: "DEEP_SECRET_SCALAR" };
+            for (let d = 0; d < 14; d++) deep = { wrap: deep };
+            say({ type: "message_end", deep });
+            say({ type: "message_update", message: { type: "text_delta", delta: "LOGSTRESS_ANSWER" } });
+            say({ type: "turn_end" });
+          }, 160);
         } else if (MODE === "turnstate") {
           // Churn turns on our own (no new prompt): start, then end->start->end. The mid re-entry
           // (turn_end -> turn_start) exercises F7's stamp-clear; we settle on turn_end (status idle,
