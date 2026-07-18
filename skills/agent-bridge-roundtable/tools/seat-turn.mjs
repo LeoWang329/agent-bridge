@@ -45,6 +45,10 @@ const VENDOR_BLACKLIST = [
   // 否则整词匹配会大量误伤正文(如 PHP Composer / music composer)。
   // 故意**不含 "cursor" 本身**(同被排除的 "omp":常用词,英文正文 "move the cursor / DB cursor" 会误伤)。
   "grok", "xai",
+  // kimi 后端的厂商级名(`kimi` 本身已在上面)。"moonshot" 作英文习语("这是个 moonshot")偶有正文误伤,但
+  // 远不到 cursor/omp 那种高频,按同粒度收进全局表;真撞上议题就用 `--vendor-topic` 降为 WARN。
+  // **不放** "k2"/"k3":太短、易在正文/版本号里误伤,要扫用每席 `--extra-names`。
+  "moonshot",
 ];
 const VENDOR_ALT = VENDOR_BLACKLIST.join("|");
 
@@ -125,7 +129,7 @@ function main(argv) {
   if (!seat) die("缺少 --seat(如 p1)");
   if (round === undefined) die("缺少 --round(如 0)");
   if (!textRef) die("缺少 --text-ref(桥返回的 textRef 绝对路径)");
-  if (!agent) die("缺少 --agent(如 omp/codex/claude/cursor)");
+  if (!agent) die("缺少 --agent(如 omp/codex/claude/cursor/kimi)");
   // 校验 seat/round:二者直接拼进文件路径与 roundRef,必须挡目录穿越/非法名(如 ../x、p1/sub)
   if (!/^p\d+$/.test(seat)) die(`--seat 必须形如 p<数字>(如 p1),收到: ${seat}`);
   const roundNum = Number(round);
