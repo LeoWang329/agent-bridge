@@ -18,6 +18,10 @@
 //                REFUSED. Exercises the round-2 edge: schemaError.error must report turn #1's OWN failure
 //                reason (from #settleTurn), not the sticky lastError that turn #2's start-refusal
 //                overwrote. [repro-schema failure-reason scenario]
+//   bigoutput  — a clean turn that first emits a commandExecution item/completed carrying a ~2 MB
+//                aggregatedOutput (the real codex shape; measured at 1.5 MB on a single log line in the
+//                field), then a long agentMessage. Proves the diagnostic log stays bounded and the event
+//                skeleton (command, exitCode, durationMs) survives. [repro-log-bounds]
 //   ctxturn    — a clean plain turn that ALSO emits a thread/tokenUsage/updated notification carrying
 //                {last:{inputTokens,totalTokens,...}, total:{...}, modelContextWindow}. Proves the bridge
 //                normalizes contextUsage from last.inputTokens (NOT total, NOT totalTokens) + modelContext-
@@ -85,6 +89,33 @@ function driveTurn(tid, schema) {
       },
     });
     say({ method: "item/completed", params: { turn: { id: tid }, item: { type: "agentMessage", text: "ctx answer", phase: "final_answer", id: "item-1" } } });
+    say({ method: "turn/completed", params: { turn: { id: tid, status: "completed" } } });
+    return;
+  }
+  if (MODE === "bigoutput") {
+    // (a) A 2 MB NON-JSON stdout line. The bridge's JSON.parse catch logs raw lines verbatim on every
+    // backend — a path no redaction/type-exclusion touches, so only appendLog's byte cap can bound it.
+    process.stdout.write(`fake-codex banner ${"z".repeat(2_000_000)}\n`);
+    // (b) The exact field layout observed in a real codex session log (keys: type,id,command,cwd,processId,
+    // source,status,commandActions,aggregatedOutput,exitCode,durationMs).
+    say({
+      method: "item/completed",
+      params: {
+        turn: { id: tid },
+        item: {
+          type: "commandExecution", id: "cmd-1",
+          command: "node -e \"process.stdout.write('x'.repeat(2e6))\"",
+          cwd: process.cwd(), processId: 4242, source: "agent", status: "completed",
+          commandActions: [{ type: "exec", command: "node -e ..." }],
+          aggregatedOutput: "x".repeat(2_000_000),
+          exitCode: 0, durationMs: 1234,
+        },
+      },
+    });
+    say({
+      method: "item/completed",
+      params: { turn: { id: tid }, item: { type: "agentMessage", text: `ran it. ${"y".repeat(50_000)}`, phase: "final_answer", id: "item-1" } },
+    });
     say({ method: "turn/completed", params: { turn: { id: tid, status: "completed" } } });
     return;
   }

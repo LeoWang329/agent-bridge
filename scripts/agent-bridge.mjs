@@ -51,6 +51,18 @@ const PID_DIR = path.join(STATE_ROOT, "pids");
 const LOG_RETENTION_DAYS = envNum("AGENT_BRIDGE_LOG_RETENTION_DAYS", 7);
 const LOG_MAX_BYTES = envNum("AGENT_BRIDGE_LOG_MAX_MB", 500) * 1024 * 1024;
 const LOG_FILE_MAX_BYTES = envNum("AGENT_BRIDGE_LOG_FILE_MAX_MB", 200) * 1024 * 1024;
+// Hard ceiling on a SINGLE appendLog write. appendLog is the sole funnel for every diagnostic write, so
+// this bounds line length for every backend — including ones added later. Without it the only defence was
+// a per-backend "don't log event type X" list, which has already had to be extended twice after the fact
+// (message_update's O(n^2) re-serialization; get_state/get_last_assistant_text at ~1GB per log, issue #1)
+// and was still wide open on codex, where one item/completed carrying a command's aggregatedOutput was
+// measured at 1,583,143 bytes on a single line. Type exclusions are whack-a-mole; this is the floor
+// underneath them. Applies ONLY to *.log/exit-journal diagnostics — never to answerFile/textRef/MCP text,
+// which stay complete by product contract.
+const LOG_LINE_MAX_BYTES = envNum("AGENT_BRIDGE_LOG_LINE_MAX_BYTES", 4096);
+// Per-string ceiling inside a logged JSON event (redactForLog). Bounds unknown/future bulk fields before
+// they reach the line cap, so a huge field truncates just itself instead of eating the rest of the event.
+const LOG_FIELD_MAX_CHARS = envNum("AGENT_BRIDGE_LOG_FIELD_MAX_CHARS", 512);
 // Durable exit journal: one JSONL line per server shutdown (clean OR crash), written to STATE_ROOT so
 // it survives the run dir being deleted on clean exit (that deletion takes bridge.log — the only record
 // of WHY we exited — with it). Bounded across process lifetimes by pruneExitJournal() at startup, which
@@ -893,14 +905,28 @@ function appendSystemPromptSummary(sess, injectionMode) {
 // session's .log would grow unbounded. Rotation keeps at most the current file plus one ".1"
 // generation (still a *.log name, so pruneLogs reaps it under the age/total caps).
 const logBytesWritten = new Map();
+// Enforce LOG_LINE_MAX_BYTES on one write. Returns a Buffer (callers pass strings AND raw stderr Buffers).
+// Head-keeping: the start of a line carries the identity of the event (method/type/ids); the tail is the
+// payload we can afford to lose. The marker ends with \n so the log stays line-oriented and a truncated
+// line is self-describing rather than silently short.
+function clampLogWrite(text) {
+  const buf = Buffer.isBuffer(text) ? text : Buffer.from(String(text), "utf8");
+  if (LOG_LINE_MAX_BYTES <= 0 || buf.length <= LOG_LINE_MAX_BYTES) return buf;
+  let end = LOG_LINE_MAX_BYTES;
+  // Never cut a multi-byte UTF-8 sequence in half: back off over continuation bytes (10xxxxxx).
+  while (end > 0 && (buf[end] & 0xc0) === 0x80) end--;
+  return Buffer.concat([buf.subarray(0, end), Buffer.from(`…[+${buf.length - end}B truncated]\n`, "utf8")]);
+}
 function appendLog(file, text) {
   if (!file || !text) return;
   // Best-effort diagnostics: a logging failure (disk full, permission, a briefly-locked file) must NEVER
   // throw into the caller's control flow — otherwise a stray log line could strand an in-flight turn.
   try {
   fs.mkdirSync(path.dirname(file), { recursive: true });
+  // Clamp BEFORE the rotation bookkeeping so the counter tracks bytes actually written to disk.
+  const payload = clampLogWrite(text);
   if (LOG_FILE_MAX_BYTES > 0) {
-    const bytes = Buffer.byteLength(text, "utf8");
+    const bytes = payload.length;
     let written = logBytesWritten.get(file) || 0;
     if (written > 0 && written + bytes > LOG_FILE_MAX_BYTES) {
       // Reset the counter ONLY when the rename actually happened. On failure (file briefly locked
@@ -916,7 +942,7 @@ function appendLog(file, text) {
     }
     logBytesWritten.set(file, written + bytes);
   }
-  fs.appendFileSync(file, text, "utf8");
+  fs.appendFileSync(file, payload);
   } catch {}
 }
 
@@ -1133,19 +1159,43 @@ function buildSessionResult(session, fullText, options = {}) {
   return result;
 }
 
-// Remove model thinking/reasoning content before logging an event (keeps the answer, tool calls,
-// and structure; drops the chain-of-thought from disk).
-function stripThinking(value, depth = 0) {
+// Keys whose value is BODY content — model prose, chain-of-thought, or a tool/command's output. These
+// are the fields that carry both the bulk and the sensitive full text (a command's stdout can be an
+// entire file). Elided to a size marker, never recorded verbatim. This is what already kept the
+// claude/cursor/kimi logs small by skipping assistant/tool/user lines wholesale; codex and omp log every
+// non-delta event, so they need it at the field level instead.
+const LOG_BODY_KEYS = new Set([
+  "thinking", "reasoning_content", "thinkingSignature", // chain-of-thought
+  "aggregatedOutput", "aggregated_output", // codex commandExecution: the command's stdout+stderr
+  "text", "content", "delta", "displayContent", // assistant / tool-result / user message bodies
+]);
+
+function elidedMarker(value) {
+  if (typeof value === "string") return `<elided ${value.length}c>`;
+  if (Array.isArray(value)) return `<elided ${value.length} items>`;
+  return "<elided>";
+}
+
+// Shape an event for the diagnostic log: keep the SKELETON (method, ids, item type, cwd, status,
+// exitCode, durationMs, and the command itself — short and high-value), drop the bodies. Every other
+// string is clamped to LOG_FIELD_MAX_CHARS, so a bulk field we have never seen (a new backend's schema,
+// a renamed one) is bounded too instead of needing a new entry in a list — and appendLog's line cap
+// backstops whatever still gets through.
+function redactForLog(value, depth = 0) {
+  if (typeof value === "string") {
+    return value.length > LOG_FIELD_MAX_CHARS
+      ? `${value.slice(0, LOG_FIELD_MAX_CHARS)}…<+${value.length - LOG_FIELD_MAX_CHARS}c>`
+      : value;
+  }
   if (!value || typeof value !== "object" || depth >= 10) return value;
   if (Array.isArray(value)) {
     return value
       .filter(item => !(item && typeof item === "object" && item.type === "thinking"))
-      .map(item => stripThinking(item, depth + 1));
+      .map(item => redactForLog(item, depth + 1));
   }
   const out = {};
   for (const [key, child] of Object.entries(value)) {
-    if (key === "thinking" || key === "reasoning_content" || key === "thinkingSignature") continue;
-    out[key] = stripThinking(child, depth + 1);
+    out[key] = LOG_BODY_KEYS.has(key) ? elidedMarker(child) : redactForLog(child, depth + 1);
   }
   return out;
 }
@@ -1863,10 +1913,14 @@ class OmpRpcSession {
     //   every call; the answer already lands via turn_end/agent_end and in answerFile, so logging
     //   the response too is redundant and re-bloats on repeated result() polling.
     // Live state is still available via the get_state response object itself.
+    // These two exclusions are frequency/redundancy filters and are kept, but they are no longer what
+    // bounds the log: redactForLog elides message bodies (the nested content[].text blobs that dominated
+    // turn_end/agent_end/tool_execution_end here) and appendLog caps the write. Adding a third exclusion
+    // for the next chatty event type should NOT be the fix.
     const isMessageUpdate = message.type === "message_update";
     const isBulkResponse =
       message.type === "response" && (message.command === "get_state" || message.command === "get_last_assistant_text");
-    if (!isMessageUpdate && !isBulkResponse) appendLog(this.logFile, `${JSON.stringify(stripThinking(message))}\n`);
+    if (!isMessageUpdate && !isBulkResponse) appendLog(this.logFile, `${JSON.stringify(redactForLog(message))}\n`);
 
     this.updatedAt = nowIso();
     if (message.type === "ready") {
@@ -2467,9 +2521,12 @@ class CodexAppServerSession {
       pushEvent(this, { type: "raw", line });
       return;
     }
-    // Skip logging the high-frequency streaming delta notifications verbatim; the final
-    // item/turn events (logged below) still capture the assembled output.
-    if (msg.method !== "item/agentMessage/delta") appendLog(this.logFile, `${JSON.stringify(stripThinking(msg))}\n`);
+    // Skip the high-frequency streaming delta notifications entirely (frequency, not size). Everything
+    // else is logged through redactForLog: the event skeleton survives — for a commandExecution that
+    // means item type, the command itself, cwd, status, exitCode, durationMs — while the bodies
+    // (aggregatedOutput, agentMessage/reasoning text) are elided to a size marker. Before this, one
+    // item/completed carrying a command's output was measured at 1.5 MB on a single line.
+    if (msg.method !== "item/agentMessage/delta") appendLog(this.logFile, `${JSON.stringify(redactForLog(msg))}\n`);
     this.updatedAt = nowIso();
     if (msg.id !== undefined && msg.method) {
       // Server-initiated request: we do not implement any, so reject. #write throws if stdin
@@ -3080,7 +3137,7 @@ class ClaudeCodeSession {
     let msg;
     try { msg = JSON.parse(line); } catch { appendLog(this.logFile, `${line}\n`); pushEvent(this, { type: "raw", line }); return; }
     // Skip verbatim-logging high-frequency streaming chunks; the result event still carries final text.
-    if (msg.type !== "assistant" && msg.type !== "stream_event") appendLog(this.logFile, `${JSON.stringify(stripThinking(msg))}\n`);
+    if (msg.type !== "assistant" && msg.type !== "stream_event") appendLog(this.logFile, `${JSON.stringify(redactForLog(msg))}\n`);
     this.updatedAt = nowIso();
     if (msg.type === "control_response") { this.#handleControlResponse(msg); return; } // method added in Task 4
     if (msg.type === "system" && msg.subtype === "init" && msg.session_id) this.claudeSessionId = msg.session_id;
@@ -3585,7 +3642,7 @@ class CursorAgentSession {
     // Don't verbatim-log high-frequency streaming (thinking deltas / assistant chunks); result carries
     // the final text. thinking is chain-of-thought — never persisted. user echoes the prompt — dropped
     // for privacy (§2.1/§5.5).
-    if (msg.type !== "assistant" && msg.type !== "thinking" && msg.type !== "user") appendLog(this.logFile, `${JSON.stringify(stripThinking(msg))}\n`);
+    if (msg.type !== "assistant" && msg.type !== "thinking" && msg.type !== "user") appendLog(this.logFile, `${JSON.stringify(redactForLog(msg))}\n`);
     this.updatedAt = nowIso();
     switch (msg.type) {
       case "system":
@@ -4098,7 +4155,7 @@ class KimiCodeSession {
     try { msg = JSON.parse(line); } catch { appendLog(this.logFile, `${line}\n`); pushEvent(this, { type: "raw" }); return; }
     // Don't verbatim-log high-frequency assistant chunks or tool results (may carry sensitive full text,
     // §2.1), nor a `user` prompt-echo line (privacy, §5.5); log meta/other lines (ids/structure only).
-    if (msg.role !== "assistant" && msg.role !== "tool" && msg.role !== "user") appendLog(this.logFile, `${JSON.stringify(stripThinking(msg))}\n`);
+    if (msg.role !== "assistant" && msg.role !== "tool" && msg.role !== "user") appendLog(this.logFile, `${JSON.stringify(redactForLog(msg))}\n`);
     this.updatedAt = nowIso();
     switch (msg.role) {
       case "user":

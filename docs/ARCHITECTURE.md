@@ -7,6 +7,16 @@
 
 ---
 
+## v0.9.1 — 诊断日志单行封顶 + 正文不落盘(2026-07-18,根因修复)
+
+**变更:** (1) `appendLog()` 内加**每次写入的字节上限** `AGENT_BRIDGE_LOG_LINE_MAX_BYTES`(默认 4096),超限写头部 + `…[+<n>B truncated]` 标记;(2) `stripThinking()` 扩为 `redactForLog()`——除原有的思维链字段外,还把**正文字段**(`aggregatedOutput` / `text` / `content` / `delta` / `displayContent`)换成尺寸标记,其余字符串按 `AGENT_BRIDGE_LOG_FIELD_MAX_CHARS`(默认 512)夹断。
+
+**为什么:** 前两次(`message_update` 的 O(n²) 重序列化、v0.6.1 的 `get_state`/`get_last_assistant_text`)都是"**发现哪类事件刷量就加一条类型排除**"。这是打地鼠:单行本身**无上限**,每接一个新后端就重新开一个洞。codex 的洞一直敞着——`item/completed` 携带命令全量输出,实测单个会话日志 8.7MB、**最长单行 1,583,143 字节**。类型排除清单治标;`appendLog` 是所有日志写入的唯一漏斗,把上限放在这里才是普适下界,新后端绕不过。同时 codex/omp 由此对齐 claude/cursor/kimi 既有的"正文不逐字落盘"隐私策略(命令本身、exit code、item 类型等骨架保留,诊断价值不丢)。
+
+**边界:** 只作用于诊断 `.log` / exit-journal。`answerFile` / `textRef` / MCP 返回的 `text` 仍是**完整未截断全文**——产品契约不变。回归见 `docs/repro-mcp-hang/repro-log-bounds.mjs`(19/19)。
+
+---
+
 ## v0.7.0 — daemon 塌缩进 MCP 进程,移除 UI(2026-06-07)
 
 **一句话:** 把"共享后台 daemon + Web UI"两层去掉,会话直接活在每个客户端自己的 MCP server 进程里。
