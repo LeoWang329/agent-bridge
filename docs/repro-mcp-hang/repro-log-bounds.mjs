@@ -385,6 +385,38 @@ try {
   await sleep(200);
   try { fs.rmSync(st10, { recursive: true, force: true }); } catch {}
 
+  // ---------- S12: a BLANK env value must not silently switch the cap off ----------
+  // envNum treated only the exact "" as unset, then Number(" ") === 0 — and 0 means "explicitly
+  // disabled" to every cap consumer. So a stray space in a .env/template/deploy config silently restored
+  // UNBOUNDED log lines: the exact root cause this whole change exists to close, reopened by whitespace.
+  // Blank is now MALFORMED (warn + default), and only a numeric 0 disables anything.
+  // The discriminator has to be the LINE CAP, not the exit-journal record: at both cap=0 and cap=4096 a
+  // handful of sessions fit untrimmed, so `sessionsOmitted` cannot tell the two apart. A 2 MB log line can.
+  const blankCase = async (label, value, expect) => {
+    const st = fs.mkdtempSync(path.join(os.tmpdir(), "ab-logbounds-blank-"));
+    const s8 = makeServer({ AGENT_BRIDGE_STATE_DIR: st, AGENT_BRIDGE_LOG_LINE_MAX_BYTES: value });
+    let warned = "";
+    s8.srv.stderr.on("data", d => { warned += d; });
+    await s8.init();
+    const { id: bid } = await oneTurn(s8);
+    const bst = await s8.call("agent_bridge_status", { session_id: bid });
+    const braw = fs.readFileSync(bst?.session?.logFile, "utf8");
+    const bmax = Math.max(...braw.split("\n").filter(Boolean).map(l => Buffer.byteLength(l, "utf8")));
+    check(`S12 (${label}) ${expect.warn ? "warns that the value is blank" : "is honoured silently"}`,
+      expect.warn ? /ignoring blank AGENT_BRIDGE_LOG_LINE_MAX_BYTES/.test(warned) : !/ignoring blank/.test(warned),
+      warned.trim().split("\n")[0]?.slice(0, 110) || "(no warning)");
+    check(`S12 (${label}) the EFFECTIVE cap is ${expect.capped ? "4096 (alive)" : "0 (disabled)"}, proven on a 2MB line`,
+      expect.capped ? bmax <= LINE_CAP - 1 && braw.includes("truncated]") : bmax > 1_000_000,
+      `maxLine=${bmax}B, log=${Buffer.byteLength(braw, "utf8")}B`);
+    s8.kill();
+    await sleep(300);
+    try { fs.rmSync(st, { recursive: true, force: true }); } catch {}
+  };
+  await blankCase("single space", " ", { warn: true, capped: true });
+  await blankCase("tab", "\t", { warn: true, capped: true });
+  // The off-switch must still work when asked for in NUMBERS — this fix must not take it away.
+  await blankCase("explicit numeric 0", "0", { warn: false, capped: false });
+
   // ---------- S11: the "no raw Buffer into appendLog" invariant, enforced by code not comment ----------
   // NOTE ON COVERAGE: the runtime branch cannot be reached through any product path — that is precisely
   // the invariant (every child stream setEncoding("utf8"), so appendLog only ever sees strings). So this

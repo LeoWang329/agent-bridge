@@ -14,10 +14,21 @@ const IS_WINDOWS = process.platform === "win32";
 // value would SILENTLY DISABLE the thing it configures (RPC timeout, watchdog, log caps) with no
 // trace. Fail loud to the default instead. (Callers needing a non-numeric default — e.g. a pid that
 // falls back to process.ppid — pass it through: an absent var returns the fallback verbatim.)
+// WHITESPACE is the same failure mode by a different route: Number(" ") is 0, not NaN, so a value of
+// " " sailed past the guard below and every "0 disables this" consumer read it as a deliberate OFF —
+// silently uncapping log size, or setting retention to keep-forever, with no trace. Blank values fall
+// out of .env files, templates and deployment systems routinely, so treat pure whitespace as MALFORMED
+// (warn + default), not as an explicit zero. A truly empty string keeps its long-standing "unset"
+// meaning (the shell's own `FOO=` idiom) and stays silent; only 0 written as a NUMBER disables anything.
 function envNum(name, fallback) {
   const raw = process.env[name];
   if (raw === undefined || raw === "") return fallback;
-  const n = Number(raw);
+  const trimmed = raw.trim();
+  if (trimmed === "") {
+    process.stderr.write(`[agent-bridge] ignoring blank ${name}=${JSON.stringify(raw)}; using default ${fallback}\n`);
+    return fallback;
+  }
+  const n = Number(trimmed);
   if (!Number.isFinite(n)) {
     process.stderr.write(`[agent-bridge] ignoring non-numeric ${name}=${JSON.stringify(raw)}; using default ${fallback}\n`);
     return fallback;
@@ -39,14 +50,16 @@ function envNum(name, fallback) {
 function envByteCap(name, fallback, min) {
   const n = envNum(name, fallback);
   if (n === 0) return 0;
-  if (Number.isInteger(n) && n > 0 && n < min) {
+  // isSafeInteger, not isInteger: Number("9007199254740993") silently rounds to ...992 and
+  // Number("1e20") is an "integer" too. A cap we cannot represent faithfully is a malformed cap.
+  if (Number.isSafeInteger(n) && n > 0 && n < min) {
     process.stderr.write(
       `[agent-bridge] ${name}=${n} is below the minimum ${min}; clamped to ${min} ` +
         `(a smaller cap cannot keep an exit-journal record parseable)\n`,
     );
     return min;
   }
-  if (!Number.isInteger(n) || n < 0) {
+  if (!Number.isSafeInteger(n) || n < 0) {
     process.stderr.write(
       `[agent-bridge] ignoring ${name}=${JSON.stringify(process.env[name])}; must be 0 or an integer >= ${min} (using default ${fallback})\n`,
     );
