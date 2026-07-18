@@ -489,6 +489,13 @@ async function main() {
     const got = realMatch(matrix.map(m => m[0]));
     for (let i = 0; i < matrix.length; i++) if (got[i] !== matrix[i][1]) return fail(`S17: real matcher on «${matrix[i][2]}» → ${got[i]}, expected ${matrix[i][1]} (cmd=${JSON.stringify(matrix[i][0])})`);
 
+    // A typo'd role must be REJECTED (exit≠0, error on stderr) — never read stdin and return all-false + exit 0,
+    // which would pass a broken diagnostic off as a valid negative result ([review R4 — diag role allowlist]).
+    const badRole = spawnSync("node", [BRIDGE, "diag", "match", "kimi-stream-jsom"], { input: JSON.stringify([capturedTurnCmd]), encoding: "utf8", windowsHide: true });
+    if (badRole.status === 0) return fail(`S17: diag match with an unknown role must exit non-zero, got ${badRole.status} stdout=${JSON.stringify(badRole.stdout)}`);
+    if (badRole.stdout.trim()) return fail(`S17: diag match with an unknown role must NOT emit a result to stdout, got ${JSON.stringify(badRole.stdout)}`);
+    if (!/known <role>/i.test(badRole.stderr)) return fail(`S17: diag match should explain the unknown-role rejection on stderr, got ${JSON.stringify(badRole.stderr)}`);
+
     // Run a REAL cleanup over TWO live orphans: (P) a genuine turn shape that MUST be reaped, and (N) the
     // M1 false-positive shape (argv0=kimi.exe, --output-format stream-json, but `-p` only inside a quoted
     // arg) that MUST NOT be reaped. This drives the REAL registry matcher end-to-end (M4).

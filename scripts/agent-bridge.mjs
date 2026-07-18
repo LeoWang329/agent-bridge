@@ -4249,8 +4249,9 @@ class KimiCodeSession {
     // SUPERSEDED child's late `close` arriving AFTER this turn began. The dummy child !== this.proc, so
     // #onChildClose MUST ignore it — never null this.proc, never settle/pollute the live turn. (Reproducing
     // this ordering from a real superseded child is scheduler-dependent; this makes the guard test
-    // deterministic. No-op unless AGENT_BRIDGE_KIMI_TEST_STALE_CLOSE is set.)
-    if (process.env.AGENT_BRIDGE_KIMI_TEST_STALE_CLOSE && this.proc === child && child.exitCode === null) {
+    // deterministic. No-op unless AGENT_BRIDGE_KIMI_TEST_STALE_CLOSE === "1" — strict so "0"/"false" can't
+    // accidentally enable it.)
+    if (process.env.AGENT_BRIDGE_KIMI_TEST_STALE_CLOSE === "1" && this.proc === child && child.exitCode === null) {
       this.#onChildClose({ staleTestChild: true }, -4058, null);
     }
 
@@ -4976,7 +4977,15 @@ async function runCli(argv) {
       const sub = rest[0];
       if (sub !== "match" && sub !== "health") throw new Error(`Unknown diag subcommand: ${JSON.stringify(sub)} (use "match <role>" or "health").`);
       const role = rest[1];
-      if (sub === "match" && (typeof role !== "string" || !role)) throw new Error("diag match requires a non-empty <role> argument.");
+      if (sub === "match") {
+        // Allowlist the role against the REAL registry roles roleMatchesCommand resolves (the `.role` field,
+        // e.g. "kimi-stream-json" — NOT the AGENTS key). Without this a typo'd role would read stdin and
+        // return all-false + exit 0, silently passing a broken diagnostic off as a valid negative result.
+        const knownRoles = Object.values(AGENTS).map(a => a.role);
+        if (typeof role !== "string" || !knownRoles.includes(role)) {
+          throw new Error(`diag match requires a known <role>; got ${JSON.stringify(role)} (valid: ${knownRoles.join(", ")}).`);
+        }
+      }
       const DIAG_MAX_BYTES = 1 << 20; // 1 MiB total; a diagnostic reads a small JSON payload, never a stream
       const parts = [];
       let total = 0;

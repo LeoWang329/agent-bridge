@@ -20,6 +20,10 @@
 > - [R3-Major S26 未证不可假通过] 迟到 close 经身份门 `this.proc===child` 被忽略：断言 **pid 保留**（this.proc 未被置空）+ 活轮**未结算**（status 仍 running、非 failed）+ 活进程仍存活 + log 录得被忽略的 `kimi exited code=-4058`。**去掉身份门**则注入 close 会置空 this.proc → 活 child 自身 close 后续被丢（`this.proc!==child`）→ 轮**挂死** → wait 超时失败，故非目标时序无法假通过。
 > - [R3-Minor diag 无界同步读 stdin] `diag` 原先无脑 `readFileSync(0)`。**改**：先校验子命令/role 再读；`fs.readSync` 循环限 `DIAG_MAX_BYTES=1 MiB`、JSON 解析出错显式报错、`match` 数组 ≤1000 且逐元素为 string 且 ≤100000 字符、`health` 须为对象 → 有界诊断契约，绝非无界 stdin sink。（`deriveHealth`/`roleMatchesCommand` 仅被**调用**，定义字节未动。）
 > R3 三套 hermetic 回归全绿（repro-kimi 26/26 稳定 K≥3、repro-health、repro-cursor），`deriveHealth`/`spawnPlan` 仍字节未动（diff 内仅出现调用点）。M6 §9 rollout 仍延期。
+>
+> **R4 复评 = APPROVE（测试钩子裁定可接受）；仅两非阻塞 nit,已补**：
+> - [R4-nit diag role allowlist] `diag match` 原先未知 role 会读 stdin 返全 false + exit 0（拼错的诊断被当有效负结果）。**改**：读 stdin 前校验 role 属于**真实注册表角色集** `Object.values(AGENTS).map(a=>a.role)`(如 `kimi-stream-json`——注意 `roleMatchesCommand` 按 `.role` 字段解析,非 AGENTS key,故 allowlist 用 `.role` 值而非 `Object.keys`),否则报错 exit≠0。回归并入 S17（拼错 role → exit1/stderr 提示/stdout 无输出）。
+> - [R4-nit env 钩子收紧] `AGENT_BRIDGE_KIMI_TEST_STALE_CLOSE` 的 truthy 判断改为 `=== "1"`,避免 `"0"`/`"false"` 意外启用（repro-kimi 本就设 `"1"`,无需改）。
 
 > **最终复审结论**：Codex（gpt-5 系，reviewer 角色，read 档）三轮 → APPROVE。R1（2 blocker+5 major+2 minor）→ R2（M1/M5/Min1/Min2 闭合；余 1 blocker+5 major：doctor lazy-resolve/matcher/turnProtocolError/summary 泄露/statSync/artifact）→ R3（余项闭合，仅 matcher 1 major：`-p` 搜索范围）→ **R3b：APPROVE**。纯文档+代码核对（评审者 read 沙箱无法跑 kimi，§2 实测事实由作者本机真跑提供）。**（此为设计期结论的历史记录；实现 + 实现后代码复审见顶部 v4 banner。）**
 
