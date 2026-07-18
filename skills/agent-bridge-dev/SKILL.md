@@ -88,7 +88,7 @@ close_session(session_id)                 用完必关
 - **能力分层**:机械实现用低延迟/足够能力档;集成/判断用中档;架构/最终整支评审用最强档(**不是"最便宜"**,别与
   "质量优先、不为省 token 缩水"冲突)。
 - **模型清单靠活查**:OMP 用 `omp models <关键字>`(子命令,非 flag;你的 shell 跑,非 MCP 工具),`model` 传全限定
-  `provider/名`;Codex/Claude 用后端默认或用户给定的有效模型(它们没有 `models` 子命令);cursor 用 `agent --list-models`,selector 带档位后缀(如 `gpt-5.3-codex-high`);kimi 用 `kimi provider list`,`model` 传 `kimi-code/…` 别名。具体模型 ID 不写死。
+  `provider/名`;Codex/Claude 用后端默认或用户给定的有效模型(它们没有 `models` 子命令);cursor 用 `agent --list-models`,selector 带档位后缀(如 `gpt-5.3-codex-high`);kimi 用 `kimi provider list --json`(必须带 `--json`,裸命令不列别名),`model` 传 `kimi-code/…` 别名。具体模型 ID 不写死。
 - **cursor / kimi 特例(见桥 skill 的对应条目)**:两者都可担任一角色,但角色注入是**首轮软注入**——架构讨论是**多轮长会话**,它们的角色纪律长程未验证、经压缩可能漂,**要长程稳守角色的关键位优先真 system 提示后端(omp/codex/claude)**;另两者 `contextUsage` 都恒 `null`(按 token 判轮换失效,把 `null` 当未知、别当 0)、都仅 Windows;cursor 另有云端 chat 删不掉,kimi 无云端 chat 存储但**推理仍走 Moonshot 云端**(prompt 出本机)。
 
 ## 评审独立性(硬规则)

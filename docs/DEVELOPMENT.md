@@ -16,22 +16,32 @@ agent-bridge/
   README.md                          User-facing documentation
 ```
 
-There are no npm dependencies. The runtime uses Node built-ins plus external CLIs:
+There are no npm dependencies. The runtime uses Node built-ins plus external CLIs. Agent Bridge only bridges to these — it never installs them, and each is optional (a backend that is not installed is reported by `doctor` as `missing` / `available:false`; it does not break the server):
 
 - `omp`
 - `codex`
+- `claude`
+- `cursor` (the `agent` CLI; **Windows-only**)
+- `kimi` (the native `kimi.exe`; **Windows-only**)
 
 ## Architecture
+
+Backends come in two process shapes. **Shape A** holds one persistent child for the whole session; **Shape B** holds no process between turns — each turn spawns a short-lived child that exits when the turn ends, and continuity comes from resuming a session id.
 
 ```mermaid
 flowchart LR
   Client["MCP client (Codex / Claude Code)"] --> Bridge["agent-bridge MCP server (stdio)"]
   Bridge --> Sessions["in-memory session map"]
-  Sessions --> OMP["OMP RPC process"]
-  Sessions --> CDX["Codex app-server"]
-  OMP --> OMPIO["JSONL stdio"]
-  CDX --> CDXIO["JSON-RPC stdio"]
+  Sessions --> ShapeA["Shape A: one persistent process per session"]
+  Sessions --> ShapeB["Shape B: short-lived process per turn, resumed by id"]
+  ShapeA --> OMP["OMP: omp --mode rpc (JSONL stdio)"]
+  ShapeA --> CDX["Codex: codex app-server (JSON-RPC stdio)"]
+  ShapeA --> CLA["Claude: claude --print (stream-json stdio)"]
+  ShapeB --> CUR["Cursor: --resume cloud chatId (stream-json)"]
+  ShapeB --> KIM["Kimi: -S local session id (stream-json)"]
 ```
+
+The Shape B split matters downstream: a Shape B session is `healthy` and idle with **no pid at all** between turns, so liveness cannot be derived from "is the child alive?" the way it is for Shape A. Cursor's resume id is a **cloud** `chatId` (minted by a create-chat round-trip); Kimi's is a **local** session id that the CLI itself mints on the first turn (no create-chat).
 
 Agent Bridge exposes a small MCP tool surface:
 
@@ -45,7 +55,7 @@ Agent Bridge exposes a small MCP tool surface:
 
 Each `agent-bridge mcp` process keeps its own in-memory session map for its own lifetime; one MCP client equals one MCP process equals one session map. A session is not persisted by Agent Bridge itself, and sessions are never shared across clients.
 
-The MCP server owns its sessions directly: `callTool` invokes `openSession`/`sendMessage`/… in-process and spawns the OMP/Codex backends as children of the MCP process. There is no background daemon, no Unix socket, and no `requestDaemon` proxy. The bridge speaks MCP over stdio only and opens no network listener of any kind. As of v0.7.0 the entire HTTP/SSE Web UI stack was removed (see [ARCHITECTURE.md](ARCHITECTURE.md)); `session.events` is still buffered to back `recentEvents` in `status`/`result`, but it is no longer broadcast anywhere.
+The MCP server owns its sessions directly: `callTool` invokes `openSession`/`sendMessage`/… in-process and spawns the backends as children of the MCP process — OMP/Codex/Claude as persistent processes held for the session's lifetime, Cursor/Kimi as short-lived per-turn processes (see Architecture: Shape A vs Shape B). There is no background daemon, no Unix socket, and no `requestDaemon` proxy. The bridge speaks MCP over stdio only and opens no network listener of any kind. As of v0.7.0 the entire HTTP/SSE Web UI stack was removed (see [ARCHITECTURE.md](ARCHITECTURE.md)); `session.events` is still buffered to back `recentEvents` in `status`/`result`, but it is no longer broadcast anywhere.
 
 Sessions are managed exclusively through the MCP tools. The CLI exposes only `mcp` (the server entrypoint) plus `doctor` and `cleanup` helpers.
 
@@ -198,12 +208,16 @@ ps -axo pid,ppid,command | rg 'agent-bridge|omp --mode rpc|codex app-server' || 
 - Never commit GitHub tokens, API keys, `.env` files, logs, or local auth files.
 - Keep public repository config portable. Avoid committing machine-specific paths such as `/Users/<name>/...`.
 - Keep `write: false` unless the user explicitly requested delegated edits.
-- Treat `write: true` as high privilege. OMP and Codex both receive auto-approval style settings in write mode.
+- Treat `write: true` as high privilege, but note the mapping is per backend and only three of the five have a distinct high-privilege switch:
+  - **OMP** — `--auto-approve --approval-mode yolo`.
+  - **Codex** — `sandbox: workspace-write` (on **Windows**, `danger-full-access`; see the apply_patch note in `scripts/agent-bridge.mjs`).
+  - **Claude** — `--permission-mode bypassPermissions`.
+  - **Cursor / Kimi** — **no separate high-privilege switch.** `read` and `write` share the exact same launch (cursor's `--force`; kimi's single `kimi.exe` invocation); the only difference is that `read` prepends a soft "read-only investigation" instruction which `write` omits. So their `write` is not *more* OS privilege — it is the same privilege with the restraint removed, and their `read` is correspondingly not a hard no-write guarantee.
 - Close sessions when finished.
 
 ## Troubleshooting
 
-If `agent_bridge_doctor` cannot find a backend, set `OMP_BIN` or `CODEX_BIN`.
+If `agent_bridge_doctor` cannot find a backend, set the matching override: `OMP_BIN`, `CODEX_BIN`, `CLAUDE_BIN`, `CURSOR_AGENT_BIN`, or `KIMI_BIN` (which must point at a native `kimi.exe`, never a `.cmd`/`.bat` shim).
 
 If Codex cannot see the MCP server, re-add it (`codex mcp add agent-bridge -- node "<REPO>/scripts/agent-bridge.mjs" mcp`), restart Codex, and check:
 

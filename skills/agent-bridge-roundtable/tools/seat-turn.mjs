@@ -129,7 +129,7 @@ function main(argv) {
   if (!seat) die("缺少 --seat(如 p1)");
   if (round === undefined) die("缺少 --round(如 0)");
   if (!textRef) die("缺少 --text-ref(桥返回的 textRef 绝对路径)");
-  if (!agent) die("缺少 --agent(如 omp/codex/claude/cursor)");
+  if (!agent) die("缺少 --agent(如 omp/codex/claude/cursor/kimi)");
   // 校验 seat/round:二者直接拼进文件路径与 roundRef,必须挡目录穿越/非法名(如 ../x、p1/sub)
   if (!/^p\d+$/.test(seat)) die(`--seat 必须形如 p<数字>(如 p1),收到: ${seat}`);
   const roundNum = Number(round);

@@ -49,7 +49,7 @@ Kimi 仅 Windows，用官方 native 安装器安装（装的是原生 `kimi.exe`
 irm https://code.kimi.com/kimi-code/install.ps1 | iex
 ```
 
-装完先跑一次 `kimi`，在里面用 `/login` 完成登录，之后 `node scripts/agent-bridge.mjs doctor` 应列出 `kimi: ok (kimi.exe) 0.27.0`。桥按 `KIMI_BIN` → `%USERPROFILE%\.kimi-code\bin\kimi.exe` → PATH 的顺序找二进制，装在别处才需要覆盖（**必须指向原生 `kimi.exe`，`.cmd`/`.bat` shim 一律拒绝**——prompt 走 argv，经 shim 会丢掉元字符安全边界）：
+装完先跑一次 `kimi`，在里面用 `/login` 完成登录，之后 `node scripts/agent-bridge.mjs doctor` 应列出 `kimi: ok (kimi.exe) <version>`（版本号随你装的 CLI 走）。桥按 `KIMI_BIN` → `%USERPROFILE%\.kimi-code\bin\kimi.exe` → PATH 的顺序找二进制，装在别处才需要覆盖（**必须指向原生 `kimi.exe`，`.cmd`/`.bat` shim 一律拒绝**——prompt 走 argv，经 shim 会丢掉元字符安全边界）：
 
 ```powershell
 $env:KIMI_BIN = "$env:USERPROFILE\.kimi-code\bin\kimi.exe"
@@ -263,7 +263,7 @@ Codex 使用 Agent Bridge 时应该遵循这个流程：
 }
 ```
 
-需要 Kimi 时，把 `agent` 换成 `kimi`（**仅 Windows**；Kimi Code CLI，Moonshot 的 K2/K3 系；形状 B——逻辑会话=kimi 首轮自己在**本地**铸的 session id、进程按轮短驻，比 cursor 简单：无 create-chat 往返、无云端 chat 存储）。几处后端特有约束：`read`/`write` 都是**软边界**（Windows 无 OS 沙箱；`read` 保留原生写工具、只靠每轮注入的「仅只读调查」策略压制，**不是真只读**——shell 仍能写盘）；`model` 用 `kimi-code/…` 别名（`kimi-code/k3` 为默认，另有 `kimi-code/kimi-for-coding`、`kimi-code/kimi-for-coding-highspeed`，清单用 `kimi provider list` 活查）；`append_system_prompt_file` 无原生 system flag、软注入为首轮用户前缀；`effort` 被接受但忽略（回显 `null`）、`schema` 不支持；`contextUsage` 恒 `null`。**隐私口径**：session 状态在本地、无云端 chat 存储，但**推理仍走 Moonshot 云端 API**——prompt 和 agent 读进去的仓库内容一样离开本机，别当成"数据不出本地"：
+需要 Kimi 时，把 `agent` 换成 `kimi`（**仅 Windows**；Kimi Code CLI，Moonshot 的 K2/K3 系；形状 B——逻辑会话=kimi 首轮自己在**本地**铸的 session id、进程按轮短驻，比 cursor 简单：无 create-chat 往返、无云端 chat 存储）。几处后端特有约束：`read`/`write` 都是**软边界**（Windows 无 OS 沙箱；`read` 保留原生写工具、只靠每轮注入的「仅只读调查」策略压制，**不是真只读**——shell 仍能写盘）；`model` 用 `kimi-code/…` 别名（`kimi-code/k3` 为默认，另有 `kimi-code/kimi-for-coding`、`kimi-code/kimi-for-coding-highspeed`，清单用 `kimi provider list --json` 活查（**要 `--json`**：裸 `kimi provider list` 只报 provider 摘要与默认模型，不列别名））；`append_system_prompt_file` 无原生 system flag、软注入为首轮用户前缀；`effort` 被接受但忽略（回显 `null`）、`schema` 不支持；`contextUsage` 恒 `null`。**隐私口径**：session 状态在本地、无云端 chat 存储，但**推理仍走 Moonshot 云端 API**——prompt 和 agent 读进去的仓库内容一样离开本机，别当成"数据不出本地"：
 
 ```json
 {
@@ -274,7 +274,7 @@ Codex 使用 Agent Bridge 时应该遵循这个流程：
 }
 ```
 
-可以在**打开会话时**指定模型与推理强度。模型是会话级参数：在 `agent_bridge_open_session` 时用 `model` 指定，整个会话内固定，`agent_bridge_send_message` 不能逐条切换；想换模型就新开一个 session。`model` 会原样传给后端的 `--model`，取值格式由后端决定。OMP 尤其可以通过 `omp --model <name>` 触达多种模型（如 `deepseek-v4-pro`、`minimax-m3`、`claude`、`gpt`）。可选的 `effort` 在 OMP 映射为 `--thinking`（`minimal|low|medium|high|xhigh`），在 Codex 作为该轮的 effort（`none|minimal|low|medium|high|xhigh`）传入，在 Claude 映射为 `--effort`（默认 `xhigh`）；**Cursor 的 `model` 必须是带档位后缀的 selector**（用 `agent --list-models` 活查），其 `effort` 被接受但忽略、`contextUsage` 恒 `null`；**Kimi 的 `model` 是 `kimi-code/…` 别名**（用 `kimi provider list` 活查，默认 `kimi-code/k3`），其 `effort` 同样被接受但忽略、`contextUsage` 也恒 `null`。不传 `model` / `effort` 时使用后端默认值。
+可以在**打开会话时**指定模型与推理强度。模型是会话级参数：在 `agent_bridge_open_session` 时用 `model` 指定，整个会话内固定，`agent_bridge_send_message` 不能逐条切换；想换模型就新开一个 session。`model` 会原样传给后端的 `--model`，取值格式由后端决定。OMP 尤其可以通过 `omp --model <name>` 触达多种模型（如 `deepseek-v4-pro`、`minimax-m3`、`claude`、`gpt`）。可选的 `effort` 在 OMP 映射为 `--thinking`（`minimal|low|medium|high|xhigh`），在 Codex 作为该轮的 effort（`none|minimal|low|medium|high|xhigh`）传入，在 Claude 映射为 `--effort`（默认 `xhigh`）；**Cursor 的 `model` 必须是带档位后缀的 selector**（用 `agent --list-models` 活查），其 `effort` 被接受但忽略、`contextUsage` 恒 `null`；**Kimi 的 `model` 是 `kimi-code/…` 别名**（用 `kimi provider list --json` 活查（**要 `--json`**：裸 `kimi provider list` 只报 provider 摘要与默认模型，不列别名），默认 `kimi-code/k3`），其 `effort` 同样被接受但忽略、`contextUsage` 也恒 `null`。不传 `model` / `effort` 时使用后端默认值。
 
 ```json
 {
@@ -319,10 +319,12 @@ node scripts/agent-bridge.mjs cleanup --json
 }
 ```
 
-写权限模式会启用高权限参数：
+写权限模式的映射**逐后端不同**，五个后端里只有三个有独立的高权限开关：
 
 - OMP：`--auto-approve --approval-mode yolo`
 - Codex：`sandbox: workspace-write`（Windows 上为 `danger-full-access`，见上）（`approvalPolicy: never`）
+- Claude：`--permission-mode bypassPermissions`
+- Cursor / Kimi：**没有独立的高权限开关**——`read` 与 `write` 用的是**完全相同的一条启动**（cursor 同 `--force`；kimi 同一条 `kimi.exe` 调用），差别只在 `read` 档会前置一句「仅只读调查」的**软提示**、`write` 档去掉它。所以这两者的 `write` **不是更高的 OS 权限**，只是把那句约束撤掉；反过来说，它们的 `read` 也**不是**硬性的不可写保证（详见 README §Backends 与桥 skill 的对应条目）。
 
 让委托代理改完后，Codex 自己仍然应该检查 git diff、运行测试，再向用户报告。
 
