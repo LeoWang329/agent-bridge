@@ -13,6 +13,13 @@
 > - [Min2] open_session 字段级描述（access/write/effort/append_system_prompt_file）补 kimi 的 soft-read / effort ignored / first-turn-prefix 语义。
 > - [Minor-R2] 文档状态自相矛盾（顶部 v4「已实现」vs §16 旧 R3b banner「尚未实现」）→ R3b 那句改注为设计期历史记录。
 > 复审同时确认：`deriveHealth`/`spawnPlan` 字节级未动、状态机/#canRun/resolver-lazy/三处主动决定 sound、C# forwarder stub 走真实路径、无空断言（R2 复评 M2/M3/M4/Min1/Min2 闭合、M6 rollout 延期不扣分）。
+>
+> **R3 复评（判 M1 完全闭合；生产 Session 逻辑确认扎实，余项 = 测试严谨性 + 1 hermetic bug + diag 小加固，均已修）**：
+> - [R3-Major hermetic 泄漏] 原 S26 靠「删缓存 bin → ENOENT-retry 走 PATH 兜底」制造第二个 child，但把 stub 目录**追加**到 `PATH` 尾——宿主已装真 kimi.exe 在 PATH 前段时 `resolveKimiBin` 会解析到**真 kimi** → 非 hermetic。**改**：S26 弃用 ENOENT-retry 机制，改 `KIMI_BIN=stub`（无 PATH/默认路径解析，真 kimi 无从泄漏）+ 生产侧 **env-gated 测试钩子 `AGENT_BRIDGE_KIMI_TEST_STALE_CLOSE`**（默认 no-op；置位时在 `#beginTurn` 后同步驱动一个 `dummy child !== this.proc` 的迟到 close 过 `#onChildClose`），确定性复现「旧 child close 迟到于新轮已 begin」这一调度依赖时序。见 §5.2/§8-S26。
+> - [R3-Major S25 未证不可假通过] 原 S25 只 `fire` send+close 再等状态「会话已消失」——post-begin close 也能令会话消失（走 abort），故旧断言在错误时序下会**假通过**。**改**：`fireBoth`（**单次 stdin write** 两条 RPC → readline 同 tick 顺序派发 → send 同步跑到 spawn-await 才读 close 行，pre-begin **确定性**）+ 断言 send 响应命中 `"was closed during send"` 分支（post-begin 会返回 accepted 后 abort = 不同分支，错误时序无法静默通过）。S18 同法（`fireBoth` 令 send+abort 确定性 pre-begin）。
+> - [R3-Major S26 未证不可假通过] 迟到 close 经身份门 `this.proc===child` 被忽略：断言 **pid 保留**（this.proc 未被置空）+ 活轮**未结算**（status 仍 running、非 failed）+ 活进程仍存活 + log 录得被忽略的 `kimi exited code=-4058`。**去掉身份门**则注入 close 会置空 this.proc → 活 child 自身 close 后续被丢（`this.proc!==child`）→ 轮**挂死** → wait 超时失败，故非目标时序无法假通过。
+> - [R3-Minor diag 无界同步读 stdin] `diag` 原先无脑 `readFileSync(0)`。**改**：先校验子命令/role 再读；`fs.readSync` 循环限 `DIAG_MAX_BYTES=1 MiB`、JSON 解析出错显式报错、`match` 数组 ≤1000 且逐元素为 string 且 ≤100000 字符、`health` 须为对象 → 有界诊断契约，绝非无界 stdin sink。（`deriveHealth`/`roleMatchesCommand` 仅被**调用**，定义字节未动。）
+> R3 三套 hermetic 回归全绿（repro-kimi 26/26 稳定 K≥3、repro-health、repro-cursor），`deriveHealth`/`spawnPlan` 仍字节未动（diff 内仅出现调用点）。M6 §9 rollout 仍延期。
 
 > **最终复审结论**：Codex（gpt-5 系，reviewer 角色，read 档）三轮 → APPROVE。R1（2 blocker+5 major+2 minor）→ R2（M1/M5/Min1/Min2 闭合；余 1 blocker+5 major：doctor lazy-resolve/matcher/turnProtocolError/summary 泄露/statSync/artifact）→ R3（余项闭合，仅 matcher 1 major：`-p` 搜索范围）→ **R3b：APPROVE**。纯文档+代码核对（评审者 read 沙箱无法跑 kimi，§2 实测事实由作者本机真跑提供）。**（此为设计期结论的历史记录；实现 + 实现后代码复审见顶部 v4 banner。）**
 

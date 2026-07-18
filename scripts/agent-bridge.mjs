@@ -4245,6 +4245,14 @@ class KimiCodeSession {
       terminateProcessTree(child.pid);
       scheduleForceKill(child.pid, 3000, () => this.proc === child && child.exitCode === null && child.signalCode === null);
     }
+    // [review R3 — test hook, env-gated] Deterministically drive the stale-close identity gate: simulate a
+    // SUPERSEDED child's late `close` arriving AFTER this turn began. The dummy child !== this.proc, so
+    // #onChildClose MUST ignore it — never null this.proc, never settle/pollute the live turn. (Reproducing
+    // this ordering from a real superseded child is scheduler-dependent; this makes the guard test
+    // deterministic. No-op unless AGENT_BRIDGE_KIMI_TEST_STALE_CLOSE is set.)
+    if (process.env.AGENT_BRIDGE_KIMI_TEST_STALE_CLOSE && this.proc === child && child.exitCode === null) {
+      this.#onChildClose({ staleTestChild: true }, -4058, null);
+    }
 
     if (options.wait) {
       try {
@@ -4963,15 +4971,37 @@ async function runCli(argv) {
       //   diag match <role>   stdin = JSON array of command-line strings → stdout = JSON array of booleans
       //                       from the REAL registry matcher (roleMatchesCommand — the one cleanup uses).
       //   diag health         stdin = a JSON session-shaped object → stdout = JSON string of deriveHealth(it).
+      // Validate the subcommand/role BEFORE reading, and BOUND every input dimension ([review R3-Minor]):
+      // this is a bounded diagnostic contract, never an unbounded stdin sink.
       const sub = rest[0];
-      const input = fs.readFileSync(0, "utf8");
+      if (sub !== "match" && sub !== "health") throw new Error(`Unknown diag subcommand: ${JSON.stringify(sub)} (use "match <role>" or "health").`);
+      const role = rest[1];
+      if (sub === "match" && (typeof role !== "string" || !role)) throw new Error("diag match requires a non-empty <role> argument.");
+      const DIAG_MAX_BYTES = 1 << 20; // 1 MiB total; a diagnostic reads a small JSON payload, never a stream
+      const parts = [];
+      let total = 0;
+      const chunk = Buffer.allocUnsafe(16384);
+      for (;;) {
+        let n;
+        try { n = fs.readSync(0, chunk, 0, chunk.length, null); } catch (e) { if (e.code === "EOF") break; throw e; }
+        if (!n) break;
+        total += n;
+        if (total > DIAG_MAX_BYTES) throw new Error(`diag input exceeds ${DIAG_MAX_BYTES} bytes.`);
+        parts.push(Buffer.from(chunk.subarray(0, n)));
+      }
+      let parsed;
+      try { parsed = JSON.parse(Buffer.concat(parts).toString("utf8")); } catch (e) { throw new Error(`diag input is not valid JSON: ${e.message}`); }
       if (sub === "match") {
-        const cmds = JSON.parse(input);
-        process.stdout.write(`${JSON.stringify(cmds.map(c => roleMatchesCommand(String(rest[1]), c)))}\n`);
-      } else if (sub === "health") {
-        process.stdout.write(`${JSON.stringify(deriveHealth(JSON.parse(input)))}\n`);
+        if (!Array.isArray(parsed)) throw new Error("diag match expects a JSON array of command-line strings.");
+        if (parsed.length > 1000) throw new Error(`diag match array too long (${parsed.length} > 1000).`);
+        process.stdout.write(`${JSON.stringify(parsed.map(c => {
+          if (typeof c !== "string") throw new Error("diag match array elements must be strings.");
+          if (c.length > 100_000) throw new Error(`diag match command-line too long (${c.length} > 100000 chars).`);
+          return roleMatchesCommand(role, c);
+        }))}\n`);
       } else {
-        throw new Error(`Unknown diag subcommand: ${sub} (use "match <role>" or "health")`);
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("diag health expects a JSON object.");
+        process.stdout.write(`${JSON.stringify(deriveHealth(parsed))}\n`);
       }
       return;
     }

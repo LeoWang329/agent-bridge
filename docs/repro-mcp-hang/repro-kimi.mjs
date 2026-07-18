@@ -118,7 +118,19 @@ function makeServer(mode, extraEnv = {}, spawnOpts = {}) {
     if (!await waitResp(id, 10000)) return fail(`no init (mode ${mode})`);
     rpc({ jsonrpc: "2.0", method: "notifications/initialized" });
   };
-  return { srv, call, fire, init, kill: () => { try { srv.kill("SIGKILL"); } catch {} } };
+  // Write TWO tool-calls in a SINGLE stdin write so the server's readline emits both lines synchronously
+  // from one chunk: the first handler runs synchronously to its spawn-await before the second line is read.
+  // This makes the send→close (or send→abort) ordering DETERMINISTIC (guaranteed pre-begin). Returns
+  // [promise-for-resp1, promise-for-resp2].
+  const fireBoth = (c1, c2, ms = 15000) => {
+    const id1 = nextId++, id2 = nextId++;
+    const line1 = JSON.stringify({ jsonrpc: "2.0", id: id1, method: "tools/call", params: { name: c1.name, arguments: c1.args } });
+    const line2 = JSON.stringify({ jsonrpc: "2.0", id: id2, method: "tools/call", params: { name: c2.name, arguments: c2.args } });
+    srv.stdin.write(`${line1}\n${line2}\n`); // ONE write → one chunk → ordered, in-tick delivery
+    const grab = async id => { const r = await waitResp(id, ms); if (r === null || r === undefined) return fail(`fireBoth: no response for id ${id} (mode ${mode})`); if (r.error) return { __error: r.error.message || JSON.stringify(r.error) }; const t = r.result?.content?.[0]?.text; if (!t) return null; try { return JSON.parse(t); } catch { return t; } };
+    return [grab(id1), grab(id2)];
+  };
+  return { srv, call, fire, fireBoth, init, kill: () => { try { srv.kill("SIGKILL"); } catch {} } };
 }
 
 const SESSION_ID_RE = /^session_[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/;
@@ -510,17 +522,19 @@ async function main() {
 
   // ── S18: concurrent abort DURING send's spawn-await (pre-begin) must not be lost (M3) ──────────────
   {
-    // The bridge processes each MCP line as it arrives, and a `send` handler runs synchronously to its
-    // spawn-await before the next line is read — so firing `abort` right after `send` lands the abort in
-    // the pre-begin window (this.turn/this.proc set, turnChild not yet). Before the M3 fix, #beginTurn
-    // reset userAborted → the killed child settled as a phantom FAILED turn; after the fix it settles as
-    // aborted/idle. Repeat to be robust.
+    // send + abort in ONE stdin write → the server runs send synchronously to its spawn-await before reading
+    // the abort line, so abort DETERMINISTICALLY lands in the pre-begin window (this.turn/this.proc set,
+    // turnChild not yet). Before the M3 fix, #beginTurn reset userAborted → the killed child settled as a
+    // phantom FAILED turn; after the fix it settles as aborted/idle. Repeat to be robust.
     const s = makeServer("hang"); await s.init();
     for (let attempt = 0; attempt < 10; attempt++) {
       const sess = (await openKimi(s))?.session;
       if (!sess?.id) return fail(`S18 attempt ${attempt}: open failed`);
-      s.fire("agent_bridge_send_message", { session_id: sess.id, message: `race ${attempt}` });
-      s.fire("agent_bridge_abort", { session_id: sess.id });
+      const [sp, ap] = s.fireBoth(
+        { name: "agent_bridge_send_message", args: { session_id: sess.id, message: `race ${attempt}` } },
+        { name: "agent_bridge_abort", args: { session_id: sess.id } },
+      );
+      await Promise.all([sp.catch(() => {}), ap.catch(() => {})]);
       let post = null;
       for (let i = 0; i < 80; i++) { await sleep(100); post = (await s.call("agent_bridge_status", { session_id: sess.id }))?.session; if (post && post.status !== "running" && post.status !== "starting") break; }
       if (!post) return fail(`S18 attempt ${attempt}: no settled status`);
@@ -633,50 +647,66 @@ async function main() {
     console.log("[harness] S24 OK — send(wait:true) timeout aborts the turn (idle, process tree-killed), never left running");
   }
 
-  // ── S25: concurrent close() DURING send's spawn-await (pre-begin) settles cleanly, no double-settle ─
+  // ── S25: concurrent close() DURING send's spawn-await (pre-begin) — NON-FAKE-PASSABLE ────────────────
   {
     const s = makeServer("hang"); await s.init();
     const sess = (await openKimi(s))?.session;
-    // Fire send + close back-to-back → close lands in the spawn-await window (status=closed, turn nulled),
-    // send bails without beginning the turn; the child's close hits the status===closed guard. No revival,
-    // no double-settle. Verify the session is gone AND the server stays healthy (a fresh turn still works).
-    s.fire("agent_bridge_send_message", { session_id: sess.id, message: "pre-begin close" });
-    s.fire("agent_bridge_close_session", { session_id: sess.id });
-    await sleep(1500);
+    // Send + close in ONE stdin write → the server runs send synchronously to its spawn-await (this.turn +
+    // this.proc set, turn NOT begun) before reading the close line, so close DETERMINISTICALLY lands in the
+    // pre-begin window: it sets status=closed + nulls this.turn, and send's post-spawn guard throws "was
+    // closed during send". Capturing that exact error is the PROOF of pre-begin (a post-begin close would
+    // return accepted:true then abort — a DIFFERENT branch — so this cannot silently pass on the wrong ordering).
+    const [sendP, closeP] = s.fireBoth(
+      { name: "agent_bridge_send_message", args: { session_id: sess.id, message: "pre-begin close" } },
+      { name: "agent_bridge_close_session", args: { session_id: sess.id } },
+    );
+    const sendResp = await sendP; await closeP;
+    if (!sendResp?.__error || !/closed during send/i.test(sendResp.__error)) return fail(`S25: send must hit the pre-begin "was closed during send" branch (proof of the spawn-await race); got ${JSON.stringify(sendResp)} — a post-begin close would have returned accepted:true`);
     const after = await s.call("agent_bridge_status", { session_id: sess.id });
-    if (!after?.__error || !/unknown session/i.test(after.__error)) return fail(`S25: after a pre-begin close the session should be gone, got ${JSON.stringify(after)}`);
-    // The SAME server must not be wedged/crashed by the race: a brand-new session opens cleanly on it.
+    if (!after?.__error || !/unknown session/i.test(after.__error)) return fail(`S25: after a pre-begin close the session should be gone (no revival), got ${JSON.stringify(after)}`);
+    // No double-settle / wedge: the SAME server still opens a fresh session cleanly.
     const reopened = await openKimi(s);
     if (!reopened?.session?.id) return fail(`S25: server should stay responsive after a pre-begin close race (reopen failed): ${JSON.stringify(reopened)}`);
     await s.call("agent_bridge_close_session", { session_id: reopened.session.id });
     s.kill(); await sleep(150);
-    console.log("[harness] S25 OK — pre-begin close (during spawn-await) settles cleanly: session gone, no double-settle/revival, server responsive");
+    console.log("[harness] S25 OK — pre-begin close PROVEN via the \"was closed during send\" branch (non-fake-passable); session gone, no double-settle/revival, server responsive");
   }
 
-  // ── S26: REAL late stale-close — an old child's close arrives AFTER a new turn began; identity gate holds ─
+  // ── S26: late stale-close — a superseded child's close arrives AFTER a new turn began; identity gate holds ─
   {
-    // Force a genuine stale close: start() caches the default-path binary (binHome); we then DELETE binHome
-    // so the first turn's cached-bin spawn ENOENTs → the ENOENT retry re-resolves and finds a DIFFERENT
-    // valid binary on PATH (binPath) → a SECOND child (candidateB) actually begins the turn. candidateA's
-    // late `close` (from the ENOENT) fires AFTER candidateB began; `this.proc===child` must ignore it so it
-    // never pollutes candidateB's turn (no phantom failure / double-settle).
-    const homeC = path.join(tmpRoot, "homeC");
-    const kimiHomeC = path.join(homeC, ".kimi-code", "bin"); fs.mkdirSync(kimiHomeC, { recursive: true });
-    const binHome = path.join(kimiHomeC, "kimi.exe"); fs.copyFileSync(stubExe, binHome);
-    const pathDir = path.join(tmpRoot, "pathbin"); fs.mkdirSync(pathDir, { recursive: true });
-    fs.copyFileSync(stubExe, path.join(pathDir, "kimi.exe")); // the PATH fallback (binPath)
-    const s = makeServer("ok", { KIMI_BIN: "", USERPROFILE: homeC, PATH: `${process.env.PATH}${path.delimiter}${pathDir}` }); await s.init();
-    const sess = (await openKimi(s))?.session; // start() caches binHome (default path wins over PATH)
+    // DETERMINISTIC + NON-FAKE-PASSABLE. The natural ENOENT-retry produces a superseded child whose close
+    // predominantly arrives BEFORE the new child begins (harmless ordering), so it can't reliably exercise
+    // the dangerous "old close AFTER new begin" case. Instead the bridge's env-gated test hook
+    // (AGENT_BRIDGE_KIMI_TEST_STALE_CLOSE) synthesizes exactly that: right after #beginTurn it drives a
+    // SUPERSEDED child's late close (dummy child !== this.proc, ENOENT code -4058) through #onChildClose.
+    // The `this.proc===child` gate MUST ignore it — keep this.proc set (pid non-null) and NOT settle the
+    // live turn. Non-fake-passable: with the gate removed, the injected close nulls this.proc (pid → null),
+    // and the live child's own later close is then dropped (this.proc!==child) → the turn HANGS → wait fails.
+    // Hermetic: normal KIMI_BIN=stub, no PATH/default-path resolution, so the real installed kimi can't leak in.
+    const s = makeServer("hang", { AGENT_BRIDGE_KIMI_TEST_STALE_CLOSE: "1" }); await s.init();
+    const sess = (await openKimi(s))?.session;
     if (!sess?.id) return fail("S26: open failed");
-    fs.rmSync(binHome, { force: true }); // cached bin vanishes → first turn's spawn ENOENTs → retry finds binPath
-    const rc = await runTurn(s, sess.id, "stale close please");
-    if (rc?.text !== "hello from kimi") return fail(`S26: the re-resolved turn must complete cleanly despite the old child's late close, got ${JSON.stringify(rc?.text)}`);
-    const st = (await s.call("agent_bridge_status", { session_id: sess.id }))?.session;
-    if (st?.status !== "idle" || st?.health !== "healthy") return fail(`S26: a stale late close must not pollute the new turn (expected idle/healthy), got status=${st?.status} health=${JSON.stringify(st?.health)}`);
-    if (st?.agentSpecific?.turnCount !== 1) return fail(`S26: exactly one turn should have settled, got turnCount ${JSON.stringify(st?.agentSpecific?.turnCount)}`);
+    await s.call("agent_bridge_send_message", { session_id: sess.id, message: "hold while a stale close is injected" });
+    // Let the turn come up; the stale close was injected synchronously during send()'s begin.
+    let st = null, backendPid = null;
+    for (let i = 0; i < 60; i++) { await sleep(120); st = (await s.call("agent_bridge_status", { session_id: sess.id }))?.session; if (st?.pid) { backendPid = st.pid; if (st.status === "running") break; } }
+    if (!backendPid) return fail("S26: never observed a running turn pid (the injected stale close may have nulled this.proc — gate removed?)");
+    if (st?.status === "failed") return fail(`S26: the injected stale close must NOT settle the live turn (turnChild gate), but status=failed lastError=${JSON.stringify(st?.lastError)}`);
+    if (st?.status !== "running") return fail(`S26: turn should still be running after the injected stale close, got ${st?.status}`);
+    // The live child must NOT have been tree-killed by the injection; confirm it and that its log recorded
+    // the superseded close (proving the stale close really flowed through #onChildClose and was gated out).
+    if (!pidAlive(backendPid)) return fail(`S26: the live turn process must survive an injected stale close, pid ${backendPid} dead`);
+    const logText = fs.existsSync(sess.logFile) ? fs.readFileSync(sess.logFile, "utf8") : "";
+    if (!/kimi exited code=-4058/.test(logText)) return fail(`S26: the injected stale close should be recorded by #onChildClose (kimi exited code=-4058) in ${sess.logFile}`);
+    // The session stays healthy/reusable: abort the (still hanging) live turn cleanly.
+    const ab = await s.call("agent_bridge_abort", { session_id: sess.id });
+    if (!ab?.aborted) return fail(`S26: abort after the injected stale close should succeed, got ${JSON.stringify(ab)}`);
+    let post = null;
+    for (let i = 0; i < 40; i++) { await sleep(120); post = (await s.call("agent_bridge_status", { session_id: sess.id }))?.session; if (post?.status === "idle") break; }
+    if (post?.status !== "idle") return fail(`S26: after aborting the live turn, status should be idle, got ${post?.status}`);
     await s.call("agent_bridge_close_session", { session_id: sess.id });
     s.kill(); await sleep(150);
-    console.log("[harness] S26 OK — REAL late stale-close (ENOENT-retry → new child begins): old child's late close ignored (this.proc===child), new turn clean");
+    console.log("[harness] S26 OK — injected late stale-close (dummy child !== this.proc) is gated out (this.proc===child): pid preserved, live turn NOT settled/killed, superseded close logged");
   }
 
   cleanupTmp();
