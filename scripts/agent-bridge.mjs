@@ -102,6 +102,15 @@ const CURSOR_ABORT_SETTLE_MS = envNum("AGENT_BRIDGE_CURSOR_ABORT_SETTLE_MS", 800
 // command line over this conservative static ceiling with a clear error rather than letting the OS
 // truncate or fail opaquely. (A file-based prompt is a future opt-in — see design §6.1.)
 const CURSOR_CMDLINE_MAX_UNITS = envNum("AGENT_BRIDGE_CURSOR_CMDLINE_MAX", 24_000);
+// ── Kimi Code backend (Shape B: local session id + per-turn short-lived process) ─────────────────
+// abort() tree-kills the turn's process, then waits this long for the child's `close` (the settlement
+// boundary) to fire and settle the turn as "aborted". Mirrors CURSOR_ABORT_SETTLE_MS; keep it > the 3s
+// force-kill grace so a live tree normally dies well within the window.
+const KIMI_ABORT_SETTLE_MS = envNum("AGENT_BRIDGE_KIMI_ABORT_SETTLE_MS", 8000);
+// The prompt rides in argv (kimi `-p <prompt>` reads no stdin prompt). Windows caps the whole command
+// line in UTF-16 code units (~32K); reject a composed command line over this conservative static ceiling
+// with a clear error rather than letting the OS truncate/fail opaquely. Mirrors CURSOR_CMDLINE_MAX_UNITS.
+const KIMI_CMDLINE_MAX_UNITS = envNum("AGENT_BRIDGE_KIMI_CMDLINE_MAX", 24_000);
 
 // Backend registry — the single source of truth for "which backends exist". Holds ONLY data and pure
 // functions so it is fully initialized at module load: TOOLS (enum), agentBin, assertAgent and doctor
@@ -166,6 +175,29 @@ const AGENTS = {
       return turnBranch || startBranch;
     },
   },
+  kimi: {
+    label: "Kimi Code",
+    env: "KIMI_BIN",
+    bin: "kimi.exe", // NOMINAL only (display/logs). The real path is resolved LAZILY by resolveKimiBin()
+    role: "kimi-stream-json", // §5.9: default ~/.kimi-code/bin/kimi.exe, KIMI_BIN overrides (must be an
+    versionArgs: ["--version"], // existing kimi.exe), PATH is a last resort (kimi.exe only). NEVER resolved at registry init.
+    // A bridge-spawned kimi turn command line =
+    //   <…\kimi.exe> --output-format stream-json [-S session_<uuid>] [-m <model>] -p <prompt>
+    // argv0's basename is strictly kimi.exe (any install dir; not fooled by model/cwd args); the prompt
+    // is always the tail (-p value) and never participates in the match.
+    matchesCommand: cmd => {
+      const s = String(cmd).trim();
+      const m = s.match(/^(?:"([^"]+)"|(\S+))(?=\s|$)/); // command-line first token (optionally quoted), then whitespace/EOL
+      const argv0 = m && (m[1] ?? m[2]); // [R2-M1] ?? not || — an empty capture must read as empty
+      if (!argv0) return false;
+      if (argv0.split(/[\\/]/).pop().toLowerCase() !== "kimi.exe") return false; // SECURITY BOUNDARY: strict argv0 basename
+      const rest = s.slice(m[0].length); // [R3-M1] search for -p ONLY after argv0, so a ` -p ` inside the install path can't cause a miss
+      const i = rest.search(/(?:^|\s)-p\s+(?=\S)/); // a real -p flag WITH a prompt argument after it (reject a dangling -p)
+      if (i < 0) return false; // every turn has -p <prompt>; without it, not one of our spawned turns
+      const head = rest.slice(0, i); // the flag region between argv0 and -p
+      return /(?:^|\s)--output-format\s+stream-json(?:\s|$)/.test(head);
+    },
+  },
 };
 
 const sessions = new Map();
@@ -183,7 +215,7 @@ const TOOLS = [
   {
     name: "agent_bridge_open_session",
     description:
-      "Open a persistent delegated-agent session. OMP uses its JSONL RPC mode; Codex drives a persistent codex app-server over JSON-RPC; Claude runs a fresh-context Claude Code worker; Cursor drives the cursor-agent CLI (Windows-only in v1; per-turn cloud chat, so read/write are both soft, contextUsage is always null, and schema/effort are unsupported; append_system_prompt_file is injected as a SOFT first-turn user-prefix — model-dependent, not a true system prompt). Use this before sending messages.",
+      "Open a persistent delegated-agent session. OMP uses its JSONL RPC mode; Codex drives a persistent codex app-server over JSON-RPC; Claude runs a fresh-context Claude Code worker; Cursor drives the cursor-agent CLI (Windows-only in v1; per-turn cloud chat, so read/write are both soft, contextUsage is always null, and schema/effort are unsupported; append_system_prompt_file is injected as a SOFT first-turn user-prefix — model-dependent, not a true system prompt). Kimi drives the native Kimi Code CLI (Windows-only in v1; a per-turn short-lived process with a LOCAL resume id — no cloud chat — so read/write are both soft, contextUsage is always null, and schema/effort are unsupported; append_system_prompt_file is injected as a SOFT first-turn user-prefix — model-dependent, not a true system prompt; inference still runs on Moonshot's cloud API). Use this before sending messages.",
     inputSchema: {
       type: "object",
       properties: {
@@ -377,7 +409,7 @@ const TOOLS = [
   },
   {
     name: "agent_bridge_doctor",
-    description: "Check whether OMP, Codex, Claude, Cursor, and Node are available for Agent Bridge.",
+    description: "Check whether OMP, Codex, Claude, Cursor, Kimi, and Node are available for Agent Bridge.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
 ];
@@ -387,7 +419,7 @@ function usage() {
     "Usage:",
     "  agent-bridge mcp                 Run the MCP server (stdio). Sessions live in this process.",
     "  agent-bridge doctor [--json]     Report environment / backend availability.",
-    "  agent-bridge cleanup [--json]    Reap orphaned omp/codex/claude/cursor children from dead MCP servers.",
+    "  agent-bridge cleanup [--json]    Reap orphaned omp/codex/claude/cursor/kimi children from dead MCP servers.",
     "",
     "Sessions are managed exclusively through the MCP server's tools (open/send/status/result/",
     "wait/abort/close). The CLI exposes only the server entrypoint plus doctor/cleanup helpers.",
@@ -575,6 +607,44 @@ function resolveCursorLauncher() {
     `Cursor native launcher not found (CURSOR_AGENT_BIN=${JSON.stringify(bin)}). ` +
       "Expected node.exe + index.js in the install dir or its versions\\<version>\\ subdir. " +
       "Point CURSOR_AGENT_BIN at the cursor-agent shim (agent.cmd/agent.ps1), its install root, or a version dir.",
+  );
+}
+
+// ── Kimi native binary resolution (§5.9, native-only, [B1]) ──────────────────────────────────────
+// Resolve the concrete native `kimi.exe` to spawn for a kimi turn / doctor probe. Returns ONLY an
+// EXISTING native kimi.exe FILE (every candidate is statSync().isFile()-checked, [R2-M4]: a directory
+// literally named kimi.exe is rejected). NEVER accepts a .cmd/.bat shim — a prompt rides in argv and a
+// shim would route it through cmd.exe (metacharacter injection). Windows-only (v1). Throws a clear,
+// actionable error when no native kimi.exe is found. MUST be called LAZILY (never at registry init,
+// [R2-B1]) so an uninstalled kimi surfaces as a doctor "unavailable", not a module-load crash.
+function resolveKimiBin() {
+  if (!IS_WINDOWS) throw new Error("kimi backend is Windows-only in v1 (no POSIX launch layout yet).");
+  const asFile = p => { try { return fs.statSync(p).isFile() ? p : null; } catch { return null; } };
+  const isKimiExe = p => path.basename(p).toLowerCase() === "kimi.exe"; // strict basename (reject kimi/kimi.cmd/…)
+  // 1. KIMI_BIN override: must be a PATH to an existing native kimi.exe file (reject .cmd/.bat, a bare
+  //    name, a directory). No PATH search / no fallthrough — an explicit override that is wrong is an error.
+  const envBin = process.env.KIMI_BIN;
+  if (envBin) {
+    const hasDir = path.isAbsolute(envBin) || envBin.includes("\\") || envBin.includes("/");
+    if (!hasDir) throw new Error(`KIMI_BIN must be a path to kimi.exe, not a bare name (got ${JSON.stringify(envBin)}).`);
+    if (!isKimiExe(envBin)) throw new Error(`KIMI_BIN must point at a native kimi.exe (got ${JSON.stringify(envBin)}); .cmd/.bat shims are not accepted.`);
+    const f = asFile(envBin);
+    if (!f) throw new Error(`KIMI_BIN=${JSON.stringify(envBin)} is not an existing file.`);
+    return f;
+  }
+  // 2. Standard native-installer path (absolute, NOT via PATH — the installer only edits User PATH, which
+  //    a long-lived MCP-server process may not have picked up; the research spike hit exactly this).
+  const std = path.join(os.homedir(), ".kimi-code", "bin", "kimi.exe");
+  const stdFile = asFile(std);
+  if (stdFile) return stdFile;
+  // 3. PATH last resort: ONLY kimi.exe (never a shim).
+  for (const dir of (process.env.PATH || "").split(path.delimiter).filter(Boolean)) {
+    const f = asFile(path.join(dir, "kimi.exe"));
+    if (f) return f;
+  }
+  throw new Error(
+    "Native kimi.exe not found (checked KIMI_BIN, %USERPROFILE%\\.kimi-code\\bin\\kimi.exe, and PATH). " +
+      "Install Kimi Code (`irm https://code.kimi.com/kimi-code/install.ps1 | iex`) or set KIMI_BIN to the kimi.exe path.",
   );
 }
 
@@ -3747,6 +3817,487 @@ class CursorAgentSession {
   }
 }
 
+// ── Kimi Code backend (Shape B: LOCAL session id + per-turn short-lived process) ──────────────────
+// Like cursor (per-turn short-lived process + `-S`/resume id) but simpler: a single self-contained native
+// kimi.exe, NO bridge-side create-chat (the id is minted LOCALLY by kimi on the first turn and captured
+// from a terminal `meta` line), and `deriveHealth`/`spawnPlan` need ZERO changes (cursor already added the
+// isReusable() hook; kimi supplies its own). So `this.proc` is null BETWEEN turns — deriveHealth() must
+// gate on isReusable() (§2.1 identity), never proc-liveness.
+//
+// TERMINAL/IDENTITY STATE MACHINE (§2.1): kimi has no `result` event — the final answer is the accumulated
+// assistant `content`, and identity comes from a terminal `meta` (session.resume_hint). The child's `close`
+// is the SOLE settlement boundary (#settleTurn): success = exit0 AND turnHadMeta AND !turnProtocolError.
+// First turn anchors chatId to session_<uuid>; a continuation turn's id MUST equal chatId and NEVER
+// overwrites it. A superseded/stale child's late `close` never touches current state (guarded on
+// this.proc===child and this.turnChild===child).
+//
+// Windows-only (v1): non-Windows fails fast in start()/doctor(). No token usage → contextUsage() is null.
+// effort/schema unsupported (ignored/rejected at the open/send gate); append_system_prompt_file is injected
+// as a SOFT first-turn user-prefix (#composePrompt) since kimi headless has no native system-prompt flag.
+class KimiCodeSession {
+  constructor(options) {
+    this.id = makeId("kimi");
+    this.agent = "kimi";
+    this.cwd = assertCwd(options.cwd);
+    this.access = resolveAccess(options); // "read" | "write"
+    this.write = this.access === "write";
+    this.model = sanitizeAgentArg(options.model, "model"); // null when unset; flows to -m
+    this.effort = null; // kimi headless has no per-invocation effort flag — ignored (not errored); echoes null (§5.10)
+    // kimi headless has no native system-prompt flag → an append_system_prompt_file is injected as a SOFT
+    // user-layer prefix on the FIRST committed turn only (the session then carries it forward via -S).
+    this.appendSystemPrompt = options.appendSystemPrompt || null; // {path,content,bytes}|null (read in openSession)
+    this.appendSystemPending = Boolean(options.appendSystemPrompt?.content); // consumed on the first begun turn
+    this.createdAt = nowIso();
+    this.updatedAt = this.createdAt;
+    this.status = "starting";
+    this.isStreaming = false;
+    this.lastAssistantText = "";     // clamped tail of the accumulated answer (progress)
+    this.finalAnswer = "";           // full accumulated assistant content (the answer; unclamped)
+    this.lastError = null;
+    this.lastStderr = null;
+    this.lastTurnError = false;      // did the most recently COMPLETED turn end in error? drives health
+    this.events = [];
+    this.proc = null;                // the CURRENT turn's short-lived process (null between turns)
+    this.chatId = null;              // LOCAL session_<uuid>; null until the first turn's meta mints it
+    this.currentTurnId = null;
+    this.lastTurnId = null;
+    this.turnStartedAt = null;
+    this.turnEndedAt = null;
+    this.turnCount = 0;
+    this.turn = null;                // { resolve, reject, promise, settled } — the in-flight turn
+    this.turnChild = null;           // the child that owns the begun turn (settlement identity, §2.1/§7)
+    // Per-turn parse state (reset in #beginTurn):
+    this.turnHadMeta = false;        // did we see a VALID terminal meta this turn? (§2.1 success gate)
+    this.turnProtocolError = false;  // [R2-M2] protocol error latch: reset each turn begin, only-increase within a turn
+    this.userAborted = false;        // set by abort() so #onChildClose settles as "aborted" (idle, not failed)
+    this.resolvedBin = null;         // [R2-B1] start() caches resolveKimiBin() here; send() reuses it
+    this.logFile = path.join(RUN_LOG_DIR, `${this.id}.log`);
+    this.answerFile = path.join(RUN_LOG_DIR, `${this.id}.answer.txt`);
+    this.pidFile = pidRecordPath(this.id);
+  }
+
+  async start() {
+    if (!IS_WINDOWS) throw new Error("kimi backend is Windows-only in v1 (no POSIX launch layout yet).");
+    // Resolve the native kimi.exe up front (LAZY resolve, [R2-B1]) so an unavailable binary fails
+    // open_session cleanly — never report a fresh idle session healthy with no binary to run. NO
+    // create-chat: kimi mints the session id locally on the first turn (captured from meta).
+    this.resolvedBin = resolveKimiBin();
+    appendLog(this.logFile, `[agent-bridge] kimi ready bin=${this.resolvedBin}\n`);
+    setSessionStatus(this, "idle", false, { source: "ready" });
+    this.proc = null;
+    return this;
+  }
+
+  // Reusable predicate ([M1]): open AND (holds a resumable chatId, OR has not settled any turn yet — an
+  // empty session can still run its first turn). isReusable() and send() share it so the three states
+  // (spawn-before-begin failure / first-turn abort / protocol error) behave consistently.
+  #canRun() {
+    return this.status !== "closed" && (this.chatId != null || this.turnCount === 0);
+  }
+  isReusable() { return this.#canRun(); } // deriveHealth hook (§5.3): between turns proc is null, so gate on identity
+
+  // Compose the argv prompt: [session instructions (first turn only)] → [read-only policy (every read
+  // turn)] → user message. Both prefixes are SOFT user-layer policy (Windows has no OS sandbox; kimi's
+  // `-p` auto-runs tools incl. writable Bash) — honest guidance, NOT a hard guarantee. The
+  // append_system_prompt_file content is injected ONLY on the first committed turn (kimi carries it forward
+  // via -S); adherence is model-dependent — it is NOT a true system prompt.
+  #composePrompt(message, injectSystem) {
+    const parts = [];
+    if (injectSystem && this.appendSystemPrompt?.content) {
+      parts.push(
+        "[Session instructions — added by agent-bridge for this whole session. Follow them for every reply.]\n" +
+          this.appendSystemPrompt.content,
+      );
+    }
+    if (this.access !== "write") {
+      parts.push(
+        "[agent-bridge READ-ONLY policy] You are in read-only review/investigation mode. Do NOT create, " +
+          "modify, move, or delete any files, and do NOT run shell commands that write to disk. You MAY read " +
+          "files, search, and run read-only shell commands to investigate. Report findings only.",
+      );
+    }
+    parts.push(message);
+    return parts.join("\n\n");
+  }
+
+  // §5.2: prompt is ALWAYS the tail (-p value); no `--` separator (kimi reads the -p value directly, §2.2).
+  #buildTurnArgs(prompt) {
+    const args = ["--output-format", "stream-json"];
+    if (this.chatId) args.push("-S", this.chatId); // resume on every turn after the first (§4)
+    if (this.model) args.push("-m", this.model);
+    args.push("-p", prompt);
+    return args;
+  }
+
+  #assertCmdlineWithinLimit(bin, args) {
+    for (const a of args) if (String(a).includes("\0")) throw new Error("kimi prompt/args contain a NUL character.");
+    // Estimate the ACTUAL Windows command line CreateProcess receives — NOT the raw join. Node quotes any
+    // argv entry containing space/tab/quote and escapes embedded quotes + preceding backslashes, so a
+    // quote-heavy prompt can expand past its raw length. Over-estimate so we reject BELOW the OS ~32767
+    // UTF-16 ceiling instead of after a synchronous spawn throw.
+    const quotedLen = value => {
+      const s = String(value);
+      const needsQuote = s === "" || /[ \t"]/.test(s);
+      let n = s.length + (needsQuote ? 2 : 0);
+      for (let i = 0; i < s.length; i++) { const c = s[i]; if (c === '"' || c === "\\") n += 1; }
+      return n + 1; // + separating space
+    };
+    const units = quotedLen(bin) + args.reduce((sum, a) => sum + quotedLen(a), 0);
+    if (units > KIMI_CMDLINE_MAX_UNITS) {
+      throw new Error(`kimi prompt too long: composed command line ~${units} UTF-16 units exceeds ${KIMI_CMDLINE_MAX_UNITS}. Shorten the prompt (a file-based prompt is not yet supported).`);
+    }
+  }
+
+  #writePidRecord(bin, args) {
+    // Strip the trailing prompt (the -p value is always the last arg) so the persisted record never leaks
+    // it (§5.5). The live OS process list still shows it (unavoidable for argv), but our artifact does not.
+    const safeArgs = args.length ? [...args.slice(0, -1), "<prompt:redacted>"] : args;
+    writePidRecord(this.pidFile, {
+      id: this.id, agent: this.agent, ownerPid: process.pid, cwd: this.cwd, createdAt: this.createdAt,
+      processes: [{ role: AGENTS.kimi.role, pid: this.proc?.pid || null, command: [bin, ...safeArgs], spawnedAt: nowIso() }].filter(p => p.pid),
+    });
+  }
+
+  #beginTurn(turnId, child) {
+    this.turnChild = child;
+    this.currentTurnId = turnId;
+    this.lastTurnId = turnId;
+    this.turnStartedAt = nowIso();
+    this.turnEndedAt = null;
+    this.finalAnswer = "";
+    this.lastAssistantText = "";
+    this.turnHadMeta = false;
+    this.turnProtocolError = false; // [R2-M2] reset each turn begin; only-increase within the turn
+    this.userAborted = false;
+  }
+
+  // The ONE idempotent settlement point. err → failed (reusable/degraded); null → idle (success/abort).
+  #settleTurn(err, status) {
+    const turn = this.turn;
+    if (!turn) return;
+    turn.settled = { err: err || null, status: status ?? null };
+    this.lastTurnError = Boolean(err); // cleared to false on a clean turn / user abort
+    this.turn = null;
+    this.turnChild = null;
+    this.currentTurnId = null;
+    this.turnCount += 1;
+    this.turnEndedAt = nowIso();
+    this.updatedAt = nowIso();
+    removePidRecord(this.pidFile); // no live child between turns → no pid record
+    if (err) {
+      this.lastError = err.message;
+      setSessionStatus(this, "failed", false, { source: "turn_error", error: err.message });
+      turn.reject(err);
+      return;
+    }
+    setSessionStatus(this, "idle", false, { source: "turn/completed", status });
+    turn.resolve();
+  }
+
+  #wireChild(child) {
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", text => { appendLog(this.logFile, text); this.lastStderr = clampText(stripAnsi(text), 4000); });
+    child.stdout.setEncoding("utf8");
+    const rl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
+    rl.on("line", line => this.#handleLine(line, child));
+    child.on("error", err => { appendLog(this.logFile, `[agent-bridge] kimi process error: ${err.message}\n`); if (this.proc === child) this.lastError = err.message; });
+    child.on("close", (code, signal) => this.#onChildClose(child, code, signal));
+  }
+
+  // The settlement boundary (§2.1). Only the ACTIVE, begun child settles current state. Order matters:
+  // abort → nonzero-exit → protocol-error(no/invalid meta) → success.
+  #onChildClose(child, code, signal) {
+    appendLog(this.logFile, `[agent-bridge] kimi exited code=${code} signal=${signal || ""}\n`);
+    if (this.proc !== child) return;        // a superseded/stale child — never touch current state (§7)
+    this.proc = null;
+    if (this.status === "closed") return;   // close() already drove the terminal state
+    if (this.turnChild !== child) return;   // closed before its turn began (spawn-failure window) — send() handles teardown
+    if (!this.turn) return;                 // already force-settled (abort fallback); nothing to do
+    const aborted = this.userAborted;
+    this.userAborted = false;
+    if (aborted) { this.#settleTurn(null, "aborted"); return; }
+    if (code !== 0 || signal) {
+      this.lastError = `kimi exited with code ${code}${signal ? ` signal=${signal}` : ""}.`;
+      this.#settleTurn(new Error(this.lastError), "exit_nonzero"); return;
+    }
+    if (!this.turnHadMeta || this.turnProtocolError) {
+      // exit0 but no valid resume id = the session is crippled (can't be resumed / id was inconsistent);
+      // do NOT silently succeed. Accumulated assistant text stays in memory (result() can read it).
+      this.lastError = this.turnProtocolError
+        ? "kimi turn protocol error: the session meta was invalid or its id did not match the resumed session."
+        : "kimi exited without a session meta (no resume hint; the session id could not be captured).";
+      this.#settleTurn(new Error(this.lastError), "protocol_error"); return;
+    }
+    this.#settleTurn(null, "success"); // meta valid; an empty assistant text is acceptable (§2.1)
+  }
+
+  #handleLine(line, child) {
+    if (this.proc !== child) return; // ignore a stale child's late output
+    if (!line.trim()) return;
+    let msg;
+    try { msg = JSON.parse(line); } catch { appendLog(this.logFile, `${line}\n`); pushEvent(this, { type: "raw" }); return; }
+    // Don't verbatim-log high-frequency assistant chunks or tool results (may carry sensitive full text,
+    // §2.1), nor a `user` prompt-echo line (privacy, §5.5); log meta/other lines (ids/structure only).
+    if (msg.role !== "assistant" && msg.role !== "tool" && msg.role !== "user") appendLog(this.logFile, `${JSON.stringify(stripThinking(msg))}\n`);
+    this.updatedAt = nowIso();
+    switch (msg.role) {
+      case "user":
+        return; // prompt echo (if kimi ever emits one) — dropped for privacy (§5.5), never logged/surfaced
+      case "assistant": {
+        if (this.turn && !this.isStreaming) setSessionStatus(this, "running", true, { source: "assistant" });
+        if (typeof msg.content === "string" && msg.content) {
+          this.finalAnswer = (this.finalAnswer || "") + msg.content; // accumulate the full answer (§5.6)
+          this.lastAssistantText = clampText(this.finalAnswer);      // clamped tail for the progress view
+        }
+        if (Array.isArray(msg.tool_calls) && msg.tool_calls.length) {
+          for (const tc of msg.tool_calls) pushEvent(this, compactEvent({ type: "tool_call", kind: tc?.function?.name }));
+        } else {
+          pushEvent(this, compactEvent({ type: "assistant" }));
+        }
+        return;
+      }
+      case "tool":
+        pushEvent(this, compactEvent({ type: "tool" })); // surface the call; never log the result body
+        return;
+      case "meta":
+        this.#handleMeta(msg);
+        return;
+      default:
+        pushEvent(this, compactEvent({ type: msg.role || msg.type }));
+    }
+  }
+
+  // §2.1 identity: capture/verify chatId from a terminal meta; latch turnProtocolError on any anomaly.
+  #handleMeta(msg) {
+    pushEvent(this, compactEvent({ type: "meta", subtype: msg.type }));
+    const ANCHOR = /^session_[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/;
+    const valid = msg.type === "session.resume_hint" && typeof msg.session_id === "string" && ANCHOR.test(msg.session_id);
+    if (!valid) { this.turnProtocolError = true; return; } // a meta line that doesn't anchor = protocol error
+    if (this.chatId == null) {
+      this.chatId = msg.session_id; // first turn: anchor identity
+      this.turnHadMeta = true;
+    } else if (msg.session_id !== this.chatId) {
+      this.turnProtocolError = true; // continuation mismatch — NEVER overwrite chatId
+    } else {
+      this.turnHadMeta = true;
+    }
+  }
+
+  async send(message, options = {}) {
+    if (!message || !String(message).trim()) throw new Error("message is required.");
+    if (this.status === "closed") throw new Error(`Kimi session ${this.id} is closed.`);
+    if (this.turn) throw new Error(`Kimi session ${this.id} already has a running turn.`);
+    // A prior turn's process may still be terminating (the pathological abort-timeout poison keeps
+    // this.proc set until the wedged child finally dies). Refuse a new turn until it's gone.
+    if (this.proc) throw new Error(`Kimi session ${this.id}: the previous turn's process is still terminating; retry shortly.`);
+    // No resumable chat AND a turn already settled (first-turn abort / prior protocol failure) → dead;
+    // v1 requires a fresh session (honest limitation, §5.2). A first turn on an empty session still runs.
+    if (!this.#canRun()) throw new Error(`Kimi session ${this.id} has no chat to resume; reopen a new session (a first-turn abort/failure needs a fresh session in v1).`);
+
+    // 1. Occupy the turn synchronously so a concurrent send is rejected by the guard above.
+    const turnId = `${this.id}-t${this.turnCount + 1}`;
+    const promise = new Promise((resolve, reject) => { this.turn = { resolve, reject }; });
+    this.turn.promise = promise;
+    const myTurn = this.turn;
+    promise.catch(() => {}); // pre-attach so an early rejection can't crash the server
+    const releaseUnbegun = err => {
+      this.lastError = err.message;
+      if (this.turn === myTurn) {
+        this.turn = null;
+        if (this.status !== "closed") setSessionStatus(this, "failed", false, { source: "send_failed", error: err.message });
+        myTurn.reject(err);
+      }
+    };
+
+    // 2. Compose the prompt ONCE (system prefix on the first turn + read-policy prefix), then spawn the
+    //    native kimi.exe with a single ENOENT retry (a moved/updated binary → re-resolve once).
+    const injectSystem = this.appendSystemPending;
+    const prompt = this.#composePrompt(String(message), injectSystem);
+    let child = null;
+    let winner = null; // { bin, args } of the attempt that actually spawned (for the pid record)
+    let lastErr = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let bin, args;
+      try {
+        bin = this.resolvedBin || (this.resolvedBin = resolveKimiBin());
+        args = this.#buildTurnArgs(prompt);
+        this.#assertCmdlineWithinLimit(bin, args);
+      } catch (err) {
+        releaseUnbegun(err instanceof Error ? err : new Error(String(err)));
+        throw err;
+      }
+      if (attempt === 0) appendLog(this.logFile, `$ ${bin} --output-format stream-json${this.chatId ? ` -S ${this.chatId}` : ""}${this.model ? ` -m ${this.model}` : ""} -p <prompt:redacted>\n`);
+      setSessionStatus(this, "running", true, { source: "send" });
+      let candidate;
+      try {
+        candidate = spawn(bin, args, { cwd: this.cwd, env: childEnv(this), stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+      } catch (err) {
+        const e = err instanceof Error ? err : new Error(String(err));
+        releaseUnbegun(e);
+        throw e;
+      }
+      this.proc = candidate;
+      this.#wireChild(candidate);
+      try {
+        await new Promise((resolve, reject) => { candidate.once("spawn", resolve); candidate.once("error", reject); });
+        child = candidate;
+        winner = { bin, args };
+        break;
+      } catch (err) {
+        lastErr = err instanceof Error ? err : new Error(String(err));
+        if (this.proc === candidate) this.proc = null;
+        // The resolved kimi.exe vanished mid-flight (upgrade/move) → re-resolve and retry EXACTLY once.
+        if (lastErr.code === "ENOENT" && attempt === 0) { appendLog(this.logFile, `[agent-bridge] kimi spawn ENOENT; re-resolving kimi.exe and retrying once\n`); this.resolvedBin = null; continue; }
+        break;
+      }
+    }
+    if (!child) { releaseUnbegun(lastErr || new Error("kimi spawn failed")); throw lastErr || new Error(this.lastError); }
+
+    // A pipelined close() could have run DURING the spawn-await and set status=closed / nulled this.turn.
+    // Do NOT resurrect a closed session by beginning a turn. Same invariant as cursor: do NOT null
+    // this.proc or re-kill here — close() already killed this exact child and scheduled a force-kill whose
+    // verifier keys on this.proc===child; the child's own close handler nulls this.proc.
+    if (this.status === "closed" || this.turn !== myTurn) {
+      if (this.status !== "closed" && child.exitCode === null && child.signalCode === null) {
+        try { terminateProcessTree(child.pid, "SIGKILL"); } catch {}
+      }
+      const e = new Error(`Kimi session ${this.id} was closed during send.`);
+      this.lastError = e.message;
+      throw e;
+    }
+
+    // 5. The process is live — the turn has begun. (No stdout/close can interleave before this: the
+    //    spawn-await continuation is a microtask, ahead of any 'close' macrotask.)
+    this.#beginTurn(turnId, child);
+    if (injectSystem) this.appendSystemPending = false; // system instructions delivered on this committed turn
+    this.#writePidRecord(winner.bin, winner.args);
+    appendLog(this.logFile, `[agent-bridge] spawned kimi turn pid=${child.pid} chatId=${this.chatId || "(first turn)"}\n`);
+
+    if (options.wait) {
+      try {
+        return await withTimeout(promise.then(() => this.result({ maxChars: options.maxChars })), options.timeout_ms || DEFAULT_WAIT_TIMEOUT_MS, "Timed out waiting for Kimi turn.");
+      } catch (err) {
+        if (this.turn) { try { await this.abort(); } catch {} }
+        throw err;
+      }
+    }
+    promise.catch(err => { this.lastError = err.message; });
+    return { accepted: true, sessionId: this.id, status: this.status, turnId };
+  }
+
+  async result(options = {}) {
+    return buildSessionResult(this, this.finalAnswer || this.lastAssistantText || "", options);
+  }
+
+  isSettled() {
+    return this.status === "idle" && !this.turn;
+  }
+
+  refreshStatus() {} // event-driven (turn settles on the child's close); sync no-op (Codex/Claude parity)
+
+  // Tree-kill the turn's process; its `close` settles the turn as "aborted" (idle, not failed). Invariants
+  // mirror cursor §7: do NOT null this.proc here (the scheduled force-kill's verify + the close handler
+  // depend on it); the turn promise MUST settle.
+  async abort() {
+    const turn = this.turn;
+    const child = this.proc;
+    if (!turn || !child || child.exitCode !== null || child.signalCode !== null) {
+      // Nothing actively in flight. Normalize a reusable session back to a clean idle (clear a stale
+      // lastTurnError — abort is user-initiated), but only when there is truly no lingering process and a
+      // resumable chatId still exists (a first-turn-abort/failed session has no chatId → leave it dead).
+      if (this.status !== "closed" && !this.proc) {
+        this.lastTurnError = false;
+        if (this.turnStartedAt && !this.turnEndedAt) this.turnEndedAt = nowIso();
+        if (this.status === "failed" && this.chatId) setSessionStatus(this, "idle", false, { source: "abort" });
+      }
+      return { aborted: true, sessionId: this.id };
+    }
+    this.userAborted = true; // #onChildClose reads this → settles as "aborted"
+    const pid = child.pid;
+    terminateProcessTree(pid);
+    scheduleForceKill(pid, 3000, () => this.proc === child && child.exitCode === null && child.signalCode === null);
+    try {
+      await withTimeout(turn.promise, KIMI_ABORT_SETTLE_MS, "kimi abort settle timeout");
+    } catch {
+      // The child did NOT `close` even after the scheduled SIGKILL (pathological wedge). Do NOT present a
+      // clean reusable idle while a process may still hold the session — poison instead: settle FAILED,
+      // KEEP this.proc + the pid record (so send()'s guard refuses a concurrent turn and cleanup can still
+      // reap the child), and let the child's own close null proc + drop the record once it dies.
+      if (this.turn === turn) {
+        this.userAborted = false;
+        const err = new Error("kimi abort: turn process did not terminate; session blocked until it exits");
+        this.lastError = err.message;
+        this.lastTurnError = true;
+        this.turn = null;
+        this.currentTurnId = null;
+        this.turnCount += 1;
+        if (this.turnStartedAt && !this.turnEndedAt) this.turnEndedAt = nowIso();
+        this.updatedAt = nowIso();
+        setSessionStatus(this, "failed", false, { source: "abort_timeout", error: err.message });
+        turn.reject(err);
+        child.once("close", () => { if (this.proc === child) this.proc = null; removePidRecord(this.pidFile); });
+      }
+    }
+    return { aborted: true, sessionId: this.id };
+  }
+
+  contextUsage() {
+    return null; // kimi stream-json stdout carries no token usage (§5.7). null ≠ 0 — "unknown".
+  }
+
+  summary() {
+    return {
+      id: this.id,
+      agent: this.agent,
+      cwd: this.cwd,
+      access: this.access,
+      write: this.write,
+      model: this.model,
+      effort: null,
+      status: this.status,
+      pid: this.proc?.pid ?? null,
+      createdAt: this.createdAt,
+      updatedAt: this.updatedAt,
+      lastError: this.lastError,
+      lastStderr: this.lastStderr ?? null,
+      name: this.name ?? null,
+      health: deriveHealth(this),
+      contextUsage: null, // always null for kimi
+      appendSystemPrompt: appendSystemPromptSummary(this, "first-turn-user-prefix"), // soft, model-dependent; only {file,bytes,injectionMode}
+      logFile: this.logFile,
+      lastTurn: lastTurnOf(this),
+      agentSpecific: { chatId: this.chatId, turnCount: this.turnCount },
+    };
+  }
+
+  // Synchronous (closeOne does not await; an async close would corrupt the returned shape).
+  close(options = {}) {
+    setSessionStatus(this, "closed", false, { source: "close" });
+    const child = this.proc;
+    const pid = child?.pid;
+    const turn = this.turn;
+    this.turn = null;
+    this.turnChild = null;
+    this.currentTurnId = null;
+    if (turn) {
+      if (this.turnStartedAt && !this.turnEndedAt) this.turnEndedAt = nowIso();
+      turn.reject?.(new Error("session closed"));
+    }
+    const killingLiveChild = child && child.exitCode === null && child.signalCode === null;
+    if (killingLiveChild) {
+      terminateProcessTree(pid);
+      scheduleForceKill(pid, 3000, () => this.proc === child && child.exitCode === null && child.signalCode === null);
+    }
+    if (options.removePidRecord !== false) {
+      if (killingLiveChild) child.once("close", () => removePidRecord(this.pidFile));
+      else removePidRecord(this.pidFile);
+    }
+    try { fs.rmSync(this.answerFile, { force: true }); } catch {}
+    this.chatId = null; // forget the local session id (v1 has no resume-after-close path)
+    return { closed: true, sessionId: this.id };
+  }
+}
+
 // Bind the session constructors onto the registry now that both classes exist. AGENTS is declared at
 // the top of the file (TOOLS/agentBin/doctor/assertAgent read it during early module load, when these
 // classes are still in the temporal dead zone), so the class refs can't live in that literal — they
@@ -3755,6 +4306,7 @@ AGENTS.omp.Session = OmpRpcSession;
 AGENTS.codex.Session = CodexAppServerSession;
 AGENTS.claude.Session = ClaudeCodeSession;
 AGENTS.cursor.Session = CursorAgentSession;
+AGENTS.kimi.Session = KimiCodeSession;
 
 function extractAssistantText(value) {
   if (!value || typeof value !== "object") return "";
@@ -4211,6 +4763,17 @@ async function doctor() {
         agents.push({ agent, label: config.label, bin, available: false, version: null, error: stripAnsi(err.message) });
         continue;
       }
+    } else if (agent === "kimi") {
+      // Kimi: LAZY-resolve the native kimi.exe (§5.9) — NOT the generic branch (which searches the stale
+      // PATH and skips the standard-install absolute path, the exact trap the research spike hit). An
+      // unresolved layout (kimi not installed, or non-Windows) is reported unavailable here.
+      try {
+        const b = resolveKimiBin();
+        plan = { command: b, args: [...config.versionArgs] };
+      } catch (err) {
+        agents.push({ agent, label: config.label, bin, available: false, version: null, error: stripAnsi(err.message) });
+        continue;
+      }
     } else {
       plan = spawnPlan(bin, config.versionArgs);
     }
@@ -4315,7 +4878,7 @@ async function runCli(argv) {
       return;
     }
     case "cleanup":
-      // Reap orphaned backend child processes (omp/codex/claude/cursor) left behind by an MCP server that
+      // Reap orphaned backend child processes (omp/codex/claude/cursor/kimi) left behind by an MCP server that
       // was SIGKILLed before it could clean up its own sessions (matched by pid records whose
       // owner MCP is gone), and remove abandoned logs/<runId>/ dirs from those dead servers.
       printCliResult({ childProcesses: cleanupStalePidRecords(), staleLogs: reclaimStaleLogs() }, args);
