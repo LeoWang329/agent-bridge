@@ -352,6 +352,146 @@ async function t6_codex_not_accepted() {
   await s.kill();
 }
 
+/** T16~T21、T23:中途快照必须自报"这不是终态"。 */
+async function t16_t23_turn_settled() {
+  const s = makeServer("partialslow");
+  await s.init();
+  const id = (await s.call("agent_bridge_open_session", { agent: "omp", cwd: CWD }))?.session?.id;
+
+  console.log("\n[T16] turn 跑一半调 result → inProgress:true,textRef 指向的是片段");
+  await s.call("agent_bridge_send_message", { session_id: id, message: "go" });
+  await sleep(900); // 已吐出 PARTIAL_,但离 2500ms 的收尾还早
+  const mid = await s.call("agent_bridge_result", { session_id: id });
+  ok("inProgress:true", mid?.inProgress === true, JSON.stringify(mid?.inProgress));
+  ok("turnSettled:false", mid?.turnSettled === false, JSON.stringify(mid?.turnSettled));
+  ok("确实取到了中途片段(不是空)", mid?.text === "PARTIAL_", JSON.stringify(mid?.text));
+  ok("textRef 非空(否则下一条断言是空绿)", !!mid?.textRef, JSON.stringify(mid?.textRef));
+  const midRef = mid?.textRef;
+
+  console.log("\n[T17/T18] turn 结束后 → turnSettled:true;wait 交付的每个元素都是终态");
+  const w = await s.call("agent_bridge_wait", { session_ids: [id], mode: "all", timeout_ms: 20000 }, 30000);
+  ok("results[0].turnSettled === true", w?.results?.[0]?.turnSettled === true, JSON.stringify(w?.results?.[0]?.turnSettled));
+  ok("results[0].inProgress === false", w?.results?.[0]?.inProgress === false, JSON.stringify(w?.results?.[0]?.inProgress));
+  ok("正文是完整答案", w?.results?.[0]?.text === "PARTIAL_FINAL", JSON.stringify(w?.results?.[0]?.text));
+  const done = await s.call("agent_bridge_result", { session_id: id });
+  ok("result 也报 turnSettled:true / inProgress:false", done?.turnSettled === true && done?.inProgress === false, JSON.stringify([done?.turnSettled, done?.inProgress]));
+  ok("同一个 textRef 路径已被最终全文覆盖", done?.textRef === midRef && done?.text === "PARTIAL_FINAL", JSON.stringify([done?.textRef === midRef, done?.text]));
+
+  console.log("\n[T19] pendingSnapshots 不带这两个字段(它不经结果构造函数)");
+  await s.call("agent_bridge_send_message", { session_id: id, message: "go" });
+  const w19 = await s.call("agent_bridge_wait", { session_ids: [id], timeout_ms: 700 }, 20000);
+  const snap = w19?.pendingSnapshots?.[0];
+  ok("确实拿到了一个 pendingSnapshot(否则下面是空绿)", !!snap, JSON.stringify(w19)?.slice(0, 160));
+  ok("snapshot 不含 turnSettled", !("turnSettled" in (snap || {})), Object.keys(snap || {}).join(","));
+  ok("snapshot 不含 inProgress", !("inProgress" in (snap || {})), Object.keys(snap || {}).join(","));
+  await s.call("agent_bridge_wait", { session_ids: [id], mode: "all", timeout_ms: 20000 }, 30000);
+
+  console.log("\n[T20] abort / failed / 从未 prompt 三态:字段只承诺它承诺的那件事");
+  const fresh = (await s.call("agent_bridge_open_session", { agent: "omp", cwd: CWD }))?.session?.id;
+  const never = await s.call("agent_bridge_result", { session_id: fresh });
+  ok("从未 prompt 过的会话 → turnSettled:true(可交付,不代表有内容)", never?.turnSettled === true, JSON.stringify(never?.turnSettled));
+  ok("而且正文确实是空的(证明 turnSettled 不承诺有正文)", !never?.text, JSON.stringify(never?.text));
+  await s.call("agent_bridge_send_message", { session_id: fresh, message: "go" });
+  await sleep(900);
+  await s.call("agent_bridge_abort", { session_id: fresh }, 15000);
+  const aborted = await s.call("agent_bridge_result", { session_id: fresh });
+  ok("abort 后 turnSettled:true", aborted?.turnSettled === true, JSON.stringify(aborted?.turnSettled));
+  ok("但正文其实是被中断的片段 —— 所以字段绝不能叫 complete", aborted?.text === "PARTIAL_", JSON.stringify(aborted?.text));
+
+  console.log("\n[T23] return_mode:'ref' × running:标记不因 text:null 丢失");
+  const refId = (await s.call("agent_bridge_open_session", { agent: "omp", cwd: CWD, return_mode: "ref" }))?.session?.id;
+  await s.call("agent_bridge_send_message", { session_id: refId, message: "go" });
+  await sleep(900);
+  const refMid = await s.call("agent_bridge_result", { session_id: refId });
+  ok("ref 模式下 text 被省略", refMid?.text === null, JSON.stringify(refMid?.text));
+  ok("inProgress 仍然在(没被 text:null 带走)", refMid?.inProgress === true, JSON.stringify(refMid?.inProgress));
+  ok("charCount 如实报片段长度", refMid?.charCount === "PARTIAL_".length, JSON.stringify(refMid?.charCount));
+  await s.call("agent_bridge_wait", { session_ids: [refId], mode: "all", timeout_ms: 20000 }, 30000);
+
+  await s.call("agent_bridge_close_session", {});
+  await s.kill();
+}
+
+/** T21:五后端的 settled 判定各是各的实现,共享构造函数的测试替代不了它们。
+ *  这里逐个后端断言 running / terminal 两态。 */
+async function t21_five_backends_settled() {
+  console.log("\n[T21] 五后端 isSettled 矩阵:running 与 terminal 两态都要对");
+  const FAKE_CLAUDE = path.join(HERE, win ? "fake-claude.cmd" : "fake-claude.sh");
+  // 每个后端各自挑能造出该状态的桩 —— 有的后端"跑得慢"和"能干净收尾"不是同一个模式:
+  // fake-claude 默认的 abortfallback 会**扣住**首轮结果(这正是它用来造 running 的手段),
+  // 所以 claude 的 terminal 态要换 ctxturn(一个干净轮)。
+  // cursor / kimi 的桩各自需要一整套安装目录 / stub exe,不在这里重复搭 —— 它们的
+  // turnSettled 断言直接加在 repro-cursor.mjs 与 repro-kimi.mjs 里(那里 harness 现成)。
+  const cases = [
+    { agent: "omp", label: "omp", running: { mode: "partialslow", env: {} }, terminal: { mode: "partialslow", env: {} } },
+    {
+      agent: "codex",
+      label: "codex",
+      running: { mode: "okturn", env: { CODEX_BIN: FAKE_CODEX, FAKE_CODEX_MODE: "schemaslowpartial" } },
+      terminal: { mode: "okturn", env: { CODEX_BIN: FAKE_CODEX, FAKE_CODEX_MODE: "schemaslowpartial" } },
+    },
+    {
+      agent: "claude",
+      label: "claude",
+      running: { mode: "okturn", env: { CLAUDE_BIN: FAKE_CLAUDE } }, // 默认 abortfallback:扣住首轮
+      terminal: { mode: "okturn", env: { CLAUDE_BIN: FAKE_CLAUDE, FAKE_CLAUDE_MODE: "ctxturn" } }, // 干净轮
+    },
+  ];
+  for (const c of cases) {
+    // running 态
+    {
+      const s = makeServer(c.running.mode, c.running.env);
+      await s.init();
+      const id = (await s.call("agent_bridge_open_session", { agent: c.agent, cwd: CWD }, 30000))?.session?.id;
+      ok(`${c.label}:running 用例的会话开起来了`, !!id, String(id));
+      if (id) {
+        await s.call("agent_bridge_send_message", { session_id: id, message: "go" });
+        await sleep(600);
+        const mid = await s.call("agent_bridge_result", { session_id: id });
+        ok(`${c.label}:running 时 turnSettled:false`, mid?.turnSettled === false, JSON.stringify([mid?.turnSettled, mid?.session?.status]));
+      }
+      await s.kill();
+    }
+    // terminal 态
+    {
+      const s = makeServer(c.terminal.mode, c.terminal.env);
+      await s.init();
+      const id = (await s.call("agent_bridge_open_session", { agent: c.agent, cwd: CWD }, 30000))?.session?.id;
+      ok(`${c.label}:terminal 用例的会话开起来了`, !!id, String(id));
+      if (id) {
+        await s.call("agent_bridge_send_message", { session_id: id, message: "go" });
+        const w = await s.call("agent_bridge_wait", { session_ids: [id], mode: "all", timeout_ms: 20000 }, 30000);
+        ok(`${c.label}:wait 真的收到了终态(否则下一条是空绿)`, !w?.timedOut && !!w?.results?.[0], JSON.stringify(w)?.slice(0, 140));
+        const fin = await s.call("agent_bridge_result", { session_id: id });
+        ok(`${c.label}:terminal 时 turnSettled:true`, fin?.turnSettled === true, JSON.stringify([fin?.turnSettled, fin?.session?.status]));
+        await s.call("agent_bridge_close_session", {});
+      }
+      await s.kill();
+    }
+  }
+}
+
+/** T22:running 时不许把半截 JSON 当最终结果去 parse。 */
+async function t22_schema_pending() {
+  console.log("\n[T22] codex + schema 跑一半调 result → json:null + schemaPending,不产 schemaError");
+  const s = makeServer("okturn", { CODEX_BIN: FAKE_CODEX, FAKE_CODEX_MODE: "schemaslowpartial" });
+  await s.init();
+  const id = (await s.call("agent_bridge_open_session", { agent: "codex", cwd: CWD }, 30000))?.session?.id;
+  await s.call("agent_bridge_send_message", { session_id: id, message: "go", schema: { type: "object" } });
+  await sleep(900); // 此刻 buffer 里是 '{"ok": tr' —— 一个必然 parse 失败的半截 JSON
+  const mid = await s.call("agent_bridge_result", { session_id: id });
+  ok("确实取到了半截 JSON(否则下面是空绿)", typeof mid?.text === "string" && mid.text.includes('{"ok"'), JSON.stringify(mid?.text));
+  ok("turnSettled:false", mid?.turnSettled === false, JSON.stringify(mid?.turnSettled));
+  ok("json 为 null", mid?.json === null, JSON.stringify(mid?.json));
+  ok("schemaPending:true", mid?.schemaPending === true, JSON.stringify(mid?.schemaPending));
+  ok("**没有** schemaError(否则调用方会以为最终失败了)", !mid?.schemaError, JSON.stringify(mid?.schemaError));
+  const w = await s.call("agent_bridge_wait", { session_ids: [id], mode: "all", timeout_ms: 20000 }, 30000);
+  ok("turn 结束后才给出真正的 json", JSON.stringify(w?.results?.[0]?.json) === JSON.stringify({ ok: true }), JSON.stringify(w?.results?.[0]?.json));
+  ok("终态不再挂 schemaPending", !w?.results?.[0]?.schemaPending, JSON.stringify(w?.results?.[0]?.schemaPending));
+  await s.call("agent_bridge_close_session", {});
+  await s.kill();
+}
+
 async function main() {
   await t2_schema_defaults_no_env();
   await t3_schema_default_env_override();
@@ -361,6 +501,9 @@ async function main() {
   await t1_t8_t15_ack_decoration();
   await t5_codex_fast_settle();
   await t6_codex_not_accepted();
+  await t16_t23_turn_settled();
+  await t21_five_backends_settled();
+  await t22_schema_pending();
 
   console.log(`\n[harness] ${passed} 通过 / ${failed} 失败`);
   if (failed) {

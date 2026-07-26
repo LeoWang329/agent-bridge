@@ -499,7 +499,14 @@ const TOOLS = [
   {
     name: "agent_bridge_result",
     description:
-      "Read the latest assistant result and recent raw events/logs from a persistent delegated-agent session. The result always reports charCount/byteCount; the full untruncated answer is written to textRef. Pass max_chars to cap the inline text (sets truncated:true) while keeping the full answer retrievable via textRef.",
+      "Read the latest assistant result and recent raw events/logs from a persistent delegated-agent session. " +
+      "⚠️ If the turn has NOT finished this returns a CURRENT SNAPSHOT — partial text, not the final answer — " +
+      "and textRef then points at that fragment, not the full answer. Judge by the returned turnSettled / " +
+      "inProgress (turnSettled:true means the wait layer would now consider this session deliverable; it does " +
+      "NOT mean the turn succeeded or the text is complete, so failed/closed + turnSettled:true is a valid " +
+      "combination). Use agent_bridge_wait for the final answer; use this to watch progress mid-turn. " +
+      "The result always reports charCount/byteCount; the full untruncated answer is written to textRef. Pass " +
+      "max_chars to cap the inline text (sets truncated:true) while keeping the full answer retrievable via textRef.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1315,8 +1322,27 @@ function buildSessionResult(session, fullText, options = {}) {
   // Everything that echoes model text inline — `text` AND schemaError.rawText (T11) — MUST use this so a
   // ref/capped session never leaks the full body through a side field; the full text is always in textRef.
   const displayText = refOmit ? null : (truncated ? text.slice(0, max) : text) || null;
+  // 中途快照现在长得跟终态一模一样(五个后端各自维护实时 buffer,这里从不检查 settled 就包装),
+  // 于是"跑一半取到的半句"和"最终答案"在返回里不可区分 —— textRef 也一样,running 时它指向片段,
+  // 而 schema 与 SKILL.md 都称它"完整未截断全文"。给个诚实的标注,而不是拒绝提供数据。
+  //
+  // ⚠️ 字段语义**严格**限定为:共享判定 `sessionSettled(session)` 此刻是否会把该会话视为可交付。
+  // 它**不表示** turn 成功、正文完整、或远端进程确定停止。`session.status` 仍表示生命周期状态,
+  // 所以 `failed`/`closed` + `turnSettled:true` 是**合法组合**。
+  // 也别把它读成"当前没有在途 turn"——那写强了:OMP 的 isSettled 是 `idle && !turnInFlight`,而
+  // FAKE_OMP_MODE=turnstate 能造出 `status:"running"` + `turnInFlight:false`,此时明明没有在途 turn,
+  // sessionSettled() 仍为 false。
+  //
+  // 为什么不叫 complete/partial:`sessionSettled` 把 failed / closed / **aborted** / 从未 prompt 过
+  // 全算 settled。codex abort 之后 sessionSettled() 已为 true,但正文其实是被中断的片段 —— 叫
+  // complete:true 就是一个新的谎言,比没有字段更糟。要 complete/partial 得先有一个跨五后端统一的
+  // lastTurnOutcome(completed/failed/aborted/running/none),那是更大的工程,本轮不做。
+  const settledNow = sessionSettled(session);
   const result = {
     session: session.summary(),
+    turnSettled: settledNow,
+    inProgress: !settledNow, // 冗余但醒目,故意的:读到 inProgress:true 就该知道这不是最终答案
+
     // Lift health to the TOP level too: wait()'s summarize withholds the heavy `session` object (T1),
     // so this is how wait().completed.health / result().health reach the caller. (This is also the
     // deterministic proof of the T1 passthrough: a new top-level field flows through wait unchanged.)
@@ -1348,7 +1374,13 @@ function buildSessionResult(session, fullText, options = {}) {
   // projection) — NOT the full `text` — or a ref/capped session would leak the whole body here (the full
   // output stays in textRef either way). JSON.parse still runs on the FULL `text`, so parsing is unaffected.
   if (session._requestedSchema) {
-    if (session.lastTurnError) {
+    // turn 还没结算就去 JSON.parse,拿到的必然是半截 JSON,产出一个看起来像"最终失败"的
+    // schemaError —— 调用方据此放弃,而模型其实还在写。running 时既不产 json 也不产 schemaError,
+    // 只挂一个 schemaPending 说明"还没到能判的时候"。
+    if (!settledNow) {
+      result.json = null;
+      result.schemaPending = true;
+    } else if (session.lastTurnError) {
       result.json = null;
       // Prefer THIS turn's captured failure reason over the sticky session lastError, which a later
       // turn/start failure (that never began a turn) could have overwritten (T11 round-2 edge).
@@ -5198,7 +5230,10 @@ async function waitSessions(params) {
 
   const summarize = async id => {
     const session = sessions.get(id);
-    if (!session) return { sessionId: id, status: "closed", text: null, gone: true };
+    // 结果构造函数**不是唯一漏斗**:这条(会话在收集期间被并发关掉)和下面的 base fallback 都绕过它。
+    // 两条都必须带上完成度字段,不能选择性省略 —— 否则 results[]/completed/settled[] 里会混进
+    // 没有这两个字段的元素,调用方按字段判别就会漏判。会话已经没了,收集这件事到此为止:turnSettled。
+    if (!session) return { sessionId: id, status: "closed", text: null, gone: true, turnSettled: true, inProgress: false };
     const r = await result(id, { maxChars: params.max_chars }).catch(() => null);
     // `base` is the flat shape wait() has always returned. When result() succeeds we ALSO spread
     // any EXTRA top-level field buildSessionResult produced — this is the N3 fix: new result fields
@@ -5207,6 +5242,7 @@ async function waitSessions(params) {
     // (the full summary snapshot) and `recentEvents` (the event stream) would bloat every wait
     // result and undercut the context hygiene callers use wait for. Today `extra` is empty, so this
     // is byte-identical to the old output; it only starts carrying fields once later tasks add them.
+    const settledNow = sessionSettled(session);
     const base = {
       sessionId: id,
       status: session.status,
@@ -5216,6 +5252,9 @@ async function waitSessions(params) {
       truncated: r?.truncated ?? false,
       textRef: r?.textRef ?? null,
       lastTurn: lastTurnOf(session),
+      // 第二条绕过 buildSessionResult 的路径(result() 抛错时的兜底)。同上:不得省略。
+      turnSettled: settledNow,
+      inProgress: !settledNow,
     };
     if (!r) return base;
     const { session: _session, recentEvents: _recentEvents, text, charCount, byteCount, truncated, textRef, ...extra } = r;

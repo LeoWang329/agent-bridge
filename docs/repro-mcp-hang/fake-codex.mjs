@@ -93,6 +93,24 @@ process.stdin.on("data", d => {
       // slowstart:把 turn/start 的 RESPONSE 本身拖慢 ~600ms,给测试一个确定的窗口,在"turn id 还不
       // 知道"的时候插进一次 abort —— 那正是 codex send() 里 accepted:false 那条分支的成因
       // (abort/close 抢在 turn/start 返回之前跑完,没法去中断一个还没有 id 的 turn)。[T6]
+      // schemaslowpartial:turn/started 之后先吐**半截** JSON 的 delta,再拖 ~2.5s 才 turn/completed。
+      // 用来考"running 时不许 JSON.parse 半截 JSON 产出一个看起来像最终失败的 schemaError"。[T22]
+      if (MODE === "schemaslowpartial") {
+        const tid = `fake-turn-${seq}`;
+        respond(id, { turn: { id: tid } });
+        setTimeout(() => {
+          say({ method: "turn/started", params: { turn: { id: tid } } });
+          say({ method: "item/agentMessage/delta", params: { turn: { id: tid }, delta: '{"ok": tr' } });
+        }, 50);
+        setTimeout(() => {
+          say({
+            method: "item/completed",
+            params: { turn: { id: tid }, item: { type: "agentMessage", text: '{"ok":true}', phase: "final_answer", id: "item-1" } },
+          });
+          say({ method: "turn/completed", params: { turn: { id: tid, status: "completed" } } });
+        }, 2500);
+        continue;
+      }
       if (MODE === "slowstart") {
         setTimeout(() => {
           respond(id, { turn: { id: tid } });

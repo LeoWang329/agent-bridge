@@ -214,9 +214,18 @@ async function main() {
     await sleep(300); // meta emitted ~50ms in, but the process stays alive ~600ms more
     const mid = (await s.call("agent_bridge_status", { session_id: sess.id }))?.session;
     if (mid?.status !== "running") return fail(`turn must stay running until the process closes (settlement boundary), got status=${mid?.status}`);
+    // C5: this backend's own half of the settled matrix (repro-collect-discipline T21 covers
+    // omp/codex/claude; kimi's stub needs the C# shim harness, which lives here).
+    const midR = await s.call("agent_bridge_result", { session_id: sess.id });
+    if (midR?.turnSettled !== false || midR?.inProgress !== true) {
+      return fail(`mid-turn kimi result must report turnSettled:false/inProgress:true, got ${JSON.stringify([midR?.turnSettled, midR?.inProgress])}`);
+    }
     const w = await s.call("agent_bridge_wait", { session_ids: [sess.id], mode: "all", timeout_ms: 5000 });
     const rc = w?.results?.[0];
     if (rc?.text !== "slow") return fail(`delayexit final text should be "slow", got ${JSON.stringify(rc?.text)}`);
+    if (rc?.turnSettled !== true || rc?.inProgress !== false) {
+      return fail(`a completed kimi turn must report turnSettled:true/inProgress:false, got ${JSON.stringify([rc?.turnSettled, rc?.inProgress])}`);
+    }
     if (rc?.status !== "idle") return fail(`after the process exits, status should be idle, got ${rc?.status}`);
     await s.call("agent_bridge_close_session", { session_id: sess.id });
     s.kill(); await sleep(150);

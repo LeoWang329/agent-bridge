@@ -87,7 +87,7 @@ process.stdin.on("data", d => {
           ? turnstateStreaming
           : MODE === "lateterminal"
           ? lateturnStreaming
-          : MODE === "slowsettle"
+          : MODE === "slowsettle" || MODE === "partialslow"
           ? slowsettleStreaming
           : (MODE === "multiturn" || MODE === "multiturn-fast")
           ? multiturnStreaming
@@ -139,6 +139,18 @@ process.stdin.on("data", d => {
             say({ type: "turn_end", message: { stopReason: "error", errorMessage: "fake-omp: simulated turn error" } });
             say({ type: "agent_end" });
           }, 60);
+        } else if (MODE === "partialslow") {
+          // 中途**已经有部分文本**的慢 turn。slowturn 在终态之前一个 delta 都不吐,mid-result 的
+          // textRef 会是 null,考不到"running 时 textRef 指向的是片段"这件事。
+          slowsettleStreaming = true;
+          say({ type: "agent_start" });
+          setTimeout(() => say({ type: "message_update", message: { type: "text_delta", delta: "PARTIAL_" } }), 200);
+          setTimeout(() => {
+            say({ type: "message_update", message: { type: "text_delta", delta: "FINAL" } });
+            say({ type: "turn_end" });
+            say({ type: "agent_end" });
+            slowsettleStreaming = false;
+          }, 2500);
         } else if (MODE === "slowsettle") {
           // 慢,但会如实收尾:turn 结束时 get_state 才翻回"没在流",这才是真 omp 的样子。
           slowsettleStreaming = true;

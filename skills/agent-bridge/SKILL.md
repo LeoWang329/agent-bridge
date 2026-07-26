@@ -89,7 +89,7 @@ close_session(session_id)                  →  用完必须关
 | `agent_bridge_send_message` | 发一条消息（**默认非阻塞**，返回 ack） | 派活、追问（复用同一 `session_id`）。慎用 `wait:true`：超时会 abort 本轮 |
 | `agent_bridge_wait` | 收口一个/多个会话（`timeout_ms` 默认 10 分钟，超时不中断 turn） | 收结果的**唯一**途径，`mode` 默认 `"any"`；返回 shape 随 mode/超时不同（见上） |
 | `agent_bridge_status` | 看运行状态 + 最近事件；无 `session_id` 时返回 `{sessions:[…]}`（你开的全部） | 查进度；看「当前主 agent 拉起了哪些 agent」 |
-| `agent_bridge_result` | 读**最近一轮** assistant 文本 + 最近事件（非全历史） | 想看目前为止的产出（含中途） |
+| `agent_bridge_result` | 读**最近一轮** assistant 文本 + 最近事件（非全历史） | 想看目前为止的产出（含中途）。⚠️ 中途取到的是**快照**，按 `turnSettled`/`inProgress` 判别，不能当最终结果——收口仍要靠 `wait` |
 | `agent_bridge_abort` | 中断当前 turn（会话仍可复用） | 要**真正停掉**正在跑的一轮（打断主 agent ≠ 停任务） |
 | `agent_bridge_close_session` | 关会话、回收后端进程。单关返回 `{closed, sessionId}`；省略 `id` 批量关返回 `{closedAll, count, sessionIds, failed}` | 常规**显式传 `id`**；省略 `id` 仅作崩溃兜底，且要查 `closedAll`/`failed` |
 | `agent_bridge_doctor` | 检查 omp/codex/claude/cursor/kimi/node 是否可用 | 排查「后端起不来」 |
@@ -113,7 +113,8 @@ close_session(session_id)                  →  用完必须关
 
 - `text`：本轮 assistant 全文，**必读内容**。
 - `charCount` / `byteCount`：成功结果里**总会返回**的长度——这是「罗盘针」，先看长度再决定要不要全量取。
-- `textRef`：一个文件路径，里面是**完整未截断**的全文。⚠️ `close_session` 会删除它——**要完整内容就先读 `textRef`、再关会话**；读不到时重新 `result`（调大或去掉 `max_chars`）。
+- `textRef`：一个文件路径，里面是**该轮结束时**完整未截断的全文。⚠️ **turn 还没结束时它指向的是当前片段**（按 `turnSettled` / `inProgress` 判别），不是最终答案。⚠️ `close_session` 会删除它——**要完整内容就先读 `textRef`、再关会话**；读不到时重新 `result`（调大或去掉 `max_chars`）。
+- `turnSettled` / `inProgress`：这一份产出是不是可交付的终态。**语义严格限定为**「收口层此刻是否会把该会话视为可交付」——**不代表** turn 成功、正文完整、或远端确实停了。所以 `status:"failed"` 配 `turnSettled:true` 是**合法组合**（失败也是一种终态）。`inProgress:true` 就当快照看，别当最终结果用。
 - `max_chars`：给 `text` 设上限；超限时 `text` 截断、`truncated:true`，但 `charCount` 仍报全长、`textRef` 仍是全文。**核心：必读内容绝不静默丢失。** 大产出（改代码/长文档）建议传个 `max_chars`（如 4000）只看头部，细节用 `git diff` / `textRef` 取。
 - `recentEvents`（`status`/`result` 带）：已**过滤掉逐 token、心跳等噪声**的精简生命周期串；要全量原始事件看 `logFile`。
 - `contextUsage`：该会话**当前上下文占用**（`{tokens, live, …}` 或 `null`；只吐绝对 `tokens`，不含窗口/百分比）——判断要不要「关旧开新」防降智的信号。判定阈值与取法见「编排策略 → 上下文卫生」。

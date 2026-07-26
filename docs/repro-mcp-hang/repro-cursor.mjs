@@ -129,6 +129,12 @@ async function main() {
     const rc = w?.results?.[0];
     if (rc?.text !== "FAKE_CURSOR_OK") return fail(`turn text should be "FAKE_CURSOR_OK", got ${JSON.stringify(rc?.text)}`);
     if (rc?.health !== "healthy") return fail(`completed turn health should be healthy, got ${JSON.stringify(rc?.health)}`);
+    // C5: the completion markers must be right for THIS backend's own isSettled, not just for the
+    // shared result builder (repro-collect-discipline T21 covers omp/codex/claude; cursor's stub needs
+    // its whole install-root harness, so its half of the matrix lives here where that harness exists).
+    if (rc?.turnSettled !== true || rc?.inProgress !== false) {
+      return fail(`a completed cursor turn must report turnSettled:true/inProgress:false, got ${JSON.stringify([rc?.turnSettled, rc?.inProgress])}`);
+    }
     if (rc?.contextUsage !== null) return fail(`wait result contextUsage must be null, got ${JSON.stringify(rc?.contextUsage)}`);
     const st = (await s.call("agent_bridge_status", { session_id: sess.id }))?.session;
     if (st?.status !== "idle") return fail(`after turn, status should be idle, got ${st?.status}`);
