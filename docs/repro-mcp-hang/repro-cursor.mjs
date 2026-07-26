@@ -323,6 +323,12 @@ async function main() {
     if (!bpid) return fail("S12: never observed a turn process pid");
     const pidFile = path.join(stateDir, "pids", `${sess.id}.json`);
     if (!fs.existsSync(pidFile)) return fail(`S12: pid record should exist during a turn (${pidFile})`);
+    // C5 (T21, running half): this backend's own isSettled must read false MID-TURN — the terminal half
+    // is asserted in S1. Without both halves a broken isSettled that always returns true would still pass.
+    const midR = await s.call("agent_bridge_result", { session_id: sess.id });
+    if (midR?.turnSettled !== false || midR?.inProgress !== true) {
+      return fail(`S12: mid-turn cursor result must report turnSettled:false/inProgress:true, got ${JSON.stringify([midR?.turnSettled, midR?.inProgress])}`);
+    }
     // C6: closing a RUNNING session is refused by default now, so first prove the guard fires (and that
     // it changes nothing), then use force — which is precisely what force exists for — so the rest of
     // this scenario still exercises the original tree-kill path.

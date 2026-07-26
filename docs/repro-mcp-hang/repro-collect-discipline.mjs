@@ -7,7 +7,8 @@
 //   · C1 ack / 未完成收集带"必须收口"信号(B2 追加)
 //
 // hermetic:全程 fake-omp 桩,零真实 token。
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -33,6 +34,15 @@ function ok(name, cond, detail = "") {
 // 一个绑定到给定 FAKE_OMP_MODE 的 MCP server。extraEnv 用于 C3 的 env 覆盖 ——
 // ⚠️ 每个 env 组合必须是**独立进程**:DEFAULT_JOIN_TIMEOUT_MS 与 TOOLS 都在**模块加载时**求值,
 // 改父进程的 env 再复用同一个 server 是假绿。
+const pidAlive = pid => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
 function makeServer(mode, extraEnv = {}) {
   const srv = spawn("node", [BRIDGE, "mcp"], {
     stdio: ["pipe", "pipe", "pipe"],
@@ -177,6 +187,8 @@ async function t9_t12_wait_shapes() {
   ok("requiredAction 的 session_ids 就是 pending", JSON.stringify(w9?.requiredAction?.arguments?.session_ids) === JSON.stringify([b]), JSON.stringify(w9?.requiredAction?.arguments));
   ok("requiredAction 回显了 mode:any", w9?.requiredAction?.arguments?.mode === "any", JSON.stringify(w9?.requiredAction?.arguments?.mode));
   ok("续等条件写的是 pending 非空,不是 timedOut", /pending/.test(w9?.requiredAction?.repeatWhile || ""), JSON.stringify(w9?.requiredAction?.repeatWhile));
+  // T18 的一半:any 返回的 `completed` 也必须带终态字段(它同样经结果构造函数)。
+  ok("completed 带 turnSettled:true / inProgress:false", w9?.completed?.turnSettled === true && w9?.completed?.inProgress === false, JSON.stringify([w9?.completed?.turnSettled, w9?.completed?.inProgress]));
 
   console.log("\n[T10] 显式 mode:'all' 仍返回 {mode:'all', results:[…]}(回归保护)");
   const w10 = await s.call("agent_bridge_wait", { session_ids: [b], mode: "all", timeout_ms: 20000 }, 30000);
@@ -192,6 +204,8 @@ async function t9_t12_wait_shapes() {
   ok("timedOut 为 true", w11?.timedOut === true, JSON.stringify(w11?.timedOut));
   ok("pending 只有仍在跑的 A", JSON.stringify(w11?.pending) === JSON.stringify([a]), JSON.stringify(w11?.pending));
   ok("已终态的 B 进了 settled", w11?.settled?.length === 1 && w11.settled[0].sessionId === b, JSON.stringify(w11?.settled?.map(x => x.sessionId)));
+  // T18 的另一半:超时分支的 settled[] 同样必须带终态字段。
+  ok("settled[0] 带 turnSettled:true / inProgress:false", w11?.settled?.[0]?.turnSettled === true && w11?.settled?.[0]?.inProgress === false, JSON.stringify([w11?.settled?.[0]?.turnSettled, w11?.settled?.[0]?.inProgress]));
   // C1:回显的 mode 必须是调用方原来那个。递回裸参数 = 静默把 all 变成 any,连返回形状一起换掉。
   ok("requiredAction 回显 mode:'all'(没被新默认污染)", w11?.requiredAction?.arguments?.mode === "all", JSON.stringify(w11?.requiredAction?.arguments?.mode));
   ok("requiredAction 的 session_ids 是 pending 而非原始全集", JSON.stringify(w11?.requiredAction?.arguments?.session_ids) === JSON.stringify([a]), JSON.stringify(w11?.requiredAction?.arguments?.session_ids));
@@ -367,6 +381,13 @@ async function t16_t23_turn_settled() {
   ok("确实取到了中途片段(不是空)", mid?.text === "PARTIAL_", JSON.stringify(mid?.text));
   ok("textRef 非空(否则下一条断言是空绿)", !!mid?.textRef, JSON.stringify(mid?.textRef));
   const midRef = mid?.textRef;
+  // 光断言"textRef 非空"证明不了 schema 里那句 caveat —— 必须**把文件读出来**,证明它此刻装的
+  // 确实是片段而不是全文。
+  let midFile = null;
+  try {
+    midFile = fs.readFileSync(midRef, "utf8");
+  } catch {}
+  ok("textRef 指向的文件此刻装的是片段", midFile === "PARTIAL_", JSON.stringify(midFile));
 
   console.log("\n[T17/T18] turn 结束后 → turnSettled:true;wait 交付的每个元素都是终态");
   const w = await s.call("agent_bridge_wait", { session_ids: [id], mode: "all", timeout_ms: 20000 }, 30000);
@@ -376,6 +397,11 @@ async function t16_t23_turn_settled() {
   const done = await s.call("agent_bridge_result", { session_id: id });
   ok("result 也报 turnSettled:true / inProgress:false", done?.turnSettled === true && done?.inProgress === false, JSON.stringify([done?.turnSettled, done?.inProgress]));
   ok("同一个 textRef 路径已被最终全文覆盖", done?.textRef === midRef && done?.text === "PARTIAL_FINAL", JSON.stringify([done?.textRef === midRef, done?.text]));
+  let doneFile = null;
+  try {
+    doneFile = fs.readFileSync(midRef, "utf8");
+  } catch {}
+  ok("同一个文件的内容确实变成了最终全文", doneFile === "PARTIAL_FINAL", JSON.stringify(doneFile));
 
   console.log("\n[T19] pendingSnapshots 不带这两个字段(它不经结果构造函数)");
   await s.call("agent_bridge_send_message", { session_id: id, message: "go" });
@@ -398,6 +424,36 @@ async function t16_t23_turn_settled() {
   ok("abort 后 turnSettled:true", aborted?.turnSettled === true, JSON.stringify(aborted?.turnSettled));
   ok("但正文其实是被中断的片段 —— 所以字段绝不能叫 complete", aborted?.text === "PARTIAL_", JSON.stringify(aborted?.text));
 
+  // 第三态:failed。杀掉后端 → status 变 failed,而 turnSettled 仍为 true —— 这是**合法组合**,
+  // 因为字段说的是"收口层是否视为可交付",失败也是一种终态。调用方必须靠 status 判成败,不是靠它。
+  const failId = (await s.call("agent_bridge_open_session", { agent: "omp", cwd: CWD }))?.session?.id;
+  const failPid = (await s.call("agent_bridge_status", { session_id: failId }))?.session?.pid;
+  ok("拿到了要杀的后端 pid", !!failPid, String(failPid));
+  // ⚠️ 必须杀**整棵树**,不能只 process.kill(pid)。桥的 health 是**读** ChildProcess 的退出状态
+  // (`exitCode`/`signalCode` 两个属性,桥并没有注册 `exit` handler),而 status 翻成 failed 是在
+  // `proc.on("close")` 里 —— 两者的时机不同。Windows 上 OMP_BIN 是
+  // 一个 .cmd shim,只杀 shim 的话 node 孙进程还握着 stdio,`close` 迟迟不来,于是 health 已经
+  // dead 而 status 还停在 idle。repro-health 断言的是 health,所以它不受这条影响;这里要的是 status。
+  if (win) {
+    spawnSync("taskkill", ["/PID", String(failPid), "/T", "/F"], { windowsHide: true });
+  } else {
+    try {
+      process.kill(failPid, "SIGKILL");
+    } catch {}
+  }
+  let failedSeen = null;
+  for (let i = 0; i < 30; i++) {
+    await sleep(200);
+    const st = (await s.call("agent_bridge_status", { session_id: failId }))?.session;
+    if (st?.status === "failed") {
+      failedSeen = st;
+      break;
+    }
+  }
+  ok("后端被杀之后会话变成 failed", failedSeen?.status === "failed", JSON.stringify(failedSeen?.status));
+  const failedRes = await s.call("agent_bridge_result", { session_id: failId });
+  ok("failed + turnSettled:true 是合法组合(不被当成错误)", failedRes?.turnSettled === true && failedRes?.session?.status === "failed", JSON.stringify([failedRes?.turnSettled, failedRes?.session?.status]));
+
   console.log("\n[T23] return_mode:'ref' × running:标记不因 text:null 丢失");
   const refId = (await s.call("agent_bridge_open_session", { agent: "omp", cwd: CWD, return_mode: "ref" }))?.session?.id;
   await s.call("agent_bridge_send_message", { session_id: refId, message: "go" });
@@ -407,6 +463,16 @@ async function t16_t23_turn_settled() {
   ok("inProgress 仍然在(没被 text:null 带走)", refMid?.inProgress === true, JSON.stringify(refMid?.inProgress));
   ok("charCount 如实报片段长度", refMid?.charCount === "PARTIAL_".length, JSON.stringify(refMid?.charCount));
   await s.call("agent_bridge_wait", { session_ids: [refId], mode: "all", timeout_ms: 20000 }, 30000);
+
+  // running × max_chars(另一条投影路径:head 截断)。标记同样不能被截断带走。
+  const capId = (await s.call("agent_bridge_open_session", { agent: "omp", cwd: CWD }))?.session?.id;
+  await s.call("agent_bridge_send_message", { session_id: capId, message: "go" });
+  await sleep(900);
+  const capMid = await s.call("agent_bridge_result", { session_id: capId, max_chars: 3 });
+  ok("max_chars 生效:text 被截断", capMid?.text === "PAR" && capMid?.truncated === true, JSON.stringify([capMid?.text, capMid?.truncated]));
+  ok("inProgress 仍然在(截断路径也不丢标记)", capMid?.inProgress === true && capMid?.turnSettled === false, JSON.stringify([capMid?.inProgress, capMid?.turnSettled]));
+  ok("charCount 报的是片段全长而不是截断后的长度", capMid?.charCount === "PARTIAL_".length, JSON.stringify(capMid?.charCount));
+  await s.call("agent_bridge_wait", { session_ids: [capId], mode: "all", timeout_ms: 20000 }, 30000);
 
   await s.call("agent_bridge_close_session", {});
   await s.kill();
@@ -556,20 +622,34 @@ async function t24_t28_close_guard() {
   await sleep(600);
   const pidB = (await s.call("agent_bridge_status", { session_id: b }))?.session?.pid;
   ok("空闲会话 b 也有 pid(否则下面的'没被殃及'是空绿)", !!pidB, String(pidB));
-  // ⚠️ 基线必须在批量关**之前**量。放到之后再比,两次读数中间什么都没发生,断言恒真 = 空绿。
-  const before = ((await s.call("agent_bridge_status", {}))?.sessions || []).map(x => x.id);
+  // ⚠️ 基线必须在批量关**之前**量,而且要量**两个**会话的 pid + 完整 id 集合。
+  // 只比列表长度 + 只比 b 的 pid 数字,会漏掉这条可构造的错误实现:先把两个后端都 close() 杀掉、
+  // 但**不删** Map 条目,再返回伪造的 blocked —— 长度不变、pid 数字不变,断言照样全绿,而 T28 随后
+  // 看到进程已死、再删 Map,也一路绿。所以必须断言"进程仍活"与"id 集合逐个相同"。
+  const beforeSessions = (await s.call("agent_bridge_status", {}))?.sessions || [];
+  const before = beforeSessions.map(x => x.id);
+  const pidA = beforeSessions.find(x => x.id === a)?.pid;
   ok("批量关之前记下基线(别写死数字:前面的用例可能留下会话)", before.length >= 2 && before.includes(a) && before.includes(b), JSON.stringify(before));
+  ok("两个会话的 pid 都在批量关之前采到了", !!pidA && !!pidB, JSON.stringify([pidA, pidB]));
   const bulkBlocked = await s.call("agent_bridge_close_session", {});
   ok("closedAll:false 且 count:0", bulkBlocked?.closedAll === false && bulkBlocked?.count === 0, JSON.stringify(bulkBlocked));
   ok("blocked:true", bulkBlocked?.blocked === true, JSON.stringify(bulkBlocked?.blocked));
   ok("runningSessionIds 只点名真在跑的那个", JSON.stringify(bulkBlocked?.runningSessionIds) === JSON.stringify([a]), JSON.stringify(bulkBlocked?.runningSessionIds));
-  const listed = await s.call("agent_bridge_status", {});
-  ok("会话列表**没有**被清空", (listed?.sessions || []).length === before.length, `after=${JSON.stringify((listed?.sessions || []).map(x => x.id))} before=${JSON.stringify(before)}`);
+  const listedSessions = (await s.call("agent_bridge_status", {}))?.sessions || [];
+  ok(
+    "会话 id 集合逐个未变(不只是长度相同)",
+    JSON.stringify(listedSessions.map(x => x.id).sort()) === JSON.stringify([...before].sort()),
+    `after=${JSON.stringify(listedSessions.map(x => x.id))} before=${JSON.stringify(before)}`,
+  );
+  const aStill = await s.call("agent_bridge_status", { session_id: a });
   const bStill = await s.call("agent_bridge_status", { session_id: b });
-  ok("空闲的 b 也一个没关(原子:要么全关要么都不关)", bStill?.session?.pid === pidB, JSON.stringify([bStill?.session?.pid, pidB]));
+  ok("在跑的 a 仍是 running", aStill?.session?.status === "running", JSON.stringify(aStill?.session?.status));
+  ok("空闲的 b 仍是 idle", bStill?.session?.status === "idle", JSON.stringify(bStill?.session?.status));
+  ok("两个 pid 数字都没变", aStill?.session?.pid === pidA && bStill?.session?.pid === pidB, JSON.stringify([aStill?.session?.pid, pidA, bStill?.session?.pid, pidB]));
+  // 关键的一条:pid 数字没变**不等于**进程还活着。被挡的批量关必须一个后端都没杀。
+  ok("两个后端进程都仍然活着(原子:要么全关要么都不关)", pidAlive(pidA) && pidAlive(pidB), JSON.stringify([pidA, pidAlive(pidA), pidB, pidAlive(pidB)]));
 
   console.log("\n[T28] 同上 + force:true → 全关掉");
-  const pidA = (await s.call("agent_bridge_status", { session_id: a }))?.session?.pid;
   const bulkForced = await s.call("agent_bridge_close_session", { force: true });
   ok("closedAll:true", bulkForced?.closedAll === true, JSON.stringify(bulkForced));
   ok("count 等于当时的会话数", bulkForced?.count === before.length, `${bulkForced?.count} vs ${before.length}`);
