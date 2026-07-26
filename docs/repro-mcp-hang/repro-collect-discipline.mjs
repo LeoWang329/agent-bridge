@@ -492,6 +492,108 @@ async function t22_schema_pending() {
   await s.kill();
 }
 
+/** T24~T28:对在途 turn 默认拒绝关闭。
+ *  只断言"返回里有 blocked"是不够的 —— 必须证明**什么都没发生**(会话还在、进程还活、结果还能收),
+ *  否则"拒绝了但其实已经关掉了"照样绿。 */
+async function t24_t28_close_guard() {
+  const s = makeServer("partialslow");
+  await s.init();
+
+  console.log("\n[T24] 对 running 会话单关(不传 force)→ 拒绝,且什么都没动");
+  const id = (await s.call("agent_bridge_open_session", { agent: "omp", cwd: CWD }))?.session?.id;
+  const pid0 = (await s.call("agent_bridge_status", { session_id: id }))?.session?.pid;
+  ok("拿到了后端 pid(否则后面的存活断言是空绿)", !!pid0, String(pid0));
+  await s.call("agent_bridge_send_message", { session_id: id, message: "go" });
+  await sleep(600);
+  const blocked = await s.call("agent_bridge_close_session", { session_id: id });
+  ok("closed:false", blocked?.closed === false, JSON.stringify(blocked));
+  ok("blocked:true", blocked?.blocked === true, JSON.stringify(blocked?.blocked));
+  ok("runningSessionIds 指名道姓", JSON.stringify(blocked?.runningSessionIds) === JSON.stringify([id]), JSON.stringify(blocked?.runningSessionIds));
+  const stillThere = await s.call("agent_bridge_status", { session_id: id });
+  ok("会话还在,而且仍在跑", stillThere?.session?.status === "running", JSON.stringify(stillThere?.session?.status));
+  ok("后端进程还活着", stillThere?.session?.pid === pid0, JSON.stringify([stillThere?.session?.pid, pid0]));
+  const rescued = await s.call("agent_bridge_wait", { session_ids: [id], mode: "all", timeout_ms: 20000 }, 30000);
+  ok("被拒之后照样能把结果收回来(这才是闸门存在的意义)", rescued?.results?.[0]?.text === "PARTIAL_FINAL", JSON.stringify(rescued?.results?.[0]?.text));
+
+  console.log("\n[T26] 先 abort 再单关(不传 force)→ 放行(abort 是正当出口)");
+  await s.call("agent_bridge_send_message", { session_id: id, message: "go" });
+  await sleep(500);
+  const ab = await s.call("agent_bridge_abort", { session_id: id }, 15000);
+  ok("abort 成功", ab?.aborted === true, JSON.stringify(ab));
+  const afterAbort = await s.call("agent_bridge_status", { session_id: id });
+  ok("abort 之后是 idle", afterAbort?.session?.status === "idle", JSON.stringify(afterAbort?.session?.status));
+  const closedAfterAbort = await s.call("agent_bridge_close_session", { session_id: id });
+  ok("此时单关放行", closedAfterAbort?.closed === true, JSON.stringify(closedAfterAbort));
+
+  console.log("\n[T25] running 会话 + force:true → 真的关掉(不只是返回 closed:true)");
+  const id2 = (await s.call("agent_bridge_open_session", { agent: "omp", cwd: CWD }))?.session?.id;
+  await s.call("agent_bridge_send_message", { session_id: id2, message: "go" });
+  await sleep(600);
+  const pid2 = (await s.call("agent_bridge_status", { session_id: id2 }))?.session?.pid;
+  ok("拿到了 pid", !!pid2, String(pid2));
+  const forced = await s.call("agent_bridge_close_session", { session_id: id2, force: true });
+  ok("closed:true", forced?.closed === true, JSON.stringify(forced));
+  // 用**列表**判存活,别指望 status(id) 的错误响应能被解析出来(错误响应没有 result.content,
+  // 解析后是 null —— 拿 null 去匹配 "unknown session" 会永远为假,那才是真的空绿)。
+  const listAfter = await s.call("agent_bridge_status", {});
+  ok("会话真的从列表里消失了", !(listAfter?.sessions || []).some(x => x.id === id2), JSON.stringify((listAfter?.sessions || []).map(x => x.id)));
+  let dead = false;
+  for (let i = 0; i < 40; i++) {
+    try {
+      process.kill(pid2, 0);
+    } catch {
+      dead = true;
+      break;
+    }
+    await sleep(150);
+  }
+  ok("后端进程真的没了", dead, `pid=${pid2}`);
+
+  console.log("\n[T27] 有 running 会话时批量关(不传 force)→ 原子 preflight:一个都不关");
+  const a = (await s.call("agent_bridge_open_session", { agent: "omp", cwd: CWD }))?.session?.id;
+  const b = (await s.call("agent_bridge_open_session", { agent: "omp", cwd: CWD }))?.session?.id;
+  await s.call("agent_bridge_send_message", { session_id: a, message: "go" }); // 只有 a 在跑,b 空闲
+  await sleep(600);
+  const pidB = (await s.call("agent_bridge_status", { session_id: b }))?.session?.pid;
+  ok("空闲会话 b 也有 pid(否则下面的'没被殃及'是空绿)", !!pidB, String(pidB));
+  // ⚠️ 基线必须在批量关**之前**量。放到之后再比,两次读数中间什么都没发生,断言恒真 = 空绿。
+  const before = ((await s.call("agent_bridge_status", {}))?.sessions || []).map(x => x.id);
+  ok("批量关之前记下基线(别写死数字:前面的用例可能留下会话)", before.length >= 2 && before.includes(a) && before.includes(b), JSON.stringify(before));
+  const bulkBlocked = await s.call("agent_bridge_close_session", {});
+  ok("closedAll:false 且 count:0", bulkBlocked?.closedAll === false && bulkBlocked?.count === 0, JSON.stringify(bulkBlocked));
+  ok("blocked:true", bulkBlocked?.blocked === true, JSON.stringify(bulkBlocked?.blocked));
+  ok("runningSessionIds 只点名真在跑的那个", JSON.stringify(bulkBlocked?.runningSessionIds) === JSON.stringify([a]), JSON.stringify(bulkBlocked?.runningSessionIds));
+  const listed = await s.call("agent_bridge_status", {});
+  ok("会话列表**没有**被清空", (listed?.sessions || []).length === before.length, `after=${JSON.stringify((listed?.sessions || []).map(x => x.id))} before=${JSON.stringify(before)}`);
+  const bStill = await s.call("agent_bridge_status", { session_id: b });
+  ok("空闲的 b 也一个没关(原子:要么全关要么都不关)", bStill?.session?.pid === pidB, JSON.stringify([bStill?.session?.pid, pidB]));
+
+  console.log("\n[T28] 同上 + force:true → 全关掉");
+  const pidA = (await s.call("agent_bridge_status", { session_id: a }))?.session?.pid;
+  const bulkForced = await s.call("agent_bridge_close_session", { force: true });
+  ok("closedAll:true", bulkForced?.closedAll === true, JSON.stringify(bulkForced));
+  ok("count 等于当时的会话数", bulkForced?.count === before.length, `${bulkForced?.count} vs ${before.length}`);
+  const emptied = await s.call("agent_bridge_status", {});
+  ok("列表清空了", (emptied?.sessions || []).length === 0, JSON.stringify(emptied?.sessions));
+  let bothDead = true;
+  for (const p of [pidA, pidB]) {
+    let d = false;
+    for (let i = 0; i < 40; i++) {
+      try {
+        process.kill(p, 0);
+      } catch {
+        d = true;
+        break;
+      }
+      await sleep(150);
+    }
+    if (!d) bothDead = false;
+  }
+  ok("两个后端进程都真的没了", bothDead, JSON.stringify([pidA, pidB]));
+
+  await s.kill();
+}
+
 async function main() {
   await t2_schema_defaults_no_env();
   await t3_schema_default_env_override();
@@ -504,6 +606,7 @@ async function main() {
   await t16_t23_turn_settled();
   await t21_five_backends_settled();
   await t22_schema_pending();
+  await t24_t28_close_guard();
 
   console.log(`\n[harness] ${passed} 通过 / ${failed} 失败`);
   if (failed) {

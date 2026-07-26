@@ -159,7 +159,7 @@ try {
     // Close in the finally — NOT the happy path — so a thrown/timed-out send still SIGTERMs the omp
     // child; otherwise the cleanup below would race a still-live session and always leak. close()
     // returns the moment it SIGTERMs the backend; the omp child (cwd == tmp) dies asynchronously.
-    if (wId) { try { await call("agent_bridge_close_session", { session_id: wId }); } catch {} }
+    if (wId) { try { await call("agent_bridge_close_session", { session_id: wId, force: true }); } catch {} } // force: this finally must clean up even mid-turn, and catch{} would swallow a C6 refusal
     // On Windows a directory with a live process's open handle can't be removed, and worse: deleting
     // it while that handle is open leaves it "delete-pending", a state fs.rm's OWN `maxRetries` (a
     // synchronous spin) never recovers from — the holding condition is the omp child's handle, which
@@ -212,7 +212,7 @@ try {
       const cwrote = fs.existsSync(ctarget) && fs.readFileSync(ctarget, "utf8").includes("E2E_CLAUDE_WRITE_OK");
       check("claude write:true edited a file on disk", cwrote, cwrote ? "ok" : "file not created");
     } finally {
-      if (cwId) { try { await call("agent_bridge_close_session", { session_id: cwId }); } catch {} }
+      if (cwId) { try { await call("agent_bridge_close_session", { session_id: cwId, force: true }); } catch {} } // same: forced teardown, not a discard of live work
       let cErr = null;
       for (let i = 0; i < 40 && fs.existsSync(ctmp); i++) { try { fs.rmSync(ctmp, { recursive: true, force: true }); break; } catch (e) { cErr = e; await sleep(250); } }
       check("claude temp dir cleaned up", !fs.existsSync(ctmp), fs.existsSync(ctmp) ? `LEAKED ${ctmp} (${cErr?.code || "unknown"})` : "");
@@ -220,7 +220,7 @@ try {
   }
 
   // 9. close all remaining + clean exit
-  const closed = await call("agent_bridge_close_session", {});
+  const closed = await call("agent_bridge_close_session", { force: true }); // bulk teardown is atomic under C6: without force one still-running session would close NONE
   check("close all sessions", closed.closedAll === true || closed.count >= 2, JSON.stringify({ count: closed.count }));
 } catch (err) {
   check(`harness error: ${err.message}`, false);

@@ -97,9 +97,14 @@ async function main() {
   if (!sawRunning) return fail("never observed status=running — test did not exercise the running case");
 
   console.log("[harness] >>> PASS: lastTurn never reports endedAt while running (coherent turn clock)");
+  // ⚠️ This session is deliberately parked at status:"running", so C6's guard would REFUSE an unforced
+  // close — and this cleanup used to ignore the response entirely, so the test would have stayed green
+  // while silently closing nothing. force:true is correct here (we are tearing down a fixture, not
+  // discarding real work) and the response IS checked, so a future guard change cannot hide here again.
   const closeId = nextId++;
-  rpc({ jsonrpc: "2.0", id: closeId, method: "tools/call", params: { name: "agent_bridge_close_session", arguments: { session_id: sid } } });
-  await waitResp(closeId, 5000);
+  rpc({ jsonrpc: "2.0", id: closeId, method: "tools/call", params: { name: "agent_bridge_close_session", arguments: { session_id: sid, force: true } } });
+  const closeResp = parse(await waitResp(closeId, 5000));
+  if (closeResp?.closed !== true) return fail(`forced close of the parked session should report closed:true, got ${JSON.stringify(closeResp)}`);
   try { srv.stdin.end(); } catch {}
   setTimeout(() => process.exit(0), 1500);
 }

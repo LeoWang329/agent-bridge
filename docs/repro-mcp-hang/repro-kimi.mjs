@@ -366,7 +366,14 @@ async function main() {
     if (!bpid) return fail("S10: never observed a turn process pid");
     const pidFile = path.join(stateDir, "pids", `${sess.id}.json`);
     if (!fs.existsSync(pidFile)) return fail(`S10: pid record should exist during a turn (${pidFile})`);
-    await s.call("agent_bridge_close_session", { session_id: sess.id });
+    // C6: an unforced close of a running session is refused now — prove the guard fires and changes
+    // nothing, then force, so the tree-kill path below is still the one under test.
+    const blocked = await s.call("agent_bridge_close_session", { session_id: sess.id });
+    if (blocked?.blocked !== true || blocked?.closed !== false) {
+      return fail(`S10: an unforced close of a running kimi session must be refused, got ${JSON.stringify(blocked)}`);
+    }
+    if (!pidAlive(bpid)) return fail("S10: a refused close must not touch the backend process");
+    await s.call("agent_bridge_close_session", { session_id: sess.id, force: true });
     let dead = false;
     for (let i = 0; i < 40; i++) { if (!pidAlive(bpid)) { dead = true; break; } await sleep(150); }
     if (!dead) return fail(`S10: close must tree-kill the in-flight turn; pid ${bpid} still alive`);
@@ -674,7 +681,10 @@ async function main() {
     // return accepted:true then abort — a DIFFERENT branch — so this cannot silently pass on the wrong ordering).
     const [sendP, closeP] = s.fireBoth(
       { name: "agent_bridge_send_message", args: { session_id: sess.id, message: "pre-begin close" } },
-      { name: "agent_bridge_close_session", args: { session_id: sess.id } },
+      // force:true is REQUIRED here, not cosmetic: at the pre-begin instant the session is NOT settled
+      // (send armed the turn before its spawn-await), so C6's guard would refuse the close and the race
+      // this scenario exists to prove would never happen — the test would go green while testing nothing.
+      { name: "agent_bridge_close_session", args: { session_id: sess.id, force: true } },
     );
     const sendResp = await sendP; await closeP;
     if (!sendResp?.__error || !/closed during send/i.test(sendResp.__error)) return fail(`S25: send must hit the pre-begin "was closed during send" branch (proof of the spawn-await race); got ${JSON.stringify(sendResp)} — a post-begin close would have returned accepted:true`);

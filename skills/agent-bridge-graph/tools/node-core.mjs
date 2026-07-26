@@ -439,7 +439,11 @@ export async function startBridge(opts = {}) {
       const st = BRIDGE_REAP_STATE.get(bridge) || {};
       let bulkFailed = false;
       try {
-        const bulk = await callTool("agent_bridge_close_session", {}, 20000);
+        // force:true —— 这是**私有**桥进程的最终清场,后面紧跟着就是杀进程树,没有"留着待收"这回事。
+        // 不加 force 的话,桥的在途闸门(批量是原子的:任一会话还在跑就一个都不关)会让这次兜底
+        // 变成空操作,反而把本该回收的会话留成孤儿。逐节点那次 close 仍然**不**加 force:那里
+        // 节点已经收尾(超时路径也先 abort 过),被拒就该如实记进回执,而不是硬杀。
+        const bulk = await callTool("agent_bridge_close_session", { force: true }, 20000);
         // 拿到 bulk 响应 = 桥已经把之前排队的请求都处理完了(包括那条我们本地等超时的 close)。
         // 所以只要"关掉了会话"或"存在未确认的 close",都以**此刻**为准重新起算强杀窗口。
         if (Number(bulk?.count) > 0 || st.unconfirmedClose) {

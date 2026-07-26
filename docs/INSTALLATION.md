@@ -346,8 +346,8 @@ node scripts/agent-bridge.mjs cleanup --json
 - OMP 的 `omp --mode rpc` 会退出
 - Codex 的 `codex app-server` 会退出
 - Claude 的 headless 进程会退出
-- Cursor 无长驻进程可退（形状 B：进程按轮短驻）——但 `close` 若逢**活跃的 create-chat / turn 短进程**会整树终止它，再忘掉云端 `chatId`；**因 cursor 无 delete-chat，云端 chat 及其读入的仓库内容仍留在 Cursor 的留存边界，删不掉**
-- Kimi 同样无长驻进程可退（形状 B）——`close` 若逢**活跃的轮短进程**会整树终止它，再忘掉本地 session id；kimi 无云端 chat 存储可删，但**已发出的 prompt 早已到过 Moonshot 云端 API**，close 追不回来
+- Cursor 无长驻进程可退（形状 B：进程按轮短驻）——**在途轮的 `close` 默认被拒**（返回 `{blocked:true, runningSessionIds}`，什么都不关）；传 `force:true` 才会整树终止那个活跃的 create-chat / turn 短进程，再忘掉云端 `chatId`；**因 cursor 无 delete-chat，云端 chat 及其读入的仓库内容仍留在 Cursor 的留存边界，删不掉**
+- Kimi 同样无长驻进程可退（形状 B）——同样**在途轮默认拒绝关**，`force:true` 才会整树终止那个活跃的轮短进程，再忘掉本地 session id；kimi 无云端 chat 存储可删，但**已发出的 prompt 早已到过 Moonshot 云端 API**，close 追不回来
 
 MCP server 进程**直接持有**它打开的会话（不再代理给任何 daemon）。当它退出时（客户端退出 / stdin 关闭 / `SIGTERM`、`SIGINT`、`SIGHUP` / stdout `EPIPE` / 未捕获异常），会清理自己持有的所有后端子进程（omp/codex/claude 长驻，及 cursor 活跃轮 / create-chat 短进程、kimi 活跃轮短进程）。stdin 关闭时它会先等 pending MCP 响应写完再退出。优雅退出（code 0）还会删除本次 run 的日志目录 `~/.agent-bridge/logs/<runId>/`；崩溃（code≠0）保留以便排查。仍然建议在任务完成后显式调用 `agent_bridge_close_session`。
 

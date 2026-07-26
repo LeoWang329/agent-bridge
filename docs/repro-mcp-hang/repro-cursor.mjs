@@ -323,7 +323,15 @@ async function main() {
     if (!bpid) return fail("S12: never observed a turn process pid");
     const pidFile = path.join(stateDir, "pids", `${sess.id}.json`);
     if (!fs.existsSync(pidFile)) return fail(`S12: pid record should exist during a turn (${pidFile})`);
-    await s.call("agent_bridge_close_session", { session_id: sess.id });
+    // C6: closing a RUNNING session is refused by default now, so first prove the guard fires (and that
+    // it changes nothing), then use force — which is precisely what force exists for — so the rest of
+    // this scenario still exercises the original tree-kill path.
+    const blocked = await s.call("agent_bridge_close_session", { session_id: sess.id });
+    if (blocked?.blocked !== true || blocked?.closed !== false) {
+      return fail(`S12: an unforced close of a running cursor session must be refused, got ${JSON.stringify(blocked)}`);
+    }
+    if (!pidAlive(bpid)) return fail("S12: a refused close must not touch the backend process");
+    await s.call("agent_bridge_close_session", { session_id: sess.id, force: true });
     let dead = false;
     for (let i = 0; i < 40; i++) { if (!pidAlive(bpid)) { dead = true; break; } await sleep(150); }
     if (!dead) return fail(`S12: close must tree-kill the in-flight turn; pid ${bpid} still alive`);

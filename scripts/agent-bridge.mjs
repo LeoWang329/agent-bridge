@@ -68,7 +68,9 @@ function envByteCap(name, fallback, min) {
   return n;
 }
 
-const BRIDGE_VERSION = "0.9.0";
+// 0.10.0:收口纪律加固。含两处破坏性变更 —— wait 的默认 mode(all→any,连带默认返回形状)与
+// close_session 的在途闸门(默认拒绝关未终态会话)。见 docs/ARCHITECTURE.md 的 v0.10.0 节。
+const BRIDGE_VERSION = "0.10.0";
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 // The INLINE clock: how long a wait:true send/open blocks before giving up. Read by all five backends'
 // send(). Timing out here is DESTRUCTIVE (see DEFAULT_JOIN_TIMEOUT_MS below for why that matters).
@@ -593,13 +595,28 @@ const TOOLS = [
   {
     name: "agent_bridge_close_session",
     description:
-      "Close a persistent delegated-agent session and stop its backend process. Omit session_id to close ALL sessions this server manages — the bulk-cleanup fallback after a crash or forgotten close (returns closedAll/count/sessionIds plus any that failed).",
+      "Close a persistent delegated-agent session and stop its backend process. Omit session_id to close ALL " +
+      "sessions this server manages — the bulk-cleanup fallback after a crash or forgotten close (returns " +
+      "closedAll/count/sessionIds plus any that failed). ⚠️ Closing a session whose turn is STILL RUNNING " +
+      "destroys that turn's output for good (the backend process tree is killed and the answer file deleted), " +
+      "so it is REFUSED by default: you get {blocked:true, runningSessionIds:[…]} and nothing is closed. " +
+      "Collect with agent_bridge_wait (or give up explicitly with agent_bridge_abort) first, or pass " +
+      "force:true if you really mean to discard the work. The bulk form is atomic: if any session is still " +
+      "running, none are closed.",
     inputSchema: {
       type: "object",
       properties: {
         session_id: {
           type: "string",
           description: "Session id to close. Omit to close EVERY session this server manages.",
+        },
+        force: {
+          type: "boolean",
+          default: false,
+          description:
+            "Close even if a turn is still running, discarding its output permanently. Default false: such a " +
+            "close is refused with {blocked:true, runningSessionIds:[…]} and nothing is closed. Only pass true " +
+            "when you genuinely mean to throw the work away (or are tearing down after collecting).",
         },
       },
       additionalProperties: false,
@@ -5368,7 +5385,7 @@ function closeOne(session) {
 // Close a single session by id, or — when session_id is omitted — every session this server manages
 // (the bulk-cleanup fallback an orchestrator wants after a crash/forgotten close, mirroring how
 // `status` with no id lists all). Prunes once after closing.
-function closeSession(sessionId) {
+function closeSession(sessionId, { force = false } = {}) {
   // The just-closed sessions' files are no longer active; prune once so the per-file/total caps are
   // enforced promptly instead of waiting up to a full periodic interval (bounds inter-sweep buildup).
   const prune = () => {
@@ -5381,6 +5398,15 @@ function closeSession(sessionId) {
   // on an accidental empty string would be a destructive surprise. Reject it explicitly.
   if (sessionId === undefined) {
     const ids = [...sessions.keys()]; // snapshot: closeOne() mutates `sessions`
+    // 批量关**也**受闸门,而且是 preflight 原子的:发现任何一个还在跑就一个都不关。
+    // 「只拦单关、批量照关」是自相矛盾的假闸门 —— 单关被拒的 agent 改调 `{}` 就能把全部关掉,
+    // 那样闸门只制造一次错误提示,什么都保证不了。
+    if (!force) {
+      const running = ids.filter(id => !sessionSettled(sessions.get(id)));
+      if (running.length) {
+        return { closedAll: false, count: 0, sessionIds: ids, failed: [], blocked: true, runningSessionIds: running };
+      }
+    }
     const failed = [];
     for (const id of ids) {
       const session = sessions.get(id);
@@ -5398,7 +5424,17 @@ function closeSession(sessionId) {
   if (typeof sessionId !== "string" || !sessionId) {
     throw new Error("session_id must be a non-empty string (omit it entirely to close ALL sessions).");
   }
-  const closed = closeOne(getSession(sessionId));
+  const session = getSession(sessionId);
+  // 关掉一个**还在跑**的会话会把那一轮产出永久毁掉(OMP 的 close 会 terminateProcessTree 并
+  // fs.rmSync(answerFile)),而文档一直只强调"完成后一定要 close",没有"close 前先证明收干净了"。
+  // 所以默认拒绝,要毁就得显式 force:true。
+  // 返回结构化的普通结果而**不是抛异常** —— 抛了调用方就拿不到 runningSessionIds,只剩一句错误文本。
+  // ⚠️ 这条只能拦住"还没终态",拦不住"已终态但结果从未被取走"(快速完成后直接 close 仍会删掉
+  // 没读过的结果)。真正的"未收口"需要一个由 result()/waitSessions 置位的 collected 标志,本轮不做。
+  if (!force && !sessionSettled(session)) {
+    return { closed: false, sessionId: session.id, blocked: true, runningSessionIds: [session.id] };
+  }
+  const closed = closeOne(session);
   prune();
   return closed;
 }
@@ -5667,7 +5703,8 @@ async function callTool(name, args) {
     case "agent_bridge_abort":
       return mcpText(await abortSession(args?.session_id));
     case "agent_bridge_close_session":
-      return mcpText(closeSession(args?.session_id));
+      // `force` 必须显式转发:漏了这一步闸门就静默失效(schema 收了参数、闭包里却读不到)。
+      return mcpText(closeSession(args?.session_id, { force: args?.force === true }));
     case "agent_bridge_doctor":
       return mcpText(renderDoctor(await doctor()));
     default:

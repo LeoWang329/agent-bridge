@@ -91,7 +91,7 @@ close_session(session_id)                  →  用完必须关
 | `agent_bridge_status` | 看运行状态 + 最近事件；无 `session_id` 时返回 `{sessions:[…]}`（你开的全部） | 查进度；看「当前主 agent 拉起了哪些 agent」 |
 | `agent_bridge_result` | 读**最近一轮** assistant 文本 + 最近事件（非全历史） | 想看目前为止的产出（含中途）。⚠️ 中途取到的是**快照**，按 `turnSettled`/`inProgress` 判别，不能当最终结果——收口仍要靠 `wait` |
 | `agent_bridge_abort` | 中断当前 turn（会话仍可复用） | 要**真正停掉**正在跑的一轮（打断主 agent ≠ 停任务） |
-| `agent_bridge_close_session` | 关会话、回收后端进程。单关返回 `{closed, sessionId}`；省略 `id` 批量关返回 `{closedAll, count, sessionIds, failed}` | 常规**显式传 `id`**；省略 `id` 仅作崩溃兜底，且要查 `closedAll`/`failed` |
+| `agent_bridge_close_session` | 关会话、回收后端进程。单关返回 `{closed, sessionId}`；省略 `id` 批量关返回 `{closedAll, count, sessionIds, failed}`。⚠️ **在途 turn 默认拒绝关**，返回 `{blocked:true, runningSessionIds}` 且**一个都不关**（批量是原子的）；确要丢弃产出才传 `force:true` | 常规**显式传 `id`**；省略 `id` 仅作崩溃兜底，且要查 `closedAll`/`failed`/`blocked` |
 | `agent_bridge_doctor` | 检查 omp/codex/claude/cursor/kimi/node 是否可用 | 排查「后端起不来」 |
 
 **典型场景：**
@@ -99,7 +99,7 @@ close_session(session_id)                  →  用完必须关
 - **看主 agent 拉起了哪些 agent**：`agent_bridge_status` 不传 `session_id`。
 - **委托长任务又想知道进展**：`send_message`（非阻塞）→ `wait`（短超时）→ 没完看一眼 `pendingSnapshots`、回报、再 `wait`。
 - **同时派多个 agent**：逐个 `send_message`（非阻塞）→ `wait`（推荐 `mode:"any"` 循环，先完成先处理）收口。
-- **兜底清场**：确认无其他活任务后，`close_session` 不传 `session_id` 可一次清空；之后查 `closedAll`/`failed`，有残留提示用户 `cleanup`。
+- **兜底清场**：确认无其他活任务后，`close_session` 不传 `session_id` 可一次清空。⚠️ 这**不再无条件成立**——只要还有一个会话在跑，批量关会**原子地全部拒绝**并返回 `{blocked:true, runningSessionIds}`，一个都不关。所以先按 `runningSessionIds` 收口（或显式 `abort`），再清场；确定要丢弃在途产出才传 `force:true`。之后查 `closedAll`/`failed`，有残留提示用户 `cleanup`。
 
 ## 会话归属（每个客户端自管自己的）
 

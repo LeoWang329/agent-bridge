@@ -353,6 +353,13 @@ process.stdin.on("data", d => {
           multiturnStreaming = false;
           multiturnPhase = "done";
         }, 400);
+      } else if (msg.type === "abort") {
+        // 真 omp 被 abort 之后就不再流式了。桩必须照做 —— 否则 get_state 会在 abort 之后继续谎报
+        // isStreaming:true,桥每次 refreshStatus 都把状态翻回 running,会话看起来永远在跑。
+        // 只清 slowsettle 这一族的标志:turnstate **故意**在轮结束后仍报 streaming(那是它存在的
+        // 理由),lateterminal 也自有节奏,都不能在这里被顺手改掉。
+        slowsettleStreaming = false;
+        if (msg.id) say({ type: "response", id: msg.id, command: "abort", success: true, data: {} });
       } else if (msg.id) {
         say({ type: "response", id: msg.id, success: true, data: {} });
       }

@@ -7,6 +7,27 @@
 
 ---
 
+## v0.10.0 — 收口纪律加固(2026-07-26,**破坏性**:wait 默认返回形状 + close 合同)
+
+**起因:** 主 agent 用桥派活后**经常忘记收口** —— 拿到非阻塞 ack 就往下走,甚至直接 `close_session`,那一轮产出被丢弃或被半成品冒充。
+
+**根因不是"提示词没写"**(已证伪:`skills/agent-bridge/SKILL.md` 里 22 行含 `wait`;稳定安装 clone 与开发 clone 的主 skill SHA-256 一致),**而是"写在会掉的那份里,桥在 agent 做决定的那一刻不提醒"**。具体八条:ack 没有"结果尚未交付"的语义;桥**没有任何主动唤醒机制**,而宿主"长调用转后台+事后通知"的经验恰好把 agent 训练成相反的先验(通知的前提是**有一个 wait 在飞**);`send_message.timeout_ms` 在默认 `wait:false` 下是**静默无效参数**(最可信的误解模型);收口义务从未被写成禁令;唯一常驻上下文的那份(MCP tool schema)写得最弱;`close_session` 没有在途闸门且会**摧毁证据**;`open_session(initial_prompt)` 是更隐蔽的 ack 路径;"已经 wait 过一次"也会半途而废。
+
+**变更(四批,各自独立提交):**
+- **C2(破坏性)`agent_bridge_wait` 的 `mode` 默认 `all` → `any`。** 默认从此等于一直以来推荐的用法,且 `any` 的返回天然带 `pending`,正是挂"必须继续收"信号的位置。⚠️ **默认返回形状随之翻转**:`{mode, results}` → `{mode, completed, pending, pendingSnapshots}`;单会话时两者返回**时机**几乎一样,差别纯在形状,所以"省略 mode + 读 `results[0]`"会静默拿到 `undefined`。三个返回点都回显 `mode` 供判别(既有设计)。
+- **C3 join 时钟与 inline 时钟分离。** 新增 `DEFAULT_JOIN_TIMEOUT_MS`(10 分钟,`AGENT_BRIDGE_JOIN_TIMEOUT_MS` 可覆盖),**只**给 `waitSessions` 用;`DEFAULT_WAIT_TIMEOUT_MS`(30 分钟)的另外五个读取点**一个都不动**。理由是两者超时后果相反:join 超时**非破坏性**(返回 `{timedOut,…}`,turn 继续跑),inline 超时**进入破坏性 abort/interrupt/tree-kill**,砍短等于开始摧毁合法长 turn(实测本仓跨模型复审 turn 跑过 15.6 / 16.2 分钟)。边界校验只对新常量收紧(拒负数/小数/非安全整数,**`0` 也拒** —— 本仓 `0` 是"关闭该功能"的惯例,而"关闭 join 超时"读作永远等,正是要消灭的死等),**不改 `envNum()` 本身**。
+- **C1 ack 与未完成收集自报"你还没拿到结果"。** 两个装饰器而非一个:ack 里确实什么都没有(`resultIncluded:false`),而 wait 的 any/超时返回**已经交付了部分结果**,只能声明 `collectionComplete:false`。装饰器**绝不能说谎**是这里的第一原则。续等条件写成"`pending` 非空"而非"`timedOut`"(超时可以合法返回 `pending:[]`,照着 timedOut 续等会把空数组撞上 `session_ids` 非空硬校验)。
+- **C5 中途快照如实标注。** 新增 `turnSettled`/`inProgress`,语义**严格**限定为"共享判定 `sessionSettled` 此刻是否视为可交付",不表示成功/正文完整/远端已停(`failed`+`turnSettled:true` 合法)。**不用 `complete`/`partial`** —— abort 之后 settled 为真但正文是片段,叫 complete 是新的谎言。structured output 在 running 时 `json:null` + `schemaPending:true`,不再对半截 JSON 产出看似最终失败的 `schemaError`。
+- **C6(破坏性)在途 turn 默认拒绝关闭。** `close_session` 加 `force`;不传时对未终态会话返回 `{blocked:true, runningSessionIds}` 且**什么都不关**,批量形式是**原子 preflight**(任一在跑则一个都不关)。⚠️ 口径:这只拦得住"**未终态**",拦不住"**已终态但结果从未被取走**" —— 真正的未收口需要一个由 `result()`/`waitSessions` 置位的 `collected` 标志,本轮不做,别宣称 R6 已全解。
+
+**测试:** 新增 `docs/repro-mcp-hang/repro-collect-discipline.mjs`(T1–T28,143 断言),配套新增四个桩:`fake-omp` 的 `slowsettle`/`partialslow`、`fake-codex` 的 `sameflush`/`slowstart`/`schemaslowpartial`。同时修掉一处**既有假绿**:`repro-turnstate` 的收尾 close 从不检查响应,加闸门后会被静默挡住而测试照绿。
+
+**施工说明书:** `docs/PLAN-collect-discipline-hardening-2026-07-26.md`(含两轮异引擎复审闭环与全部"不要做什么")。
+
+**顺带订正说明书的一处事实错误:** T14 不能用 `slowturn` —— 它的 `get_state` 恒报 `isStreaming:true`,而 `waitIdle` 要的正是 `!isStreaming`,所以 inline `wait:true` 在它上面**永远完不成**,那条用例会退化成"卡满 30 分钟"而不是在考时钟隔离。为此新增了会如实收尾的 `slowsettle`。
+
+---
+
 ## v0.9.1 — 诊断日志单行封顶 + 正文不落盘(2026-07-18,根因修复)
 
 **变更:** (1) `appendLog()` 内加**每次写入的字节上限** `AGENT_BRIDGE_LOG_LINE_MAX_BYTES`(默认 4096,合法值为 0 或 ≥512 的整数),超限写头部 + `…[+<n>B truncated]` 标记;(2) `stripThinking()` 扩为 `redactForLog()`——除原有的思维链字段外,还把**已知正文键**(`aggregatedOutput` / `aggregated_output` / `text` / `delta` / `output`,以及仅当取值是字符串时的 `content` / `displayContent`)换成尺寸标记,其余字符串按 `AGENT_BRIDGE_LOG_FIELD_MAX_CHARS`(默认 512)夹断。
