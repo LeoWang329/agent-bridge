@@ -1,0 +1,375 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Agent Bridge 使用场景 KT</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #172033;
+      --muted: #5d687b;
+      --line: #dce2ea;
+      --panel: #f6f8fb;
+      --accent: #3157d5;
+      --accent-soft: #eaf0ff;
+      --success: #18794e;
+      --warn: #9a6700;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: #eef2f7;
+      font: 16px/1.7 "Segoe UI", "Microsoft YaHei", sans-serif;
+    }
+
+    main {
+      width: min(1000px, calc(100% - 32px));
+      margin: 32px auto;
+      padding: 48px 56px;
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      box-shadow: 0 16px 44px rgba(23, 32, 51, 0.08);
+    }
+
+    h1, h2, h3, h4 { line-height: 1.3; }
+    h1 { margin: 0 0 10px; font-size: 34px; }
+    h2 { margin: 46px 0 16px; font-size: 25px; }
+    h3 { margin: 28px 0 10px; font-size: 20px; }
+    h4 { margin: 20px 0 6px; font-size: 17px; }
+    p { margin: 8px 0 14px; }
+    a { color: var(--accent); }
+    ul, ol { padding-left: 24px; }
+    li + li { margin-top: 6px; }
+
+    .subtitle {
+      margin-bottom: 20px;
+      color: var(--muted);
+      font-size: 18px;
+    }
+
+    .source {
+      margin-bottom: 28px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .summary, .scenario, .note, .avoid {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 20px 22px;
+    }
+
+    .summary { background: var(--panel); }
+    .scenario { margin: 20px 0; }
+    .scenario.primary { border-color: #b9c8ff; background: var(--accent-soft); }
+    .note { margin: 18px 0; background: #fff9e8; }
+    .avoid { margin: 18px 0; background: #fff5f5; border-color: #f0cccc; }
+
+    .eyebrow {
+      margin-bottom: 6px;
+      color: var(--accent);
+      font-size: 13px;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .tag {
+      display: inline-block;
+      margin: 3px 5px 3px 0;
+      padding: 2px 9px;
+      color: #294bb8;
+      background: #edf1ff;
+      border-radius: 999px;
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    code {
+      padding: 2px 6px;
+      background: #edf0f5;
+      border-radius: 5px;
+      font-family: Consolas, "Cascadia Code", monospace;
+      font-size: 0.92em;
+    }
+
+    pre {
+      overflow-x: auto;
+      margin: 12px 0 18px;
+      padding: 16px 18px;
+      color: #eaf0ff;
+      background: #182033;
+      border-radius: 10px;
+      white-space: pre-wrap;
+      line-height: 1.55;
+    }
+
+    pre code { padding: 0; background: transparent; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 14px 0;
+    }
+
+    th, td {
+      padding: 11px 12px;
+      border: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th { background: var(--panel); }
+    .yes { color: var(--success); font-weight: 700; }
+    .no { color: #b42318; font-weight: 700; }
+
+    .flow {
+      margin: 14px 0;
+      padding: 14px 16px;
+      color: #29405e;
+      background: #f4f7fb;
+      border-left: 4px solid var(--accent);
+      font-weight: 700;
+    }
+
+    footer {
+      margin-top: 44px;
+      padding-top: 18px;
+      color: var(--muted);
+      border-top: 1px solid var(--line);
+      font-size: 14px;
+    }
+
+    @media (max-width: 700px) {
+      main { width: 100%; margin: 0; padding: 28px 20px; border: 0; border-radius: 0; }
+      h1 { font-size: 28px; }
+      table { display: block; overflow-x: auto; }
+    }
+
+    @media print {
+      body { background: #fff; }
+      main { width: 100%; margin: 0; padding: 0; border: 0; box-shadow: none; }
+      .scenario { break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Agent Bridge 使用场景 KT</h1>
+      <p class="subtitle">从使用者视角理解：什么时候该用、该怎么说、过程如何推进、最终会得到什么</p>
+      <p class="source">项目资料：<a href="https://research.ic-digital.cn/p/9pX90z1-Zuw2kq6ZTomK-Q">https://research.ic-digital.cn/p/9pX90z1-Zuw2kq6ZTomK-Q</a></p>
+    </header>
+
+    <section class="summary">
+      <strong>核心理解：</strong>Agent Bridge 不是另一个聊天窗口，而是一套“让当前 Agent 调度其他独立 Agent”的能力。
+      使用者不需要操作底层会话工具，只要明确说出要使用 Agent Bridge、希望完成的任务、是否允许改文件，以及是否需要独立复核、并行调查、圆桌讨论或无人值守闭环。
+    </section>
+
+    <h2>先选场景</h2>
+    <table>
+      <thead>
+        <tr><th>你的诉求</th><th>应使用的场景</th><th>典型结果</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>找一个独立 Agent 给第二意见、复核材料或并行查资料</td><td><strong>基础委托</strong></td><td>一份独立结论或多份并行结果</td></tr>
+        <tr><td>实现功能、评审代码、设计方案或定位复杂 Bug</td><td><strong>开发工作流 Dev</strong></td><td>实现、独立评审、修复和验证闭环</td></tr>
+        <tr><td>至少需要三个不同视角，对高风险问题作裁决或全面探索</td><td><strong>圆桌 Roundtable</strong></td><td>匿名多轮审议记录和主席综合结论</td></tr>
+        <tr><td>任务很大，希望从需求合同一直自动跑到黑盒验收通过</td><td><strong>自动交付 Loop</strong></td><td>验收合同、逐 Goal 迭代证据、整支评审和交付报告</td></tr>
+      </tbody>
+    </table>
+
+    <aside class="avoid">
+      <strong>不要滥用：</strong>普通问答、小修小补、路径明确且当前 Agent 自己就能完成的任务，不需要 Agent Bridge。只有明确需要“其他独立 Agent”带来的复核、并行、角色分工或闭环价值时才使用。
+    </aside>
+
+    <h2>场景一：基础委托</h2>
+    <section class="scenario primary">
+      <div class="eyebrow">Agent Bridge</div>
+      <span class="tag">独立第二意见</span><span class="tag">只读调查</span><span class="tag">并行多开</span><span class="tag">持续追问</span>
+
+      <h3>什么时候用</h3>
+      <ul>
+        <li>你希望另一个模型独立复核当前结论，避免“自己评自己”。</li>
+        <li>一个问题可以拆成多个互不依赖的方向，希望同时调查。</li>
+        <li>你指定要用 OMP、Codex、Claude，或经 OMP 调用某个模型。</li>
+        <li>任务需要连续追问，希望同一个委托 Agent 保留这条任务线的上下文。</li>
+      </ul>
+
+      <h3>你需要怎么说</h3>
+      <p>必须明确说出“使用 Agent Bridge”或“找其他独立 Agent”。建议同时给出任务范围、工作目录、是否允许改文件和完成标准。</p>
+      <pre><code>使用 Agent Bridge，找一个独立 Agent 只读检查这个项目的鉴权逻辑。
+重点看登录绕过和权限提升，不要修改文件。最终按严重程度列问题，并给出文件位置和证据。</code></pre>
+      <pre><code>使用 Agent Bridge 并行找两个不同 Agent：
+一个检查性能瓶颈，一个检查异常处理。两边都只读，最后汇总共同问题和分歧。</code></pre>
+
+      <h3>实际会怎么运行</h3>
+      <div class="flow">创建独立会话 → 发出任务 → 后台执行 → 分段查看进度 → 读取完整结果 → 必要时追问 → 结束会话</div>
+      <ul>
+        <li>长任务不会因为一次等待结束而中断，主 Agent 会用短周期持续查看进度。</li>
+        <li>并行任务会开启多个独立会话，先完成的结果可以先处理。</li>
+        <li>同一任务的追问会继续使用原会话；换模型或换无关任务时会创建新会话。</li>
+        <li>只读任务默认允许读取文件、搜索和执行调查命令；只有明确要求修改时才使用写权限。</li>
+      </ul>
+
+      <h3>你最终会拿到什么</h3>
+      <p>主 Agent 会整合委托结果，并对关键结论自行复核。若委托 Agent 修改了文件，主 Agent仍会检查差异并执行必要测试，不会直接把委托方的“已完成”当作事实。</p>
+    </section>
+
+    <h2>场景二：开发工作流</h2>
+    <section class="scenario">
+      <div class="eyebrow">Agent Bridge Dev</div>
+      <p>Dev 适合开发类任务。它不是简单“找一个 Agent 写代码”，而是根据任务选择实现者、评审者、架构师或调试者，并组织成闭环。</p>
+
+      <h3>2.1 已明确需求：实现 → 独立评审 → 修复 → 复评</h3>
+      <p><strong>适用：</strong>功能目标和验收标准已经明确，希望由委托 Agent 实现，并由另一个不同引擎或模型独立评审。</p>
+      <pre><code>使用 agent-bridge-dev 实现“导出 CSV”功能。
+需求以 docs/export-spec.md 为准；只允许修改 src/export 和对应测试。
+完成后必须找一个不同引擎的 reviewer 独立评审，修到 APPROVE，再由你运行必要测试并汇报。</code></pre>
+      <div class="flow">实现者写代码和测试 → 独立 Reviewer 检查固定范围 → 有问题退回实现者 → 重新评审 → 主 Agent 自查</div>
+      <p>Reviewer 必须与实现者使用不同引擎或模型。评审范围会先固定，避免一边评审一边继续变化导致结论失效。</p>
+
+      <h3>2.2 方案未定：双架构师多轮讨论</h3>
+      <p><strong>适用：</strong>存在两条以上合理路径，且涉及数据模型、公共 API、并发模型、框架选型或跨模块契约等高风险决定。</p>
+      <pre><code>使用 agent-bridge-dev 做架构设计讨论。
+问题是任务调度应该采用数据库队列还是消息队列。
+请先说明准备拉哪些独立架构师和讨论轮数，等我确认后再开始；最后给出推荐方案、权衡和未决点，不要写代码。</code></pre>
+      <div class="flow">用户确认阵容 → 两个异引擎架构师独立出方案 → 交叉讨论 2–3 轮 → 主 Agent 综合 → 用户确认后才进入实现</div>
+      <p>路径唯一、改动局部或很容易回退时，应跳过架构讨论，直接进入实现。</p>
+
+      <h3>2.3 复杂 Bug：双调试者并行定位根因</h3>
+      <p><strong>适用：</strong>问题难复现、根因不清、单一路径容易形成先入为主判断。</p>
+      <pre><code>使用 agent-bridge-dev 调试这个偶发超时问题。
+复现步骤、日志和最近改动在 docs/timeout-case.md。
+请让两个不同引擎的 debugger 并行只读调查，先比较根因；根因确认后只允许一个 writer 修复，并走独立评审。</code></pre>
+      <div class="flow">主 Agent 固化现场 → 两个调试者并行只读调查 → 比对一致点与分歧 → 单一 Writer 修复 → 独立复审</div>
+      <p>调查阶段不允许两个 Agent 同时写同一工作区。需要诊断埋点时，由主 Agent统一加入一次，再把结果反馈给相关调试者。</p>
+    </section>
+
+    <h2>场景三：多 Agent 圆桌审议</h2>
+    <section class="scenario">
+      <div class="eyebrow">Agent Bridge Roundtable</div>
+      <span class="tag">默认 3 席</span><span class="tag">匿名盲发</span><span class="tag">多轮收敛</span><span class="tag">可选实时可视化</span>
+
+      <h3>什么时候值得开圆桌</h3>
+      <p>问题必须确实需要三个以上不同视角，且选错代价高、决策难回退，或者漏掉关键维度的代价很高。普通方案二审只需要两个架构师时，使用 Dev 即可。</p>
+
+      <h3>先选一种模式</h3>
+      <table>
+        <thead><tr><th>模式</th><th>适用问题</th><th>目标</th><th>示例</th></tr></thead>
+        <tbody>
+          <tr><td><strong>裁决 adjudicate</strong></td><td>“哪个好、能不能、该不该”</td><td>防止假共识导致选错，在互斥路径中作出决定</td><td>该选自研权限系统还是接入统一 IAM？</td></tr>
+          <tr><td><strong>探索 explore</strong></td><td>“有哪些、怎样全面、把问题想透”</td><td>防止漏点，把互补视角铺全并继续深挖</td><td>全面梳理 Agent 平台上线前的风险和治理方案</td></tr>
+        </tbody>
+      </table>
+
+      <h3>你需要怎么说</h3>
+      <pre><code>使用 agent-bridge-roundtable，开一场 3 席裁决圆桌。
+议题：内部知识库应该采用方案 A 还是方案 B。
+重点从安全、运维成本和长期扩展性审议；遇到没有客观优劣的产品取舍时停下来问我。
+我希望打开实时可视化。</code></pre>
+      <pre><code>使用 agent-bridge-roundtable 的探索模式，全面深挖“医疗问答系统上线需要考虑哪些风险”。
+至少覆盖合规、数据、模型质量、监控和人工升级机制，最终输出分层清单和建议路线图。</code></pre>
+
+      <h3>实际会怎么运行</h3>
+      <div class="flow">确定模式和席位 → Round 0 各席互不可见地独立作答 → 匿名共享完整论证 → 多轮交锋或延伸 → 主席判断收敛 → 输出终稿</div>
+      <ul>
+        <li>各席使用不同引擎或模型，第一轮盲发，避免相互锚定。</li>
+        <li>后续轮次可以看到其他席的完整论证，但看不到发言者身份；不是只看主席摘要。</li>
+        <li>主 Agent 是主席，只负责调度、记录、判断是否收敛和写最终综合，不下场代表某个立场。</li>
+        <li>涉及成本与速度、产品优先级、不可逆安全姿态等只能由人决定的问题，会暂停并请用户拍板。</li>
+        <li>用户同意时可开启实时页面查看轮次、发言和收敛进度；无论是否开启，可审计记录都会保留。</li>
+      </ul>
+
+      <h3>你最终会拿到什么</h3>
+      <p>一份主席综合终稿，以及完整的匿名轮次记录、分歧与覆盖记录。圆桌产出的方案若需要落地写代码，后续仍应进入 Dev 的实现与独立评审流程。</p>
+    </section>
+
+    <h2>场景四：合同驱动的自动交付循环</h2>
+    <section class="scenario">
+      <div class="eyebrow">Agent Bridge Loop</div>
+      <span class="tag">验收合同</span><span class="tag">生成者 × 验证者</span><span class="tag">黑盒验收</span><span class="tag">支持无人值守</span>
+
+      <h3>什么时候用</h3>
+      <ul>
+        <li>任务较大，不能接受“一轮实现后口头说完成”，希望每个目标都有可执行验收标准。</li>
+        <li>希望生成者与验证者严格分离，由不同引擎互相制衡。</li>
+        <li>需要连续多轮修复直到全绿，并保留全过程证据。</li>
+        <li>需要无人值守或定时触发，在独立工作区完成后交付分支和报告。</li>
+      </ul>
+
+      <h3>你需要先给出的两个选择</h3>
+      <ol>
+        <li><strong>人在环还是无人值守：</strong>人在环时，关键歧义和卡点会询问你；无人值守时不提问，由主 Agent 作合理假设并写入假设账本。</li>
+        <li><strong>是否使用评审团：</strong>可选双架构师、N 席圆桌或不使用。无人值守时强制使用评审团，默认双架构师。</li>
+      </ol>
+
+      <h3>请求示例：人在环</h3>
+      <pre><code>使用 agent-bridge-loop，人在环，评审团使用双架构师。
+任务：为现有服务增加批量导入功能。
+先和我确认需求并生成验收合同；合同经我确认后再开始实现。每个 Goal 必须经过独立黑盒验证，最后做整支代码评审。</code></pre>
+
+      <h3>请求示例：无人值守</h3>
+      <pre><code>使用 agent-bridge-loop，无人值守，评审团=架构师。
+任务：修复 docs/issue-142.md 描述的问题并补齐回归测试。
+在独立 worktree 和分支中完成；歧义自行拍板并记入假设账本。全部验收通过后交付分支名、证据和最终报告。</code></pre>
+
+      <h3>实际会怎么运行</h3>
+      <div class="flow">需求挖掘 → 验收合同 → 用户/评审团过闸 → 生成者实现 → 独立验证者黑盒验收 → 缺陷退回循环 → 整支评审 → 最终报告</div>
+      <ol>
+        <li><strong>需求合同：</strong>把任务拆成多个 Goal，每个 Goal 写明可执行的验收标准、边界和验证环境。</li>
+        <li><strong>生成：</strong>生成者按当前 Goal 实现并编写产品测试。</li>
+        <li><strong>验证：</strong>另一个引擎的验证者从公开边界执行测试、端到端探针或日志检查；生成者不能自证通过。</li>
+        <li><strong>循环：</strong>有任何失败就把缺陷原样退回生成者修复，随后使用 fresh 验证者全量重验。</li>
+        <li><strong>收官：</strong>全部 Goal 通过后，再做一次覆盖整支改动的独立代码评审和主 Agent 自查。</li>
+      </ol>
+
+      <h3>如何理解“通过”</h3>
+      <ul>
+        <li>生成者说“完成”不算通过，只有独立验证者对当前 Goal 给出全绿证据才算。</li>
+        <li>有用户可观察行为的 Goal，不能只跑生成者自己写的单元测试，还需要独立的端到端、CLI、API、文件或日志验证。</li>
+        <li>概率性或 LLM 输出不能单次等值判断，要在合同中约定采样次数、通过配额和判断规则。</li>
+        <li>如果达到迭代上限仍未通过：人在环会让用户选择加轮、修改合同或放弃；无人值守会停止后续 Goal，并在报告中标红。</li>
+      </ul>
+
+      <h3>你最终会拿到什么</h3>
+      <p>验收合同、假设账本、每个 Goal 每轮的生成与验证记录、验证资产、整支评审结论和最终交付报告。无人值守模式还会给出独立分支名，不会直接占用或污染用户正在工作的主树。</p>
+    </section>
+
+    <h2>权限与交互怎么表达</h2>
+    <table>
+      <thead><tr><th>你的意图</th><th>建议在请求里明确写</th></tr></thead>
+      <tbody>
+        <tr><td>只分析，不改文件</td><td>“只读调查，不要修改文件；允许运行测试和诊断命令。”</td></tr>
+        <tr><td>允许实现</td><td>“允许修改文件；只能改这些路径：……；完成标准：……”</td></tr>
+        <tr><td>要求真正独立复核</td><td>“Reviewer 必须与实现者使用不同引擎或模型，并新开独立会话。”</td></tr>
+        <tr><td>需要并行</td><td>“按互不重叠的子任务并行；多个写任务不得修改同一批文件。”</td></tr>
+        <tr><td>希望持续知晓进度</td><td>“任务运行期间定期汇报当前阶段、部分输出和是否仍在推进。”</td></tr>
+        <tr><td>希望完全自动完成</td><td>“使用 Loop，无人值守；歧义自行拍板并记录，卡死按 halt 处理。”</td></tr>
+      </tbody>
+    </table>
+
+    <h2>常见选择错误</h2>
+    <ul>
+      <li><span class="no">错误：</span>一个小改动也开 Loop。<br><span class="yes">正确：</span>需求明确的单任务实现和评审使用 Dev。</li>
+      <li><span class="no">错误：</span>只需要两个方案意见却开 N 席圆桌。<br><span class="yes">正确：</span>使用 Dev 的双架构师讨论。</li>
+      <li><span class="no">错误：</span>让实现者用同一会话评审自己。<br><span class="yes">正确：</span>使用不同引擎或模型的新 Reviewer 会话。</li>
+      <li><span class="no">错误：</span>两个写 Agent 并行修改同一批文件。<br><span class="yes">正确：</span>拆成不重叠范围、使用隔离工作区，或改为串行。</li>
+      <li><span class="no">错误：</span>把“单元测试绿”当成 Loop 的完整验收。<br><span class="yes">正确：</span>从用户可观察边界增加独立黑盒验证。</li>
+    </ul>
+
+    <aside class="note">
+      <strong>最简单的使用口诀：</strong>只要第二意见，用基础委托；要做开发闭环，用 Dev；要三个以上视角审议，用 Roundtable；要从验收合同自动跑到全绿，用 Loop。
+    </aside>
+
+    <footer>
+      本文从使用层面整理自项目中的 <code>agent-bridge</code>、<code>agent-bridge-dev</code>、<code>agent-bridge-roundtable</code> 和 <code>agent-bridge-loop</code> 四份 Skill 说明，不包含安装与注册步骤。
+    </footer>
+  </main>
+</body>
+</html>

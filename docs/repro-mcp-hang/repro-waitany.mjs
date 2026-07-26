@@ -7,7 +7,7 @@
 //   R2 — a NEVER-prompted OMP session could not satisfy sessionSettled (the turnStarted gate is
 //        false until a first turn streams), so waiting on it dead-blocked until the full timeout,
 //        while a fresh codex session settles immediately (`!turn`). Cross-backend inconsistency
-//        whose failure mode is the expensive one (default 30-min dead wait).
+//        whose failure mode is the expensive one (a dead wait to the caller's deadline).
 // Drives the real MCP server with the fake-omp stub (FAKE_OMP_MODE=okturn: a prompt acks, answers,
 // and completes with agent_end ~60ms later).
 // NOTE: this used to drive FAKE_OMP_MODE=turnstate, which deliberately churns turn_start/turn_end

@@ -70,7 +70,41 @@ function envByteCap(name, fallback, min) {
 
 const BRIDGE_VERSION = "0.9.0";
 const MCP_PROTOCOL_VERSION = "2025-06-18";
+// The INLINE clock: how long a wait:true send/open blocks before giving up. Read by all five backends'
+// send(). Timing out here is DESTRUCTIVE (see DEFAULT_JOIN_TIMEOUT_MS below for why that matters).
 const DEFAULT_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
+
+// envNum for a JOIN WINDOW. Only a positive whole number of milliseconds is meaningful.
+// 0 is REJECTED rather than assigned a meaning, deliberately: elsewhere in this file 0 is the
+// "disable this cap" idiom (envByteCap), and "disable the join timeout" reads as "wait forever" —
+// exactly the dead-wait trap this constant exists to remove. Reading it the other way ("return
+// immediately") would silently turn every wait into a no-op that collects nothing. Neither reading is
+// safe to guess at, so refuse the value and say so. isSafeInteger, not isInteger: Number("1e20") is an
+// "integer" too, and a window we cannot represent faithfully is a malformed window.
+function envJoinTimeout(name, fallback) {
+  const n = envNum(name, fallback);
+  if (!Number.isSafeInteger(n) || n <= 0) {
+    process.stderr.write(
+      `[agent-bridge] ignoring ${name}=${JSON.stringify(process.env[name])}; must be a positive integer of milliseconds ` +
+        `(0 is not "no timeout") — using default ${fallback}\n`,
+    );
+    return fallback;
+  }
+  return n;
+}
+
+// The JOIN clock: the `agent_bridge_wait` TOOL's default window when the caller omits timeout_ms.
+// Deliberately short, and deliberately NOT DEFAULT_WAIT_TIMEOUT_MS. The two clocks have opposite
+// consequences on expiry:
+//   · join (this one)  — NON-DESTRUCTIVE. Returns {timedOut, settled, pending, pendingSnapshots} and
+//     leaves the turn running; the caller simply waits again. So a short default costs one extra call.
+//   · inline (above)   — DESTRUCTIVE. Every wait:true path enters an abort / interrupt / tree-kill on
+//     expiry and the turn is no longer collectable (remote stop is best-effort on top of that).
+// Shortening the inline clock to match would start destroying legitimately long turns — measured, not
+// hypothetical: cross-review turns in this repo ran 15.6 and 16.2 minutes. Keep the two clocks apart.
+// Env-overridable because the tests need it: nobody can wait 10 minutes in a hermetic run, so they set
+// AGENT_BRIDGE_JOIN_TIMEOUT_MS=800 and assert against a sub-second default.
+const DEFAULT_JOIN_TIMEOUT_MS = envJoinTimeout("AGENT_BRIDGE_JOIN_TIMEOUT_MS", 10 * 60 * 1000);
 // Bound for a single OMP RPC round-trip. Every OMP command is an immediate ack (prompt is
 // acked up front; long work is observed by waitIdle/wait POLLING get_state), so a response
 // missing for this long means the backend is wedged or the pipe is half-broken — reject
@@ -79,7 +113,8 @@ const DEFAULT_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 const OMP_RPC_TIMEOUT_MS = envNum("AGENT_BRIDGE_OMP_RPC_TIMEOUT_MS", 10_000);
 // Consecutive OMP RPC timeouts that mark a session unresponsive (failed) and reap its backend, so a
 // half-dead backend — process alive, pipe writable, but answering nothing — makes wait/status FAIL
-// FAST instead of polling 10s timeouts until the caller's own (default 30-min) wait deadline.
+// FAST instead of polling 10s timeouts until the caller's own wait deadline (DEFAULT_JOIN_TIMEOUT_MS
+// for the wait tool, DEFAULT_WAIT_TIMEOUT_MS for an inline wait:true).
 const OMP_RPC_TIMEOUT_FAILS = envNum("AGENT_BRIDGE_OMP_RPC_TIMEOUT_FAILS", 3);
 // Start-time tolerance for the cleanup PID-reuse guard's FALLBACK path (used when the definitive env
 // marker can't be read — Windows, or a pre-0.8.0 child). A genuine child's OS creation time is at or
@@ -336,7 +371,7 @@ const TOOLS = [
   {
     name: "agent_bridge_open_session",
     description:
-      "Open a persistent delegated-agent session. OMP uses its JSONL RPC mode; Codex drives a persistent codex app-server over JSON-RPC; Claude runs a fresh-context Claude Code worker; Cursor drives the cursor-agent CLI (Windows-only in v1; per-turn cloud chat, so read/write are both soft, contextUsage is always null, and schema/effort are unsupported; append_system_prompt_file is injected as a SOFT first-turn user-prefix — model-dependent, not a true system prompt). Kimi drives the native Kimi Code CLI (Windows-only in v1; a per-turn short-lived process with a LOCAL resume id — no cloud chat — so read/write are both soft, contextUsage is always null, and schema/effort are unsupported; append_system_prompt_file is injected as a SOFT first-turn user-prefix — model-dependent, not a true system prompt; inference still runs on Moonshot's cloud API). Use this before sending messages.",
+      "Open a persistent delegated-agent session. OMP uses its JSONL RPC mode; Codex drives a persistent codex app-server over JSON-RPC; Claude runs a fresh-context Claude Code worker; Cursor drives the cursor-agent CLI (Windows-only in v1; per-turn cloud chat, so read/write are both soft, contextUsage is always null, and schema/effort are unsupported; append_system_prompt_file is injected as a SOFT first-turn user-prefix — model-dependent, not a true system prompt). Kimi drives the native Kimi Code CLI (Windows-only in v1; a per-turn short-lived process with a LOCAL resume id — no cloud chat — so read/write are both soft, contextUsage is always null, and schema/effort are unsupported; append_system_prompt_file is injected as a SOFT first-turn user-prefix — model-dependent, not a true system prompt; inference still runs on Moonshot's cloud API). Use this before sending messages. If you pass initial_prompt WITHOUT wait:true, that first turn runs asynchronously: the returned `initial` is only an ack, not the answer, and you must collect it with agent_bridge_wait — the bridge never delivers a result on its own.",
     inputSchema: {
       type: "object",
       properties: {
@@ -391,9 +426,15 @@ const TOOLS = [
         wait: {
           type: "boolean",
           default: false,
-          description: "When initial_prompt is provided, wait for that turn to finish before returning.",
+          description:
+            "Default false: with initial_prompt the FIRST TURN RUNS ASYNCHRONOUSLY and the returned `initial` is " +
+            "only an ack — you must still collect it with agent_bridge_wait. Pass true to block until that turn " +
+            "finishes and return its result inline.",
         },
-        timeout_ms: { type: "number", description: "Optional wait timeout in milliseconds." },
+        timeout_ms: {
+          type: "number",
+          description: "Optional inline wait timeout in milliseconds. Applies ONLY when wait:true; ignored otherwise.",
+        },
       },
       required: ["agent", "cwd"],
       additionalProperties: false,
@@ -402,7 +443,10 @@ const TOOLS = [
   {
     name: "agent_bridge_send_message",
     description:
-      "Send a message to an existing persistent delegated-agent session. Returns immediately with an ack by default (non-blocking) so you stay responsive; join the result with agent_bridge_wait, using a short timeout_ms (e.g. 5-10 min) to check progress without dead-waiting. Pass wait=true to block inline until the turn completes and return its result.",
+      "Send a message to an existing persistent delegated-agent session. Returns immediately with an ack by " +
+      "default (non-blocking) so you stay responsive — the ack is NOT the result and the bridge will never " +
+      "push you one, so you must collect it with agent_bridge_wait before ending your turn or closing the " +
+      "session. Pass wait=true to block inline until the turn completes and return its result instead.",
     inputSchema: {
       type: "object",
       properties: {
@@ -419,7 +463,13 @@ const TOOLS = [
           description:
             "Default false: return immediately with an ack, then join via agent_bridge_wait (recommended with a short timeout_ms so you can poll progress instead of dead-waiting). Pass true to block until the turn completes and return its result inline.",
         },
-        timeout_ms: { type: "number", description: "Optional wait timeout in milliseconds." },
+        timeout_ms: {
+          type: "number",
+          description:
+            "Optional inline wait timeout in milliseconds. Applies ONLY when wait:true. With the default " +
+            "wait:false this parameter is IGNORED — it does not schedule anything, and no result will be " +
+            "delivered to you later. To bound how long you wait, call agent_bridge_wait with its own timeout_ms.",
+        },
         max_chars: {
           type: "number",
           description:
@@ -467,25 +517,45 @@ const TOOLS = [
   {
     name: "agent_bridge_wait",
     description:
-      "Block until delegated-agent sessions finish their current turn, then return their results. Use after " +
-      'sending with wait=false to several sessions. mode "all" returns once every listed session is done; mode ' +
-      '"any" returns as soon as the first finishes (call again with the remaining ids to handle each as it ' +
-      "completes). One blocking call replaces polling agent_bridge_status in a loop.",
+      "Collect the results of delegated-agent turns. This is the ONLY way a result reaches you: the bridge " +
+      "never pushes anything on its own, so a turn nobody waits on is simply never collected. " +
+      "Timing out is NOT a failure and does NOT interrupt the turn — you get " +
+      "{timedOut, settled, pending, pendingSnapshots} and the work keeps running, so call again. " +
+      "KEEP CALLING while the response has a non-empty pending[] (feed that array straight back in as " +
+      "session_ids); stopping early discards whatever those sessions produce. Three return shapes, all " +
+      'echoing `mode`: mode "any" (default) -> {mode, completed, pending, pendingSnapshots}; mode "all" ' +
+      "when everything finished -> {mode, results}; either mode on timeout -> {timedOut, settled, pending, " +
+      "pendingSnapshots}. One call replaces polling agent_bridge_status in a loop.",
     inputSchema: {
       type: "object",
       properties: {
         session_ids: {
           type: "array",
           items: { type: "string" },
-          description: 'Session ids to wait on. For mode "any", pass only the still-running ids on each call.',
+          description:
+            "Session ids to collect. On each subsequent call pass the remaining (not-yet-returned) ids — i.e. " +
+            "the previous response's `pending` verbatim. Note `pending` means \"not delivered to you yet\", " +
+            "which is not the same as \"still running\": it can include a session that settled in the same " +
+            "poll tick as the one being returned.",
         },
         mode: {
           type: "string",
           enum: ["all", "any"],
-          default: "all",
-          description: '"all": return when every session is done. "any": return when the first one is done.',
+          default: "any",
+          description:
+            '"any" (default): return as soon as the first session finishes, so you can handle results as they ' +
+            'land — the rest come back in `pending`, call again with those. "all": return only once every ' +
+            "listed session is done, as {mode, results}; use it when you need to compare them side by side.",
         },
-        timeout_ms: { type: "number", description: "Optional overall wait timeout in milliseconds." },
+        timeout_ms: {
+          type: "number",
+          default: DEFAULT_JOIN_TIMEOUT_MS,
+          description:
+            `Optional join window in milliseconds (default ${DEFAULT_JOIN_TIMEOUT_MS}, overridable via ` +
+            "AGENT_BRIDGE_JOIN_TIMEOUT_MS). Expiry is non-destructive: the turn keeps running and you call " +
+            "again. Prefer short windows and repeat calls over one long one — some hosts cap how long a " +
+            "single tool call may run.",
+        },
         max_chars: {
           type: "number",
           description:
@@ -5032,8 +5102,15 @@ function sessionSettled(session) {
 async function waitSessions(params) {
   const rawIds = Array.isArray(params.session_ids) ? params.session_ids.filter(Boolean) : [];
   if (!rawIds.length) throw new Error("session_ids is required (a non-empty array of session ids).");
-  const mode = params.mode === "any" ? "any" : "all";
-  const timeoutMs = parseNumber(params.timeout_ms, DEFAULT_WAIT_TIMEOUT_MS);
+  // Default "any", not "all": "handle each result as it lands" is the recommended shape (it surfaces the
+  // first failure sooner and keeps the caller moving), and its return carries `pending` — which is where
+  // the must-keep-collecting signal hangs. Same "unknown value falls to the default" grammar as before,
+  // just the other way round. ⚠️ This flips the DEFAULT RETURN SHAPE: {mode, results} → {mode, completed,
+  // pending, pendingSnapshots}. All three return points echo `mode` so a caller can tell which it got.
+  const mode = params.mode === "all" ? "all" : "any";
+  // The JOIN clock, never the inline one — see DEFAULT_JOIN_TIMEOUT_MS. Timing out here does not touch
+  // the turn, so the default can be short; the five wait:true paths keep DEFAULT_WAIT_TIMEOUT_MS.
+  const timeoutMs = parseNumber(params.timeout_ms, DEFAULT_JOIN_TIMEOUT_MS);
   // Tail length for progress snapshots, bounded so a bad value can't blow up the payload or slice
   // backwards (parseNumber only parses; clampInt enforces 0..4000).
   const tailChars = clampInt(parseNumber(params.tail_chars, 240), 0, 4000);

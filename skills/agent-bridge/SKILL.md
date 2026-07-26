@@ -18,14 +18,16 @@ wait(session_ids, mode:"any", timeout_ms)  →  收结果；先完成先处理
 close_session(session_id)                  →  用完必须关
 ```
 
-- ⚠️ `wait` **必须显式传 `timeout_ms`**（建议 **≤ 5 分钟＝`300000` 短轮询 + 循环**，简单任务再降）；**不传默认死等 30 分钟**。
+- ⚠️ **每个 accepted 的 turn 都必须被收口**——ack 不是结果，桥也不会把结果推给你。见「安全规则」里的收口 invariant。
+- ⚠️ `wait` 的 `timeout_ms` 可以省略（默认 **10 分钟**）；显式传个更短的（如 `300000`）便于更勤地看进展。超时**不是失败、不中断 turn**，接着 `wait` 就行。
 - ⚠️ **别给 `send_message` / `open_session` 传 `wait:true`**——超时会 **abort 掉那轮 turn**（任务被中断，不是回头再取）；用非阻塞 send + `wait` 收口。
-- 收口默认 `mode:"any"`（先完成先处理）；`wait` 的返回 shape 随 mode / 超时而不同，见「并行委托」。
+- `mode` 默认已是 `"any"`（先完成先处理）；`wait` 的返回 shape 随 mode / 超时而不同，见「并行委托」。
 - 要完整产出，在 `close_session` **之前**读 `textRef`（关会话会删它）。
 
 ## 核心机制
 
 - 会话**活在 MCP server 进程内**：你所在的客户端启动了一个 `agent-bridge mcp` 进程，它直接 spawn 并持有你 open 的 OMP/Codex/Claude 后端（**cursor / kimi 例外**：只持有逻辑会话，进程按轮短驻）。**没有共享 daemon、没有 UI、不跨客户端共享**；客户端退出，这些会话随之被清理。
+- ⚠️ **桥没有任何主动通知 / 唤醒机制。** 一轮委托跑完不会通知任何人；**只有你自己调 `agent_bridge_wait` 才能拿到结果**。宿主把在飞的长工具调用转后台、跑完再通知你，那是**宿主**行为，前提是**有一个 `wait` 正在飞**——没 `wait` 就没通知。你的回合一结束，那轮产出就无人接收。（这条最容易踩，因为"长调用会自己回来找我"在别处是对的。）
 - CLI 只剩三条：`mcp`（由 MCP 客户端拉起，你一般不手动跑）、`doctor`（查后端可用性）、`cleanup`（回收被 kill 的 server 残留的子进程）。**没有 CLI 会话命令，也没有 daemon/ui 命令**。
 
 ## 工作流：非阻塞 + 短超时 wait（看进展，不死等）
@@ -33,10 +35,10 @@ close_session(session_id)                  →  用完必须关
 委托一轮可能要几分钟甚至更久。**不要用阻塞调用死等**——会卡住主 agent、看不到进展、也不好被打断。标准做法：
 
 1. `agent_bridge_send_message`（默认非阻塞）→ 立刻拿到 ack，任务在后端会话里跑。
-2. `agent_bridge_wait` 传**短 `timeout_ms`**（建议 **≤ 5 分钟＝`300000`**，简单任务再降；**不传默认死等 30 分钟**）：
+2. `agent_bridge_wait` 收口（`timeout_ms` 省略即 **10 分钟**；想更勤地看进展就显式传短一点，如 `300000`）：
    - 超时前结束 → 直接返回结果（含 `text`）。
-   - 到点没完 → 返回 `{ timedOut, settled, pending, pendingSnapshots }`，**不报错**。
-3. 「`wait` → 看 `pendingSnapshots` → 再 `wait`」循环，直到完成。
+   - 到点没完 → 返回 `{ timedOut, settled, pending, pendingSnapshots }`，**不报错、也不中断 turn**。
+3. 「`wait` → 看 `pendingSnapshots` → 再 `wait`」循环，**直到 `pending` 为空**。
 
 > **短的是「单次请求」，不是任务本身。** 一轮委托要跑 4~5 分钟很正常，就多轮 `wait` 接着等——别为了怕超时去砍任务。短请求让 stdio 传输尽快回到 idle，压掉「长请求 × 机器重载 → 客户端 teardown 掉整个 MCP 连接」这个最危险组合的暴露面（见 `docs/INVESTIGATION-mcp-cleanexit-heavy-delegation-2026-07-02.md`）。
 >
@@ -48,9 +50,13 @@ close_session(session_id)                  →  用完必须关
 - `lastEvent`：最近一条生命周期事件（turn/工具）。
 - 一次 `wait` 就能判断「还在动 vs 卡住、在做什么」，不必再单独调 `status`/`result`。
 
-**为什么不死等：** `send_message`/`open_session` 的 `wait:true`（或 `wait` 不设超时）会阻塞到**默认上限 30 分钟**（不传 `timeout_ms` 时），期间主 agent 完全卡住；而且 **`wait:true` 超时会 abort 掉那一轮 turn**（这轮被中断，不是回头再取）。短超时 `agent_bridge_wait` 超时**不中断 turn**，任务继续在后台跑，再 `wait` 即可接着等。
+**为什么不死等：** `send_message`/`open_session` 的 `wait:true` 会阻塞到**默认上限 30 分钟**（不传 `timeout_ms` 时），期间主 agent 完全卡住；而且 **`wait:true` 超时会 abort 掉那一轮 turn**（这轮被中断，不是回头再取）。`agent_bridge_wait` 是**另一个时钟**：默认 10 分钟，超时**不中断 turn**，任务继续在后台跑，再 `wait` 即可接着等。两者的超时后果相反，别混为一谈。
 
-**何时才直接 `wait:true`：** 只有一轮**确定很快**（几秒级、简单改动）时图省事；`open_session` 同时传 `initial_prompt` + `wait:true` 可一步完成「开+发+等」。
+**何时才直接 `wait:true`：** 只有一轮**确定很快**（几秒级、简单改动）时图省事；`open_session` 同时传 `initial_prompt` + `wait:true` 可一步完成「开+发+等」。⚠️ 反过来说：`open_session` 传了 `initial_prompt` 而**没**传 `wait:true` 时，首轮是**异步**的，返回里的 `initial` 只是 ack——最容易被当成"开会话并完成首轮"，实际那轮还没被收口。
+
+## 宿主交互
+
+部分宿主对**单次 MCP 调用**有自己的上限（实测 Claude Code ≈120s 会把在飞调用转后台 + 事后通知）。所以**别把 `timeout_ms` 设得很长来"一次等完"**——短切片 + 循环在所有宿主上行为一致，而且转后台的前提本来就是「有一个 `wait` 在飞」。
 
 ## 并行委托：同时跑多个 agent
 
@@ -58,8 +64,9 @@ close_session(session_id)                  →  用完必须关
 
 1. 对每个会话各发一次 `send_message`（默认非阻塞），都立刻拿到 ack，后台并行跑。
 2. 用 `agent_bridge_wait` 收口，省去循环轮询 `status`。**推荐 `mode:"any"`**（先完成先处理，比 `all` 更早拿到结果、更早暴露问题）：
-   - `mode:"any"`：第一个完成就返回 `{ completed, pending, pendingSnapshots }`。处理 `completed`，然后**直接拿 `pending`（纯 id 数组）当下一轮的 `session_ids`**，循环到 `pending` 空。别把 `completed.sessionId` 加回去，也别把 `pendingSnapshots`（对象）当 id 传。
-   - `mode:"all"`：要等齐了一起处理（如对比双评）时才用，返回 `{ results: [...] }`。
+   - `mode:"any"`（**默认，省略即此**）：第一个完成就返回 `{ completed, pending, pendingSnapshots }`。处理 `completed`，然后**直接拿 `pending`（纯 id 数组）当下一轮的 `session_ids`**，循环到 `pending` 空。别把 `completed.sessionId` 加回去，也别把 `pendingSnapshots`（对象）当 id 传。
+   - `mode:"all"`：要等齐了一起处理（如对比双评）时才用，返回 `{ results: [...] }`。**省略 `mode` 拿到的是 `any` 形状**——照着 `results[0]` 取会拿到 `undefined`。
+   - ⚠️ **`pending` 的含义是「还没交付给你」，不等于「还在跑」**：它可能包含**与本次返回的那个在同一 poll tick 里已经 settle** 的 id。那个 id 下一次调用会立刻作为 `completed` 回来——所以照着「循环到 `pending` 空」做就对了，别自作主张把看起来已完成的 id 剔掉。
 3. 失败或被关闭的会话也按「已完成」返回（`status` 为 `failed`/`closed`），便于一并处理。
 
 **`wait` 三种返回 shape 不同**——取错字段会拿到 `undefined`：
@@ -67,7 +74,7 @@ close_session(session_id)                  →  用完必须关
 | 场景 | 顶层字段 | 结果在哪 |
 |---|---|---|
 | `mode:"all"` 全部完成 | `{ results }` | `results[i].text` |
-| `mode:"any"` 首个完成 | `{ completed, pending, pendingSnapshots }` | `completed.text`；待处理 id 在 `pending` |
+| `mode:"any"`（默认）首个完成 | `{ completed, pending, pendingSnapshots }` | `completed.text`；待处理 id 在 `pending` |
 | 超时（两种 mode 都会） | `{ timedOut, settled, pending, pendingSnapshots }` | 已完成在 `settled[i].text`；还在跑在 `pendingSnapshots` |
 
 > 并发纪律：
@@ -80,7 +87,7 @@ close_session(session_id)                  →  用完必须关
 |---|---|---|
 | `agent_bridge_open_session` | 开持久会话（选 agent/model/effort/access/cwd） | 派活前。换模型/换角色就**新开**一个 |
 | `agent_bridge_send_message` | 发一条消息（**默认非阻塞**，返回 ack） | 派活、追问（复用同一 `session_id`）。慎用 `wait:true`：超时会 abort 本轮 |
-| `agent_bridge_wait` | 阻塞 join 一个/多个会话；**务必传 `timeout_ms`**（默认 30 分钟） | 收结果的**主力**，推荐 `mode:"any"`；返回 shape 随 mode/超时不同（见上） |
+| `agent_bridge_wait` | 收口一个/多个会话（`timeout_ms` 默认 10 分钟，超时不中断 turn） | 收结果的**唯一**途径，`mode` 默认 `"any"`；返回 shape 随 mode/超时不同（见上） |
 | `agent_bridge_status` | 看运行状态 + 最近事件；无 `session_id` 时返回 `{sessions:[…]}`（你开的全部） | 查进度；看「当前主 agent 拉起了哪些 agent」 |
 | `agent_bridge_result` | 读**最近一轮** assistant 文本 + 最近事件（非全历史） | 想看目前为止的产出（含中途） |
 | `agent_bridge_abort` | 中断当前 turn（会话仍可复用） | 要**真正停掉**正在跑的一轮（打断主 agent ≠ 停任务） |
@@ -185,6 +192,9 @@ contextUsage: { tokens, live, isCompacting?, autoCompactionEnabled? } | null
 
 ## 安全规则
 
+- ⚠️ **收口 invariant（最容易违反的一条）：每个 accepted 的 turn，在你结束主任务或 `close_session` 之前，必须通过 `agent_bridge_wait` 收到终态结果，或由你显式 `agent_bridge_abort` 放弃。返回里 `pending` 非空时必须继续 `wait`。未满足时不得向用户报告委托完成。**
+  - 不是「一次 `send` 一次 `wait`」——`mode:"all"` 可以一次收多个，`wait:true` 已经内联收过了。判据是**每个 turn 都有归宿**。
+  - 没收口不等于结果作废：只要会话还活着就还能取。但**`close_session` 或宿主退出之后可能永久丢失**（OMP 的 close 会杀进程树并删掉 answerFile）。
 - `cwd` 必须是当前工作区的绝对路径——桥不校验 workspace root，主 agent 自己负责别传 home / 父目录 / 临时目录。
 - 能力档就低不就高（见「Agent 与模型 → `access` 能力档」）：代码审查、方案设计、只读复核、跑测试/命令做调查 → `access:"read"`（read 自带 shell,够调查用；注意 omp/claude/cursor/kimi 的 read 能软写、只有 codex 硬只读）；只有用户明确要改文件才 `access:"write"`。
 - **场景编排 skill 的权限模型优先**：agent-bridge-dev / -roundtable / -loop 对特定角色/席位的能力档与工作区形态另有明确规定时（如 loop 验证者 `access:"write"` 自建验证脚本、圆桌 write 席 + git worktree），按该 skill 执行——用户调用该 skill 即视为对其权限模型的授权，不必再逐会话套用上一条的通用默认。

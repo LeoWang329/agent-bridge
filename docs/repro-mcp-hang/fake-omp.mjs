@@ -19,7 +19,13 @@
 //               [repro-wait-shape (T1 result-field passthrough) / repro-laststderr (T4) / repro-health (T9)]
 //   slowturn  — ack prompt + agent_start, then stay running ~2.5s before message_update + turn_end, so a
 //               SECOND send() lands mid-turn and must be rejected ("already has a running turn").
+//               get_state reports isStreaming:true FOREVER, so this mode can only be used to produce a
+//               "still running" reading — an inline wait:true on it never completes (waitIdle wants
+//               !isStreaming). Use slowsettle when the slow turn must actually finish.
 //               [repro-omp-concurrent (T3)]
+//   slowsettle— like slowturn (~2.5s) but get_state flips back to isStreaming:false when the turn really
+//               ends, which is what real omp does. The only slow mode an inline wait:true can complete
+//               on. [repro-collect-discipline T13/T14 -> join clock vs inline clock]
 //   errturn   — ack prompt + agent_start, then turn_end with stopReason:"error" so the turn completes
 //               in ERROR (session returns to idle but health must read degraded). [repro-health (T9)]
 //   echoturn  — like okturn but ECHOES the received prompt text back as the answer ("ECHO:<prompt>"), so
@@ -54,6 +60,11 @@ let multiturnLastText = "."; // 真 omp 实现 get_last_assistant_text,这里如
 let turnstateStreaming = false; // turnstate 模式:请求完成后才翻成 true(制造状态不一致)
 let lateturnCount = 0;
 let lateturnStreaming = false;
+// slowsettle 模式:和 slowturn 一样跑满 ~2.5s,但 get_state 会在 turn 真正结束时翻回"没在流"。
+// ⚠️ 这个区别是必须的,不是锦上添花:slowturn 的 get_state **恒报 isStreaming:true**,而 OMP 的
+// waitIdle 要的正是 `!isStreaming && turnStarted` —— 所以 slowturn 永远完不成一次 inline wait:true,
+// 它只能用来造"正在跑"。要考"inline 时钟没被 join 默认污染"就必须有一个能真正收尾的慢桩。
+let slowsettleStreaming = false;
 const say = obj => process.stdout.write(JSON.stringify(obj) + "\n");
 
 let buf = "";
@@ -76,6 +87,8 @@ process.stdin.on("data", d => {
           ? turnstateStreaming
           : MODE === "lateterminal"
           ? lateturnStreaming
+          : MODE === "slowsettle"
+          ? slowsettleStreaming
           : (MODE === "multiturn" || MODE === "multiturn-fast")
           ? multiturnStreaming
           : !(MODE === "okturn" || MODE === "errturn" || MODE === "echoturn" || MODE === "ctxturn" || MODE === "logstress" || MODE === "badline" || MODE === "toolturns" || MODE === "agentenderr");
@@ -126,6 +139,16 @@ process.stdin.on("data", d => {
             say({ type: "turn_end", message: { stopReason: "error", errorMessage: "fake-omp: simulated turn error" } });
             say({ type: "agent_end" });
           }, 60);
+        } else if (MODE === "slowsettle") {
+          // 慢,但会如实收尾:turn 结束时 get_state 才翻回"没在流",这才是真 omp 的样子。
+          slowsettleStreaming = true;
+          say({ type: "agent_start" });
+          setTimeout(() => {
+            say({ type: "message_update", message: { type: "text_delta", delta: "SLOW_DONE" } });
+            say({ type: "turn_end" });
+            say({ type: "agent_end" });
+            slowsettleStreaming = false;
+          }, 2500);
         } else if (MODE === "slowturn" || MODE === "ctxslow") {
           // Stay running long enough that a concurrent second send() is attempted mid-turn.
           say({ type: "agent_start" });

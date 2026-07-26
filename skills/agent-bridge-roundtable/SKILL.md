@@ -26,7 +26,7 @@ description: 用 agent-bridge 组织一场「agent 圆桌审议」——主 agen
 1. **工具存在性守卫**:当前工具列表里**没有** `agent_bridge_*` 工具就**停下**,提示用户先安装/启用 agent-bridge MCP 服务器。
 2. **先加载桥 skill 拿完整用法**:本流程建在 agent-bridge 之上。**先加载 `agent-bridge` skill**(手动 link 态名为 `agent-bridge`,插件态 `agent-bridge:agent-bridge`,让 harness 解析),它有完整工具用法、返回 shape、并发纪律、`textRef` 关会话前读、`contextUsage` 阈值、`doctor`/`omp models` 探测、`append_system_prompt_file` 注入角色等。本文件只在关键处**重复两条最致命纪律**。
 3. **两条致命纪律(内联,别只靠跨引用)**:
-   - `agent_bridge_wait` **必须传 `timeout_ms`**(如 `300000`≈5 分钟短轮询循环),**不传默认死等 30 分钟**。
+   - `agent_bridge_wait` 是**唯一**能拿到结果的途径(桥不会主动推给你),`timeout_ms` 省略即默认 **10 分钟**;本 skill 流程里写死的 `300000` 仍然有效、也是好实践(更勤地看进展)。超时**不中断 turn**,接着 `wait` 即可。**`pending` 非空必须继续 wait。**
    - **别给 `send_message`/`open_session` 传 `wait:true`**——超时会 **abort 掉那轮 turn**(任务被中断)。用非阻塞 send + 短超时 `wait` 收口。
 
 ## 关键事实(别踩坑)

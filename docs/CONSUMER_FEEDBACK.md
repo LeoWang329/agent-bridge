@@ -326,3 +326,5 @@ v0.8.1 的 P2 只在 **stdin EOF** 时回收 server。但 server 可能被孤立
 **实测**:新增 `docs/repro-mcp-hang/repro-waitfail.mjs`(fake-omp 新增 `rejectprompt` 模式:拒绝每个 prompt、保活 idle)。**负向对照成立**——临时去掉 catch 里的 `turnInFlight=false` 即 FAIL(死等满 6068ms 超时);修复后 **PASS**:被拒会话 `wait` **45ms** 即 settle。全量 **9/9 PASS**(waitfail / waitany / turnstate / halfdead / reclaim / watchdog-disarm / pipebreak / parent-death / kill)。按用户决定**本轮不再追加评审一轮**,以负向对照 + 全量回归 + 两家已收敛的共识收口。
 
 > **schema 文案待办(已知,未计入逻辑缺陷)**:两家都点到 `agent_bridge_wait` 的入参/出参描述仍说 `mode:"any"` 的 `pending`/`pendingSnapshots` 是"still-running ids",与 R1 新语义(可能含同 tick 已 settle 的 id)不一致。属文档措辞,留待后续低成本订正。
+>
+> **【已订正 · v0.10.0】** 随收口纪律加固(C4.6)一并改掉:`session_ids` 的描述现在写的是"remaining / unreturned ids",并明说 `pending` 的含义是"还没交付给你"而非"还在跑"。SKILL.md 的三种返回形状表同步。

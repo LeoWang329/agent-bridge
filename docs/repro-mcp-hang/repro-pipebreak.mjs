@@ -55,7 +55,7 @@ async function main() {
   // deadline + one OMP_RPC_TIMEOUT_MS (the in-flight poll has to time out first) — well inside
   // the 25s watch window. Pre-fix the loop is wedged inside `await state()` and never returns.
   const waitId = nextId++;
-  rpc({ jsonrpc: "2.0", id: waitId, method: "tools/call", params: { name: "agent_bridge_wait", arguments: { session_ids: [sid], timeout_ms: 8000 } } });
+  rpc({ jsonrpc: "2.0", id: waitId, method: "tools/call", params: { name: "agent_bridge_wait", arguments: { session_ids: [sid], mode: "all", timeout_ms: 8000 } } });
 
   const deadline = Date.now() + 25000;
   while (Date.now() < deadline) {

@@ -21,7 +21,7 @@ description: 用 agent-bridge 跑一个「合同驱动的自动交付循环」�
    `agent-bridge`),它有完整工具用法、返回 shape、并发纪律、`textRef` 关会话前读、`contextUsage` 阈值、
    `doctor`/`omp models` 探测、`append_system_prompt_file` 注入角色等。
 3. **两条致命纪律(内联,别只靠跨引用)**:
-   - `agent_bridge_wait` **必须传 `timeout_ms`**(如 `300000`≈5 分钟短轮询循环),**不传默认死等 30 分钟**。
+   - `agent_bridge_wait` 是**唯一**能拿到结果的途径(桥不会主动推给你),`timeout_ms` 省略即默认 **10 分钟**;本 skill 流程里写死的 `300000` 仍然有效、也是好实践(更勤地看进展)。超时**不中断 turn**,接着 `wait` 即可。**`pending` 非空必须继续 wait。**
    - **别给 `send_message`/`open_session` 传 `wait:true`**——超时会 **abort 掉那轮 turn**(任务被中断)。
      用非阻塞 send + 短超时 `wait` 收口。
 

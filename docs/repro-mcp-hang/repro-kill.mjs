@@ -66,7 +66,7 @@ async function main() {
     if (!sid || !backendPid) { console.log("[harness] open failed:", JSON.stringify(open)?.slice(0, 400)); break; }
 
     const waitId = nextId++;
-    rpc({ jsonrpc: "2.0", id: waitId, method: "tools/call", params: { name: "agent_bridge_wait", arguments: { session_ids: [sid], timeout_ms: 60000 } } });
+    rpc({ jsonrpc: "2.0", id: waitId, method: "tools/call", params: { name: "agent_bridge_wait", arguments: { session_ids: [sid], mode: "all", timeout_ms: 60000 } } });
     await sleep(1200);
     try { process.kill(backendPid, "SIGKILL"); console.log(`[harness] SIGKILLed backend ${backendPid}`); } catch (e) { console.log(`[harness] kill failed: ${e.message}`); }
 
