@@ -4,8 +4,12 @@
 //               T+3s while staying alive (graceful-teardown / broken-pipe shape). [repro-pipebreak]
 //   silent    — ack prompt + agent_start, but NEVER answer get_state (process alive, pipe writable,
 //               no responses) — the half-dead backend shape. [repro-halfdead -> P/F4 fast-fail]
-//   turnstate — ack prompt, then emit turn_start -> turn_end -> turn_start (a backend re-entering a
-//               turn on its own) and stay quiet/running. [repro-turnstate -> F7/F8 coherent clock]
+//   turnstate — two phases. (1) A request that genuinely COMPLETES (agent_start + text + turn_end +
+//               agent_end), so the bridge really writes an end stamp — without this the F8 check would
+//               be vacuous. (2) No further lifecycle events at all: get_state simply starts reporting
+//               isStreaming:true, which is the real OMP incoherence (BUG-omp-turn-state-inconsistency)
+//               that flips status back to "running" while the end stamp is still set.
+//               [repro-turnstate -> F7/F8 coherent clock]
 //   rejectprompt — REFUSE the prompt (respond success:false) while staying alive and idle, so no turn
 //               ever starts. send() throws, status returns to idle. [repro-waitfail -> R2/turnInFlight:
 //               a rejected-prompt session must still settle wait(), not dead-wait on a turn that never comes]
@@ -32,6 +36,24 @@
 //               in pendingSnapshots[].contextUsage (mid-wait watch of a long session). [repro-context-usage]
 // Launched via fake-omp.cmd (Windows) or fake-omp.sh (POSIX) through OMP_BIN; env is inherited.
 const MODE = process.env.FAKE_OMP_MODE || "pipebreak";
+
+// --- multiturn / multiturn-fast:**「已完成的请求又自己动起来」** 的防御性用例
+//     起源是真机事故(omp + deepseek-v4-pro:一次委托被拆成多个内部 turn,桥在第一个 turn_end 就收结果,
+//     拿到一个字符 "."),但那个**根因已经在协议层面修掉了** —— 现在桥以 `agent_end` 为完成边界,
+//     真实 OMP 的多子轮形状由 `toolturns` 模式覆盖。
+//     ⚠️ 如实标注这两个模式**现在测的是什么**:它们在**已经发过 agent_end 之后**又自行 turn_start。
+//     真实 OMP 的 wire 会扣住中间的 agent_end、由后来的那个取代,只把最终一次交给 rpc 消费者
+//     (agent-session.ts:#pendingAgentEndEmit),所以这已不是真实 OMP 的复刻,而是
+//     **「后端违反协议时,桥的正文归属(generation)仍不能把上一轮的文本当本轮答案」** 这条防线。
+//     钩子挂在 `get_last_assistant_text`(result() 必发的那次 RPC)上,所以复现是确定性的,不靠抢时序。
+let multiturnStreaming = false;
+let multiturnPhase = "idle"; // idle → first(第一轮已结束) → second(已重开) → done
+let multiturnLastText = "."; // 真 omp 实现 get_last_assistant_text,这里如实回报当前正文(见下)
+// lateterminal 模式:第二轮开头先发一个"迟到的"(属于上一轮的)**agent_end**(还带错误负载),
+// 考两件事:桥会不会据此误判本轮已结束,以及它的错误会不会被记进本轮的健康字段
+let turnstateStreaming = false; // turnstate 模式:请求完成后才翻成 true(制造状态不一致)
+let lateturnCount = 0;
+let lateturnStreaming = false;
 const say = obj => process.stdout.write(JSON.stringify(obj) + "\n");
 
 let buf = "";
@@ -48,7 +70,15 @@ process.stdin.on("data", d => {
         if (MODE === "silent") continue; // half-dead: swallow the poll, never respond
         // Turns that settle idle (okturn/errturn/echoturn/ctxturn/logstress) must report NOT streaming, else
         // state() would flip status back to running after turn_end and the session would never settle for wait().
-        const isStreaming = !(MODE === "okturn" || MODE === "errturn" || MODE === "echoturn" || MODE === "ctxturn" || MODE === "logstress");
+        // multiturn 自己管这个标志(见下方 multiturn 分支):第一轮 turn_end 后报"没在流",让会话真的 settle;
+        // 注入 turn_start 之后报"在流",这样 wait 才会接着等第二轮,而不是又立刻 settle 一次。
+        const isStreaming = MODE === "turnstate"
+          ? turnstateStreaming
+          : MODE === "lateterminal"
+          ? lateturnStreaming
+          : (MODE === "multiturn" || MODE === "multiturn-fast")
+          ? multiturnStreaming
+          : !(MODE === "okturn" || MODE === "errturn" || MODE === "echoturn" || MODE === "ctxturn" || MODE === "logstress" || MODE === "badline" || MODE === "toolturns" || MODE === "agentenderr");
         const data = { isStreaming, queuedMessageCount: 0, sessionId: "fake", messageCount: 1 };
         // ctx* modes: real omp reports current-context occupancy in get_state.data (contextUsage sub-object
         // + isCompacting/autoCompactionEnabled siblings — see the probe dump). The bridge normalizes this to
@@ -76,6 +106,7 @@ process.stdin.on("data", d => {
           setTimeout(() => {
             say({ type: "message_update", message: { type: "text_delta", delta: "OKTURN_ANSWER" } });
             say({ type: "turn_end" });
+            say({ type: "agent_end" }); // 整个请求结束(rpc 消费者的 idle 信号)
           }, 60);
         } else if (MODE === "echoturn") {
           // Echo the received prompt back as the answer, so a test can confirm the exact prompt body
@@ -85,6 +116,7 @@ process.stdin.on("data", d => {
           setTimeout(() => {
             say({ type: "message_update", message: { type: "text_delta", delta: `ECHO:${echo}` } });
             say({ type: "turn_end" });
+            say({ type: "agent_end" });
           }, 60);
         } else if (MODE === "errturn") {
           // Turn completes IN ERROR: session returns to idle but the last-turn outcome is error, so
@@ -92,6 +124,7 @@ process.stdin.on("data", d => {
           say({ type: "agent_start" });
           setTimeout(() => {
             say({ type: "turn_end", message: { stopReason: "error", errorMessage: "fake-omp: simulated turn error" } });
+            say({ type: "agent_end" });
           }, 60);
         } else if (MODE === "slowturn" || MODE === "ctxslow") {
           // Stay running long enough that a concurrent second send() is attempted mid-turn.
@@ -99,6 +132,7 @@ process.stdin.on("data", d => {
           setTimeout(() => {
             say({ type: "message_update", message: { type: "text_delta", delta: "SLOW_DONE" } });
             say({ type: "turn_end" });
+            say({ type: "agent_end" });
           }, 2500);
         } else if (MODE === "logstress") {
           // Drive the diagnostic-log redaction/cap paths [repro-log-bounds]:
@@ -130,18 +164,160 @@ process.stdin.on("data", d => {
             say({ type: "message_end", deep });
             say({ type: "message_update", message: { type: "text_delta", delta: "LOGSTRESS_ANSWER" } });
             say({ type: "turn_end" });
+            say({ type: "agent_end" });
           }, 160);
+        } else if (MODE === "lateterminal") {
+          // 第一轮正常;**第二轮**一开头先吐一个"迟到的" **agent_end**(冒充上一轮请求的完成 ——
+          // OMP 的事件不带 request id,桥分不出它属于哪一次),而且是在本轮 agent_start **之前**。
+          // 桥若信了它 → 会话被判"已完成" → wait 把**上一轮**的正文当本轮答案交出去(静默错答)。
+          // (注意这里发的必须是 agent_end 而不是 turn_end:按 OMP 协议 turn_end 本来就不代表请求结束,
+          //  发 turn_end 考不到"误判完成"这件事。)
+          lateturnCount += 1;
+          if (lateturnCount === 1) {
+            say({ type: "agent_start" });
+            setTimeout(() => {
+              say({ type: "message_update", message: { type: "text_delta", delta: "FIRST_ANSWER" } });
+              say({ type: "turn_end" });
+              say({ type: "agent_end" });
+            }, 60);
+          } else {
+            lateturnStreaming = true;
+            // ← 迟到的、属于上一次请求的完成事件,本轮还没 start。**带错误负载**:上一轮如果是失败的,
+            //   迟到过来就是这个形状(事件不带 request id,桥分不出是谁的)。它既不能把本轮判成已结束,
+            //   也不能把自己的错误记进本轮的健康字段 —— 后者要求"归属判定"跑在**任何**请求级写入之前,
+            //   而不是先写完再拒收(先写后拒 → lastError 会留着上一轮的失败,本轮干净完成也洗不掉)。
+            say({ type: "agent_end", messages: [{ role: "assistant", stopReason: "error", errorMessage: "fake-omp: late foreign failure" }] });
+            setTimeout(() => {
+              say({ type: "agent_start" });
+              say({ type: "message_update", message: { type: "text_delta", delta: "SECOND_ANSWER" } });
+              say({ type: "turn_end" });
+              say({ type: "agent_end" });
+              lateturnStreaming = false;
+            }, 500);
+          }
+        } else if (MODE === "badline") {
+          // Emit lines that PARSE as JSON but are not objects. Reading `.type` off the `null` one
+          // throws TypeError inside the bridge's rl "line" listener = uncaught = whole server dies.
+          // Then a normal answer, so the test can prove the session still works afterwards.
+          say({ type: "agent_start" });
+          for (const poison of [null, 123, [], "just a string", true]) {
+            try { process.stdout.write(`${JSON.stringify(poison)}\n`); } catch {}
+          }
+          try { process.stdout.write("{not json\n"); } catch {} // unparseable too, for good measure
+          setTimeout(() => {
+            say({ type: "message_update", message: { type: "text_delta", delta: "BADLINE_ANSWER" } });
+            say({ type: "turn_end" });
+            say({ type: "agent_end" });
+          }, 60);
+        } else if (MODE === "multiturn" || MODE === "multiturn-fast") {
+          // 第一次请求正常完成(只吐了一个字符)。桥到此判定 settled、开始取正文 ——
+          // 而后端会在**取正文的那次 RPC 期间**自己再开一轮(真机上是自动压缩/后续轮那类"无人再 prompt
+          // 却自己动起来"的情形,OMP 源码注释里明说 agent_end 可能被更晚的一次取代)。
+          multiturnStreaming = false;
+          say({ type: "agent_start" });
+          setTimeout(() => {
+            say({ type: "message_update", message: { type: "text_delta", delta: "." } });
+            say({ type: "turn_end" });
+            say({ type: "agent_end" });
+            multiturnPhase = "first";
+          }, 60);
+        } else if (MODE === "agentenderr") {
+          // **真实存在的错误路径**(omp 16.0.3 `pi-agent-core/src/agent.ts`:当被拦截的输出不是 "visible"
+          // 那一支):直接发 `agent_end({messages:[errorMsg]})`,**一个 turn_end 都不发**。
+          // 桥若只从 turn_end 取错误标志 → 这次失败会保留上一次的健康状态(报 healthy、lastError 为 null),
+          // 即最坏的静默失败。
+          say({ type: "agent_start" });
+          setTimeout(() => {
+            say({
+              // `role:"assistant"` 是真实协议里 errorMsg 的形状(它就是一条被追加进历史的 assistant 消息)。
+              // 桥在 messages[] 里找的是**最后一条 assistant**,不是数组末项 —— 这里带上 role,
+              // 走的才是那条主路径而不是"无 role 就退回末项"的兼容分支。
+              type: "agent_end",
+              messages: [{ role: "assistant", stopReason: "error", errorMessage: "fake-omp: agent_end-only failure" }],
+            });
+          }, 60);
+        } else if (MODE === "toolturns") {
+          // **真实 OMP 的常态形状**(源码 agent-loop.ts:一次 prompt 会发出多组 turn_start→turn_end,
+          // 工具/steering/后续轮全跑完才发 agent_end;agent-session.ts 更明说 rpc 消费者把 agent_end
+          // 当作 "session is idle" 信号)。
+          // 这里模拟:第一个子轮只吐半句就 turn_end(工具调用间隙),真正的答案在第二个子轮,
+          // 最后才 agent_end。桥若把 turn_end 当请求结束 → 交出半句 "PARTIAL_"(静默截断)。
+          say({ type: "agent_start" });
+          setTimeout(() => {
+            say({ type: "message_update", message: { type: "text_delta", delta: "PARTIAL_" } });
+            say({ type: "turn_end" });            // ← 子轮结束,请求还没完
+          }, 60);
+          setTimeout(() => {
+            say({ type: "turn_start" });          // ← 工具跑完,继续下一个子轮
+            say({ type: "message_update", message: { type: "text_delta", delta: "TOOLTURNS_ANSWER" } });
+            say({ type: "turn_end" });
+            say({ type: "agent_end" });           // ← 到这里才是整个请求结束
+          }, 700);
         } else if (MODE === "turnstate") {
-          // Churn turns on our own (no new prompt): start, then end->start->end. The mid re-entry
-          // (turn_end -> turn_start) exercises F7's stamp-clear; we settle on turn_end (status idle,
-          // turnEndedAt SET) while get_state keeps reporting isStreaming:true — so the bridge's
-          // status()/state() path flips status->running with the end stamp still set. That "running +
-          // endedAt" contradiction is exactly what F8 (status-aware lastTurnOf) must suppress.
-          say({ type: "turn_start" });
-          setTimeout(() => { say({ type: "turn_end" }); say({ type: "turn_start" }); say({ type: "turn_end" }); }, 120);
+          // 两阶段,专考 F7/F8 的「轮时钟不许自相矛盾」:
+          //  ① 先**正常完成**一次请求(turn_start → 正文 → turn_end → agent_end)。到这里 turnEndedAt
+          //     被真正写入、status 回 idle —— 这一步是让后面那条断言**有东西可测**。
+          //  ② 然后**不发任何事件**,只让 get_state 单方面翻成 isStreaming:true(真实 omp 就有这种
+          //     状态不一致,见 docs/BUG-omp-turn-state-inconsistency-2026-06-10.md)。桥的
+          //     status()/state() 路径会把 status 翻成 running,而结束戳仍然留着 ——
+          //     「running + endedAt」这个矛盾正是 F8(状态感知的 lastTurnOf)必须压住的。
+          //  ⚠️ 老版本在 turn_end 就 settle、从不发 agent_end,于是 turnEndedAt **压根不会被写**,
+          //     F8 的门控删掉测试照样绿(空绿)。这个顺序不能倒过来。
+          turnstateStreaming = false;
+          say({ type: "agent_start" });
+          setTimeout(() => {
+            say({ type: "turn_start" });
+            say({ type: "message_update", message: { type: "text_delta", delta: "TURNSTATE_ANSWER" } });
+            say({ type: "turn_end" });
+            say({ type: "agent_end" });
+            // 请求已结束、时钟已写入;稍后再让 get_state 自说自话地报"还在流"
+            setTimeout(() => { turnstateStreaming = true; }, 400);
+          }, 60);
         } else {
           say({ type: "agent_start" });
         }
+      } else if (MODE === "multiturn-fast" && msg.type === "get_last_assistant_text") {
+        // ★★ 比 multiturn **更毒**的形状,专门打「只复核 settled、不复核 generation」这个洞:
+        //    后端在**同一次 RPC 之内**把整整一轮跑完 —— turn_start → 新正文 → turn_end 一次性发完,
+        //    **然后才**回复这次 get_last_assistant_text,而且回的是**旧**正文。
+        //    于是桥复核时:状态又是 idle(settled 成立!),generation 却已经变了。
+        //    只看 settled 的实现会把旧的半句 "." 当成答案交出去,还会把它写进 answerFile。
+        //    multiturn 那个模式把第二轮拖了 400ms,复核时仍是 running,所以**盖不到**这一支。
+        if (multiturnPhase !== "first") {
+          say({ type: "response", id: msg.id, success: true, data: { text: multiturnLastText } });
+          continue;
+        }
+        multiturnPhase = "done";
+        say({ type: "turn_start" });
+        say({ type: "message_update", message: { type: "text_delta", delta: "MULTITURN_ANSWER" } });
+        say({ type: "turn_end" });
+        say({ type: "agent_end" });
+        multiturnLastText = "MULTITURN_ANSWER";
+        // ⚠️ 回的是**旧**正文:真 omp 的这次 RPC 在新一轮开始前就被受理了,拿回来的自然是上一轮的文本。
+        //    这正是"无法归属到当前 generation 的文本"——桥不得使用它。
+        say({ type: "response", id: msg.id, success: true, data: { text: "." } });
+      } else if (MODE === "multiturn" && msg.type === "get_last_assistant_text") {
+        // 真 omp 是**实现**这个命令的(会如实返回当前的助手正文),所以这里也如实返回 —— 不能像别的
+        // mode 那样敷衍成 `data:{}`。否则桥会走 `full = text || lastAssistantText` 的回退分支,
+        // 把上一段内部 turn 的正文重新写回(agent-bridge.mjs:2242 的陈旧写回),
+        // 测试就会把**桥的一个 bug**当成期望值锁进断言里。
+        const reply = () => say({ type: "response", id: msg.id, success: true, data: { text: multiturnLastText } });
+        if (multiturnPhase !== "first") { reply(); continue; }
+        // ★ 这里就是真机那个竞态窗口:桥已经判定 settled,正在 await 这次取文本 ——
+        //   后端就在此刻自己重开了一轮。**先发 turn_start 再回响应**,顺序必须是这个。
+        multiturnPhase = "second";
+        multiturnStreaming = true;
+        say({ type: "turn_start" });
+        reply(); // 此刻如实回报的仍是第一段那个 "." —— 收下它就是真机那次事故(charCount:1)
+        // 第二轮才是真答案;完事后回到"没在流",会话正常 settle
+        setTimeout(() => {
+          say({ type: "message_update", message: { type: "text_delta", delta: "MULTITURN_ANSWER" } });
+          say({ type: "turn_end" });
+          say({ type: "agent_end" });
+          multiturnLastText = "MULTITURN_ANSWER";
+          multiturnStreaming = false;
+          multiturnPhase = "done";
+        }, 400);
       } else if (msg.id) {
         say({ type: "response", id: msg.id, success: true, data: {} });
       }

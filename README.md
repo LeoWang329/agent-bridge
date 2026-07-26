@@ -25,7 +25,7 @@ node scripts/agent-bridge.mjs doctor
 Agent Bridge runs **straight from the clone** — nothing is copied into a package directory, so a single `git pull` updates everything. There are two pieces, both pointing at this clone in place, and setup is identical for **Claude Code** (`~/.claude`) and **Codex** (`~/.codex`):
 
 1. the **MCP server** — the eight `agent_bridge_*` tools;
-2. the **skills** — `agent-bridge` (the bridge usage guide) plus three optional companions: `agent-bridge-dev` (delegated code dev/review/design/debug via role personas from `skills/agent-bridge-dev/roles/`), `agent-bridge-roundtable` (N-agent anonymous deliberation with a live SSE observer page), and `agent-bridge-loop` (contract-driven generator/validator delivery loop with an AC-climb observer page; supports unattended runs).
+2. the **skills** — `agent-bridge` (the bridge usage guide) plus four optional companions: `agent-bridge-dev` (delegated code dev/review/design/debug via role personas from `skills/agent-bridge-dev/roles/`), `agent-bridge-roundtable` (N-agent anonymous deliberation with a live SSE observer page), `agent-bridge-loop` (contract-driven generator/validator delivery loop with an AC-climb observer page; supports unattended runs), and `agent-bridge-graph` (write a few dozen lines of JS to orchestrate a run whose nodes are *different vendors* — the one thing a single-vendor runner cannot do; see `skills/agent-bridge-graph/tools/node-core.mjs`).
 
 > **Consumer or maintainer?** If you only *use* Agent Bridge, point everything at your clone and `git pull` to update — the steps below are written for you (`<REPO>` = your clone). If you *develop* Agent Bridge, do **not** point your everyday agent at your working tree: uncommitted, untested edits go live (skills are re-read every session; the server reloads on restart). Keep a **separate stable clone** for your agent to consume and advance it only with a deliberate `git pull` — see [docs/INSTALLATION.md](docs/INSTALLATION.md) *(Consumer vs maintainer)*.
 
@@ -61,15 +61,17 @@ ln -s "<REPO>/skills/agent-bridge"            ~/.claude/skills/agent-bridge
 ln -s "<REPO>/skills/agent-bridge-dev"        ~/.claude/skills/agent-bridge-dev        # optional: dev-role companion
 ln -s "<REPO>/skills/agent-bridge-roundtable" ~/.claude/skills/agent-bridge-roundtable # optional: N-agent roundtable
 ln -s "<REPO>/skills/agent-bridge-loop"       ~/.claude/skills/agent-bridge-loop       # optional: delivery loop
+ln -s "<REPO>/skills/agent-bridge-graph"      ~/.claude/skills/agent-bridge-graph      # optional: JS-orchestrated heterogeneous run
 
 # Windows (PowerShell or cmd) — junction, no admin needed
 cmd /c mklink /J "%USERPROFILE%\.claude\skills\agent-bridge"            "<REPO>\skills\agent-bridge"
 cmd /c mklink /J "%USERPROFILE%\.claude\skills\agent-bridge-dev"        "<REPO>\skills\agent-bridge-dev"
 cmd /c mklink /J "%USERPROFILE%\.claude\skills\agent-bridge-roundtable" "<REPO>\skills\agent-bridge-roundtable"
 cmd /c mklink /J "%USERPROFILE%\.claude\skills\agent-bridge-loop"       "<REPO>\skills\agent-bridge-loop"
+cmd /c mklink /J "%USERPROFILE%\.claude\skills\agent-bridge-graph"      "<REPO>\skills\agent-bridge-graph"
 ```
 
-A per-user skills directory has **no plugin namespace**, so the skills load under their bare directory names — `agent-bridge`, `agent-bridge-dev`, `agent-bridge-roundtable`, `agent-bridge-loop`.
+A per-user skills directory has **no plugin namespace**, so the skills load under their bare directory names — `agent-bridge`, `agent-bridge-dev`, `agent-bridge-roundtable`, `agent-bridge-loop`, `agent-bridge-graph`.
 
 ### 3. Restart the client
 
@@ -98,12 +100,13 @@ If a user asks an AI agent (Claude Code, Codex, …) to set Agent Bridge up, fol
    # Codex
    codex mcp add agent-bridge -- node "<MJS>" mcp
    ```
-4. **Link the skills** into the client's skills dir (`~/.claude/skills/` for Claude Code, `~/.codex/skills/` for Codex) — `agent-bridge`, plus any of the companions `agent-bridge-dev` / `agent-bridge-roundtable` / `agent-bridge-loop` (Windows: `cmd /c mklink /J`):
+4. **Link the skills** into the client's skills dir (`~/.claude/skills/` for Claude Code, `~/.codex/skills/` for Codex) — `agent-bridge`, plus any of the companions `agent-bridge-dev` / `agent-bridge-roundtable` / `agent-bridge-loop` / `agent-bridge-graph` (Windows: `cmd /c mklink /J`):
    ```sh
    ln -s "<REPO>/skills/agent-bridge"            ~/.claude/skills/agent-bridge
    ln -s "<REPO>/skills/agent-bridge-dev"        ~/.claude/skills/agent-bridge-dev
    ln -s "<REPO>/skills/agent-bridge-roundtable" ~/.claude/skills/agent-bridge-roundtable
    ln -s "<REPO>/skills/agent-bridge-loop"       ~/.claude/skills/agent-bridge-loop
+   ln -s "<REPO>/skills/agent-bridge-graph"      ~/.claude/skills/agent-bridge-graph
    ```
 5. **Restart the client** — the tools and skills only load after a restart. Tell the user to do this.
 6. **Verify:** run `node "<MJS>" doctor` (each backend the user will use must print `ok`); then `claude mcp list` / `codex mcp list` shows `agent-bridge` connected. To update later, `git pull` in the clone — both tools and skills track it in place.

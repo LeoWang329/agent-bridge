@@ -82,6 +82,24 @@ async function main() {
   s2.kill();
   await sleep(300);
 
+  // --- degraded via an agent_end that carries the error and NO turn_end at all ---
+  // Real path in omp 16.0.3 (pi-agent-core/src/agent.ts): when the blocked output is not "visible",
+  // it appends the error message, sets state.error, and emits agent_end({messages:[errorMsg]}) —
+  // no turn_end is ever emitted. A bridge that reads the turn outcome only from turn_end keeps the
+  // PREVIOUS health here, so a failed request reports "healthy" with lastError null. Silent failure.
+  const s2b = makeServer("agentenderr");
+  await s2b.init();
+  const aeId = (await s2b.call("agent_bridge_open_session", { agent: "omp", cwd: CWD }, 30000))?.session?.id;
+  if (!aeId) return fail("open omp (agentenderr) failed");
+  await s2b.call("agent_bridge_send_message", { session_id: aeId, message: "go" });
+  await s2b.call("agent_bridge_wait", { session_ids: [aeId], mode: "all", timeout_ms: 8000 });
+  const stAe = (await s2b.call("agent_bridge_status", { session_id: aeId }))?.session;
+  if (stAe?.health !== "degraded") return fail(`agent_end carrying an error (no turn_end) should be "degraded", got ${JSON.stringify(stAe?.health)} (status=${stAe?.status})`);
+  if (!/agent_end-only failure/i.test(stAe?.lastError || "")) return fail(`agent_end-only error should set lastError, got ${JSON.stringify(stAe?.lastError)}`);
+  console.log(`[harness] agent_end-only error OK — health=degraded, lastError set (no turn_end was ever emitted)`);
+  s2b.kill();
+  await sleep(300);
+
   // --- dead via SIGNAL on a backend WITHOUT an OMP-style `dead` flag (claude): exercises the
   // signalCode branch of procGone (exitCode stays null on signal death). ---
   const s3 = makeServer("okturn");

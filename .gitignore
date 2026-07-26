@@ -7,6 +7,8 @@ node_modules/
 logs/
 .agent-bridge/
 /.roundtable/
+# agent-bridge-graph 的 run 目录(节点产出 + 回执 + 现场),默认写在被审目录下
+.graph/
 # serve.mjs writes viz.pid into whatever run-dir it's given; the sample fixture doubles as one under test.
 skills/agent-bridge-roundtable/viz/sample/viz.pid
 dist/

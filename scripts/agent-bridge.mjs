@@ -87,6 +87,15 @@ const OMP_RPC_TIMEOUT_FAILS = envNum("AGENT_BRIDGE_OMP_RPC_TIMEOUT_FAILS", 3);
 // two clocks (sub-second in practice). It is not a window of accepted reuse: on Linux/macOS the env
 // marker (processMarkerMatches) is the primary, exact identity check and bypasses this entirely.
 const PID_START_SKEW_MS = 1000;
+// How long a matched orphan gets to honour SIGTERM before the sweep escalates to SIGKILL, and how long
+// we then wait to CONFIRM the kill. Mirrors the 3000ms grace the live-session close path uses
+// (scheduleForceKill), so a backend sees the same deadline no matter who is reaping it.
+const REAP_GRACE_MS = 3000;
+const REAP_CONFIRM_MS = 2000;
+// How recently a pid record must have been touched for "I cannot parse this" to mean "someone is
+// writing it right now" rather than "this is corrupt junk". Deleting in the first case would throw
+// away the only handle on a LIVE backend, so the benefit of the doubt goes to keeping the record.
+const PID_RECORD_SETTLE_MS = 5000;
 const MAX_EVENTS = 300;
 const MAX_TEXT = 400_000;
 const STATE_ROOT = process.env.AGENT_BRIDGE_STATE_DIR || path.join(os.homedir(), ".agent-bridge");
@@ -1167,7 +1176,12 @@ function buildSessionResult(session, fullText, options = {}) {
   const charCount = text.length;
   const byteCount = Buffer.byteLength(text, "utf8");
   let textRef = null;
-  if (text) {
+  // `persist:false` = the caller could not attribute this text to the CURRENT turn (the backend
+  // re-entered a turn across the RPC that produced it). Writing it would overwrite the artifact with
+  // text belonging to a turn that is already over — the exact way a half-finished fragment ends up
+  // masquerading as the answer on disk. So we skip the write AND leave textRef null: textRef must
+  // always point at a file whose content IS this `text`, never at a stale one that merely looks close.
+  if (text && options.persist !== false) {
     try {
       fs.writeFileSync(session.answerFile, text, "utf8");
       textRef = session.answerFile;
@@ -1305,9 +1319,24 @@ function writePidRecord(file, record) {
   if (!file) return;
   // Best-effort (parity with removePidRecord, which already swallows): a pid-record write failure must not
   // throw into a caller's control flow — cleanup degrades gracefully without a record.
+  //
+  // Written via a temp file + rename so the record is NEVER observable half-written. A plain
+  // writeFileSync truncates first, so a concurrent reader can catch an empty or partial file — and the
+  // reader here is a cleanup sweep in ANOTHER server process, whose reaction to unparseable JSON is to
+  // DELETE the record. That turns a millisecond-wide write window into a permanently lost handle on a
+  // live backend. cursor/kimi make it routine rather than exotic: they rewrite this same file every
+  // turn. rename(2) within one directory is atomic on POSIX and on NTFS via MoveFileEx-replace.
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, `${JSON.stringify({ ...record, updatedAt: nowIso() }, null, 2)}\n`, "utf8");
+    const body = `${JSON.stringify({ ...record, updatedAt: nowIso() }, null, 2)}\n`;
+    const tmp = `${file}.${process.pid}.tmp`;
+    try {
+      fs.writeFileSync(tmp, body, "utf8");
+      fs.renameSync(tmp, file);
+    } catch (err) {
+      try { fs.rmSync(tmp, { force: true }); } catch {}
+      throw err;
+    }
   } catch {}
 }
 
@@ -1532,6 +1561,27 @@ function scheduleForceKill(pid, graceMs = 3000, verify = null) {
   timer.unref?.();
 }
 
+/** Wait for `pid` to die, or for the budget to run out. Returns "gone" (it exited), or whatever the
+ *  identity probe says at the end: "ours" (still alive), "reuse" (the pid moved to another process),
+ *  "unknown" (the probe could not tell — which must NOT be read as success).
+ *
+ *  ⚠️ **The polling loop is deliberately spawn-free.** `pidAlive` is a bare `process.kill(pid, 0)`;
+ *  the identity probe (`classify`) is not. On Windows classifyChild shells out to PowerShell via
+ *  spawnSync, which blocks the ENTIRE event loop for as long as it takes (its own timeout is 15s) —
+ *  calling that on every 250ms tick would freeze in-flight MCP requests of a server that is merely
+ *  doing background housekeeping. Being async does not help one bit: `await` yields between ticks,
+ *  but a synchronous OS probe inside a tick still stops the world.
+ *  So identity is confirmed exactly TWICE — once when the wait ends (to answer "is it still ours?"),
+ *  and that is it. Liveness alone drives the loop, and liveness is free. */
+async function waitUntilReaped(pid, classify, budgetMs) {
+  const deadline = Date.now() + budgetMs;
+  for (;;) {
+    if (!pidAlive(pid)) return "gone";
+    if (Date.now() >= deadline) return classify(); // one identity probe, at the end — see above
+    await sleep(Math.min(250, Math.max(1, deadline - Date.now())));
+  }
+}
+
 // Log/answer files belonging to live sessions. pruneLogs must never remove a file that may still
 // be appended to. A file is safe to prune only when its backend process is truly gone: the
 // session was explicitly closed, or the child has exited. Status alone is NOT enough — Codex
@@ -1671,7 +1721,9 @@ function reclaimStaleLogs() {
   return { runDirsRemoved, freedBytes };
 }
 
-function cleanupStalePidRecords() {
+// Async because reaping honestly requires WAITING: "the signal was delivered" is not "the process is
+// gone", and the record must not be deleted until the process really is (see the kill block below).
+async function cleanupStalePidRecords() {
   ensureDirs();
   resetWinProcessSnapshot(); // fresh process snapshot per sweep
   const summary = {
@@ -1681,7 +1733,9 @@ function cleanupStalePidRecords() {
     skippedProbeFailures: 0,
     skippedPidReuse: 0,
     skippedUnconfirmed: 0,
+    skippedFreshlyWritten: 0, // unparseable but touched moments ago — probably mid-write, kept for next sweep
     terminated: [],
+    unreaped: [], // matched orphans we could NOT confirm dead — their records are kept for a retry
   };
   // POSIX probe guard (mirrors the Windows snapshot guard below): if `ps` cannot be spawned at all,
   // every processCommand/processStartedAtMs returns null and we could neither confirm identity nor
@@ -1701,6 +1755,20 @@ function cleanupStalePidRecords() {
     try {
       record = JSON.parse(fs.readFileSync(file, "utf8"));
     } catch {
+      // Unparseable. Two very different causes, and deleting is only right for one of them:
+      //   · genuinely corrupt leftover from an old crash → drop it, nothing can use it;
+      //   · a record being rewritten RIGHT NOW by another live server (cursor/kimi rewrite theirs every
+      //     turn) → deleting it throws away the only handle on a running backend.
+      // writePidRecord now writes atomically, so the second case should no longer be reachable through
+      // this bridge — but a record written by an OLDER version, or by a half-finished non-atomic write
+      // still on disk, can be. mtime is the cheap discriminator: if it was touched moments ago, someone
+      // is actively working on it; leave it and let the next sweep decide.
+      let mtimeMs = 0;
+      try { mtimeMs = fs.statSync(file).mtimeMs; } catch {}
+      if (Date.now() - mtimeMs < PID_RECORD_SETTLE_MS) {
+        summary.skippedFreshlyWritten += 1;
+        continue;
+      }
       removePidRecord(file);
       summary.removed += 1;
       continue;
@@ -1736,16 +1804,46 @@ function cleanupStalePidRecords() {
         summary.skippedPidReuse += 1;
         continue;
       }
-      // verdict === "ours": confirmed our orphan. Graceful kill first, then a SIGKILL backstop that
-      // RE-CONFIRMS identity before firing (the pid could be reused during the grace window). If the
-      // graceful pass fails, force-kill synchronously — the `cleanup` CLI exits immediately, so the
-      // unref'd backstop timer would never fire there.
-      if (terminateProcessTree(pid)) {
-        scheduleForceKill(pid, 3000, () => classifyChild(child.role, record.id, referenceMs, expectMarker, pid, true) === "ours");
-        summary.terminated.push({ pid, role: child.role });
-      } else if (terminateProcessTree(pid, "SIGKILL")) {
+      // verdict === "ours": confirmed our orphan. Ask nicely, WAIT for it to actually die, escalate,
+      // and only then let the record be deleted.
+      //
+      // ⚠️ The wait is the whole point. `terminateProcessTree()` returns true when the signal was
+      // DELIVERED — taskkill exiting 0/128, or process.kill not throwing — NOT when the process died.
+      // A backend that ignores SIGTERM therefore took the "graceful worked" branch: it was counted in
+      // summary.terminated, unreapableOrphan stayed false, and the pid record — the ONLY handle anyone
+      // has on that orphan — was deleted below. The orphan then survives every future sweep, because
+      // there is nothing left to find it by. The old SIGKILL backstop could not save it either: its
+      // timer is unref'd and the `cleanup` CLI exits immediately, so it never fires there (the comment
+      // that used to sit here knew about the CLI, but only covered the "delivery FAILED" branch —
+      // "delivered and ignored" is the branch that actually leaks).
+      //
+      // Identity is re-confirmed before ESCALATING, so a pid recycled during the grace window is never
+      // SIGKILLed: "reuse"/"gone" both mean our child is no longer there, and we stop right there.
+      // (It is checked at the end of each wait rather than on every tick — see waitUntilReaped for why
+      // probing on every tick would freeze the event loop of a server doing background housekeeping.)
+      const stillOurs = () => classifyChild(child.role, record.id, referenceMs, expectMarker, pid, true);
+      terminateProcessTree(pid);
+      let verdictAfter = await waitUntilReaped(pid, stillOurs, REAP_GRACE_MS);
+      // ⚠️ The Windows process snapshot is taken ONCE per sweep, which was safe only while this sweep
+      // was synchronous. Now that it awaits, that snapshot can be seconds old by the time the NEXT
+      // record is examined — long enough for a pid to have been recycled by an unrelated process, which
+      // the stale snapshot would still describe with our backend's old command line and start time,
+      // i.e. classify as "ours" and TERM. So the snapshot's lifetime must not span an await: drop it
+      // here and let the next child rebuild it lazily on first use. (Cheaper than always forcing a
+      // fresh probe: a sweep that never waits never pays for a rebuild.)
+      resetWinProcessSnapshot();
+      if (verdictAfter === "ours") {
+        terminateProcessTree(pid, "SIGKILL");
+        verdictAfter = await waitUntilReaped(pid, stillOurs, REAP_CONFIRM_MS);
+        resetWinProcessSnapshot();
+      }
+      if (verdictAfter === "gone" || verdictAfter === "reuse") {
         summary.terminated.push({ pid, role: child.role });
       } else {
+        // Still alive after SIGKILL, or the probe went blind. Either way we cannot claim it was
+        // reaped — keep the record so a later sweep can try again. Reporting it is not optional:
+        // a silent "removed: 1" would read as success.
+        summary.unreaped.push({ pid, role: child.role, verdict: verdictAfter });
         unreapableOrphan = true;
       }
     }
@@ -1760,6 +1858,31 @@ function cleanupStalePidRecords() {
     summary.removed += 1;
   }
   return summary;
+}
+
+// A line that PARSES as JSON is not necessarily a MESSAGE. `null`, `42`, `"x"`, `true` and arrays all
+// parse fine, and the very next thing every consumer does is read a property off the result. On bare
+// `null` that read throws TypeError — and every one of these consumers runs inside an `rl.on("line")`
+// listener, where a throw is an UNCAUGHT exception: installProcessHandlers turns it into
+// cleanupAndExit(1). One malformed line — from any backend, or from an MCP client — would take down
+// the whole server and every session on it.
+//
+// The check lives HERE, welded to the parse, rather than as six hand-written guards at six call sites
+// that the seventh backend would forget. Callers keep their own "this line isn't protocol" handling
+// (each logs it differently), they just no longer have to remember WHY.
+//
+// Arrays are rejected too: no backend and no MCP client here speaks in bare arrays (JSON-RPC batching
+// is not supported), so an array is a malformed line, not a message.
+// Returns { ok:true, value } | { ok:false, reason:"syntax", error } | { ok:false, reason:"not-object", value }.
+function parseMessageLine(line) {
+  let value;
+  try {
+    value = JSON.parse(line);
+  } catch (err) {
+    return { ok: false, reason: "syntax", error: err };
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return { ok: false, reason: "not-object", value };
+  return { ok: true, value };
 }
 
 // ─── Backend session contract ───────────────────────────────────────────────────────────────────
@@ -1821,7 +1944,8 @@ class OmpRpcSession {
     // sessionSettled uses to decide "is there still something to wait for". Set synchronously at
     // send() entry (before any await, so a concurrent wait poll can't observe a mid-flight send as
     // settled, and it covers BOTH the first prompt and a re-prompt's pre-ack window); cleared at
-    // every terminal-for-this-turn transition (turn_end/agent_end, abort, a rejected prompt). This
+    // the request's completion (`agent_end` — NOT `turn_end`, which only ends one internal sub-turn;
+    // see the terminal branch in #applyEvent), abort, or a rejected prompt. This
     // replaces the older turnStarted-gate / everPrompted proxy: turnStarted needed agent_start to be
     // observed (so a never-prompted session dead-waited), and everPrompted latched true forever (so a
     // rejected prompt or a pre-stream abort dead-waited). A flag that is honestly cleared when the
@@ -1829,6 +1953,12 @@ class OmpRpcSession {
     // genuinely in-flight pre-stream turn (it stays true across that window). Terminal states
     // (failed/closed) short-circuit sessionSettled before this is read, so they need not clear it.
     this.turnInFlight = false;
+    // Bumped every time the backend (re-)enters a turn — i.e. exactly where lastAssistantText is
+    // cleared. OMP terminal events carry no turn id, so this counter is the only way to answer
+    // "is the text I read a moment ago still the text of the CURRENT turn?" across an await.
+    // Needed because omp with an agentic model splits ONE delegation into several internal turns
+    // (turn_end immediately followed by its own turn_start), so "a turn ended" is not "the work ended".
+    this.turnGeneration = 0;
     this.sessionState = null;
     this.currentTurnId = null;
     this.lastTurnId = null;
@@ -1990,14 +2120,13 @@ class OmpRpcSession {
   #handleLine(line) {
     if (!line.trim()) return;
 
-    let message;
-    try {
-      message = JSON.parse(line);
-    } catch {
+    const parsed = parseMessageLine(line);
+    if (!parsed.ok) {
       appendLog(this.logFile, `${line}\n`);
       pushEvent(this, { type: "raw", line });
       return;
     }
+    const message = parsed.value;
 
     // Don't log noisy lines verbatim:
     // - message_update: OMP re-serializes the entire growing message on every delta, so logging
@@ -2050,6 +2179,7 @@ class OmpRpcSession {
     if (this.dead) return;
     if (message.type === "agent_start" || message.type === "turn_start") {
       this.lastAssistantText = "";
+      this.turnGeneration += 1; // see the field's comment: this is the "which turn's text is this" stamp
       this.turnStarted = true;
       // Re-entering a turn (backend's own multi-step loop, no new send()): clear the prior end stamp
       // so the turn clock isn't left both "ended" and "running". (lastTurnOf also gates on status as
@@ -2059,12 +2189,76 @@ class OmpRpcSession {
       return;
     }
     if (message.type === "agent_end" || message.type === "turn_end") {
-      // A turn can END on a provider/backend error rather than a real answer: the embedded assistant
-      // message carries stopReason:"error" + errorMessage (e.g. "402 Insufficient Balance") with empty
-      // content. Surface that to lastError so a caller can see WHY the turn returned nothing instead of
-      // a silent empty idle turn. Status still goes idle (the turn IS over and the session stays
-      // reusable); lastError just explains it. Only turn_end carries the single `message`.
-      const ended = message.message;
+      // ⚠️ **`turn_end` does NOT mean the request finished.** Upstream OMP defines these two lifecycles
+      // separately, and the bridge conflating them is what let a caller receive half an answer:
+      //   types.ts        "Turn lifecycle - a turn is one assistant response + any tool calls/results"
+      //   agent-loop.ts   one prompt emits MANY turn_start→turn_end pairs (tools, steering, follow-ups)
+      //   agent-session.ts "Subscribers (rpc-mode, ACP, Cursor) treat agent_end as the 'session is idle'
+      //                     signal" — and OMP deliberately withholds agent_end until promptInFlightCount
+      //                     hits zero, precisely so an rpc client cannot prompt into a still-busy session.
+      // The bridge IS an rpc-mode subscriber, so `agent_end` is the completion boundary and `turn_end`
+      // is an internal sub-turn boundary. Everything the bridge previously bolted on to survive
+      // multi-turn backends (generation stamps, settled re-checks) was compensation for reading the
+      // wrong event; they stay as belt-and-braces for the text-attribution question, but the
+      // completion question is answered here, by the right event.
+      const isCompletion = message.type === "agent_end";
+      // A COMPLETION for a request whose start we never observed cannot be OUR completion. OMP's events
+      // carry no request id, so a late agent_end from a previous (e.g. aborted) prompt is byte-identical
+      // to ours; the one thing that distinguishes them is that ours must be preceded by a start we saw.
+      // Settling on such an event hands the caller the PREVIOUS request's text — silent corruption.
+      // So leave turnInFlight armed and keep waiting for our own start.
+      //
+      // ⚠️ Deliberately the FIRST statement that can run for a completion, ahead of EVERY request-level
+      // write — the clock (turnEndedAt), the status, AND the health fields (lastError / lastTurnError).
+      // Rejecting the event afterwards is not the same thing: a foreign timestamp left in this request's
+      // clock survives if an abort / backend failure / close arrives before the next agent_start clears
+      // it, and a foreign error left in lastError never clears at all (it is write-only), so a request
+      // that then succeeds still reports someone else's failure. Proven by repro-multiturn T5, whose
+      // late agent_end carries an error: move this guard back below the writes and it goes red.
+      //
+      // ⚠️ It deliberately does NOT cover `turn_end`, even though attribution reads like a property of
+      // the event's position rather than its type. **Wire order is not guaranteed**, so "arrived before
+      // our start" is not proof of foreignness for a turn_end (omp 16.0.3, verified in the installed
+      // source): `Agent.#emit` invokes listeners fire-and-forget without awaiting them (agent.ts), and
+      // `AgentSession.#emitSessionEvent` awaits that event's extension hooks before re-emitting outward,
+      // with no cross-event serialization for lifecycle events (the queued path at #queueExtensionEvent
+      // is used only for message_update). A slow agent_start/turn_start hook therefore lets a later
+      // turn_end reach the wire first — legal extension scheduling, not a protocol violation.
+      // What decides the asymmetry is the cost of being wrong in each direction:
+      //   · agent_end — mis-attributing hands back the PREVIOUS request's text as this request's answer
+      //     (silent, unrecoverable). Dropping a legitimate one costs a visible dead-wait until timeout.
+      //     Worth the guard.
+      //   · turn_end — mis-attributing costs a stale lastError / a stale degraded flag; dropping a
+      //     legitimate one costs a stale lastTurnError that the next clean turn_end would have cleared.
+      //     Same class either way, so the guard buys nothing and risks discarding real events.
+      // RESIDUAL (accepted, not overlooked): a foreign turn_end arriving before our start can still write
+      // lastError. Same class as the late-terminal-after-our-start residual documented at the bottom of
+      // this branch, and unfixable for the same reason — the RPC has no request id to correlate on.
+      if (isCompletion && this.turnInFlight && !this.turnStarted) {
+        pushEvent(this, compactEvent({ type: message.type, unattributed: true }));
+        return;
+      }
+      // `turn_end` carries a single `message`; `agent_end` carries `messages[]` (upstream types.ts).
+      // Both must be read, because OMP has an error path that emits ONLY agent_end with the error
+      // message and no turn_end at all (agent.ts: the branch taken when the blocked output is not
+      // "visible" — it appends the error message, sets state.error, and emits agent_end directly).
+      // Reading just `message.message` there would leave lastTurnError at its PREVIOUS value, so a
+      // failed request would report `healthy` with lastError null: the worst kind of silent failure.
+      //
+      // Inside messages[] we want the last ASSISTANT message, not the last element. A request's outcome
+      // IS an assistant message's stopReason; the array's tail need not be one, because when an errored
+      // or aborted assistant had tool calls OMP appends placeholder tool results after it. Reading the
+      // tail happens to be safe today (that shape always emits an errored turn_end first, and the
+      // no-turn_end path sends messages:[errorMsg]) — but safe by accident of ordering, which is exactly
+      // the kind of incidental dependency that already bit the text-attribution path once.
+      const bundle = Array.isArray(message.messages) ? message.messages : null;
+      const lastAssistant = bundle ? bundle.filter(m => m && m.role === "assistant").pop() : null;
+      const ended = message.message
+        ?? lastAssistant
+        // Bundles that carry no `role` at all are older/looser shapes — fall back to the tail there.
+        // With roles present, "no assistant in the bundle" genuinely means "no assistant outcome here".
+        ?? (bundle && !bundle.some(m => m && m.role) ? bundle[bundle.length - 1] : null)
+        ?? null;
       const endedInError = Boolean(ended && ended.stopReason === "error");
       if (endedInError) {
         // errorMessage already carries the status text (e.g. "402 Insufficient Balance"), so use it
@@ -2072,23 +2266,42 @@ class OmpRpcSession {
         const detail = ended.errorMessage || ended.error || (ended.errorStatus ? `HTTP ${ended.errorStatus}` : "backend turn ended with an error");
         this.lastError = clampText(stripAnsi(String(detail)), 4000);
       }
-      // Record the outcome of the turn that just completed for health (T9). OMP returns to idle even on a
-      // turn error, so status alone can't tell healthy from degraded — this can. A clean turn clears it.
-      this.lastTurnError = endedInError;
+      // Record the outcome for health (T9). OMP returns to idle even on an errored turn, so status alone
+      // can't tell healthy from degraded — this can.
+      // The two events get different rules, and the asymmetry is the point:
+      //   · `turn_end` REPLACES the flag. Its job is to let the NEXT request's clean turn clear the
+      //     PREVIOUS request's failure — health answers "is this session usable now", not "has it ever
+      //     failed". (Within one request a clean sub-turn after a failed one is not a real OMP path: an
+      //     assistant stopReason:"error" ends the request outright, and a failing tool does not set
+      //     stopReason at all. So this rule's reach is across requests, not inside one.)
+      //   · `agent_end` may only LATCH it on. A normal completion carries no error in its messages[],
+      //     and clearing from there would wipe the failure a sub-turn just recorded (measured:
+      //     repro-health goes red). But an agent_end that DOES carry an error means the whole request
+      //     failed — including on the path where no turn_end was ever emitted.
+      if (!isCompletion) this.lastTurnError = endedInError;
+      else if (endedInError) this.lastTurnError = true;
+      if (!isCompletion) {
+        // Sub-turn boundary only. The request is still in flight (more tool calls / follow-ups may
+        // come), so the session must NOT be reported as settle-able and must NOT be flipped to idle:
+        // doing either is what handed callers the first sub-turn's fragment as the final answer.
+        // The end stamp stays unset for the same reason — the turn clock ends at agent_end.
+        return;
+      }
       this.turnEndedAt = nowIso();
-      this.turnInFlight = false; // turn finished — the session is now settle-able
+      this.turnInFlight = false; // request finished — the session is now settle-able
       setSessionStatus(this, "idle", false, { source: message.type });
       return;
-      // KNOWN LIMITATION: OMP terminal events carry no turn id, so this clears turnInFlight for
-      // WHATEVER turn is current — it cannot tell "my current turn's terminal" from a stale/duplicate
-      // one (e.g. a late turn_end from a turn that was already aborted, landing after a new send() armed
-      // a fresh turn). That stale terminal wrongly clears the new turn's in-flight flag, which the T3
-      // send() guard relies on. We deliberately do NOT "swallow N terminals after abort" to patch this:
-      // that heuristic is only correct if the backend ALWAYS emits a post-abort terminal — if it
-      // sometimes doesn't, the counter eats the next REAL terminal and bricks the session (a strictly
-      // worse failure). A correct fix needs turn-id correlation the OMP RPC does not provide. In
-      // practice the window is tiny (abort → immediate re-send → a genuinely late terminal from the
-      // aborted turn); real aborts terminate promptly. Tracked as a follow-up in PLAN doc.
+      // REMAINING LIMITATION (narrowed, not gone): OMP's events carry no request id, so a late
+      // `agent_end` that lands AFTER we observed the new request's start is still indistinguishable
+      // from our own. The guard above only rules out the ones arriving BEFORE our start.
+      // We deliberately do NOT "swallow N terminals after abort" to patch the rest: that heuristic is
+      // only correct if the backend ALWAYS emits a post-abort terminal — if it sometimes doesn't, the
+      // counter eats the next REAL one and bricks the session (a strictly worse failure). Nor do we
+      // demand a get_state confirmation: OMP's get_state can report isStreaming:true after a turn ends
+      // (docs/BUG-omp-turn-state-inconsistency-2026-06-10.md), so requiring !isStreaming would make such
+      // a session never settle — measured, not theorised (that variant failed repro-waitany).
+      // A complete fix needs request-id correlation the OMP RPC does not provide. The window that
+      // remains is narrow: abort → immediate re-send → a genuinely late agent_end from the aborted run.
     }
     if (message.type === "message_update") {
       const update = message.assistantMessageEvent || message.message || message;
@@ -2186,8 +2399,8 @@ class OmpRpcSession {
     this.turnStarted = false;
     // Arm the in-flight flag synchronously, before the prompt await: a wait() polling this session
     // now sees an unsettled send even in the sub-ms pre-ack window (and on a re-prompt, before the
-    // old turn's stamps are overwritten). Cleared on completion (turn_end), rejection (catch below),
-    // or abort.
+    // old turn's stamps are overwritten). Cleared on completion (`agent_end`), rejection (catch below),
+    // or abort — NOT on `turn_end`, which merely ends one internal sub-turn of this same request.
     this.turnInFlight = true;
     setSessionStatus(this, "running", true, { source: "send" });
     try {
@@ -2232,20 +2445,33 @@ class OmpRpcSession {
     const response = await this.request("get_state");
     this.sessionState = response.data || null;
     if (this.sessionState) {
-      setSessionStatus(this, this.sessionState.isStreaming ? "running" : "idle", Boolean(this.sessionState.isStreaming), {
-        source: "state",
-      });
+      const streaming = Boolean(this.sessionState.isStreaming);
+      setSessionStatus(this, streaming ? "running" : "idle", streaming, { source: "state" });
     }
     return this.sessionState;
   }
 
   async result(options = {}) {
+    // Stamp which turn's text we are about to read. The RPC below is a real round-trip, and an agentic
+    // OMP model can END one internal turn and START the next inside that window — turn_start clears
+    // lastAssistantText, and without this stamp the write-back at the bottom would resurrect the
+    // previous turn's text over that clear, permanently corrupting the session's progress view.
+    const generation = this.turnGeneration;
     let text = this.lastAssistantText;
     try {
       const response = await this.request("get_last_assistant_text");
       if (response.data && typeof response.data.text === "string") text = response.data.text;
     } catch {
       // Keep accumulated stream text when the helper command is unavailable.
+    }
+    if (this.turnGeneration !== generation) {
+      // The backend started a NEW turn while we were reading. `text` — whether it came from the RPC or
+      // from the pre-RPC snapshot — belongs to a turn that is already over, and nothing here can tell
+      // how much of it the new turn has already superseded. So we do not report it, do not write it
+      // back over turn_start's clear, and do not let it reach the artifact: we answer with the CURRENT
+      // turn's own buffer (usually empty, because it just started) and persist nothing.
+      // Callers that need a settled answer (wait) re-check the same generation and simply keep waiting.
+      return buildSessionResult(this, this.lastAssistantText || "", { ...options, persist: false });
     }
     const full = text || this.lastAssistantText || "";
     this.lastAssistantText = clampText(full);
@@ -2609,14 +2835,13 @@ class CodexAppServerSession {
 
   #handleLine(line) {
     if (!line.trim()) return;
-    let msg;
-    try {
-      msg = JSON.parse(line);
-    } catch {
+    const parsed = parseMessageLine(line);
+    if (!parsed.ok) {
       appendLog(this.logFile, `${line}\n`);
       pushEvent(this, { type: "raw", line });
       return;
     }
+    const msg = parsed.value;
     // Skip the high-frequency streaming delta notifications entirely (frequency, not size). Everything
     // else is logged through redactForLog: the event skeleton survives — for a commandExecution that
     // means item type, the command itself, cwd, status, exitCode, durationMs — while the bodies
@@ -3230,8 +3455,9 @@ class ClaudeCodeSession {
 
   #handleLine(line) {
     if (!line.trim()) return;
-    let msg;
-    try { msg = JSON.parse(line); } catch { appendLog(this.logFile, `${line}\n`); pushEvent(this, { type: "raw", line }); return; }
+    const parsed = parseMessageLine(line);
+    if (!parsed.ok) { appendLog(this.logFile, `${line}\n`); pushEvent(this, { type: "raw", line }); return; }
+    const msg = parsed.value;
     // Skip verbatim-logging high-frequency streaming chunks; the result event still carries final text.
     // On a `result` event, `result` IS the answer verbatim — the one field the generic string clamp would
     // otherwise leave 512 characters of on disk, and the OPENING of an answer is exactly where a summary,
@@ -3740,8 +3966,9 @@ class CursorAgentSession {
   #handleLine(line, child) {
     if (this.proc !== child) return; // ignore a stale child's late output
     if (!line.trim()) return;
-    let msg;
-    try { msg = JSON.parse(line); } catch { appendLog(this.logFile, `${line}\n`); pushEvent(this, { type: "raw" }); return; }
+    const parsed = parseMessageLine(line);
+    if (!parsed.ok) { appendLog(this.logFile, `${line}\n`); pushEvent(this, { type: "raw" }); return; }
+    const msg = parsed.value;
     // Don't verbatim-log high-frequency streaming (thinking deltas / assistant chunks); result carries
     // the final text. thinking is chain-of-thought — never persisted. user echoes the prompt — dropped
     // for privacy (§2.1/§5.5).
@@ -4254,8 +4481,9 @@ class KimiCodeSession {
   #handleLine(line, child) {
     if (this.proc !== child) return; // ignore a stale child's late output
     if (!line.trim()) return;
-    let msg;
-    try { msg = JSON.parse(line); } catch { appendLog(this.logFile, `${line}\n`); pushEvent(this, { type: "raw" }); return; }
+    const parsed = parseMessageLine(line);
+    if (!parsed.ok) { appendLog(this.logFile, `${line}\n`); pushEvent(this, { type: "raw" }); return; }
+    const msg = parsed.value;
     // Don't verbatim-log high-frequency assistant chunks or tool results (may carry sensitive full text,
     // §2.1), nor a `user` prompt-echo line (privacy, §5.5); log meta/other lines (ids/structure only).
     if (msg.role !== "assistant" && msg.role !== "tool" && msg.role !== "user") appendLog(this.logFile, `${JSON.stringify(redactForLog(msg))}\n`);
@@ -4774,18 +5002,30 @@ async function result(sessionId, options = {}) {
 }
 
 // A session has finished the turn we are waiting on once it leaves the running/starting
-// state. OMP also gates on turnStarted (mirroring waitIdle) so a pre-stream idle window is
-// never mistaken for a completed turn; Codex completion is driven by its turn promise.
+// state. OMP's own isSettled gates on turnInFlight (armed synchronously at send) so a pre-stream idle
+// window is never mistaken for a completed turn; Codex completion is driven by its turn promise.
+// (This used to say OMP "gates on turnStarted, mirroring waitIdle" — it does not, and has not since
+// turnInFlight replaced that gate. waitIdle still demands `idle && turnStarted` from an authoritative
+// get_state; isSettled cannot demand the same, because OMP's get_state may keep reporting
+// isStreaming:true after the request has ended — see the terminal branch in #applyEvent. The shape that
+// proves it is FAKE_OMP_MODE=turnstate, modeled on the real incoherence in
+// docs/BUG-omp-turn-state-inconsistency-2026-06-10.md: requiring !isStreaming to settle makes that
+// session never settle. Measured back when repro-waitany still drove that mode; repro-turnstate owns
+// the shape now and repro-waitany runs on okturn.)
 function sessionSettled(session) {
   if (!session) return true;
   if (session.status === "failed" || session.status === "closed") return true;
-  // Delegate the backend-specific "this turn is done" test to the session. OMP's isSettled gates on
-  // idle AND turnInFlight (armed synchronously at send() entry, cleared at every terminal-for-this-turn
-  // transition: turn_end/agent_end, abort, rejected prompt), so it covers every shape without
-  // dead-waiting — a never-prompted session (flag false → settles, codex parity), a completed turn
-  // (cleared at turn_end), and a failed/aborted send (cleared in the catch/abort) — while a genuinely
-  // in-flight pre-stream turn keeps the flag true across the window where status reads a transient
-  // idle. Codex's isSettled mirrors this with its own `!turn` "no active turn" test.
+  // Delegate the backend-specific "this REQUEST is done" test to the session. OMP's isSettled gates on
+  // idle AND turnInFlight (armed synchronously at send() entry, cleared on the request's completion —
+  // `agent_end`, abort, or a rejected prompt). `turn_end` deliberately does NOT clear it: upstream OMP
+  // emits many turn_start/turn_end pairs per prompt (one per assistant response + its tool calls) and
+  // reserves agent_end as the rpc consumer's "session is idle" signal, so settling on turn_end handed
+  // callers the first sub-turn's fragment. See the terminal branch in #applyEvent.
+  // This covers every shape without dead-waiting — a never-prompted session (flag false → settles,
+  // codex parity), a completed request (cleared at agent_end), and a failed/aborted send (cleared in
+  // the catch/abort) — while a genuinely in-flight pre-stream turn keeps the flag true across the
+  // window where status reads a transient idle. Codex's isSettled mirrors this with its own `!turn`
+  // "no active turn" test; per-item events there do not settle either.
   return session.isSettled();
 }
 
@@ -4853,6 +5093,15 @@ async function waitSessions(params) {
   };
   const pendingIds = () => ids.filter(id => !sessionSettled(sessions.get(id)));
 
+  // "Is the payload I just assembled still describing the turn I judged finished?" — settled alone
+  // cannot answer that. A backend can END the turn we waited on, START another, and END that one too,
+  // all inside a single summarize() round-trip; the session then reads settled again and the stale
+  // payload sails through. turnGeneration (bumped at every turn (re-)entry) is what closes that hole.
+  // Backends that do not expose it (their terminal events carry turn ids, so they never had this
+  // ambiguity) read 0 and the check degrades to the settled test alone.
+  const stampOf = id => sessions.get(id)?.turnGeneration ?? 0;
+  const stable = (id, stamp) => sessionSettled(sessions.get(id)) && stampOf(id) === stamp;
+
   const started = Date.now();
   for (;;) {
     // Refresh still-running sessions before reading settled. OMP polls via get_state (a real async
@@ -4867,28 +5116,60 @@ async function waitSessions(params) {
     }
     const settledIds = ids.filter(id => sessionSettled(sessions.get(id)));
     if (mode === "any" && settledIds.length) {
-      // `pending` is every OTHER id — including ones that settled in this same poll tick, not just
-      // the still-running ones. The documented protocol is "pass `pending` back as the next call's
-      // session_ids; loop until empty", so excluding a simultaneously-settled id from both
-      // `completed` and `pending` (the old pendingIds() shape) silently dropped its result from the
-      // loop. A settled id left in `pending` simply comes back as `completed` on the next call,
-      // immediately. (The timeout branch below already returns ALL settled ids — same contract.)
-      const completedId = settledIds[0];
-      const pending = ids.filter(id => id !== completedId);
-      return { mode, completed: await summarize(completedId), pending, pendingSnapshots: pending.map(snapshot) };
-    }
-    if (mode === "all" && settledIds.length === ids.length) {
-      return { mode, results: await Promise.all(ids.map(summarize)) };
+      // ⚠️ TOCTOU: settledIds was read BEFORE any await, and summarize() is a real round-trip
+      // (result() → get_last_assistant_text). An agentic OMP model ends one internal turn and starts
+      // the next inside that window, so the payload we just assembled can describe a session that has
+      // moved on — in the worst case it reads settled again, yet the text is the previous turn's
+      // fragment. Re-confirm with `stable()` before returning; otherwise fall through and keep
+      // waiting, which is what a wait is for.
+      //
+      // Every settled candidate gets a try IN THIS ROUND, not just settledIds[0]: if one candidate
+      // keeps re-entering turns exactly when we summarize it, retrying only that one would starve
+      // every other session that finished cleanly — they would sit unreported until the deadline and
+      // come back as timedOut despite having been deliverable for minutes.
+      for (const completedId of settledIds) {
+        // Each summarize() is a real RPC (OMP's own default cap is 10s). Trying every candidate in one
+        // round is what kills the head-of-line starvation, but it must not turn the caller's overall
+        // `timeout_ms` into N × RPC-timeout: check the absolute deadline before starting the NEXT one,
+        // and let the timeout branch below take over the moment it has passed.
+        if (Date.now() - started >= timeoutMs) break;
+        const stamp = stampOf(completedId);
+        const completed = await summarize(completedId);
+        if (!stable(completedId, stamp)) continue; // this one moved on — try the next settled candidate
+        // `pending` is every OTHER id — including ones that settled in this same poll tick, not just
+        // the still-running ones. The documented protocol is "pass `pending` back as the next call's
+        // session_ids; loop until empty", so excluding a simultaneously-settled id from both
+        // `completed` and `pending` (the old pendingIds() shape) silently dropped its result from the
+        // loop. A settled id left in `pending` simply comes back as `completed` on the next call,
+        // immediately. (The timeout branch below returns ALL settled ids — same contract.)
+        const pending = ids.filter(id => id !== completedId);
+        return { mode, completed, pending, pendingSnapshots: pending.map(snapshot) };
+      }
+    } else if (mode === "all" && settledIds.length === ids.length) {
+      const stamps = new Map(ids.map(id => [id, stampOf(id)]));
+      const results = await Promise.all(ids.map(summarize));
+      if (ids.every(id => stable(id, stamps.get(id)))) return { mode, results }; // same re-confirm as above
     }
     if (Date.now() - started >= timeoutMs) {
-      const pending = pendingIds();
-      return {
-        mode,
-        timedOut: true,
-        settled: await Promise.all(settledIds.map(summarize)),
-        pending,
-        pendingSnapshots: pending.map(snapshot),
-      };
+      // The timeout path carries the SAME hazard as the two branches above and needs the same cure:
+      // summarize() is a round-trip, so a session that was settled when we split the ids can re-enter
+      // a turn while its payload is being assembled. Reporting it under `settled` would hand back a
+      // running session's fragment — and worse, it would not appear in `pending` either, so a caller
+      // looping on `pending` would never wait for its real answer.
+      // So: split, summarize, then re-confirm each one, and demote whoever moved on back into pending.
+      const firstPass = pendingIds();
+      const candidates = ids.filter(id => !firstPass.includes(id));
+      const stamps = new Map(candidates.map(id => [id, stampOf(id)]));
+      const summarized = await Promise.all(candidates.map(summarize));
+      const settled = [];
+      const unstable = [];
+      candidates.forEach((id, i) => {
+        if (stable(id, stamps.get(id))) settled.push(summarized[i]);
+        else unstable.push(id);
+      });
+      // Keep the original id order so `pending` stays predictable for callers feeding it back in.
+      const pending = ids.filter(id => firstPass.includes(id) || unstable.includes(id));
+      return { mode, timedOut: true, settled, pending, pendingSnapshots: pending.map(snapshot) };
     }
     await sleep(250);
   }
@@ -5123,7 +5404,7 @@ async function runCli(argv) {
       // Reap orphaned backend child processes (omp/codex/claude/cursor/kimi) left behind by an MCP server that
       // was SIGKILLed before it could clean up its own sessions (matched by pid records whose
       // owner MCP is gone), and remove abandoned logs/<runId>/ dirs from those dead servers.
-      printCliResult({ childProcesses: cleanupStalePidRecords(), staleLogs: reclaimStaleLogs() }, args);
+      printCliResult({ childProcesses: await cleanupStalePidRecords(), staleLogs: reclaimStaleLogs() }, args);
       return;
     case "diag": {
       // READ-ONLY diagnostic entry (no sessions, no processes touched) for exercising two pure security/
@@ -5227,7 +5508,18 @@ function serveMcp() {
   try {
     fs.writeFileSync(path.join(RUN_LOG_DIR, "owner"), `${process.pid}\n`, "utf8");
   } catch {}
-  cleanupStalePidRecords();
+  // Startup sweep is best-effort background work — it reaps OTHER (dead) servers' orphans and has no
+  // bearing on this server's ability to serve, so it is deliberately not awaited: the grace/confirm
+  // waits (REAP_GRACE_MS + REAP_CONFIRM_MS per stubborn orphan) would otherwise be added to every
+  // client's first request. The .catch keeps a failed sweep from surfacing as an unhandled rejection
+  // (which the process handlers treat as fatal).
+  //
+  // Being unawaited buys the WAITS back, not full isolation: the OS probes this sweep performs are
+  // synchronous (spawnSync — `ps` on POSIX, PowerShell on Windows), and a synchronous call blocks the
+  // whole event loop no matter who awaits whom. That is precisely why waitUntilReaped polls with a
+  // spawn-free liveness test and confirms identity only at the ends — a handful of probes per orphan
+  // instead of one per tick.
+  cleanupStalePidRecords().catch(() => {});
   reclaimStaleLogs(); // sweep run dirs left by servers that did not exit cleanly
   pruneExitJournal(); // cap the durable exit journal before this run appends to it
   installProcessHandlers();
@@ -5280,13 +5572,20 @@ function serveMcp() {
   };
   rl.on("line", line => {
     if (!line.trim()) return;
-    let message;
-    try {
-      message = JSON.parse(line);
-    } catch (err) {
-      rpcError(null, -32700, `Invalid JSON: ${err instanceof Error ? err.message : String(err)}`);
+    const parsed = parseMessageLine(line);
+    if (!parsed.ok) {
+      // Two distinct client errors, two distinct JSON-RPC codes: -32700 is "I could not parse this",
+      // -32600 is "I parsed it and it is not a request object" (bare `null`/number/string/array).
+      // Collapsing them would tell a client its valid JSON was malformed.
+      if (parsed.reason === "syntax") {
+        const err = parsed.error;
+        rpcError(null, -32700, `Invalid JSON: ${err instanceof Error ? err.message : String(err)}`);
+      } else {
+        rpcError(null, -32600, `Invalid Request: expected a JSON object, got ${parsed.value === null ? "null" : Array.isArray(parsed.value) ? "an array" : typeof parsed.value}`);
+      }
       return;
     }
+    const message = parsed.value;
     if (message.id === undefined) return;
     activeRequests += 1;
     handleMcp(message)

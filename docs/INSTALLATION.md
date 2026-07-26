@@ -127,12 +127,14 @@ ln -s "<REPO>/skills/agent-bridge"            ~/.codex/skills/agent-bridge
 ln -s "<REPO>/skills/agent-bridge-dev"        ~/.codex/skills/agent-bridge-dev        # 可选：委托角色编排 companion
 ln -s "<REPO>/skills/agent-bridge-roundtable" ~/.codex/skills/agent-bridge-roundtable # 可选：N 席圆桌审议
 ln -s "<REPO>/skills/agent-bridge-loop"       ~/.codex/skills/agent-bridge-loop       # 可选：合同驱动交付循环
+ln -s "<REPO>/skills/agent-bridge-graph"      ~/.codex/skills/agent-bridge-graph      # 可选：JS 编排的异构多厂商跑批
 
 # Windows — junction，免管理员
 cmd /c mklink /J "%USERPROFILE%\.codex\skills\agent-bridge"            "<REPO>\skills\agent-bridge"
 cmd /c mklink /J "%USERPROFILE%\.codex\skills\agent-bridge-dev"        "<REPO>\skills\agent-bridge-dev"
 cmd /c mklink /J "%USERPROFILE%\.codex\skills\agent-bridge-roundtable" "<REPO>\skills\agent-bridge-roundtable"
 cmd /c mklink /J "%USERPROFILE%\.codex\skills\agent-bridge-loop"       "<REPO>\skills\agent-bridge-loop"
+cmd /c mklink /J "%USERPROFILE%\.codex\skills\agent-bridge-graph"      "<REPO>\skills\agent-bridge-graph"
 ```
 
 重启 Codex，确认能看到：
@@ -186,7 +188,7 @@ claude mcp remove agent-bridge --scope user
 
 ### 5.3 安装 skill
 
-`skills/` 下的中文使用指引与 Claude Code skill 兼容，软链到用户 skill 目录即可（`agent-bridge` 是桥用法指引；可选 companion：`agent-bridge-dev` 委托角色编排、`agent-bridge-roundtable` N 席圆桌审议、`agent-bridge-loop` 合同驱动交付循环）：
+`skills/` 下的中文使用指引与 Claude Code skill 兼容，软链到用户 skill 目录即可（`agent-bridge` 是桥用法指引；可选 companion：`agent-bridge-dev` 委托角色编排、`agent-bridge-roundtable` N 席圆桌审议、`agent-bridge-loop` 合同驱动交付循环、`agent-bridge-graph` 用 JS 编排一次异构多厂商跑批）：
 
 ```sh
 mkdir -p ~/.claude/skills
@@ -194,6 +196,7 @@ ln -sfn "$PWD/skills/agent-bridge"            ~/.claude/skills/agent-bridge
 ln -sfn "$PWD/skills/agent-bridge-dev"        ~/.claude/skills/agent-bridge-dev        # 可选
 ln -sfn "$PWD/skills/agent-bridge-roundtable" ~/.claude/skills/agent-bridge-roundtable # 可选
 ln -sfn "$PWD/skills/agent-bridge-loop"       ~/.claude/skills/agent-bridge-loop       # 可选
+ln -sfn "$PWD/skills/agent-bridge-graph"      ~/.claude/skills/agent-bridge-graph      # 可选
 ```
 
 不装 skill 也能直接调用 MCP 工具，skill 只是补充「何时该委托」的判断指引。会话流程（open → send → status/result → 复用 → close）以及写权限、清理规则都与 Codex 完全一致。
@@ -383,8 +386,8 @@ codex mcp list | rg agent-bridge   # 或 claude mcp list
 
 ```sh
 codex mcp remove agent-bridge                          # 或 claude mcp remove agent-bridge --scope user
-rm -f ~/.codex/skills/agent-bridge  ~/.codex/skills/agent-bridge-dev  ~/.codex/skills/agent-bridge-roundtable  ~/.codex/skills/agent-bridge-loop
-rm -f ~/.claude/skills/agent-bridge ~/.claude/skills/agent-bridge-dev ~/.claude/skills/agent-bridge-roundtable ~/.claude/skills/agent-bridge-loop
+rm -f ~/.codex/skills/agent-bridge  ~/.codex/skills/agent-bridge-dev  ~/.codex/skills/agent-bridge-roundtable  ~/.codex/skills/agent-bridge-loop  ~/.codex/skills/agent-bridge-graph
+rm -f ~/.claude/skills/agent-bridge ~/.claude/skills/agent-bridge-dev ~/.claude/skills/agent-bridge-roundtable ~/.claude/skills/agent-bridge-loop ~/.claude/skills/agent-bridge-graph
 ```
 
 如果不再使用 Agent Bridge，也可以删除本地状态目录：

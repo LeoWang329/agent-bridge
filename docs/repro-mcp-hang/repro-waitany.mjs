@@ -8,8 +8,12 @@
 //        false until a first turn streams), so waiting on it dead-blocked until the full timeout,
 //        while a fresh codex session settles immediately (`!turn`). Cross-backend inconsistency
 //        whose failure mode is the expensive one (default 30-min dead wait).
-// Drives the real MCP server with the fake-omp stub (FAKE_OMP_MODE=turnstate: a prompt acks, churns
-// turn_start/turn_end on its own, and settles idle ~120ms later). Zero real model usage.
+// Drives the real MCP server with the fake-omp stub (FAKE_OMP_MODE=okturn: a prompt acks, answers,
+// and completes with agent_end ~60ms later).
+// NOTE: this used to drive FAKE_OMP_MODE=turnstate, which deliberately churns turn_start/turn_end
+// WITHOUT ever emitting agent_end. Under OMP's actual protocol that session is genuinely never
+// finished (agent_end is the rpc consumer's idle signal; turn_end only ends one assistant response
+// plus its tool calls), so asserting it settles was asserting the bug. Zero real model usage.
 import { spawn } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,9 +27,9 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 const srv = spawn("node", [BRIDGE, "mcp"], {
   stdio: ["pipe", "pipe", "pipe"],
   windowsHide: true,
-  env: { ...process.env, OMP_BIN: FAKE, FAKE_OMP_MODE: "turnstate" },
+  env: { ...process.env, OMP_BIN: FAKE, FAKE_OMP_MODE: "okturn" },
 });
-console.log(`[harness] server pid=${srv.pid} (FAKE_OMP_MODE=turnstate)`);
+console.log(`[harness] server pid=${srv.pid} (FAKE_OMP_MODE=okturn)`);
 
 let exited = null;
 srv.on("close", (code, signal) => { exited = { code, signal }; console.log(`[srv-close] code=${code} signal=${signal}`); });

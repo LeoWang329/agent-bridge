@@ -55,15 +55,30 @@ async function main() {
   if (!sid) return fail("open_session failed");
   console.log(`[harness] opened ${sid}`);
 
-  // Non-blocking send; the fake then churns turn_start/turn_end on its own and settles on turn_end.
+  // ── Phase 1: a request that genuinely COMPLETES (agent_end), so the clock is really written. ──
+  // Without this the whole test is vacuous: if turnEndedAt is never set, "endedAt must be null while
+  // running" holds trivially and deleting F8's gate would not fail anything. (That is exactly what
+  // happened when this fixture stopped emitting agent_end — the assertion below stayed green while
+  // testing nothing.)
   const sendId = nextId++;
   rpc({ jsonrpc: "2.0", id: sendId, method: "tools/call", params: { name: "agent_bridge_send_message", arguments: { session_id: sid, message: "go" } } });
   if (!await waitResp(sendId, 10000)) return fail("send did not ack");
 
-  await sleep(800); // let the turn churn settle (ends on turn_end; get_state still reports streaming)
+  const waitId = nextId++;
+  rpc({ jsonrpc: "2.0", id: waitId, method: "tools/call", params: { name: "agent_bridge_wait", arguments: { session_ids: [sid], mode: "all", timeout_ms: 15000 } } });
+  const done = parse(await waitResp(waitId, 25000));
+  const finished = done?.results?.[0];
+  if (!finished || done?.timedOut) return fail(`request did not complete: ${JSON.stringify(done).slice(0, 300)}`);
+  if (finished.text !== "TURNSTATE_ANSWER") return fail(`expected the completed answer, got ${JSON.stringify(finished.text)}`);
+  if (!finished.lastTurn?.endedAt) return fail(`a COMPLETED request must carry an end stamp — got ${JSON.stringify(finished.lastTurn)} (the clock is not being written, so the check below would be vacuous)`);
+  if (!(finished.lastTurn.durationMs >= 0)) return fail(`completed request should report durationMs >= 0, got ${JSON.stringify(finished.lastTurn)}`);
+  console.log(`[harness] phase 1 OK — completed request has endedAt=${finished.lastTurn.endedAt} durationMs=${finished.lastTurn.durationMs}`);
 
-  // Poll status. status(id) drives get_state -> state() flips status->running on the live isStreaming
-  // reading; assert the clock never reports an end stamp while running.
+  // ── Phase 2: no further EVENTS — the fake now merely reports isStreaming:true to get_state. ──
+  // status(id) drives get_state -> state() flips status->running while the end stamp from phase 1 is
+  // still set internally. That "running + endedAt" contradiction is what F8's status-aware lastTurnOf
+  // must suppress. Remove that gate and this goes red, because turnEndedAt IS non-null here.
+  await sleep(600);
   let sawRunning = false;
   for (let k = 0; k < 6; k++) {
     const stId = nextId++;
