@@ -1241,6 +1241,51 @@ function deriveHealth(session) {
 // (the "compass needle"), and the full untruncated answer is persisted to an artifact that
 // `textRef` points at — so a caller who caps inline size with `max_chars` can always retrieve
 // the whole thing. Without max_chars the full text comes back inline (current behavior).
+// ── "你还没拿到结果" 的两个装饰器 ────────────────────────────────────────────────────────────
+// 桥没有任何主动推送:一轮 turn 被 accept 之后,除非调用方自己 wait,结果就没人接收。而 ack 长得
+// 太像"这件事成了"(accepted:true + 一个 status),skill 文档又未必被宿主加载 —— 所以提示必须落在
+// **决策点**上,也就是工具返回值本身。
+//
+// 为什么是两个而不是一个:ack 里确实什么结果都没有;而 wait 的 any 返回带着 completed、超时返回
+// 带着 settled[],**那里已经交付了结果**,顶层再写 resultIncluded:false 就是撒谎。装饰器绝不能
+// 说谎——每个字段在它出现的每一条路径上都必须为真,否则下次没人信它。
+
+// 纯 ack:turn 被接受了,但这个 payload 里没有结果。
+// `resultIncluded:false` 在**两种** ack 上都成立——还在跑的那种,以及 codex 那条"turn 已经结算
+// 完、只是没放进 ack"的快速分支。所以字段名是 resultIncluded / mustCollectResult("你还没拿到"),
+// 不是 resultPending("还在跑")——后者在快速分支上是假话。
+function decorateUncollectedAck(payload, sessionIds) {
+  return {
+    ...payload,
+    resultIncluded: false,
+    mustCollectResult: true,
+    requiredAction: {
+      tool: "agent_bridge_wait",
+      arguments: { session_ids: sessionIds },
+      repeatWhile: "the response still has a non-empty pending[]",
+    },
+  };
+}
+
+// wait 的返回里还剩 pending:结果**部分**交付了,所以只声明"这次收集没做完",绝不声明没给结果。
+// `mode` 必须回显进重试参数:调用方可能显式要了 mode:"all",把裸参数递回去会静默变成 any(新默认),
+// 连返回形状一起换掉。
+// ⚠️ 续等的条件只能是 "pending 非空",绝不能是 "timedOut" —— 超时分支可以合法地返回
+// {timedOut:true, settled:[…全部…], pending:[]}(deadline 过了但候选全部二次确认通过),而
+// waitSessions 开头就硬校验 session_ids 非空,照着 timedOut 续等会把空数组传进去直接报错。
+function decorateIncompleteCollection(payload, pendingIds, mode) {
+  return {
+    ...payload,
+    collectionComplete: false,
+    mustCollectResult: true,
+    requiredAction: {
+      tool: "agent_bridge_wait",
+      arguments: { session_ids: pendingIds, mode },
+      repeatWhile: "the response still has a non-empty pending[]",
+    },
+  };
+}
+
 function buildSessionResult(session, fullText, options = {}) {
   const text = String(fullText ?? "");
   const charCount = text.length;
@@ -5002,7 +5047,14 @@ async function openSession(params) {
       throw err;
     }
   }
-  return { session: session.summary(), initial };
+  const out = { session: session.summary(), initial };
+  // 只装饰**外层**,`initial` 里不重复携带:外层调用成功、对象又很完整,是最容易被当成
+  // "开会话并完成首轮"的一条路径。条件里的 `accepted === true` 不能省——首轮被后端拒掉时
+  // (accepted:false)没有 turn 可收,再叫人去 wait 就是把调用方支去等一个不存在的东西。
+  if (params.initial_prompt && !params.wait && initial?.accepted === true) {
+    return decorateUncollectedAck(out, [session.id]);
+  }
+  return out;
 }
 
 function getSession(sessionId) {
@@ -5058,12 +5110,16 @@ async function sendMessage(params) {
   if (schema && session.agent !== "codex") {
     throw new Error(`schema (structured output) is not supported for backend "${session.agent}" yet; only codex.`);
   }
-  return await session.send(message, {
+  const ack = await session.send(message, {
     wait: Boolean(params.wait),
     timeout_ms: params.timeout_ms,
     maxChars: params.max_chars,
     schema,
   });
+  // wait:true 的返回**就是结果**,不能装饰(那会说"你还没拿到"这句假话)。accepted:false 同理:
+  // codex 的 send 里有一条 abort/close 抢跑的分支,那轮压根没被接受,没有东西可收。
+  if (!params.wait && ack?.accepted === true) return decorateUncollectedAck(ack, [session.id]);
+  return ack;
 }
 
 async function result(sessionId, options = {}) {
@@ -5220,7 +5276,9 @@ async function waitSessions(params) {
         // loop. A settled id left in `pending` simply comes back as `completed` on the next call,
         // immediately. (The timeout branch below returns ALL settled ids — same contract.)
         const pending = ids.filter(id => id !== completedId);
-        return { mode, completed, pending, pendingSnapshots: pending.map(snapshot) };
+        const payload = { mode, completed, pending, pendingSnapshots: pending.map(snapshot) };
+        // 这次交付了 completed,但收集没做完 —— 只声明后者(见 decorateIncompleteCollection)。
+        return pending.length ? decorateIncompleteCollection(payload, pending, mode) : payload;
       }
     } else if (mode === "all" && settledIds.length === ids.length) {
       const stamps = new Map(ids.map(id => [id, stampOf(id)]));
@@ -5246,7 +5304,10 @@ async function waitSessions(params) {
       });
       // Keep the original id order so `pending` stays predictable for callers feeding it back in.
       const pending = ids.filter(id => firstPass.includes(id) || unstable.includes(id));
-      return { mode, timedOut: true, settled, pending, pendingSnapshots: pending.map(snapshot) };
+      const payload = { mode, timedOut: true, settled, pending, pendingSnapshots: pending.map(snapshot) };
+      // pending 为空是可达的(deadline 过了,但候选全部二次确认通过)——那种情况下收集其实已经完成,
+      // 挂 requiredAction 会把调用方支去用空数组再调一次,直接撞上 session_ids 的非空硬校验。
+      return pending.length ? decorateIncompleteCollection(payload, pending, mode) : payload;
     }
     await sleep(250);
   }

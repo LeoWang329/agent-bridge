@@ -26,6 +26,11 @@
 //                {last:{inputTokens,totalTokens,...}, total:{...}, modelContextWindow}. Proves the bridge
 //                normalizes contextUsage from last.inputTokens (NOT total, NOT totalTokens) + modelContext-
 //                Window, with live:false. [repro-context-usage]
+//   sameflush  — turn/start's RESPONSE and the WHOLE turn lifecycle go out in ONE stdout.write with no
+//                event-loop yield in between, so the bridge settles the turn before its own
+//                `await #request("turn/start")` continuation resumes. Hits codex send()'s "already
+//                settled" fast branch — the one ack whose result really does exist already.
+//                [repro-collect-discipline T5]
 // Requests answered: initialize, thread/start, turn/start, turn/interrupt (+ any other id'd request → {}).
 // Notifications are emitted ~50ms after the turn/start RESPONSE so the normal async path runs (send()
 // returns its ack / arms the wait, THEN the turn settles via notification) rather than the same-flush path.
@@ -59,8 +64,42 @@ process.stdin.on("data", d => {
         say({ id, error: { code: -32000, message: `fake-codex: turn/start refused (${MODE})` } });
         continue;
       }
+      // sameflush:把 turn/start 的 RESPONSE 和整个 turn 生命周期用**一次** stdout.write 连着吐出去,
+      // 中间不 setTimeout / 不 setImmediate / 不做任何让出事件循环的事。桥的按行处理会在
+      // `await this.#request("turn/start", …)` 的 continuation 恢复**之前**同步吃完这一整批,于是
+      // myTurn 早已 settled —— 正好命中 codex send() 里 `if (this.turn !== myTurn) { if (myTurn.settled) … }`
+      // 那条"结果其实已经 ready、只是没放进 ack"的快速分支。
+      // 这个时序是**确定可控**的,不靠抢运气:默认路径特意延迟 50ms 走异步,sameflush 就是把它反过来。
+      // (四条 NDJSON 远小于管道的原子写入尺寸,不会被拆包。)
+      if (MODE === "sameflush") {
+        const tid = `fake-turn-${seq}`;
+        process.stdout.write(
+          JSON.stringify({ id, result: { turn: { id: tid } } }) +
+            "\n" +
+            JSON.stringify({ method: "turn/started", params: { turn: { id: tid } } }) +
+            "\n" +
+            JSON.stringify({
+              method: "item/completed",
+              params: { turn: { id: tid }, item: { type: "agentMessage", text: "SAMEFLUSH_ANSWER", phase: "final_answer", id: "item-1" } },
+            }) +
+            "\n" +
+            JSON.stringify({ method: "turn/completed", params: { turn: { id: tid, status: "completed" } } }) +
+            "\n",
+        );
+        continue;
+      }
       const tid = `fake-turn-${seq}`;
       const schema = params.outputSchema ?? null;
+      // slowstart:把 turn/start 的 RESPONSE 本身拖慢 ~600ms,给测试一个确定的窗口,在"turn id 还不
+      // 知道"的时候插进一次 abort —— 那正是 codex send() 里 accepted:false 那条分支的成因
+      // (abort/close 抢在 turn/start 返回之前跑完,没法去中断一个还没有 id 的 turn)。[T6]
+      if (MODE === "slowstart") {
+        setTimeout(() => {
+          respond(id, { turn: { id: tid } });
+          setTimeout(() => driveTurn(tid, schema), 50);
+        }, 600);
+        continue;
+      }
       // Accept the turn with NO terminal status → the bridge keeps it in flight and is driven by the
       // notifications below (the common non-blocking path).
       respond(id, { turn: { id: tid } });

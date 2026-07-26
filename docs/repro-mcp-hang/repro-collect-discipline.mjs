@@ -169,12 +169,21 @@ async function t9_t12_wait_shapes() {
     w9?.pendingSnapshots?.[0]?.status === "running",
     JSON.stringify(w9?.pendingSnapshots?.[0]?.status),
   );
+  // C1:这次交付了 completed,所以只能声明"收集没做完",绝不能声明"没给你结果"。
+  ok("有 collectionComplete:false", w9?.collectionComplete === false, JSON.stringify(w9?.collectionComplete));
+  ok("有 mustCollectResult:true", w9?.mustCollectResult === true, JSON.stringify(w9?.mustCollectResult));
+  ok("**没有** resultIncluded(这里确实给了结果,写 false 就是撒谎)", !("resultIncluded" in (w9 || {})), Object.keys(w9 || {}).join(","));
+  ok("requiredAction 指向 wait", w9?.requiredAction?.tool === "agent_bridge_wait", JSON.stringify(w9?.requiredAction?.tool));
+  ok("requiredAction 的 session_ids 就是 pending", JSON.stringify(w9?.requiredAction?.arguments?.session_ids) === JSON.stringify([b]), JSON.stringify(w9?.requiredAction?.arguments));
+  ok("requiredAction 回显了 mode:any", w9?.requiredAction?.arguments?.mode === "any", JSON.stringify(w9?.requiredAction?.arguments?.mode));
+  ok("续等条件写的是 pending 非空,不是 timedOut", /pending/.test(w9?.requiredAction?.repeatWhile || ""), JSON.stringify(w9?.requiredAction?.repeatWhile));
 
   console.log("\n[T10] 显式 mode:'all' 仍返回 {mode:'all', results:[…]}(回归保护)");
   const w10 = await s.call("agent_bridge_wait", { session_ids: [b], mode: "all", timeout_ms: 20000 }, 30000);
   ok("mode 回显为 all", w10?.mode === "all", JSON.stringify(w10?.mode));
   ok("是 all 形状:有 results、没有 completed", Array.isArray(w10?.results) && w10?.completed === undefined, Object.keys(w10 || {}).join(","));
   ok("results[0] 是 B 的答案", w10?.results?.[0]?.text === "SLOW_DONE", JSON.stringify(w10?.results?.[0]?.text));
+  ok("全部完成 → 不挂 requiredAction/mustCollectResult", !w10?.requiredAction && !w10?.mustCollectResult, Object.keys(w10 || {}).join(","));
 
   console.log("\n[T11] 显式 all 且超时 → pending 只含没交付的那个,不是原始全集");
   await s.call("agent_bridge_send_message", { session_id: a, message: "go" }); // A 又跑 2500ms;B 空闲
@@ -183,6 +192,9 @@ async function t9_t12_wait_shapes() {
   ok("timedOut 为 true", w11?.timedOut === true, JSON.stringify(w11?.timedOut));
   ok("pending 只有仍在跑的 A", JSON.stringify(w11?.pending) === JSON.stringify([a]), JSON.stringify(w11?.pending));
   ok("已终态的 B 进了 settled", w11?.settled?.length === 1 && w11.settled[0].sessionId === b, JSON.stringify(w11?.settled?.map(x => x.sessionId)));
+  // C1:回显的 mode 必须是调用方原来那个。递回裸参数 = 静默把 all 变成 any,连返回形状一起换掉。
+  ok("requiredAction 回显 mode:'all'(没被新默认污染)", w11?.requiredAction?.arguments?.mode === "all", JSON.stringify(w11?.requiredAction?.arguments?.mode));
+  ok("requiredAction 的 session_ids 是 pending 而非原始全集", JSON.stringify(w11?.requiredAction?.arguments?.session_ids) === JSON.stringify([a]), JSON.stringify(w11?.requiredAction?.arguments?.session_ids));
 
   console.log("\n[T12] timedOut:true 但 pending 为空(deadline 已过、候选全部二次确认通过)");
   // 确定性构造:会话已终态 + timeout_ms:0。any 分支的 for 循环第一句就撞上 deadline 而 break,
@@ -192,6 +204,10 @@ async function t9_t12_wait_shapes() {
   ok("timedOut 为 true", w12?.timedOut === true, JSON.stringify(w12?.timedOut));
   ok("pending 为空数组", Array.isArray(w12?.pending) && w12.pending.length === 0, JSON.stringify(w12?.pending));
   ok("settled 里有结果(不是空转)", w12?.settled?.length === 1 && w12.settled[0].sessionId === b, JSON.stringify(w12?.settled?.map(x => x.sessionId)));
+  // 这条是 C1 的关键反例:pending 空 = 收集其实已经做完。此时挂 requiredAction 会把调用方支去用
+  // 空数组再调一次,直接撞上 waitSessions 开头的 session_ids 非空硬校验。
+  ok("pending 空 → 不挂 requiredAction", !w12?.requiredAction, JSON.stringify(w12?.requiredAction));
+  ok("pending 空 → 不挂 mustCollectResult", !w12?.mustCollectResult, JSON.stringify(w12?.mustCollectResult));
 
   await s.call("agent_bridge_wait", { session_ids: [a], mode: "all", timeout_ms: 20000 }, 30000); // 收干净再关
   await s.call("agent_bridge_close_session", {});
@@ -233,12 +249,118 @@ async function t13_t14_two_clocks() {
   await s.kill();
 }
 
+const FAKE_CODEX = path.join(HERE, win ? "fake-codex.cmd" : "fake-codex.sh");
+
+/** T1/T4/T7/T8/T15:ack 与未完成收集必须自报"你还没拿到结果"。 */
+async function t1_t8_t15_ack_decoration() {
+  const s = makeServer("okturn");
+  await s.init();
+
+  console.log("\n[T1] send_message(默认 wait:false)→ ack 自报未收口");
+  const id = (await s.call("agent_bridge_open_session", { agent: "omp", cwd: CWD }))?.session?.id;
+  const ack = await s.call("agent_bridge_send_message", { session_id: id, message: "go" });
+  ok("ack 仍然是 accepted:true(没破坏既有字段)", ack?.accepted === true, JSON.stringify(ack?.accepted));
+  ok("resultIncluded:false", ack?.resultIncluded === false, JSON.stringify(ack?.resultIncluded));
+  ok("mustCollectResult:true", ack?.mustCollectResult === true, JSON.stringify(ack?.mustCollectResult));
+  ok("requiredAction.tool === agent_bridge_wait", ack?.requiredAction?.tool === "agent_bridge_wait", JSON.stringify(ack?.requiredAction?.tool));
+  ok("requiredAction 带上了这个会话的 id", JSON.stringify(ack?.requiredAction?.arguments?.session_ids) === JSON.stringify([id]), JSON.stringify(ack?.requiredAction?.arguments));
+  // ack 没有"调用方原本的 mode"这个概念,而且省略即推荐值 —— 硬塞一个 mode 是无中生有。
+  ok("ack 的 arguments **不带** mode", !("mode" in (ack?.requiredAction?.arguments || {})), JSON.stringify(ack?.requiredAction?.arguments));
+  await s.call("agent_bridge_wait", { session_ids: [id], mode: "all", timeout_ms: 15000 });
+
+  console.log("\n[T4] send_message(wait:true)→ 返回就是结果,不许再说'你还没拿到'");
+  const r4 = await s.call("agent_bridge_send_message", { session_id: id, message: "go", wait: true }, 30000);
+  ok("拿到了正文", typeof r4?.text === "string" && r4.text.length > 0, JSON.stringify(r4?.text)?.slice(0, 60));
+  ok("不含 mustCollectResult", !("mustCollectResult" in (r4 || {})), Object.keys(r4 || {}).join(","));
+  ok("不含 requiredAction", !("requiredAction" in (r4 || {})), Object.keys(r4 || {}).join(","));
+  ok("不含 resultIncluded", !("resultIncluded" in (r4 || {})), Object.keys(r4 || {}).join(","));
+
+  console.log("\n[T7] open_session + initial_prompt 且不传 wait → 外层装饰、initial 不重复携带");
+  const o7 = await s.call("agent_bridge_open_session", { agent: "omp", cwd: CWD, initial_prompt: "go" }, 30000);
+  ok("initial.accepted === true", o7?.initial?.accepted === true, JSON.stringify(o7?.initial?.accepted));
+  ok("外层 mustCollectResult:true", o7?.mustCollectResult === true, JSON.stringify(o7?.mustCollectResult));
+  ok("外层 requiredAction 指向本会话", JSON.stringify(o7?.requiredAction?.arguments?.session_ids) === JSON.stringify([o7?.session?.id]), JSON.stringify(o7?.requiredAction?.arguments));
+  ok("initial 里**不**重复携带装饰", !("mustCollectResult" in (o7?.initial || {})), Object.keys(o7?.initial || {}).join(","));
+  await s.call("agent_bridge_wait", { session_ids: [o7?.session?.id], mode: "all", timeout_ms: 15000 });
+
+  console.log("\n[T8] open_session + initial_prompt + wait:true → 外层与 initial 都不装饰");
+  const o8 = await s.call("agent_bridge_open_session", { agent: "omp", cwd: CWD, initial_prompt: "go", wait: true }, 40000);
+  ok("外层不含 mustCollectResult", !("mustCollectResult" in (o8 || {})), Object.keys(o8 || {}).join(","));
+  ok("initial 不含 mustCollectResult", !("mustCollectResult" in (o8?.initial || {})), Object.keys(o8?.initial || {}).join(","));
+  ok("initial 就是结果(有正文)", typeof o8?.initial?.text === "string" && o8.initial.text.length > 0, JSON.stringify(o8?.initial?.text)?.slice(0, 60));
+
+  console.log("\n[T15] 把 pending 原样喂回去循环,最后一次不再要求继续收");
+  const x = (await s.call("agent_bridge_open_session", { agent: "omp", cwd: CWD }))?.session?.id;
+  const y = (await s.call("agent_bridge_open_session", { agent: "omp", cwd: CWD }))?.session?.id;
+  await s.call("agent_bridge_send_message", { session_id: x, message: "go" });
+  await s.call("agent_bridge_send_message", { session_id: y, message: "go" });
+  let ids = [x, y];
+  const collected = [];
+  let rounds = 0;
+  let last = null;
+  while (ids.length && rounds < 5) {
+    rounds += 1;
+    last = await s.call("agent_bridge_wait", { session_ids: ids, timeout_ms: 15000 }, 25000);
+    if (last?.completed) collected.push(last.completed.sessionId);
+    else if (Array.isArray(last?.settled)) collected.push(...last.settled.map(r => r.sessionId));
+    ids = Array.isArray(last?.pending) ? last.pending : [];
+  }
+  ok("两个会话都收齐了", collected.length === 2 && collected.includes(x) && collected.includes(y), JSON.stringify(collected));
+  ok("循环真的收敛(没靠轮数上限兜底)", ids.length === 0, JSON.stringify(ids));
+  ok("最后一次返回不再要求继续收", !last?.mustCollectResult, JSON.stringify(last?.mustCollectResult));
+
+  await s.call("agent_bridge_close_session", {});
+  await s.kill();
+}
+
+/** T5:codex "结果其实已经 ready、只是没放进 ack" 的快速分支 —— 六处 ack 里唯一的那处。
+ *  只断言"被装饰了"会在**普通异步路径**上假绿(那条路径也被装饰),所以必须additionally钉住
+ *  `status === "idle"`:普通路径此刻是 running,只有快速分支才是 idle。 */
+async function t5_codex_fast_settle() {
+  console.log("\n[T5] codex 快速结算分支:结果已 ready 但没进 ack → 仍要装饰,且 status 是 idle");
+  const s = makeServer("okturn", { CODEX_BIN: FAKE_CODEX, FAKE_CODEX_MODE: "sameflush" });
+  await s.init();
+  const id = (await s.call("agent_bridge_open_session", { agent: "codex", cwd: CWD }, 30000))?.session?.id;
+  ok("codex 会话开起来了", !!id, String(id));
+  const ack = await s.call("agent_bridge_send_message", { session_id: id, message: "go" }, 20000);
+  ok("accepted:true", ack?.accepted === true, JSON.stringify(ack));
+  ok("命中的确实是快速分支(status 已是 idle,不是 running)", ack?.status === "idle", JSON.stringify(ack?.status));
+  ok("仍然装饰:mustCollectResult:true", ack?.mustCollectResult === true, JSON.stringify(ack?.mustCollectResult));
+  ok("字段名说的是'你还没拿到'而不是'还在跑'", ack?.resultIncluded === false, JSON.stringify(ack?.resultIncluded));
+  const w = await s.call("agent_bridge_wait", { session_ids: [id], mode: "all", timeout_ms: 15000 }, 25000);
+  ok("照着 requiredAction 去收,确实收得到", w?.results?.[0]?.text === "SAMEFLUSH_ANSWER", JSON.stringify(w?.results?.[0]?.text));
+  await s.call("agent_bridge_close_session", {});
+  await s.kill();
+}
+
+/** T6:accepted:false 的分支不得装饰 —— 那轮压根没被接受,叫人去 wait 是把他支去等一个不存在的东西。
+ *  用 slowstart 把 turn/start 的响应拖慢,在"turn id 还不知道"的窗口里插一次 abort。 */
+async function t6_codex_not_accepted() {
+  console.log("\n[T6] codex accepted:false(abort 抢在 turn/start 返回之前)→ 不装饰");
+  const s = makeServer("okturn", { CODEX_BIN: FAKE_CODEX, FAKE_CODEX_MODE: "slowstart" });
+  await s.init();
+  const id = (await s.call("agent_bridge_open_session", { agent: "codex", cwd: CWD }, 30000))?.session?.id;
+  // 流水线发出:send 的 turn/start 会在后端压 600ms,abort 在这期间到达。
+  const sendPromise = s.call("agent_bridge_send_message", { session_id: id, message: "go" }, 20000);
+  await sleep(150);
+  await s.call("agent_bridge_abort", { session_id: id }, 15000);
+  const ack = await sendPromise;
+  ok("命中了 accepted:false 分支", ack?.accepted === false, JSON.stringify(ack));
+  ok("没有被装饰:无 mustCollectResult", !("mustCollectResult" in (ack || {})), Object.keys(ack || {}).join(","));
+  ok("没有被装饰:无 requiredAction", !("requiredAction" in (ack || {})), Object.keys(ack || {}).join(","));
+  await s.call("agent_bridge_close_session", {});
+  await s.kill();
+}
+
 async function main() {
   await t2_schema_defaults_no_env();
   await t3_schema_default_env_override();
   await t3b_env_boundaries();
   await t9_t12_wait_shapes();
   await t13_t14_two_clocks();
+  await t1_t8_t15_ack_decoration();
+  await t5_codex_fast_settle();
+  await t6_codex_not_accepted();
 
   console.log(`\n[harness] ${passed} 通过 / ${failed} 失败`);
   if (failed) {
