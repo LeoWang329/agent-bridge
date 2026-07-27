@@ -15,6 +15,8 @@
 //     [--schema-file D:/schema.json]         # 强制格式,**仅 codex**
 //     [--no-reask]                           # 不合格时不打回重说(默认打回一次)
 //     [--force] [--reuse-if-same]            # 幂等闸的两种解法
+//     [--write]                              # 改代码档:**恒定跑在自己的 git worktree 里**
+//     [--base-ref HEAD] [--allow-dirty-base] # 仅 --write:基线,与"主树脏了也照跑"
 //     [--json]                               # stdout 只吐回执 JSON(给脚本吃)
 //
 // 退出码(描述**这一个环节**的结局):
@@ -28,7 +30,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { withBridge, runNode, UsageError, STATUS_EXIT } from "./node-core.mjs";
 
-const BOOLEAN_FLAGS = new Set(["no-reask", "force", "reuse-if-same", "json", "help"]);
+const BOOLEAN_FLAGS = new Set(["no-reask", "force", "reuse-if-same", "write", "allow-dirty-base", "json", "help"]);
 
 function die(msg, code = 5) {
   process.stderr.write(`[node-turn] ${msg}\n`);
@@ -54,6 +56,7 @@ const USAGE = `用法:node node-turn.mjs --id <名> --agent <omp|codex|claude|cu
 
 可选:--model --effort --role-file --require-keys a,b --schema-file <文件>
       --no-reask --force --reuse-if-same --json
+      --write [--base-ref HEAD] [--allow-dirty-base]   # 改代码档(自动用 git worktree 隔离)
 
 退出码:0 成功 / 1 崩了 / 2 格式不合格 / 3 后端挂 / 4 超时 / 5 用法错 / 6 未知状态(已保留现场)`;
 
@@ -76,6 +79,19 @@ async function main() {
     force: Boolean(args.force),
     reuseIfSame: Boolean(args["reuse-if-same"]),
   };
+
+  // `access` 只在明确 --write 时才设。**不能无条件写 `access: args.write ? "write" : "read"`** ——
+  // 那会让 --base-ref / --allow-dirty-base 这类"仅 write 有意义"的参数在 read 档下**永远撞上拒绝**,
+  // 本该报"你传了没用的参数"的地方变成一句莫名其妙的错。
+  if (args.write) {
+    spec.access = "write";
+    if (args["base-ref"]) spec.baseRef = args["base-ref"];
+    if (args["allow-dirty-base"]) spec.allowDirtyBase = true;
+  } else {
+    for (const k of ["base-ref", "allow-dirty-base"]) {
+      if (args[k] !== undefined) die(`--${k} 只在 --write 时有意义`);
+    }
+  }
 
   if (args["require-keys"]) {
     spec.outputShape = { requiredKeys: args["require-keys"].split(",").map((s) => s.trim()).filter(Boolean) };

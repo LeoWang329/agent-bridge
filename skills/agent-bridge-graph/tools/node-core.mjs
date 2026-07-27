@@ -210,10 +210,32 @@ export function normalizeSpec(raw) {
   const outStat = statSafe(s.outDir);
   if (outStat && !outStat.isDirectory()) throw new UsageError(`outDir 已存在但不是目录:${s.outDir}`);
 
-  // v1 只允许只读。⚠️ 只有 codex 的 read 是 OS 沙箱硬只读,另外四家是软的(shell 能写盘,
+  // ⚠️ 只有 codex 的 read 是 OS 沙箱硬只读,另外四家是软的(shell 能写盘,
   // cursor/kimi 连原生写工具都还在)—— 要硬保证不写盘就点名 codex。
   s.access = s.access ?? "read";
-  if (s.access !== "read") throw new UsageError(`v1 只支持 access:"read"(改文件的环节整块不在本版范围),拿到:${s.access}`);
+  if (!["read", "write"].includes(s.access)) {
+    throw new UsageError(`access 只能是 "read" 或 "write",拿到:${JSON.stringify(s.access)}`);
+  }
+
+  // write 档**恒定**跑在自己的 git worktree 里,没有"在主工作区写"这个选项。
+  // 这是本 skill 里 write 唯一安全的形态:扇出是核心用法,N 个环节共享一个 cwd 同时改文件必然互相踩;
+  // worktree 是**文件系统级硬隔离**(写互不碰撞、主工作区不脏),不是靠提示词压着。
+  // ⚠️ 隔离的是**写**,不是**读**:桥没有 OS 沙箱,有 shell 的环节技术上仍能 `../..` 读到主工作区。
+  if (s.access === "write") {
+    s.baseRef = s.baseRef === undefined || s.baseRef === null || s.baseRef === "" ? "HEAD" : requireString(s.baseRef, "baseRef");
+    if (s.allowDirtyBase === undefined || s.allowDirtyBase === null) s.allowDirtyBase = false;
+    if (typeof s.allowDirtyBase !== "boolean") {
+      throw new UsageError(`allowDirtyBase 必须是布尔值(true/false),拿到 ${typeof s.allowDirtyBase}:${JSON.stringify(s.allowDirtyBase)}`);
+    }
+  } else {
+    // 只对 write 有意义的参数出现在 read 环节上 = 调用方以为自己安排了什么而其实没有。
+    // 当场拒绝,不静默忽略(同 send_message.timeout_ms 在 wait:false 下静默无效那个教训)。
+    for (const k of ["baseRef", "allowDirtyBase"]) {
+      if (s[k] !== undefined) throw new UsageError(`${k} 只在 access:"write" 时有意义,当前 access="${s.access}"`);
+    }
+    s.baseRef = undefined;
+    s.allowDirtyBase = undefined;
+  }
 
   if (s.roleFile !== undefined && s.roleFile !== null && s.roleFile !== "") {
     s.roleFile = path.resolve(requireString(s.roleFile, "roleFile"));
@@ -283,6 +305,11 @@ function computeSpecHash(s) {
     schema: s.schema === undefined ? null : stableStringify(s.schema),
     outputShape: s.outputShape === undefined ? null : stableStringify(s.outputShape),
     timeoutMs: s.timeoutMs, reask: s.reask,
+    // baseRef 会改变执行结局(对着哪个基线改代码),进指纹。
+    // ⚠️ allowDirtyBase **不进**:它只决定"要不要拒绝开跑",跑起来之后不影响结果。
+    // ⚠️ 但 baseRef="HEAD" 会随时间解析到不同 commit —— 指纹管不了这件事,
+    //    所以复用时还要**另外**比对回执里记下的 baseCommit(见 runNode 的复用闸)。
+    baseRef: s.baseRef ?? null,
   };
   return crypto.createHash("sha256").update(stableStringify(ident)).digest("hex").slice(0, 32);
 }
@@ -423,13 +450,24 @@ export async function startBridge(opts = {}) {
     throw e;
   }
 
+  // 并发闸。默认 4 —— 不是机器扛不住,是怕挤垮主 agent 自己那条桥连接(SKILL §组合纪律)。
+  // 从"写在文档里的纪律"改成"代码保证",调用方照写 Promise.all 即可,超限的自动排队。
+  const maxConcurrent = opts.maxConcurrent === undefined ? 4 : opts.maxConcurrent;
+  if (!Number.isSafeInteger(maxConcurrent) || maxConcurrent < 1) {
+    await teardown();
+    throw new UsageError(`maxConcurrent 必须是 ≥1 的整数,拿到:${JSON.stringify(opts.maxConcurrent)}`);
+  }
+  const gate = makeSemaphore(maxConcurrent);
+
   const bridge = {
     callTool,
     get stderrTail() { return state.stderrTail; },
     get exited() { return state.exited; },
     get lateResponses() { return state.lateResponses; },
     get pid() { return child.pid; },
+    get maxConcurrent() { return maxConcurrent; },
     _activeNodes: state.activeNodes,
+    _gate: gate,
     doctor: (timeoutMs = RPC_TIMEOUT_MS) => callTool("agent_bridge_doctor", {}, timeoutMs),
     runNode: (spec) => runNode(bridge, spec),
     async close() {
@@ -521,10 +559,34 @@ function copyBytes(src, dest) {
   try { fs.copyFileSync(src, dest); return true; } catch { return false; }
 }
 
-/** 产出的内容指纹,用来判断"复用时这份文件还是当初那份吗"。 */
+/** 产出的内容指纹,用来判断"复用时这份文件还是当初那份吗"。读不到就是 null。
+ *  ⚠️ **必须流式异步**。`readFileSync` 会把整份文件塞进堆,而且**同步读会冻住事件循环** ——
+ *  本模块刻意让所有 git 都走异步 spawn,正是为了不让一个环节的收尾卡死其它并发环节的 wait 循环;
+ *  在收尾处用一次同步整文件读,就把那份努力当场抵消了(write 环节的 diff 含二进制时并不小)。 */
 function sha256File(p) {
-  try { return crypto.createHash("sha256").update(fs.readFileSync(p)).digest("hex"); }
-  catch { return null; }
+  return new Promise((resolve) => {
+    const h = crypto.createHash("sha256");
+    const s = fs.createReadStream(p);
+    s.on("error", () => resolve(null));
+    s.on("data", (c) => h.update(c));
+    s.on("end", () => resolve(h.digest("hex")));
+  });
+}
+
+/** 字符串指纹。用来把"一个可能重名的标签"变成"一个不会重的资源名"。 */
+function sha256Text(s) {
+  return crypto.createHash("sha256").update(String(s), "utf8").digest("hex");
+}
+
+/** 把一段人类可读的标签洗成 git 分支名认得的样子。
+ *  **唯一性由后面拼上的全路径哈希保证**,所以这里怎么洗都不会把两个不同的 outDir 洗成同一个 ——
+ *  洗掉的只是可读性,换来的是"一个完全合法的 outDir(比如目录名带空格)不会让 write 档直接不可用"。 */
+function gitSafeSlug(s) {
+  let t = String(s).replace(/[^A-Za-z0-9._-]+/g, "-"); // 空格、@{、控制字符等一律换掉
+  t = t.replace(/\.{2,}/g, "-");                       // 分支名里不能出现 `..`
+  t = t.replace(/^[-._]+|[-._]+$/g, "");               // 不能以 . 或 - 开头/结尾
+  t = t.replace(/\.lock$/i, "");                       // 不能以 .lock 结尾
+  return t || "run";
 }
 
 /** 原子写:同目录临时文件 + rename。避免崩在半路留下一个不可 parse 的回执。 */
@@ -533,6 +595,468 @@ function writeAtomic(file, data) {
   fs.writeFileSync(tmp, data, "utf8");
   try { fs.renameSync(tmp, file); }
   catch (e) { try { fs.unlinkSync(tmp); } catch {} throw e; }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// git / worktree —— `access:"write"` 的硬隔离
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** 单次 git 调用的硬超时。**必须有**:仓库损坏、`index.lock` 竞争、凭据提示都会让 git 一直挂着。 */
+const GIT_TIMEOUT_MS = 120000;
+/** 建/拆工作区的固定预算。**刻意不受环节总预算约束** ——
+ *  超时收场的环节同样要把已经改出来的代码保住,否则"预算耗尽"就等于"工作白干"。 */
+const WORKSPACE_BUDGET_MS = 180000;
+
+/** 异步跑一条 git。**绝不能用 spawnSync**:`git worktree add` 在大仓上要好几秒,
+ *  同步调用会冻住整个事件循环 —— 连带把并发跑的其它环节的 wait 循环一起卡死,
+ *  制造出一批莫名其妙的超时。("异步不等于不阻塞"的反面:同步 OS 调用就是真的阻塞。) */
+function git(args, cwd, { timeoutMs = GIT_TIMEOUT_MS, toFile = null } = {}) {
+  return new Promise((resolve) => {
+    let fd = null;
+    if (toFile) {
+      try { fd = fs.openSync(toFile, "w"); }
+      catch (e) { return resolve({ ok: false, stdout: "", stderr: `打不开输出文件 ${toFile}:${e.message}`, code: null }); }
+    }
+    let child;
+    try {
+      child = spawn("git", args, {
+        cwd,
+        windowsHide: true,
+        // 大 diff 直接写文件,不在内存里攒 —— 一个几十 MB 的 diff 不该进 Node 堆。
+        stdio: ["ignore", fd ?? "pipe", "pipe"],
+        // 禁掉任何交互式凭据提示,否则 git 会挂到超时才被杀。
+        env: { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_OPTIONAL_LOCKS: "0" },
+      });
+    } catch (e) {
+      if (fd !== null) { try { fs.closeSync(fd); } catch {} }
+      return resolve({ ok: false, stdout: "", stderr: `起不了 git:${e.message}`, code: null });
+    }
+    let out = "", err = "", done = false, timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; try { child.kill("SIGKILL"); } catch {} }, timeoutMs);
+    if (!fd) child.stdout.on("data", (d) => { out += d; });
+    child.stderr.on("data", (d) => { err = (err + d).slice(-8000); });
+    const settle = (code, spawnErr) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      if (fd !== null) { try { fs.closeSync(fd); } catch {} }
+      resolve({
+        ok: !spawnErr && !timedOut && code === 0,
+        code, stdout: out, stderr: err.trim(), timedOut,
+        spawnError: spawnErr ? spawnErr.message : null,
+      });
+    };
+    child.on("error", (e) => settle(null, e));
+    child.on("close", (code) => settle(code, null));
+  });
+}
+
+/** 跑一条必须成功的 git,失败就变成人话 UsageError。用于开跑前的体检。 */
+async function gitMust(args, cwd, what) {
+  const r = await git(args, cwd);
+  if (!r.ok) {
+    const why = r.timedOut ? `超过 ${GIT_TIMEOUT_MS}ms 没返回` : (r.spawnError || r.stderr || `退出码 ${r.code}`);
+    throw new UsageError(`${what} 失败(git ${args.join(" ")}):${why}`);
+  }
+  return r.stdout.trim();
+}
+
+/** 把 runKey / nodeId 拼成一个**git 认的**分支名。不自己写正则猜规则 —— 交给 git 自己判。 */
+async function makeBranchName(repoRoot, runKey, nodeId) {
+  const branch = `graph/${runKey}/${nodeId}`;
+  const r = await git(["check-ref-format", "--branch", branch], repoRoot);
+  if (!r.ok) {
+    throw new UsageError(
+      `拼出来的分支名 git 不认:"${branch}"(由 outDir 目录名+指纹 "${runKey}" 与环节 id "${nodeId}" 组成)。\n` +
+      `outDir 目录名那段已经洗成 git 合法形式了,所以问题多半出在环节 id "${nodeId}" 上 ——\n` +
+      `换一个不含 ".."、不以 "." 或 "-" 开头、不以 "." 或 ".lock" 结尾的 id。`,
+    );
+  }
+  return branch;
+}
+
+/** 开跑前的仓库体检。**只做只读探查**,不改任何东西。 */
+async function inspectRepo(cwd, baseRef) {
+  const probe = await git(["rev-parse", "--show-toplevel"], cwd);
+  if (!probe.ok) {
+    throw new UsageError(
+      `access:"write" 要求 cwd 是一个 git 仓库(要用 worktree 做隔离),但 ${cwd} 不是。\n` +
+      `原因:${probe.spawnError || probe.stderr || `git 退出码 ${probe.code}`}`,
+    );
+  }
+  // realpath 一次:后面所有"某路径在不在仓库里"的比较都以它为基准(见 realpathSafe 的说明)
+  const repoRoot = realpathSafe(path.resolve(probe.stdout.trim()));
+  // `<ref>^{commit}` 强制解析成 commit:传 tag 或 annotated tag 时不会拿到一个 tag 对象。
+  const baseCommit = await gitMust(["rev-parse", "--verify", `${baseRef}^{commit}`], repoRoot, `解析基线 "${baseRef}"`);
+  return { repoRoot, baseCommit };
+}
+
+/** 主树是否有未提交改动。未跟踪文件**照样算脏** —— 它们同样不在 HEAD 里,节点同样看不见。
+ *
+ *  ⚠️ 必须排除**我们自己造的脚手架**(worktree 根目录与本次 outDir),否则会自己咬自己 ——
+ *  第一个 write 环节跑完就在主树里留下这些东西,主树变"脏",第二个 write 环节被自己拦下。
+ *  用 git 原生 pathspec 排除(而不是回来自己解析 porcelain 的路径串,那还要处理带空格/被引号包住的路径)。
+ *  **只排这两条具体路径,不排整个 `.graph/`** —— 用户仓库里 `.graph/` 下若真有他自己跟踪的东西,
+ *  那是他的改动,不该被我们悄悄忽略掉。
+ *
+ *  ⚠️ **探不出来时 fail-closed**(返回 null,由调用方拒绝):这是一道安全闸,
+ *  探测失败就放行等于"闸坏了默认开门" —— 使用者以为自己被保护着,其实没有。 */
+async function dirtyEntries(repoRoot, scaffoldRels = []) {
+  // ⚠️ 必须是 `-uall`(逐文件),不能用默认的 `-unormal`:后者会把整个未跟踪目录**折叠成一条**
+  // `?? .graph/`,按具体路径的判断**根本匹配不上那条折叠项**,于是我们自己的脚手架被当成用户的改动、
+  // 把每个 write 环节都拦下。(代价是大仓上逐文件列举更慢一点;每个 write 环节只跑这一次。)
+  // ⚠️ `-z`:输出以 NUL 分隔且**完全不做引号转义**,带空格/非 ASCII 的路径原样出现,
+  //    不用再跟 `core.quotePath` 和 `"\344\270\255"` 那套转义较劲。
+  const r = await git(["status", "--porcelain", "--untracked-files=all", "-z"], repoRoot);
+  if (!r.ok) return null;
+  const toks = r.stdout.split("\0");
+  const entries = [];
+  for (let i = 0; i < toks.length; i++) {
+    const t = toks[i];
+    if (!t) continue;
+    const xy = t.slice(0, 2);
+    const p = t.slice(3); // 格式是 `XY<空格>路径`
+    // 重命名/复制会**多带一个「来源路径」token**;不跳过它就会被当成一条独立的脏条目。
+    if (xy[0] === "R" || xy[0] === "C") i++;
+    // ⚠️ **只排掉「未跟踪的脚手架」,绝不排掉任何被跟踪文件的改动。**
+    // 早先的写法是 pathspec `:(exclude)<outDir>/**` 整片排 —— 而 outDir 是调用方给的**任意目录**,
+    // 设成 `repo/src` 之类就把 `src/nodes/**` 里**真实的源码改动**一起吞了:
+    // 一道安全闸被自己的排除项悄悄关掉,比压根没有这道闸更危险。
+    // 我们写出去的东西必然是未跟踪的(产出/回执/diff/现场/锁、以及 worktree 目录本身),
+    // 所以"未跟踪 + 在我们的目录下"就是精确的判据,不多排一个字节。
+    if (xy === "??" && scaffoldRels.some((s) => p === s || p.startsWith(`${s}/`))) continue;
+    entries.push(`${xy} ${p}`);
+  }
+  return entries;
+}
+
+/** worktree 都放在仓库根下的这个相对目录里(用 POSIX 分隔符 —— git pathspec 只认 `/`)。 */
+const WT_ROOT_REL = ".graph/wt";
+
+/** 解析成真实路径。**跨 git 与 Node 比较路径前必须做** ——
+ *  `git rev-parse --show-toplevel` 给的是**解析后的长路径**,而调用方传进来的 cwd/outDir 可能是
+ *  8.3 短名(Windows 的 `LEO~1.WAN\…`)或经过符号链接。两者直接 `path.relative` 会算出一串 `../..`,
+ *  于是"outDir 在仓库里吗"判成否 —— 排除项失效,我们自己写的脚手架被当成用户的未提交改动。
+ *  (实测:临时目录走 `os.tmpdir()` 拿到 8.3 短名时必现。) */
+function realpathSafe(p) {
+  try { return (fs.realpathSync.native || fs.realpathSync)(p); }
+  catch { return path.resolve(p); }
+}
+
+/** 脏树闸。**真跑与复用都要过** —— 见调用处的说明。`allowDirtyBase` 时整条跳过。 */
+async function assertCleanBase({ repoRoot, spec, baseCommit, nodesDir }) {
+  if (spec.allowDirtyBase) return;
+  // 把**我们自己写东西的那个目录**排掉(它通常就在仓库里):产出/回执/diff/现场/锁都在这儿,
+  // 是脚手架不是用户的改动。
+  // ⚠️ 排的是 `outDir/nodes`,**不是整个 outDir** —— 后者是调用方给的任意目录,
+  // 传成 `repo/src` 这类源码目录时就会把 `src/**` 整片排掉,于是真有未提交改动也被判成干净:
+  // 一道安全闸被它自己的排除项悄悄关掉,比没有这道闸更危险。本工具只往 `outDir/nodes` 下写,
+  // 排除范围就该正好等于这个事实。
+  const relOut = path.relative(repoRoot, realpathSafe(nodesDir)).split(path.sep).join("/");
+  const insideRepo = relOut && !relOut.startsWith("../") && relOut !== ".." && !path.isAbsolute(relOut);
+  const dirty = await dirtyEntries(repoRoot, [WT_ROOT_REL, ...(insideRepo ? [relOut] : [])]);
+  if (dirty === null) {
+    // fail-closed:这是一道安全闸,探测失败就放行 = 闸坏了默认开门,
+    // 使用者以为自己被保护着、其实没有。宁可停下让人看一眼。
+    throw new UsageError(
+      `查不出主工作区是否干净(git status 失败),而这道闸的作用正是防止环节对着错误的基线干活。\n` +
+      `先确认仓库状态正常;确实要继续请显式加 allowDirtyBase:true。`,
+    );
+  }
+  if (!dirty.length) return;
+  throw new UsageError(
+    `主工作区有未提交改动,而 worktree 只能基于已提交的 ${spec.baseRef}(${baseCommit.slice(0, 8)})——\n` +
+    `**这个环节将完全看不到下面这些改动**:\n` +
+    dirty.slice(0, 20).map((l) => `    ${l}`).join("\n") +
+    (dirty.length > 20 ? `\n    …还有 ${dirty.length - 20} 条` : "") +
+    `\n\n先 git commit / git stash 定住基线,或者明确接受这一点:给该环节加 allowDirtyBase:true。`,
+  );
+}
+
+/** 建 worktree。返回给回执用的工作区信息。 */
+async function createWorktree({ repoRoot, wtPath, branch, baseCommit, force }) {
+  if (fs.existsSync(wtPath)) {
+    if (!force) {
+      throw new UsageError(
+        `工作区目录已存在:${wtPath}\n` +
+        `要么上次异常退出留下了它,要么 id 撞了。确认没人在用后:\n` +
+        `  git -C "${repoRoot}" worktree remove --force "${wtPath}"`,
+      );
+    }
+    // **必须看返回值**:清不掉旧残留时,下面的 `worktree add` 会因为目录已存在而失败,
+    // 报出来的却是"建 worktree 失败" —— 根因(上次的残留清不掉)被埋掉,人会查错方向。
+    const rmOld = await removeWorktree(repoRoot, wtPath);
+    if (!rmOld.ok) {
+      throw new UsageError(`force:true 想覆盖,但清不掉上次残留的工作区 ${wtPath}:${rmOld.note}`);
+    }
+  }
+  // 分支已存在:同样不猜,让调用方决定(force 才覆盖)。
+  const exists = await git(["rev-parse", "--verify", `refs/heads/${branch}`], repoRoot);
+  if (exists.ok) {
+    if (!force) {
+      throw new UsageError(`分支已存在:${branch}(上次跑过同名环节?)。要覆盖请给该环节加 force:true,或先 git branch -D "${branch}"`);
+    }
+    const delOld = await git(["branch", "-D", branch], repoRoot);
+    if (!delOld.ok) throw new UsageError(`force:true 想覆盖,但删不掉旧分支 ${branch}:${delOld.stderr || delOld.code}`);
+  }
+  ensureDir(path.dirname(wtPath));
+  // 用**解析后的 commit** 而不是 baseRef:一次运行里所有环节钉在同一个基线上,
+  // 就算跑到一半主树的 HEAD 动了,也不会有的环节基于旧的、有的基于新的。
+  const add = await git(["worktree", "add", "--quiet", wtPath, "-b", branch, baseCommit], repoRoot, { timeoutMs: WORKSPACE_BUDGET_MS });
+  if (!add.ok) {
+    // ⚠️ `worktree add` 可能**已经建了分支、写了登记**才失败。此刻 runNode 里的 `workspace`
+    // 还没被赋值,外层 finally 的兜底清理够不着它 —— 不在这里收干净就会永久留下垃圾。
+    await removeWorktree(repoRoot, wtPath);
+    await git(["branch", "-D", branch], repoRoot);
+    const why = add.timedOut ? `超过 ${WORKSPACE_BUDGET_MS}ms 没建完` : (add.spawnError || add.stderr || `退出码 ${add.code}`);
+    throw new UsageError(`建 worktree 失败(${wtPath}):${why}`);
+  }
+  return { mode: "worktree", path: wtPath, branch, baseCommit };
+}
+
+/** 删掉一棵 worktree。**必须能扛住"目录被占着"** ——
+ *  关会话只是把 SIGTERM 送到,后端进程真正退出是异步的;Windows 上只要它还握着 worktree 的句柄,
+ *  `git worktree remove` 就会**注销掉登记、却删不掉文件**(留下一个目录和一个假的失败)。
+ *  所以:先让 git 正常删一次,然后**退出去异步等 + 从外面反复重删**。
+ *  ⚠️ 不能靠 `fs.rm` 自带的 `maxRetries`:那是同步自旋,而阻塞条件是**别的进程**的句柄,
+ *     自旋不让出事件循环,那个进程也就永远退不出去 —— 自己把自己锁死。 */
+async function removeWorktree(repoRoot, wtPath) {
+  const rm = await git(["worktree", "remove", "--force", wtPath], repoRoot, { timeoutMs: WORKSPACE_BUDGET_MS });
+  let lastErr = rm.ok ? null : (rm.stderr || `退出码 ${rm.code}`);
+  let waited = false;
+  for (let i = 0; i < 40 && fs.existsSync(wtPath); i++) {
+    waited = true;
+    await sleep(250);
+    try { fs.rmSync(wtPath, { recursive: true, force: true }); }
+    catch (e) { lastErr = e.message; }
+  }
+  // 上面若是我们自己删的,git 那边的登记可能还留着 —— prune 掉,否则 `git worktree list` 会有幽灵条目。
+  await git(["worktree", "prune"], repoRoot);
+  if (!fs.existsSync(wtPath)) {
+    return { ok: true, note: waited ? "worktree 目录被后端进程占着,等它退出后才删掉" : null };
+  }
+  return { ok: false, note: `删 worktree 失败(目录留着了):${lastErr}` };
+}
+
+/** 收工作区:提交 → 导出 diff → 删 worktree(**保留分支**)。
+ *  **不抛异常** —— 它跑在收尾路径上,环节可能已经失败了;这里再抛会盖掉真正的死因。
+ *  所有问题记进 notes,由调用方并进 diagnostics。 */
+async function finalizeWorktree({ repoRoot, ws, diffPath, nodeId, runKey, closeConfirmed }) {
+  const notes = [];
+  const out = {
+    ...ws, committed: false, headCommit: null, filesChanged: [],
+    diffPath: null, diffSha256: null, removed: false,
+    // 「我们**确知**这棵工作树里有没有改动」。false = git 探测失败,既不能说有也不能说没有。
+    changesKnown: false,
+    // **这个环节到底交付了什么**,唯一权威结论。调用方(finish 的降级判断、复用闸)一律只看它,
+    // 不各自拿 committed/filesChanged 再推一遍 —— 三处各推一遍,迟早推出三种结论。
+    //   "delivered"   改动已提交到本环节分支,且 head/diff/摘要齐全
+    //   "no-changes"  确知一个字都没动(HEAD 仍在基线上、索引为空)
+    //   "unknown"     其余一切:探测失败、提交失败、交付物残缺、agent 自己动了 git
+    outcome: "unknown",
+  };
+  /** 说不清的岔子:什么都不删,原样保留,由人来判。 */
+  const preserve = (why) => {
+    notes.push(
+      `${why} —— 已**原样保留** worktree 与分支,什么都没删:${ws.path}\n` +
+      `        请人工确认后自行处理:git -C "${ws.path}" status && git -C "${ws.path}" log --oneline`,
+    );
+    return { ...out, notes };
+  };
+  /** `name-status` 的一行 → {status, path}。 */
+  const parseNameStatus = (stdout) =>
+    stdout.split("\n").map((l) => l.replace(/\r$/, "")).filter(Boolean)
+      .map((l) => {
+        // ⚠️ 按**第一个制表符**切,不能 `split(/\s+/)` —— `name-status` 的分隔符是 TAB,
+        // 而路径里**允许有空格**;按空白切会把 "src/my file.ts" 拆坏。
+        // 重命名是 `R100<TAB>旧<TAB>新`,这里如实把两段都留在 path 里(用 → 连接)。
+        const i = l.indexOf("\t");
+        if (i < 0) return { status: "?", path: l.trim() };
+        return { status: l.slice(0, i), path: l.slice(i + 1).split("\t").join(" → ") };
+      });
+
+  try {
+    // ── 0) 先弄清 agent 把 HEAD 放哪了。**这一步不能省**。
+    // ⚠️ 只看 `git add -A` 之后的暂存区是**不够**的:agent 完全可能自己 `git commit`(很多编码
+    //    后端就是这么干的),那时暂存区是空的。照着"零改动"去删 worktree + `branch -D`,
+    //    删掉的正是它刚提交的成果 —— 提交只剩悬空对象,静默、不可恢复。
+    //    所以「零改动」必须**同时**证明两件事:索引里没东西 **且** HEAD 还停在基线上。
+    const symref = await git(["symbolic-ref", "--quiet", "HEAD"], ws.path);
+    const head0 = await git(["rev-parse", "HEAD"], ws.path);
+    if (!head0.ok) return preserve("读不出这棵工作树的 HEAD(git 探测失败)");
+    const headNow = head0.stdout.trim();
+    // agent 若切了分支或进了 detached HEAD,它的提交就不在我们声称的那条分支上;
+    // 此时任何"删树"都可能抹掉唯一还引用着那些提交的东西。
+    if (!symref.ok || symref.stdout.trim() !== `refs/heads/${ws.branch}`) {
+      return preserve(
+        `工作区的 HEAD 已经不在本环节的分支 ${ws.branch} 上` +
+        `(现在是 ${symref.ok ? symref.stdout.trim() : `detached @ ${headNow.slice(0, 8)}`})` +
+        ` —— agent 自己动过 git,交付物落在哪已经无法判定`,
+      );
+    }
+
+    // ── 1) 还没提交的改动
+    // ⚠️ `-A` 会把 agent 在工作树里留下的**一切未被 gitignore 的东西**都提交进来 ——
+    // 跑测试产生的 coverage/、临时文件、它自己写的 .env 都算。这是刻意的(它写的新文件通常正是产物),
+    // 但**不是"天然安全"**:仓库 gitignore 不全时,噪声甚至敏感文件会进提交、并被导出到 diff 里。
+    // 所以 `filesChanged` 一定要如实回报,而 SKILL 要求主 agent 合并前自己看 diff。
+    const add = await git(["add", "-A"], ws.path, { timeoutMs: WORKSPACE_BUDGET_MS });
+    if (!add.ok) notes.push(`工作区 git add 失败:${add.stderr || add.code}`);
+    // `-c core.quotePath=false`:否则含非 ASCII 的路径会被 git 转义成 "\344\270\255" 那种鬼样子。
+    const staged = add.ok
+      ? await git(["-c", "core.quotePath=false", "diff", "--cached", "--name-status"], ws.path)
+      : null;
+    if (staged && !staged.ok) notes.push(`列暂存改动失败:${staged.stderr || staged.code}`);
+    // **把"不知道"当成"没有"是这里最贵的一个错**:磁盘满、索引损坏、worktree 的 git 链接被弄坏时
+    // 列出来同样是空,若照着"零改动"分支走就会把代码连同分支一起删掉。
+    if (!staged?.ok) return preserve("无法确认工作区里有没有未提交的改动(git 探测失败)");
+    out.changesKnown = true;
+    const pending = parseNameStatus(staged.stdout);
+
+    // ── 2) 真的一个字都没动?**两个条件都成立**才敢下这个结论
+    if (pending.length === 0 && headNow === ws.baseCommit) {
+      out.outcome = "no-changes";
+      notes.push("这个环节没有改动任何文件");
+      // ⚠️ 同样要过「关会话已确认」那道闸:关闭没被确认 = 后端可能还活着、还在写。
+      // 此刻它虽然一个字都没改,删了树之后它再写的东西就没地方落了 —— 留着只是脏,删错是丢代码。
+      if (closeConfirmed !== true) {
+        notes.push(`关会话未被确认,后端可能仍在写 —— **保留**这棵(当前为空的)工作区与分支不删:${ws.path}`);
+        return { ...out, notes };
+      }
+      // 不留空提交,也不留一条指向基线的垃圾分支。
+      const rmEmpty = await removeWorktree(repoRoot, ws.path);
+      out.removed = rmEmpty.ok;
+      if (rmEmpty.note) notes.push(rmEmpty.note);
+      const del = await git(["branch", "-D", ws.branch], repoRoot);
+      if (del.ok) out.branch = null;
+      // 删不掉就**如实说**:留着一条指向基线的空分支不影响正确性,但悄悄留下就没人知道该去清。
+      else notes.push(`空分支删除失败,${ws.branch} 留在仓库里了(指向基线,可自行 git branch -D):${del.stderr || del.code}`);
+      return { ...out, notes };
+    }
+
+    // ── 3) 有东西。先把还没提交的那部分提上去
+    if (pending.length > 0) {
+      // 仓库没配 user.email 时 commit 会直接失败 —— 那等于把改好的代码丢了。
+      // 有身份就用仓库自己的,没有才补一个明确标着来源的兜底身份。
+      const idc = await git(["config", "user.email"], ws.path);
+      const idFlags = idc.ok && idc.stdout.trim()
+        ? []
+        : ["-c", "user.name=agent-bridge-graph", "-c", "user.email=graph@agent-bridge.local"];
+      if (idFlags.length) notes.push("仓库未配置 user.email,本次提交用了兜底身份 graph@agent-bridge.local");
+
+      const msg = `graph(${runKey}): ${nodeId}`;
+      // ⚠️ `--no-verify` **只**跳过 pre-commit 与 commit-msg,**挡不住 post-commit**。
+      // 而这是一次纯机械的"把 agent 干的活拍个快照"的提交,让仓库的任意钩子在这时候跑,
+      // 就等于允许它在我们刚清点完之后再改工作树、甚至切走 HEAD —— 紧接着我们就
+      // `worktree remove --force`,它写的东西一并没了。所以把 hooksPath 指到一个不存在的目录,
+      // 让"不跑钩子"这件事是完整的,而不是只做了一半。
+      const noHooks = ["-c", `core.hooksPath=${path.join(ws.path, "__agent_bridge_no_hooks__")}`];
+      const commit = await git([...idFlags, ...noHooks, "commit", "--no-verify", "-m", msg], ws.path, { timeoutMs: WORKSPACE_BUDGET_MS });
+      if (!commit.ok) {
+        return preserve(`提交失败(改动还在工作区里,删了就没了):${commit.stderr || commit.code}`);
+      }
+    } else {
+      notes.push(`agent 自己提交过(HEAD 已从基线移到 ${headNow.slice(0, 8)}),本环节没有额外要提交的东西`);
+    }
+
+    // ── 4) 记 head、列交付的改动、导出 diff
+    const head1 = await git(["rev-parse", "HEAD"], ws.path);
+    if (!head1.ok) return preserve("提交之后反而读不出 HEAD 了(git 探测失败)");
+
+    // ⚠️ **提交完要再看一眼,别假设"提交成功 = 树就静止了"。**
+    // 钩子、后台进程、还没退干净的后端都可能在这之后继续动这棵树。这里若不复查就直接
+    // 判 delivered 并删树,新写出来的东西既不在 diff 里、也没了。
+    const leftover = await dirtyEntries(ws.path, []);
+    if (leftover === null) return preserve("提交之后查不出工作区是否还有残留改动(git 探测失败)");
+    if (leftover.length) {
+      return preserve(
+        `提交之后工作区里又出现了改动(共 ${leftover.length} 条,如 ${leftover.slice(0, 3).join(" / ")})` +
+        ` —— 它们不在 base..HEAD 里,删树就没了。**不自动再提交一次**:说不清是谁写的,交给人判`,
+      );
+    }
+    const symref1 = await git(["symbolic-ref", "--quiet", "HEAD"], ws.path);
+    if (!symref1.ok || symref1.stdout.trim() !== `refs/heads/${ws.branch}`) {
+      return preserve(`提交之后 HEAD 被切走了(现在是 ${symref1.ok ? symref1.stdout.trim() : "detached"}),交付坐标已不可信`);
+    }
+
+    out.headCommit = head1.stdout.trim();
+    out.committed = true;
+    // **交付的改动 = 基线到 HEAD 的全部**,不是"我们刚提交的那一笔"。
+    // agent 自己提交过时,后者是空的 —— 拿它当 filesChanged 就是在回执里撒谎说"没改任何文件"。
+    const names = await git(
+      ["-c", "core.quotePath=false", "diff", "--name-status", ws.baseCommit, "HEAD"], ws.path,
+      { timeoutMs: WORKSPACE_BUDGET_MS },
+    );
+    if (names.ok) out.filesChanged = parseNameStatus(names.stdout);
+    else notes.push(`列交付改动失败:${names.stderr || names.code}`);
+    // --binary:二进制改动也要能被 git apply 还原,否则 diff 是残的
+    const dr = await git(["diff", "--binary", ws.baseCommit, "HEAD"], ws.path, { timeoutMs: WORKSPACE_BUDGET_MS, toFile: diffPath });
+    if (dr.ok) {
+      out.diffPath = diffPath;
+      // 内容指纹:复用时要能确认"这份 diff 还是当初那份"(同 artifactSha256 的道理)
+      out.diffSha256 = await sha256File(diffPath);
+    } else notes.push(`导出 diff 失败:${dr.stderr || dr.code}`);
+
+    // ── 5) **交付物齐了吗?四样缺一不可。**
+    // 只查 `committed` 是不够的:提交成功、但 rev-parse / 列改动 / 导出 diff / 算摘要任一步失败时,
+    // 回执里就少了 headCommit 或 diffPath/diffSha256 —— 这种残回执**首跑会报 ok**,
+    // 要等到下次复用才被闸拦下。等于"第一次骗你,第二次才告诉你"。
+    if (/^[0-9a-f]{40}$/.test(out.headCommit) && names.ok
+        && out.diffPath && /^[0-9a-f]{64}$/.test(out.diffSha256 || "")) {
+      out.outcome = "delivered";
+      // HEAD 前进了但净改动为零(agent 建了空提交,或提交完又 revert)。分支上只有历史、没有内容变化,
+      // diff 于是是 0 字节 —— 这是合法结局,复用闸那边也**不拿 0 字节当失败**(两边判据必须一致)。
+      if (out.filesChanged.length === 0) {
+        notes.push(`HEAD 相对基线前进了(${ws.baseCommit.slice(0, 8)} → ${out.headCommit.slice(0, 8)}),但净改动为空 —— 分支上只有历史,没有内容变化`);
+      }
+    } else {
+      return preserve("提交成功了,但交付物不完整(head / 改动清单 / diff / 摘要有一样没拿到)");
+    }
+
+    // ── 6) 删 worktree 是最后一步(**保留分支**)。
+    if (closeConfirmed !== true) {
+      // ⚠️ 关会话**没被确认**意味着后端进程可能还活着、还在往这棵树里写。
+      // 此刻删树 = 把它后续的写入连同目录一起抹掉,而我们刚提交的只是个半成品。
+      // 提交保住了已有的部分;树留着,让人能看到它后来又写了什么。
+      notes.push(
+        `关会话未被确认,后端可能仍在写这棵树 —— 已提交当前状态到 ${ws.branch},但**保留**工作区不删:${ws.path}`,
+      );
+    } else {
+      const rm = await removeWorktree(repoRoot, ws.path);
+      out.removed = rm.ok;
+      if (rm.note) notes.push(rm.note);
+    }
+  } catch (e) {
+    // 这里兜的是**任何**没预料到的异常。finalize 跑在收尾路径上,环节可能已经失败了;
+    // 让它抛出去会盖掉真正的死因。⚠️ 兜底覆盖整个函数体(含删树),不是只覆盖前半段。
+    notes.push(`收工作区时出错(已停在当前状态,不再删任何东西):${e?.message || String(e)}`);
+  }
+  return { ...out, notes };
+}
+
+/** 并发闸:把「一次并行别超过 4 个」从纪律变成机制。
+ *  超限的 runNode **排队等待**,而不是报错 —— 调用方照写 `Promise.all`,不用自己搓限流。
+ *
+ *  ⚠️ 释放时必须把名额**直接交接**给队首,不能"先 `active--`、等队首醒来再 `active++`"。
+ *  后者在这两步之间留了一个 `active` 偏低的空窗:唤醒队首只是排了个微任务,而任何**早于它入队**的
+ *  微任务里若有一次新的 `acquire()`,就会看到 `active < max` 直接放行 —— 队首随后再 `++`,
+ *  于是同时在跑的比 max 多一个。实测 max=2 时峰值到 3(见 W16 的最小复现)。
+ *  交接式写法让 `active` 在有人排队时**恒等于真实在跑的数量**,空窗不存在。 */
+function makeSemaphore(max) {
+  let active = 0;
+  const queue = [];
+  return {
+    async acquire() {
+      if (active < max) { active++; return; }
+      await new Promise((resolve) => queue.push(resolve));
+      // 名额是 release() 直接转手过来的,这里**绝不能**再 ++(否则又把空窗补回去了)
+    },
+    release() {
+      const next = queue.shift();
+      if (next) { next(); return; } // 名额转手,active 不变
+      active--;
+    },
+  };
 }
 
 /**
@@ -552,9 +1076,13 @@ export async function runNode(bridge, rawSpec) {
   const artifactPath = path.join(nodesDir, `${spec.id}.md`);
   const receiptPath = path.join(nodesDir, `${spec.id}.receipt.json`);
   const sceneDir = path.join(nodesDir, `${spec.id}.scene`);
-  const startedAt = nowIso();
-  const t0 = monoNow();
-  const deadline = t0 + spec.timeoutMs;
+  // ⚠️ 计时**从拿到并发闸之后**才起算(见下面的 startClock)——排队等待不算进环节预算。
+  // 否则扇出 20 个、闸开 4 个时,排在后面的会带着一个已经烧掉大半的 timeoutMs 开跑,
+  // 于是"同一张任务单,排第几位决定它超不超时"——那不是超时,那是抽签。
+  let startedAt = nowIso();
+  let t0 = monoNow();
+  let deadline = t0 + spec.timeoutMs;
+  const startClock = () => { startedAt = nowIso(); t0 = monoNow(); deadline = t0 + spec.timeoutMs; };
   /** 本环节还剩多少总预算。**每一次 RPC 都受它约束** —— 否则 open/send 卡住就能把「总上限」顶穿。 */
   const remaining = () => deadline - monoNow();
   /** 上一次 RPC 的期限**是不是由本环节的总预算决定的**(而不是那类调用的默认上限)。
@@ -603,7 +1131,33 @@ export async function runNode(bridge, rawSpec) {
     throw new UsageError(`无法创建环节锁文件 ${lockPath}:${e.message}`);
   }
 
+  let gateHeld = false;
+  let workspaceFinalized = false; // 收过工作区没有。**不能靠 workspace.removed 推断** ——
+                                  // "提交失败所以故意留着目录"也是 removed:false,那种情况绝不能再收一次。
+  let workspace = null;      // write 环节的 worktree 信息(read 环节恒为 null)
+  let repoRoot = null;
+  let baseCommit = null;
+  // `runId` 只是给人看的标签。**资源唯一性不能只靠它** —— 它取自 outDir 的目录名,
+  // 而 `D:/a/run-1` 与 `D:/b/run-1` 的目录名一模一样:两次运行会映射到同一条 worktree 路径
+  // 和同一个分支名。默认情况下第二个撞上"目录已存在/分支已存在"报 UsageError(还算安全),
+  // 但只要有一边带 `force:true`,就会把另一边**正在写**的工作树连同分支一起删掉 —— 静默丢代码。
+  // 拼上 outDir 全路径的短哈希,让「不同 outDir = 不同资源」成为事实而不是巧合。
+  const runId = path.basename(spec.outDir);
+  const runKey = `${gitSafeSlug(runId)}-${sha256Text(realpathSafe(spec.outDir)).slice(0, 8)}`;
+  const diffPath = path.join(nodesDir, `${spec.id}.diff`);
+
   try {
+    // --- write 环节的仓库体检(只读探查)。**排在幂等闸之前** —— 复用时要拿 baseCommit 去比对。
+    if (spec.access === "write") {
+      const info = await inspectRepo(spec.cwd, spec.baseRef);
+      repoRoot = info.repoRoot;
+      baseCommit = info.baseCommit;
+      // ⚠️ 脏树闸也**排在幂等闸之前** —— 否则它只保护"真跑",不保护"复用":
+      // 同一个脏工作区下,新跑会被拒绝,而命中复用却照样交货,且调用方分不出这两种情况。
+      // 复用出来的结果同样是对着 HEAD 做的、同样看不见那些未提交改动,该拦就得一起拦。
+      await assertCleanBase({ repoRoot, spec, baseCommit, nodesDir });
+    }
+
     // --- 幂等闸
     if (fs.existsSync(receiptPath) && !spec.force) {
       let prev = null;
@@ -641,11 +1195,121 @@ export async function runNode(bridge, rawSpec) {
           `回执里没有合法的产出内容指纹(artifactSha256),无法确认产出还是当初那份:${receiptPath}。要重跑请加 force。`,
         );
       }
-      const nowSha = sha256File(artifactPath);
+      const nowSha = await sha256File(artifactPath);
       if (nowSha !== prev.artifactSha256) {
         throw new UsageError(`产出文件内容与回执记录的不一致(可能被改过或被覆盖):${artifactPath}。要重跑请加 force。`);
       }
+      // write 环节还要多一道:**指纹管不住基线漂移**。baseRef 通常是 "HEAD",
+      // 它今天和上周解析到的是两个 commit,而 specHash 里只有字符串 "HEAD" —— 一模一样。
+      // 不比对解析后的 baseCommit,就会把"对着上周代码改出来的结果"当成这次的答案。
+      if (spec.access === "write") {
+        const pw = prev.workspace;
+        if (pw?.baseCommit !== baseCommit) {
+          throw new UsageError(
+            `回执可复用,但基线变了(旧 ${pw?.baseCommit ?? "(无记录)"} ≠ 今 ${baseCommit}):${receiptPath}\n` +
+            `上次的改动是对着另一份代码做的,复用等于把过期的 diff 当成本次结果。要重跑请加 force。`,
+          );
+        }
+        // write 环节的**交付物是分支和 diff**,不只是那段文字。只校验文字产出的 sha 就复用,
+        // 等于宣称"上次那份改动还在" —— 而分支可能早被 `git branch -D` 掉了,diff 文件可能被换过。
+        // 这道闸与 artifactSha256 是同一个道理,不能只做一半。
+        //
+        // ⚠️ **按 outcome 分派,而不是 `if (pw?.committed)`**。后者是同一族缺陷的第三次出现:
+        // 字段缺失(null/undefined)时条件为假,**整段校验被静默跳过** —— 而字段缺失恰恰说明
+        // 上次收尾出过问题,正是最该拦住的那种回执。这里两个分支都要求 outcome 是**明确的字面量**,
+        // 缺字段 / 旧回执 / 手改过的回执一律落到最后那个 else,结构上没有"跳过"这条路可走。
+        if (pw?.outcome === "delivered") {
+          // 交付物齐全的那条路:分支、head、diff 三样逐个坐实,每一条都**不是可选的**。
+          //
+          // ⚠️ **先查字段齐不齐,再查对不对**,顺序不能反。缺字段说明上次收尾没走完;
+          // 若先做等值比较,`diffPath: null` 会被报成"路径不一致",把"上次就没写完"
+          // 说成"有人动过你的文件" —— 两种根因完全不同,报错指错方向比不报还费事。
+          const missing = [];
+          if (!pw.branch) missing.push("branch");
+          if (!/^[0-9a-f]{40}$/.test(pw.headCommit || "")) missing.push("headCommit");
+          if (!pw.diffPath) missing.push("diffPath");
+          if (!/^[0-9a-f]{64}$/.test(pw.diffSha256 || "")) missing.push("diffSha256");
+          // 「四样齐全」里的**改动清单**也要查:回执缺它/它不是数组,交付物同样是残的,
+          // 而且下游拿它 `.map`/`.length` 会直接崩。`changesKnown:false` 更是自相矛盾
+          // ——都不确知有没有改动了,凭什么说 delivered。
+          if (pw.changesKnown !== true) missing.push("changesKnown");
+          if (!Array.isArray(pw.filesChanged)) missing.push("filesChanged");
+          if (missing.length) {
+            throw new UsageError(
+              `回执声称已交付(outcome=delivered),却缺字段:${missing.join("、")}(${receiptPath})\n` +
+              `字段不全说明上次收尾那几步没走完 —— 交付物是残的,不复用。要重跑请加 force。`,
+            );
+          }
+          // 字段齐了,再看是不是**本次**该有的那份 —— 不能听信回执里写的任意分支名/路径。
+          const expectBranch = `graph/${runKey}/${spec.id}`;
+          if (pw.branch !== expectBranch) {
+            throw new UsageError(
+              `回执里的分支名与本次算出来的不一致(回执 ${JSON.stringify(pw.branch)} ≠ 本次 ${expectBranch}):${receiptPath}。要重跑请加 force。`,
+            );
+          }
+          if (pw.diffPath !== diffPath) {
+            throw new UsageError(
+              `回执里的 diff 路径与本次算出来的不一致(回执 ${JSON.stringify(pw.diffPath)} ≠ 本次 ${diffPath}):${receiptPath}。要重跑请加 force。`,
+            );
+          }
+          const head = await git(["rev-parse", "--verify", `refs/heads/${pw.branch}^{commit}`], repoRoot);
+          if (!head.ok) {
+            throw new UsageError(`回执说改动在分支 ${pw.branch} 上,但那条分支已经不存在了:${receiptPath}。要重跑请加 force。`);
+          }
+          if (head.stdout.trim() !== pw.headCommit) {
+            throw new UsageError(
+              `分支 ${pw.branch} 已经不指向回执记的那个提交(回执 ${pw.headCommit} ≠ 现在 ${head.stdout.trim()}):${receiptPath}。要重跑请加 force。`,
+            );
+          }
+          const dst = statSafe(pw.diffPath);
+          // ⚠️ **不拿 `size === 0` 当失败。** HEAD 前进了但净改动为零(agent 建了空提交、
+          // 或提交完又 revert)时 diff 本来就是 0 字节,而首跑那边判的是 delivered ——
+          // 两边判据不一致就会出现"首跑成功、复用必拒"这种同一结局前后打架。
+          // 「内容还是不是当初那份」由 sha 负责,它对空文件同样有效。
+          if (!dst || !dst.isFile()) {
+            throw new UsageError(`回执说导出过 diff,但文件不在了:${pw.diffPath}。要重跑请加 force。`);
+          }
+          if (await sha256File(pw.diffPath) !== pw.diffSha256) {
+            throw new UsageError(`diff 文件内容与回执记录的不一致(可能被改过):${pw.diffPath}。要重跑请加 force。`);
+          }
+        } else if (pw?.outcome === "no-changes") {
+          // "确知一个字都没改"也是一种合法的成功。它没有分支、没有 diff 可查,
+          // 但**必须坐实当初真的探测成功过** —— 否则 `changesKnown:false`(探测失败、什么都没结论)
+          // 也会被当成"没改动"复用掉,那正是第 1 轮修掉的那个错换了个地方重演。
+          if (pw.changesKnown !== true || !Array.isArray(pw.filesChanged) || pw.filesChanged.length !== 0) {
+            throw new UsageError(
+              `回执说"没有改动",但它自己的记录对不上(changesKnown=${JSON.stringify(pw.changesKnown)}, ` +
+              `filesChanged=${JSON.stringify(pw.filesChanged)}):${receiptPath}。要重跑请加 force。`,
+            );
+          }
+        } else {
+          throw new UsageError(
+            `回执是 ok,但 write 环节的交付结论无法确认(workspace.outcome=${JSON.stringify(pw?.outcome)}):${receiptPath}\n` +
+            `只有 "delivered"(改动已落到分支)与 "no-changes"(确知没改动)两种结论可以复用;\n` +
+            `缺这个字段说明它是旧版回执或上次收尾没走完 —— 不复用。要重跑请加 force。`,
+          );
+        }
+      }
       return { ...prev, reused: true };
+    }
+
+    // --- 并发闸:到这里才排队。前面几步(体检/幂等)都是本地 I/O,不占桥的连接,不该被排队拖慢。
+    await bridge._gate.acquire();
+    gateHeld = true;
+    startClock(); // 预算从**真正开跑**这一刻起算,不含排队时间
+
+    // --- write 环节:建隔离工作区
+    if (spec.access === "write") {
+      // ⚠️ 脏树**再查一次**。上面那次跑在排队之前,而扇出时一个环节可能在闸外等上几分钟;
+      // 这中间用户完全可能动了主树。只查一次 = 拿一个几分钟前的结论给现在放行。
+      // (基线 commit 不重新解析:一次运行里各环节钉在各自开跑前解析的那个 commit 上,
+      //  重解析会让"排在后面"变成"基于另一份代码",反而更难解释。)
+      await assertCleanBase({ repoRoot, spec, baseCommit, nodesDir });
+      const branch = await makeBranchName(repoRoot, runKey, spec.id);
+      // 与 dirtyEntries 的排除项共用同一个常量 —— 两处写死会各自漂,漂了就变成"自己把主树弄脏、
+      // 再被自己的脏树闸拦下"这种最难查的自伤。
+      const wtPath = path.join(repoRoot, ...WT_ROOT_REL.split("/"), runKey, spec.id);
+      workspace = await createWorktree({ repoRoot, wtPath, branch, baseCommit, force: spec.force });
     }
 
     const receipt = {
@@ -656,11 +1320,22 @@ export async function runNode(bridge, rawSpec) {
       contextUsage: null, reaskCount: 0, durationMs: null,
       startedAt, endedAt: null, diagnostics: [], error: null, scene: null,
       sessionId: null, abortConfirmed: null, closeConfirmed: null, artifactSha256: null,
+      // read 环节恒为 null;write 环节在 finish() 里被 finalizeWorktree 的结果填满
+      // (branch / baseCommit / headCommit / filesChanged / diffPath / committed / removed)。
+      access: spec.access, workspace: workspace ? { ...workspace } : null,
     };
 
     let sessionId = null;
     let logFile = null;
     let lastTextRef = null;
+    /** open_session 这一步的结局。**「没拿到 sessionId」≠「后端没起来」** ——
+     *  请求可能已经发出去、桥那边真把会话建起来了,只是响应超时或管道断了,我们没拿到句柄。
+     *  收工作区时把这两种情况混为一谈,就会在后端可能还活着的时候把工作树删掉。
+     *    "not-attempted" 请求压根没发(还没发预算就耗尽了)
+     *    "refused"       桥**明确回报**开不起来 —— 确定没有后端(最常见:后端没装/起不来)
+     *    "unknown"       发出去了但结局不明(本地超时 / 断管 / 返回形状不认识)
+     *    "opened"        拿到了 sessionId */
+    let openOutcome = "not-attempted";
 
     /** 现场保留(三件套):桥干净退出会删掉本次 run 的日志目录、close_session 会删 textRef,
      *  所以**必须在关会话/关桥之前**把现场 cp 出来。缺哪件就在 diagnostics 里说明原因。 */
@@ -740,13 +1415,59 @@ export async function runNode(bridge, rawSpec) {
       });
     };
 
-    /** 统一收尾:**先保现场 → 再关会话 → 最后原子写回执**。顺序不能换。 */
+    /** 统一收尾:**先保现场 → 关会话 → 收工作区 → 最后原子写回执**。顺序不能换。 */
     const finish = async (status, extra = {}) => {
       Object.assign(receipt, extra);
       receipt.status = status;
       if (status !== "ok") await saveScene(extra._sceneTag || status);
       delete receipt._sceneTag;
       await closeSession();
+      // 收工作区排在**关会话之后**:后端进程还活着时它可能还握着 worktree 里的文件句柄,
+      // Windows 上那会让 `git worktree remove` 直接失败。
+      // **不受 remaining() 约束** —— 环节可能正是因为预算耗尽才走到这里,
+      // 而"把已经改出来的代码保住"不能因为超时就放弃。
+      if (workspace && !workspaceFinalized) {
+        workspaceFinalized = true;
+        const fin = await finalizeWorktree({
+          repoRoot, ws: workspace, diffPath, nodeId: spec.id, runKey,
+          // 「后端确定不会再往这棵树里写了」。三种情况成立:关会话被确认、请求压根没发出去、
+          // 或桥**明确回报**开不起来(后者最常见:后端没装/起不来;若也按"关闭未确认"保留,
+          // 每次失败都白留一棵空工作树和一条空分支,越攒越多)。
+          // ⚠️ 判据是 openOutcome 而**不是** `sessionId === null` —— 后者把"桥说没建成"
+          // 和"我们没拿到句柄但它可能已经建成了"混成一谈,于是在后端可能还活着时删树。
+          closeConfirmed: receipt.closeConfirmed === true
+            || openOutcome === "not-attempted" || openOutcome === "refused",
+        });
+        const { notes, ...rest } = fin;
+        workspace = rest;
+        receipt.workspace = rest;
+        for (const n of notes) receipt.diagnostics.push(`工作区:${n}`);
+        // **write 环节的交付物不只是那段文字,还包括"改动确实落到了分支上"。**
+        // 有改动却没提交、或压根不知道有没有改动 —— 这时报 ok,调用方(以及 reuseIfSame 的
+        // "只复用 ok"那道闸)就会把一个**没有产出的 write 环节**当成功,并在此之上继续往下建。
+        // 降级成 unknown 而不是某种失败:我们确实不知道后端干了多少,按纪律停下等人、不诱导重跑。
+        // (不补 saveScene:会话已关,现场三件套只能取到残缺的一份;真正的证据是**被保留下来的
+        //  worktree 与分支**,路径就在 diagnostics 里。)
+        // 判据只有一个:finalizeWorktree 给出的 outcome。**不在这里拿 committed/filesChanged
+        // 自己再推一遍** —— 同一件事在两处各推一次,迟早推出两种结论(第 3 轮复审就是这么被抓到的:
+        // 提交成功但 diff/head 没拿到时,这里按 `committed` 判成功,回执里却缺字段)。
+        // ⚠️ **不限于原本是 `ok` 的情况。** `backend_failed` / `timeout` 在本工具的契约里是
+        // "可以安全换个人重跑"的档;而重跑通常带 `force`,`force` 会把**正因为说不清才被保留下来**的
+        // 那棵工作树连同分支一起删掉。工作区状态不明时宣称"可安全重跑",等于亲手安排了一次数据销毁。
+        // 所以只要 outcome 不明,顶层一律按 unknown(停下等人),原始结局记进 diagnostics 不丢信息。
+        if (rest.outcome !== "delivered" && rest.outcome !== "no-changes") {
+          const was = receipt.status;
+          receipt.status = "unknown";
+          if (was !== "ok") {
+            receipt.diagnostics.push(
+              `原始结局是 ${was},但工作区状态无法确认 —— 已按 unknown 处理(${was} 会被理解成"可安全重跑",` +
+              `而重跑加 force 会删掉这棵保留下来的工作树)`,
+            );
+          }
+          receipt.error = `${receipt.error ? `${receipt.error};` : ""}write 环节的交付物没能确认落到分支上` +
+            `(outcome=${rest.outcome})——工作区已保留:${rest.path},详见 diagnostics`;
+        }
+      }
       receipt.endedAt = nowIso();
       receipt.durationMs = Math.round(monoNow() - t0);
       try {
@@ -763,7 +1484,11 @@ export async function runNode(bridge, rawSpec) {
     try {
       // --- 开会话
       const openArgs = {
-        agent: spec.agent, cwd: spec.cwd, access: spec.access,
+        agent: spec.agent,
+        // write 环节跑在自己的 worktree 里,**不是**调用方给的 cwd —— 这就是隔离本身。
+        // ⚠️ 隔离的是写:桥没有 OS 沙箱,有 shell 的环节技术上仍能 `../..` 读回主工作区。
+        cwd: workspace ? workspace.path : spec.cwd,
+        access: spec.access,
         // 结果走 textRef + cp,不把几 MB 正文塞进 JSON-RPC 管道
         return_mode: "ref",
         name: `graph-${spec.id}-${spec.specHash.slice(0, 6)}`,
@@ -773,8 +1498,19 @@ export async function runNode(bridge, rawSpec) {
       if (spec.roleFile) openArgs.append_system_prompt_file = spec.roleFile;
 
       if (remaining() <= 0) return await finish("timeout", { error: `还没开会话,总预算 ${spec.timeoutMs}ms 就已耗尽` });
-      const opened = await bridge.callTool("agent_bridge_open_session", openArgs, budget());
+      let opened;
+      try {
+        // 一旦发出去,结局就默认按**不明**记 —— 只有下面两条路能把它改掉。
+        openOutcome = "unknown";
+        opened = await bridge.callTool("agent_bridge_open_session", openArgs, budget());
+      } catch (e) {
+        // 桥**明确回报**的错(BridgeReportedError)= 会话确定没建起来,后端确定没在跑;
+        // 其余(本地 RPC 超时、断管)= 请求可能已经生效,只是我们不知道 —— 维持 "unknown"。
+        if (e instanceof BridgeReportedError) openOutcome = "refused";
+        throw e;
+      }
       sessionId = opened?.session?.id ?? null;
+      if (sessionId) openOutcome = "opened";
       logFile = opened?.session?.logFile ?? null;
       receipt.sessionId = sessionId;
       if (!sessionId) {
@@ -912,7 +1648,7 @@ export async function runNode(bridge, rawSpec) {
         receipt.artifactPath = artifactPath;
         receipt.charCount = typeof settled.charCount === "number" ? settled.charCount : text.length;
         receipt.byteCount = typeof settled.byteCount === "number" ? settled.byteCount : Buffer.byteLength(text, "utf8");
-        receipt.artifactSha256 = sha256File(artifactPath);
+        receipt.artifactSha256 = await sha256File(artifactPath);
         // 算不出产出的哈希 = 刚写下的文件读不回来,本地落盘完整性有问题。
         // 这时不能报 ok:否则会写出一张**没有指纹**的成功回执,让下次复用绕过内容校验。
         if (!receipt.artifactSha256) {
@@ -963,6 +1699,20 @@ export async function runNode(bridge, rawSpec) {
       });
     }
   } finally {
+    // ⚠️ 建了 worktree 却没走到 finish() 的路径(UsageError 抛在中途、或桥本身崩了):
+    // 这里必须兜底,否则每次异常都在磁盘上留一个工作树和一条分支,越攒越多。
+    // 与 finish() 里那次是幂等关系:finalize 成功后 workspace.removed=true,不会重复删。
+    if (workspace && !workspaceFinalized) {
+      workspaceFinalized = true;
+      // 走到这条兜底路径 = 没经过 finish(),会话大概率没被正常关过 → 按"关闭未确认"对待,
+      // **保留**工作区不删。这里宁可留脏也不能删掉可能还在被写的树。
+      try {
+        workspace = await finalizeWorktree({
+          repoRoot, ws: workspace, diffPath, nodeId: spec.id, runKey, closeConfirmed: false,
+        });
+      } catch {}
+    }
+    if (gateHeld) bridge._gate.release();
     active.delete(activeKey);
     try { if (lockFd !== null) fs.closeSync(lockFd); } catch {}
     try { fs.rmSync(lockPath, { force: true }); } catch {}

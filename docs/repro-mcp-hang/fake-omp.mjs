@@ -41,7 +41,19 @@
 //               short-timeout wait times out with the session still running and the OMP reading is LIVE
 //               in pendingSnapshots[].contextUsage (mid-wait watch of a long session). [repro-context-usage]
 // Launched via fake-omp.cmd (Windows) or fake-omp.sh (POSIX) through OMP_BIN; env is inherited.
+import fs from "node:fs";
+import path from "node:path";
+import { execFileSync } from "node:child_process";
+
 const MODE = process.env.FAKE_OMP_MODE || "pipebreak";
+
+/** 所有"往 cwd 里写文件"的模式。写完之后各自还会再干点别的(自己提交 / 切走 HEAD / 弄坏 git 链接)。 */
+const WRITE_MODES = [
+  "writeturn", "writeturn-break", "writeturn-commit", "writeturn-detach",
+  // 只建一个**空提交**,一个文件都不写:HEAD 前进了但净改动为零。
+  // 用来考"首跑判 delivered、复用却因为 diff 是 0 字节而拒绝"这种前后打架。[W24]
+  "writeturn-emptycommit",
+];
 
 // --- multiturn / multiturn-fast:**「已完成的请求又自己动起来」** 的防御性用例
 //     起源是真机事故(omp + deepseek-v4-pro:一次委托被拆成多个内部 turn,桥在第一个 turn_end 就收结果,
@@ -67,8 +79,17 @@ let lateturnStreaming = false;
 let slowsettleStreaming = false;
 const say = obj => process.stdout.write(JSON.stringify(obj) + "\n");
 
+// deafstart:进程正常起来、正常收 stdin,但**一个字都不回**。用来造「open_session 请求确实发出去了,
+// 结局却不明」——本地 RPC 超时,而后端可能已经把会话建起来了。这与「桥明确回报开不起来」是两回事:
+// 后者可以放心把工作区当成没人在写,前者不行。[repro-graph-worktree W22]
+if (MODE === "deafstart") {
+  process.stdin.resume();
+  setInterval(() => {}, 1 << 30); // 保持进程活着,别让事件循环排空
+}
+
 let buf = "";
 process.stdin.on("data", d => {
+  if (MODE === "deafstart") return; // 收下,但一个字都不回
   buf += d.toString();
   let i;
   while ((i = buf.indexOf("\n")) >= 0) {
@@ -91,7 +112,7 @@ process.stdin.on("data", d => {
           ? slowsettleStreaming
           : (MODE === "multiturn" || MODE === "multiturn-fast")
           ? multiturnStreaming
-          : !(MODE === "okturn" || MODE === "errturn" || MODE === "echoturn" || MODE === "ctxturn" || MODE === "logstress" || MODE === "badline" || MODE === "toolturns" || MODE === "agentenderr");
+          : !(MODE === "okturn" || MODE === "errturn" || MODE === "echoturn" || WRITE_MODES.includes(MODE) || MODE === "ctxturn" || MODE === "logstress" || MODE === "badline" || MODE === "toolturns" || MODE === "agentenderr");
         const data = { isStreaming, queuedMessageCount: 0, sessionId: "fake", messageCount: 1 };
         // ctx* modes: real omp reports current-context occupancy in get_state.data (contextUsage sub-object
         // + isCompacting/autoCompactionEnabled siblings — see the probe dump). The bridge normalizes this to
@@ -121,6 +142,73 @@ process.stdin.on("data", d => {
             say({ type: "turn_end" });
             say({ type: "agent_end" }); // 整个请求结束(rpc 消费者的 idle 信号)
           }, 60);
+        } else if (WRITE_MODES.includes(MODE)) {
+          // **真往 cwd 里写一个文件**。用于验证 agent-bridge-graph 的 `access:"write"` worktree 隔离:
+          // 桥用会话的 cwd 起后端,所以这里的 process.cwd() 就是该环节自己那棵工作树 ——
+          // 写进去的内容必须只出现在它自己的分支上,别的环节和主工作区都看不见。
+          // 文件名带上 prompt 的头几个字,这样多环节并发时能一眼看出"谁写的落在了谁那里"。
+          say({ type: "agent_start" });
+          const body = String(msg.message ?? "").slice(0, 200);
+          let note;
+          try {
+            if (MODE === "writeturn-emptycommit") {
+              // 一个文件都不写,只建空提交 —— HEAD 前进,净改动为零
+              const gg = (a) => execFileSync("git", a, { cwd: process.cwd(), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+              gg(["-c", "user.name=fake-agent", "-c", "user.email=fake@agent.local",
+                  "commit", "--allow-empty", "--no-verify", "-m", "empty commit by agent"]);
+              note = "EMPTYCOMMIT_OK";
+            } else {
+              fs.writeFileSync(path.join(process.cwd(), "wrote-by-node.txt"), `${body}\n`, "utf8");
+              // 路径里带空格的那种文件 —— 用来验证 name-status 是按 TAB 切而不是按空白切
+              if (process.env.FAKE_OMP_WRITE_EXTRA) {
+                fs.writeFileSync(path.join(process.cwd(), "a file with spaces.txt"), `${body}\n`, "utf8");
+              }
+              note = "WROTE_OK";
+            }
+          } catch (e) { note = `WRITE_FAILED:${e.message}`; }
+          // writeturn-break:写完文件后**弄坏这棵 worktree 的 git 链接**(worktree 里的 `.git` 是个
+          // 写着 `gitdir: <repo>/.git/worktrees/<name>` 的文件)。用来注入"收工作区时 git 探测失败":
+          // 此时既不能说有改动、也不能说没有,而错误的实现会把它当成"零改动"并**删掉工作树和分支**,
+          // 把 agent 刚写出来的代码一起抹掉。
+          // ⚠️ 不能用「删掉 .git」来注入:worktree 就落在主仓目录树**里面**(<repo>/.graph/wt/…),
+          //    .git 一没,git 会**往上走**找到主仓的 .git,一切照常成功 —— 故障压根没注进去。
+          //    必须把 gitfile 留着、但让它指向一个不存在的 gitdir,git 才会当场报 not a git repository。
+          if (MODE === "writeturn-break") {
+            // 注入结果要**如实回报**进答案正文:注入悄悄失败的话,整个 W11 会变成一条空绿断言
+            // (什么都没坏,于是"没删代码"当然成立)。
+            try {
+              const gf = path.join(process.cwd(), ".git");
+              // ⚠️ 必须**先删再建**:Windows 上 worktree 的 .git gitfile 带隐藏属性,
+              // 直接 writeFileSync(flag "w") 打开隐藏文件会 EPERM —— 注入会悄悄失败。
+              fs.rmSync(gf, { force: true });
+              fs.writeFileSync(gf, `gitdir: ${path.join(process.cwd(), "__no_such_gitdir__")}\n`, "utf8");
+              note += " BREAK_OK";
+            } catch (e) { note += ` BREAK_FAILED:${e.message}`; }
+          }
+          // writeturn-commit / writeturn-detach:模拟**agent 自己动 git**。很多编码后端会自己
+          // `git commit`;这时收工作区那边的暂存区是空的,把它当成"零改动"就会把它刚提交的成果
+          // 连同分支一起删掉。detach 更进一步:提交完再把 HEAD 切走,交付物就不在我们声称的分支上了。
+          // 注入结果同样**如实回报**进正文 —— 注入悄悄失败会让整条用例变成空绿。
+          if (MODE === "writeturn-commit" || MODE === "writeturn-detach") {
+            const gg = (args) => execFileSync("git", args, { cwd: process.cwd(), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+            try {
+              gg(["add", "-A"]);
+              gg(["-c", "user.name=fake-agent", "-c", "user.email=fake@agent.local",
+                  "commit", "--no-verify", "-m", "agent's own commit"]);
+              note += " SELFCOMMIT_OK";
+              if (MODE === "writeturn-detach") {
+                gg(["checkout", "--detach", "HEAD"]);
+                note += " DETACH_OK";
+              }
+            } catch (e) { note += ` SELFCOMMIT_FAILED:${e.stderr || e.message}`; }
+          }
+          // 并发观测用:把这一轮拖长,好让测试有窗口采样到"两棵工作树同时存在"
+          const delay = Number(process.env.FAKE_OMP_WRITE_DELAY_MS || 60);
+          setTimeout(() => {
+            say({ type: "message_update", message: { type: "text_delta", delta: `WRITETURN ${note} cwd=${process.cwd()}` } });
+            say({ type: "turn_end" });
+            say({ type: "agent_end" });
+          }, Number.isFinite(delay) && delay >= 0 ? delay : 60);
         } else if (MODE === "echoturn") {
           // Echo the received prompt back as the answer, so a test can confirm the exact prompt body
           // (e.g. a message_file's content) reached the backend.

@@ -53,12 +53,22 @@ import { withBridge, runNode, normalizeSpec, UsageError, STATUS_EXIT } from "./n
 | `model` | | 后端认的型号名(omp 要 `provider/名` 全限定;cursor 要带档位后缀) |
 | `effort` | | 思考强度(**kimi/cursor 会忽略**) |
 | `roleFile` | | 角色设定文件(注入为追加 system;cursor/kimi 是软注入,首轮用户前缀) |
-| `access` | | v1 **只能是 `"read"`**,传别的当场报错 |
+| `access` | | `"read"`(默认)或 `"write"`。**`write` 恒定跑在自己的 git worktree 里**,`cwd` 传仓库根目录即可 |
+| `baseRef` | | **仅 write**(默认 `"HEAD"`):worktree 基于哪个提交。read 环节传它当场报错 |
+| `allowDirtyBase` | | **仅 write**(默认 `false`):主树有未提交改动时是否放行。默认拒绝并列出节点看不到哪些文件 |
 | `schema` | | 强制输出格式,**仅 codex**;传给别人当场报错 |
 | `outputShape` | | 弱检查,如 `{ requiredKeys: ["findings"] }`——只查能否 parse + 顶层键在不在 |
 | `reask` | | `0` 或 `1`(默认 1):格式不合格时打回重说几次。**全系统唯一的 retry** |
-| `force` | | 覆盖已存在的回执 |
+| `force` | | 覆盖已存在的回执;write 环节还会覆盖同名分支/残留 worktree |
 | `reuseIfSame` | | 回执已存在且**指纹一致**就复用;指纹变了报错 |
+
+### `withBridge` / `startBridge` 的选项
+
+| 选项 | 默认 | 说明 |
+|---|---|---|
+| `maxConcurrent` | `4` | 同时在跑的环节上限。**超限的 `runNode` 自动排队**(不报错、不用改写法),别自己再搓限流。计时**从拿到闸之后**才起算,排队不算进 `timeoutMs` |
+| `env` | — | 附加环境变量(传给桥进程) |
+| `bridgePath` | 自动定位 | 桥脚本路径 |
 
 ### 回执(runNode 的返回值)
 
@@ -78,16 +88,99 @@ import { withBridge, runNode, normalizeSpec, UsageError, STATUS_EXIT } from "./n
   "scene": null,                                // 非正常收场才有:{dir, files:[session.log, answer.txt, status.json]}
   "sessionId": "codex-…",
   "abortConfirmed": null,                       // 超时路径才有:桥**确实回报**打断了才是 true
-  "closeConfirmed": true                        // 关会话是否被桥确认(不是"没抛异常就算成")
+  "closeConfirmed": true,                       // 关会话是否被桥确认(不是"没抛异常就算成")
+  "access": "read",
+  "workspace": null                             // read 恒为 null;write 见下
 }
 ```
 
+write 环节的 `workspace` 块:
+
+```jsonc
+"workspace": {
+  "mode": "worktree",
+  "path": "<repo>/.graph/wt/<runKey>/<id>",     // 已删除,仅供追溯
+  "branch": "graph/<runKey>/<id>",              // **保留**给你合并;没有改动时为 null(空分支已清掉)
+  "outcome": "delivered",                       // ← **唯一权威结论**,见下
+  "baseCommit": "a3f9…", "headCommit": "7c21…",
+  "changesKnown": true,                         // 我们**确知**这棵树里有没有改动;false = git 探测失败
+  "committed": true,
+  "filesChanged": [{ "status": "M", "path": "src/auth.ts" }],   // 基线→HEAD 的**全部**改动
+  "diffPath": "<outDir>/nodes/<id>.diff",
+  "diffSha256": "b1946a…",                      // diff 的内容指纹,复用前比对
+  "removed": true                               // worktree 是否已删掉
+}
+```
+
+`runKey` = **outDir 的目录名 + 它全路径的 8 位指纹**。只用目录名的话,`…/a/run-1` 与 `…/b/run-1`
+会算出同一条分支和同一棵工作树:默认会撞出报错(还算安全),但只要一边带 `force:true`,
+就会把另一边**正在写**的树连同分支一起删掉。
+
+**`outcome` 是唯一权威结论**,调用方一律只看它,别自己拿 `committed` + `filesChanged` 再推一遍
+（同一件事在两处各推一次,迟早推出两种结论）:
+
+| `outcome` | 含义 | 环节状态 |
+|---|---|---|
+| `delivered` | 改动已提交到本环节分支,且 head / 改动清单 / diff / diff 摘要**四样齐全** | 可以是 `ok` |
+| `no-changes` | **确知**一个字都没改(索引为空 **且** HEAD 仍在基线上) | 可以是 `ok` |
+| `unknown` | 其余一切:git 探测失败、提交失败、交付物残缺、agent 自己把 HEAD 切走了 | 降级为 `unknown` |
+
+**worktree 只在两个前提都满足时才删**:①`outcome` 明确(`delivered` 或 `no-changes`)②**后端确定不会再写**
+(关会话被确认，或桥**明确回报**会话没建起来)。缺任一就**保留目录**并在 `diagnostics` 里说明
+——留着只是脏，删错了是丢代码。`no-changes` 还会顺手删掉那条指向基线的空分支；`delivered` **保留分支**。
+
+⚠️ **`outcome` 不明时,顶层状态一律降级成 `unknown` —— 不限于原本是 `ok` 的情况。**
+`backend_failed` / `timeout` 在本工具的契约里是"可以安全换个人重跑"；而重跑通常带 `force`，
+`force` 会把**正因为说不清才被保留下来**的那棵工作树连同分支一起删掉。工作区状态不明时还宣称"可安全重跑"，
+等于亲手安排了一次数据销毁。原始结局记进 `diagnostics`，信息不丢。
+
+⚠️ **提交之后还要再看一眼。** `--no-verify` 只跳过 pre-commit 和 commit-msg，**挡不住 post-commit**：
+钩子可以在我们清点完之后继续改工作树、甚至切走 HEAD，而紧接着就是 `worktree remove --force`。
+所以本工具自己的那次 commit 会把 `core.hooksPath` 指到不存在的目录（让"不跑钩子"是完整的），
+并在提交后复查「工作区干净」与「HEAD 仍在本环节分支上」，任一不成立就 `unknown` + 保留，**绝不自动再提交一次**。
+
+> ⚠️ 「没拿到 sessionId」**不等于**「后端没起来」:请求可能已经发出、会话真建起来了,只是响应超时或断管。
+> 判据用的是 open 这一步的结局(`refused` / `not-attempted` 才算静默),不是 `sessionId === null`。
+
+⚠️ **两个"零改动"的陷阱,都会导致静默丢代码**:
+- `changesKnown:false`(git 探测失败)时列出来的改动同样是空 —— 把"不知道"当成"没有",就会把
+  已经写出来的代码连同分支一起删掉。
+- agent **自己 `git commit`** 过时,`git add -A` 之后暂存区也是空的 —— 所以「零改动」必须**同时**
+  证明"索引为空"和"HEAD 还在基线上"。它自己提交过是正常的,交付按**基线→HEAD 的全部**算。
+
+⚠️ **`git add -A` 不是"天然安全"**:agent 在工作树里留下的**一切未被 gitignore 的东西**都会进提交并出现在
+diff 里——跑测试产生的 `coverage/`、临时文件、它自己写的 `.env` 都算。这是刻意的（它新建的文件通常正是产物），
+但意味着**仓库的 gitignore 不全时会有噪声甚至敏感文件入库**。所以 `filesChanged` 一定要看，合并前自己过一遍 diff。
+
 **指纹(`specHash`)算的是**:agent / model / effort / access / cwd / 提问原文 / 角色文件内容 /
-`schema` / `outputShape` / **`timeoutMs`** / **`reask`** —— 凡是会改变执行结局的都算在内
+`schema` / `outputShape` / **`timeoutMs`** / **`reask`** / **`baseRef`** —— 凡是会改变执行结局的都算在内
 (否则"上次 1 秒超时、这次给 60 秒"会被当成同一个任务直接复用旧失败)。键序无关。
+⚠️ `allowDirtyBase` **不进指纹**:它只决定要不要拒绝开跑,跑起来之后不影响结果。
 
 **复用(`reuseIfSame`)的闸门**:回执版本对得上 → 指纹一致 → 上次是 `ok` → 产出路径就是本次算出的那个
-→ 产出存在且非空 → 内容 SHA-256 与回执一致。任一不满足都拒绝复用并说明原因。
+→ 产出存在且非空 → 内容 SHA-256 与回执一致。**write 环节还要再过几道**:主工作区干净(同真跑) →
+`baseCommit` 没变 → 按 `outcome` 分派:
+- `delivered`:先查**字段齐不齐**(`branch`/`headCommit`/`diffPath`/`diffSha256`),再查**对不对**
+  (分支名与 diff 路径必须等于本次算出来的那个、分支仍指向回执记的 `headCommit`、diff 文件内容与摘要一致)。
+  顺序不能反 —— 先做等值比较的话,缺字段会被报成"不一致",把"上次就没写完"说成"有人动过你的文件"。
+- `no-changes`:必须坐实 `changesKnown:true` 且 `filesChanged` 确实为空。
+- **其余一切(含缺这个字段)一律拒绝**。
+
+任一不满足都拒绝复用并说明原因。
+
+> write 这几道都不是多余的:
+> - **脏树闸也管复用**:否则同一个脏工作区下,真跑会被拒、复用却照样交货,而调用方分不出这两种情况。
+>   复用出来的结果同样是对着 HEAD 做的、同样看不见那些未提交改动。
+> - **`baseCommit`**:`baseRef` 通常是 `"HEAD"`,今天和上周解析到两个 commit,而指纹里只有字符串
+>   `"HEAD"`——一模一样。不比对就会把"对着上周代码改出来的 diff"当成这次的结果。
+> - **分支与 diff**:write 环节的**交付物是分支和 diff**,不只是那段文字。只校验文字产出的 sha 就复用,
+>   等于宣称"上次那份改动还在"——而分支可能早被 `git branch -D` 掉了,diff 文件可能被换过。
+>   这与 `artifactSha256` 是同一个道理,不能只做一半。
+> - ⚠️ **字段缺失 = 拒绝,不是跳过**。写成 `if (pw.diffPath) { …校验… }` / `if (pw.committed) { … }`
+>   会让"回执里没这个字段"静默绕过校验,而**字段缺失恰恰说明上次收尾出过问题**(diff 没导出成、
+>   `rev-parse` 失败),正是最该拦住的那种回执。这个坑本仓踩过**三次**(`artifactSha256`、`diffPath`、
+>   `committed`),所以现在改成**按 `outcome` 的字面量分派** —— 缺字段的回执连不上任何一个分支,
+>   只能落到"拒绝"那一档,结构上就没有"跳过"这条路。
 
 **`runNode` 只为用法错抛异常**(`UsageError`);环节失败一律进 `status`,因为"挂了怎么办"是策略、归调用方。
 
