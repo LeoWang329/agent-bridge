@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 // 示例:异构分头查 → 过滤 → 换引擎汇总。**可直接跑**,也是本 skill 的真跑 e2e。
 //
-//   node examples/hetero-audit.mjs <要审计的目录> [--agents codex,omp,claude] [--out <目录>]
+//   node examples/hetero-audit.mjs <要审计的目录> [--agents codex,omp,claude] [--out <目录>] [--viz]
+//
+// 带 --viz 会顺手开一个**只读**的本地观测台,地址打在 stderr 上。它只是一块屏幕:
+// 看不看它,这段脚本照跑;关掉浏览器也不影响任何环节。
 //
 // 这段脚本本身就是"graph 工程"该长的样子:
 //   · 扇出/等齐  = Promise.all(JS 自带,不用我们发明)
@@ -23,7 +26,12 @@ function parseArgs(argv) {
   const out = { _: [] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a.startsWith("--")) { out[a.slice(2)] = argv[++i]; } else { out._.push(a); }
+    if (a.startsWith("--")) {
+      // 开关(`--viz`)与带值的参数(`--out x`)混在一起时,不能一律把下一个 token 当值:
+      // `--viz --out D:/x` 会让 --viz 把 --out 吃掉,而且**不报错**。
+      const next = argv[i + 1];
+      out[a.slice(2)] = (next === undefined || next.startsWith("--")) ? true : argv[++i];
+    } else { out._.push(a); }
   }
   return out;
 }
@@ -34,6 +42,8 @@ const AGENTS = (args.agents || "codex,omp,claude").split(",").map((s) => s.trim(
 const OUT_DIR = path.resolve(args.out || path.join(TARGET, ".graph", `run-${Date.now()}`));
 // 单个环节的上限。短的是「单次请求」不是任务本身 —— 内核内部会按 5 分钟切片反复 wait。
 const PER_NODE_TIMEOUT_MS = Number(args["timeout-ms"] || 900000);
+// --viz 是个开关,不带值 —— parseArgs 会把下一个位置参数吃掉当值,所以这里只判"在不在"。
+const VIZ = "viz" in args;
 
 // 每家查一个不同的角度 —— 异构的价值在"不同脑子看不同地方",不是同一个问题问三遍
 const ANGLES = [
@@ -69,6 +79,7 @@ if (!SUMMARIZER || AGENTS.includes(SUMMARIZER)) {
 }
 
 const result = await withBridge(async (bridge) => {
+  if (VIZ && bridge.vizUrl) console.log(`[viz] 观测台 ${bridge.vizUrl}(只读,本机,关掉也不影响运行)`);
   // 开跑前先体检(便宜)。注意 doctor 只查版本号,不验登录,过了也可能起不来。
   const doc = await bridge.doctor();
   console.log(`[doctor]\n${(doc?._raw || JSON.stringify(doc)).trim()}\n`);
@@ -117,7 +128,12 @@ const result = await withBridge(async (bridge) => {
     prompt:
       `只读任务(**不要修改任何文件**)。下面几份文件是几个不同引擎对同一个仓库的独立审计结果,` +
       `**请自己读这些文件**(别等我贴内容):\n` +
-      ok.map((a) => `  - ${a.artifactPath}(来自 ${a.agent})`).join("\n") +
+      // ⚠️ 用**相对 cwd 的路径**,不是回执里那个绝对路径。两个原因,第二个才是关键:
+      //   ① 被委托方与我们共享 cwd,相对路径一样打得开,还短;
+      //   ② 依赖推断**只认相对形式** —— 绝对路径被当成"指向另一个 out-dir",于是不成边。
+      //      贴绝对路径的话,这次运行在观测台上就是一堆**互不相连**的方块:
+      //      汇总明明读了那两份产出,图上却看不出来。
+      ok.map((a) => `  - ${path.relative(TARGET, a.artifactPath).replace(/\\/g, "/")}(来自 ${a.agent})`).join("\n") +
       `\n\n请输出:\n` +
       `  1) **多家共同点名**的问题(这些最可能是真的)——逐条给文件:行号 + 一句话\n` +
       `  2) 只有一家提到、但你读完代码认为**确实成立**的问题\n` +
@@ -132,7 +148,7 @@ const result = await withBridge(async (bridge) => {
     summarizer: SUMMARIZER,
     summary: { status: summary.status, path: summary.artifactPath, chars: summary.charCount },
   };
-});
+}, { viz: VIZ, outDir: OUT_DIR });
 
 console.log(`\n[done]\n${JSON.stringify(result, null, 2)}`);
 if (result.summary?.path) {

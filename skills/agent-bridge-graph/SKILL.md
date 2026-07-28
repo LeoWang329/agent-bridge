@@ -271,6 +271,11 @@ bridge.runNode({ id: "implement", agent: "claude", cwd: REPO, outDir,
 <out-dir>/nodes/<id>.t-<key>.md      ← **每一轮**的完整产出
 <out-dir>/nodes/<id>.t-<key>.scene/  ← 那一轮的现场(只有非正常收场才有)
 <out-dir>/nodes/<id>.receipt.json    ← **仍然只有一张**:kind:"conversation" + turns[]
+
+开了 viz 之后多一份**这一次运行自己的归档**(上面那些是 canonical 区,会被同 id 重跑覆盖;
+这里是快照,不会):
+<out-dir>/nodes/.runs/<graphId>/transcript.jsonl        ← 事件流(页面的唯一数据源)
+<out-dir>/nodes/.runs/<graphId>/<seq>-<id>/…            ← 那一刻的输入、产出、diff、现场
 ```
 
 **对话的回执顶层没有逐轮字段**(`artifactPath`/`charCount`/… 全在 `turns[]` 里),
@@ -287,11 +292,53 @@ bridge.runNode({ id: "implement", agent: "claude", cwd: REPO, outDir,
 与回执记录一致**(防文件被换过)、write 环节还要**基线 `baseCommit` 没变**。**没有这些,就会把上一版任务的
 结果当成这一版——静默出错,最难查的一类。**
 
+## 看运行:观测台(`viz`)
+
+`withBridge` 传 `{ viz: true }` 就会起一个**只读**的本地网页,把这次运行画出来:图/时间轴、每个环节的
+输入与产出、每一轮、每一次尝试、write 环节的分支与 diff。地址在 `bridge.vizUrl`,也会打印到 stderr。
+
+```js
+await withBridge(async (b) => { … }, { viz: true, outDir });
+//  [viz] 观测台 http://127.0.0.1:53211/  (graph 9f1d…)
+```
+
+**它只是一块屏幕**:没有暂停、重跑、改参数、合分支 —— 一个操作按钮都没有。看不看它,运行照跑。
+
+几条会影响你怎么用它的口径:
+
+- **一个 `withBridge` = 一个 graph = 一个页面。** 同一个 `outDir` 跑第二个 `withBridge`,
+  是**另一个**页面、另一份记录。**不提供跨波全貌** —— 分波跑的流程要自己在几个页面之间对照。
+- **本机、只读、不出网**:HTTP 只听 `127.0.0.1`,`/file` 只放行**这一次运行自己的归档目录**
+  (canonical 产出区都在放行范围之外)。**页面上的内容不会发到任何地方。**
+  但它是一个**没有鉴权**的本地端口:同机器上的其它进程能读到这次运行的全部产出。
+  跑敏感内容时按这个口径判断要不要开。
+- **viewer 不写任何 pid / state 文件**,判活只有一条合同:它与 `withBridge` 之间那条管道。
+  你的脚本一结束(哪怕是被强杀),页面上会**如实**说"没有观测到正常收尾",而不是装作还在跑。
+- **进度是"没看到"不是"没有"**:被中断时页面标 `abandoned`,意思是**观测者没有看到终态** ——
+  工作副本、分支、锁往往都还在,不是"结果永远拿不到了"。
+- **推断的依赖画成虚线**,声明的画成实线。虚线是**系统按文件名猜的**,点开有依据。别当事实用。
+
+⚠️ **回执升到了 v2,既有回执全部失去复用资格。** `reuseIfSame` 认的是 `RECEIPT_VERSION`,
+v1 的回执**一律不复用**(不是报错,是当成没有)。所以升级后第一次跑,**上一批产出会全部重跑一遍** ——
+这是一次性代价,心里有数就行;不想付就换个 `outDir`,把旧的留在原地。
+
+离线看一眼它长什么样(不起桥、不花钱):
+
+```sh
+VIZ_OUT_DIR=skills/agent-bridge-graph/viz/sample VIZ_GRAPH_ID=gr-sample-main VIZ_PORT=8080 \
+  node skills/agent-bridge-graph/viz/serve.mjs
+```
+
+事件流的合同全文在 `skills/agent-bridge-graph/EVENTS.md`(**对外接口文档**,页面照它写)。
+
 ## 这一版明确不做
 
-不做通用流程引擎(plan/DAG 格式、依赖解析、调度器)· 不做可视化 ·
+不做通用流程引擎(plan/DAG 格式、依赖解析、调度器)·
 不做跨程序断点续跑(但**分波 + `reuseIfSame` 已经能当续跑用**,见写法三)· 不改 dev / roundtable / loop ·
 **不做运行中途找人/找主 agent 确认**(见下)。
+
+观测台这一侧也有几条明确不做:**页面只读**(不提供暂停/重跑/改参数/合分支)· 不做"重开旧 run"的入口 ·
+不做跨波聚合与多 run 对比 · **不做按轮重跑**(复用粒度就是整个环节)。
 
 ⚠️ **别把"不做流程引擎"读成"不支持循环和分支"**——你自己那段 JS 里爱怎么 `for`、怎么 `if` 都行。
 不做的是"替你把循环分支抽象成一套通用格式"那件事。
@@ -311,4 +358,8 @@ bridge.runNode({ id: "implement", agent: "claude", cwd: REPO, outDir,
 ```sh
 node docs/repro-mcp-hang/repro-graph-node.mjs        # 环节生命周期 / 失败三档 / 幂等 / 零残留
 node docs/repro-mcp-hang/repro-graph-worktree.mjs    # write 隔离 / 基线闸 / 复用闸 / 并发闸
+node docs/repro-mcp-hang/repro-viz-events.mjs        # 事件 writer:schema / 有界化 / 半行安全
+node docs/repro-mcp-hang/repro-viz-graph.mjs         # graph 作用域与归档写入器
+node docs/repro-mcp-hang/repro-graph-viz.mjs         # viz 开着时的事件流 / SSE / /file 四道闸
+node skills/agent-bridge-graph/viz/test-viz.mjs      # 页面这一侧:事件流 → 页面上写了什么
 ```
