@@ -255,6 +255,27 @@ async function c6() {
   } catch (e) { got = e; }
   // ⚠️ 零轮检查只是兜底诊断,回调已经抛出的异常才是根因 —— **兜底不许盖根因**
   ok("抛的是回调那个异常对象本身", got === boom, String(got?.message));
+
+  // ── C6b「调过 turn() 但被吞了」≠「一轮都没调」──────────────────────────────────
+  // 回调把入场用法错静默吞掉时,turns[] 同样是空的,可"编排空转"是**假话** —— 它起过,
+  // 只是参数写错了。两者处置完全不同(去看那次 turn() 的参数 vs 去看编排为什么空转),
+  // 所以运行时必须独立记账 turnCalls,而不是拿 turns.length 反推。
+  // 这也是 EVENTS.md 事件层分 zero-turn / turn-validation 两档的唯一依据。
+  console.log("\n[C6b] 回调吞掉 turn() 的用法错:不许谎报成「一轮都没调」");
+  let msg = null;
+  try {
+    await withBridge(async (b) => b.conversation(
+      spec({ id: "cv3", outDir }),
+      async (turn) => {
+        try { await turn({ key: "bad/key", prompt: "x", timeoutMs: 30000 }); } catch { /* 吞掉 */ }
+        try { await turn({ key: "also bad", prompt: "x", timeoutMs: 30000 }); } catch { /* 再吞一次 */ }
+      },
+    ), { env: env("okturn") });
+  } catch (e) { msg = e?.message ?? ""; }
+  ok("★ 没说成「一次 turn() 都没调」", !/一次 turn\(\) 都没调/.test(msg), msg?.slice(0, 90));
+  ok("★ 说出了调过几次", /调用了 2 次 turn\(\)/.test(msg), msg?.slice(0, 90));
+  ok("★ 带上了最后一次的真实原因", /also bad/.test(msg), msg?.slice(0, 160));
+  ok("同样不写空回执", !readReceipt(outDir, "cv3"));
 }
 
 // ── C8 回调炸 ──────────────────────────────────────────────────────────────────

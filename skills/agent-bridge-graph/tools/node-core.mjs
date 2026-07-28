@@ -1164,6 +1164,9 @@ export async function prepareRun(bridge, rawSpec, { kind = "node" } = {}) {
     turns: [],
     poisonedAfter: null,
     turnKeys: new Set(),
+    turnCalls: 0,            // 回调调用过几次 turn()。**与 turns.length 是两回事**:入场被拒的
+                             // 那几次不进 turns[],但它们证明"编排不是空转"。
+    lastAdmissionError: null, // 最后一次死在参数校验上的用法错(回调吞了它时,收尾还得说得出话)
     activeTurn: false, // §3.1 串行闸:同步查+置位,不许有第二轮同时进来
     sealed: false,     // fn 返回后封 admission
     diffPath: path.join(nodesDir, `${spec.id}.diff`),
@@ -2253,6 +2256,11 @@ async function conversationBody(bridge, rawSpec, fn) {
   //    否则调用方忘了 await 的那次拒绝会变成 unhandled rejection 把整个进程打死 ——
   //    一个用法错不该有这种杀伤力,而且它会在收尾跑完之前就把锁和工作树留在盘上。
   const turn = (raw) => {
+    // 「回调调用过 turn() 吗」必须**独立于「有没有一轮跑起来」**记账:回调完全可以把入场异常
+    // 吞掉(`try { await turn(...) } catch {}`),那时 `run.turns` 仍是空的,但"编排一轮都没起过"
+    // 是**假话** —— 它起过,只是参数写错了。两者的处置完全不同(一个去看那次 turn() 的参数,
+    // 一个去看编排那段 JS 为什么空转),所以下面收尾时要能分辨。
+    run.turnCalls += 1;
     // ── 同步闸区:这一段到 `run.activeTurn = true` 之间**一个 await 都没有**,
     //    JS 又是单线程 ⇒ "查 + 置位"是原子的。
     //    ⚠️ 谁也别往中间插 await(比如把校验改成 `await validate(...)`)—— 那会当场废掉这道闸,
@@ -2276,7 +2284,13 @@ async function conversationBody(bridge, rawSpec, fn) {
     run.activeTurn = true;
     // ── 同步闸区结束 ──
     const p = (async () => {
-      const t = normalizeTurn(run, raw); // 到这里都还没有任何副作用
+      let t;
+      try {
+        t = normalizeTurn(run, raw); // 到这里都还没有任何副作用
+      } catch (e) {
+        run.lastAdmissionError = e; // 回调若把它吞了,收尾还得说得出是哪一项写错了
+        throw e;
+      }
       run.turnKeys.add(t.key);
       return prev ? await replayTurn(run, t, prev) : await liveTurn(run, t);
     })();
@@ -2317,6 +2331,15 @@ async function conversationBody(bridge, rawSpec, fn) {
     if (run.turns.length === 0) {
       // ⚠️ 回调已经抛出的异常才是根因,零轮检查只是"你什么都没干"的兜底诊断 —— **兜底不许盖根因**。
       if (threw) throw callbackError;
+      // 两种「零轮」的处置完全不同,所以报两句不同的话(事件层据此分 zero-turn / turn-validation)。
+      if (run.turnCalls > 0) {
+        throw new UsageError(
+          `这段对话调用了 ${run.turnCalls} 次 turn(),但没有一轮进得去 —— 每次都死在参数校验上,` +
+          `而回调把异常吞了(\`try { await turn(...) } catch {}\`),于是外面什么都没看见。\n` +
+          `最后一次失败的原因是:${run.lastAdmissionError?.message ?? "(没记到)"}\n` +
+          `⚠️ 别在回调里静默吞 turn() 的用法错 —— 那会让"参数写错了"看起来像"编排空转"。`,
+        );
+      }
       throw new UsageError(
         "这段对话一轮都没跑(回调一次 turn() 都没调)。**不写空回执** —— " +
         "一张 turns:[] 的回执会让下次的复用闸面对一个没有任何判据的对象。",
