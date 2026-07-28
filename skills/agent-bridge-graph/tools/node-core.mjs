@@ -40,6 +40,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { performance } from "node:perf_hooks";
+import { AsyncLocalStorage } from "node:async_hooks";
 
 export const RECEIPT_VERSION = 1;
 
@@ -308,13 +309,30 @@ export function normalizeSpec(raw, { kind = "node" } = {}) {
   return s;
 }
 
+/** 把「要发出去的那段正文」**在算指纹的同一刻定死**,之后一律发这份字节。
+ *
+ *  ⚠️ 这不是优化,是修一条**确定性的错误复用**:指纹在规范化那一刻按内容 A 算好,
+ *  而 `message_file` 发的是**路径**——桥要到几个 await 之后(拿闸、建工作树、开会话)才去读它。
+ *  这中间调用方把文件改成 B、跑完再改回 A,回执里就成了「指纹 H(A) + 产出是 B 的答案」;
+ *  下次拿着 A 来复用,指纹、路径、SHA 全对得上,于是**把 B 的答案当成 A 的结果交出去**。
+ *  静默、可稳定复现,而且正是本工具存在的理由那一类错。
+ *
+ *  ⚠️ 为什么不"把文件复制一份快照再发那个路径":桥要求 `message_file` **必须在会话 cwd 里面**。
+ *  read 档的 cwd 就是用户的工作区(往里写盘直接破了只读的承诺),write 档的 cwd 是 worktree
+ *  (写进去会混进这次的 diff)。两边都不能写 —— 所以正确的做法是**根本不发路径,发字节**。 */
+function freezePromptBody(o, what) {
+  if (!o.promptFile) return o.prompt;
+  try { return fs.readFileSync(o.promptFile, "utf8"); }
+  catch (e) { throw new UsageError(`读 ${what} 失败:${e.message}`); }
+}
+
 /** 输入指纹:决定「这张旧回执记的,是不是当前这份任务单的结果」。
  *  少了它,改了 prompt/模型后重跑会把上一版结果当成这一版 —— 静默出错,最难查的一类。
  *  **凡是会改变执行结局的字段都要进指纹**(含 timeoutMs / reask:超时时长和重说次数都会改变结局)。 */
 function computeSpecHash(s) {
-  let promptBody, roleBody = "";
-  try { promptBody = s.promptFile ? fs.readFileSync(s.promptFile, "utf8") : s.prompt; }
-  catch (e) { throw new UsageError(`读 promptFile 失败:${e.message}`); }
+  let roleBody = "";
+  // ⚠️ 读一次、存下来、以后就发这一份 —— 见 freezePromptBody 里那条错误复用路径。
+  const promptBody = s.promptBody = freezePromptBody(s, "promptFile");
   if (s.roleFile) {
     try { roleBody = fs.readFileSync(s.roleFile, "utf8"); }
     catch (e) { throw new UsageError(`读 roleFile 失败:${e.message}`); }
@@ -503,7 +521,6 @@ export async function startBridge(opts = {}) {
     _activeNodes: state.activeNodes,
     _gate: gate,
     _scopeGate: scopeGate,
-    _inConversation: false, // 嵌套 conversation 会在对话闸上成环 —— 同步标记,当场拒
     doctor: (timeoutMs = RPC_TIMEOUT_MS) => callTool("agent_bridge_doctor", {}, timeoutMs),
     runNode: (spec) => runNode(bridge, spec),
     conversation: (spec, fn) => conversation(bridge, spec, fn),
@@ -1401,8 +1418,9 @@ async function checkReuse(run) {
       throw new UsageError(`回执说是对话且成功,却没有 turns[] —— 没有任何可比对的判据:${receiptPath}。要重跑请加 force。`);
     }
     // 逐轮的产出与指纹在回放时一轮一轮比对(见 replayTurn),这里只坐实整段的前提。
-    // write 的那几道闸对两档是同一套,继续往下走。
-    if (spec.access !== "write") return { ...prev, reused: true };
+    // ⚠️ 下面那段节点级的产出校验对**对话**不适用(对话回执顶层压根没有 artifactPath),
+    // 所以走 else 跳过它;而 write 的那几道闸(基线没漂、分支还在、diff 没被换)两档共用同一套,
+    // 就在这个 if/else 之后 —— **不在这里提前 return**,那会变成"同一个结论两个出口"。
   } else {
   // 产出还在不在?回执说 ok 但文件被删/被截断的话,复用就是在骗下游。
   // 而且产出路径必须就是**本次算出来的**那个,不能听信回执里写的任意路径。
@@ -1611,6 +1629,8 @@ export async function runTurn(run, t) {
         // ⚠️ 隔离的是写:桥没有 OS 沙箱,有 shell 的环节技术上仍能 `../..` 读回主工作区。
         cwd: run.workspace ? run.workspace.path : spec.cwd,
         access: spec.access,
+        // 结果走 textRef + cp,不把几 MB 正文塞进 JSON-RPC 管道
+        return_mode: "ref",
         name: `graph-${spec.id}-${spec.specHash.slice(0, 6)}`,
       };
       if (spec.model) openArgs.model = spec.model;
@@ -1652,8 +1672,8 @@ export async function runTurn(run, t) {
       // --- 发消息(默认非阻塞,立刻拿 ack)
       const msgArgs = { session_id: run.sessionId };
       if (attempt === 0) {
-        if (t.promptFile) msgArgs.message_file = t.promptFile;
-        else msgArgs.message = t.prompt;
+        // **发的就是算指纹时冻下来的那份字节**(不发 message_file 那条路径,见 freezePromptBody)
+        msgArgs.message = t.promptBody;
       } else {
         msgArgs.message =
           `上一条回复不符合约定的输出格式:${lastReason}\n` +
@@ -1827,14 +1847,17 @@ export async function runTurn(run, t) {
  *
  * 现场已经在 `settleTurn` 里冻过了,这里**不再补取**。
  */
-export async function finalizeRun(run, { callbackError = null } = {}) {
+export async function finalizeRun(run, { callbackError = null, callbackThrew = false } = {}) {
   const { spec, receipt } = run;
   if (run.isConv) {
     receipt.turns = run.turns;
     receipt.poisonedAfter = run.poisonedAfter;
     receipt.status = worstTurnStatus(run.turns);
-    if (callbackError) {
-      const detail = `${callbackError?.name || "Error"}:${callbackError?.message || String(callbackError)}`;
+    // ⚠️ 判据是**抛没抛**,不是"抛出来的东西真不真"。写成 `if (callbackError)` 时
+    // `throw null` / `throw 0` / `throw ""` 会让这段整个跳过 —— 于是一次崩掉的编排
+    // 落下一张 `status:"ok"` 的回执,下次 reuseIfSame 还会命中它。
+    if (callbackThrew) {
+      const detail = describeThrown(callbackError);
       if (receipt.status === "ok") {
         // 全轮都成了、回调自己炸了 —— 绝不能落一张 ok 回执:那等于把一次崩掉的编排缓存起来,
         // 下次 reuseIfSame 还会命中它。
@@ -1851,6 +1874,12 @@ export async function finalizeRun(run, { callbackError = null } = {}) {
   // 这一轮**自己**的结局。下面工作区那道闸可能把 receipt.status 改写成 unknown,
   // 而回执写失败时报的"原始结局"说的是改写**之前**那个 —— 先存下来,别事后去读已经被改过的值。
   const turnStatus = receipt.status;
+  // ⚠️ **收尾自己出错也绝不能把异常抛出去。** 旧版所有 `finish(...)` 都在那个大 catch 里面,
+  // 收尾抛错会被接住、再走一次 `finish("unknown")`,最终**仍然落一张回执**。
+  // 抽取之后 finalize 跑在 catch 外面,不包这一层就成了"抛异常 + 没有回执" ——
+  // 既改了 `runNode` 的既有行为,也破了"只有用法错才抛"这条对外合同。
+  // (`finalizeWorktree` 是这里唯一真会抛的一步:close 与 writeAtomic 各自内部已经接住了。)
+  try {
   await run.closeSession();
   // 收工作区排在**关会话之后**:后端进程还活着时它可能还握着 worktree 里的文件句柄,
   // Windows 上那会让 `git worktree remove` 直接失败。
@@ -1897,6 +1926,14 @@ export async function finalizeRun(run, { callbackError = null } = {}) {
       receipt.error = `${receipt.error ? `${receipt.error};` : ""}write 环节的交付物没能确认落到分支上` +
         `(outcome=${rest.outcome})——工作区已保留:${rest.path},详见 diagnostics`;
     }
+  }
+  } catch (e) {
+    // 分不清收尾走到哪一步就断了 ⇒ 按 unknown 停下等人,**绝不**报成"可安全重跑"
+    // (重跑常带 force,而 force 会把可能刚保留下来的工作树连同分支一起删掉)。
+    receipt.status = "unknown";
+    receipt.error = `收尾时出错(${e?.name || "Error"}:${e?.message || String(e)});原始结局=${turnStatus}` +
+      (receipt.error ? `;${receipt.error}` : "");
+    receipt.diagnostics.push(`收尾异常:${e?.stack || e}`.slice(0, 2000));
   }
   receipt.endedAt = nowIso();
   // ⚠️ 用**环节**的起点(首轮起钟那一刻),不是最后一轮的 t0 —— 多轮时后者只算得出最后一轮的耗时。
@@ -1972,7 +2009,7 @@ export async function runNode(bridge, rawSpec) {
   try {
     await runTurn(run, {
       key: "main",
-      prompt: run.spec.prompt, promptFile: run.spec.promptFile,
+      prompt: run.spec.prompt, promptBody: run.spec.promptBody,
       timeoutMs: run.spec.timeoutMs,
       schema: run.spec.schema, outputShape: run.spec.outputShape, reask: run.spec.reask,
     });
@@ -1996,12 +2033,45 @@ export async function runNode(bridge, rawSpec) {
  *  20 对"复审→修订"这类用法足够宽(实测 2~6 轮)。 */
 const MAX_TURNS = 20;
 
+/** 「我此刻是不是在某段对话的回调里」——**必须是调用上下文,不能是一个全局标志**。
+ *
+ *  ⚠️ 用桥级布尔写过一版,两个方向都是错的(复审当场抓出、C17 能稳定复现):
+ *   - **兄弟对话被误判成嵌套**:`A` 进了回调把标志置上,平级的 `B` 一来就被拒 ——
+ *     而"要并行就开多段对话"正是本设计给出的唯一并行办法,等于把它堵死了。
+ *   - **真嵌套反而漏过去**:两段兄弟对话都进了回调,先结束的那个把标志清零,
+ *     此后真正的嵌套就检查不出来,`maxConversations=1` 下变成确定性自锁。
+ *
+ *  `AsyncLocalStorage` 顺着 await 链传递,天生就是"调用上下文"这个语义。
+ *  存的是**这条链上已经占了哪几座桥的对话闸**:同一座桥再来一段 = 成环,拒;
+ *  另一座桥有它自己的闸、不成环,放行(拒了就是误报)。 */
+const CONV_CTX = new AsyncLocalStorage();
+
+/** 安全地把"被抛出来的东西"变成一句话。
+ *  ⚠️ **不能直接 `String(x)`**:`throw Object.create(null)` 抛出来的东西没有 `toString`,
+ *  `String(x)` 自己会再抛一个 TypeError —— 那会盖掉原始异常,还把收尾拦腰打断(会话没关成)。 */
+function describeThrown(e) {
+  try {
+    if (e instanceof Error) return `${e.name || "Error"}:${e.message || "(无消息)"}`;
+    if (e === null) return "null";
+    if (typeof e === "object") return `${Object.prototype.toString.call(e)}:${JSON.stringify(e) ?? "(无法序列化)"}`;
+    return `${typeof e}:${String(e)}`;
+  } catch { return "(抛出来的东西连描述都取不出来)"; }
+}
+
+/** 一个**已经被"认领"过的** rejected promise:调用方 await 它照样拿到异常,
+ *  但调用方**忘了 await** 时不会变成 unhandled rejection。
+ *  ⚠️ Node 默认 unhandled rejection = 进程直接退出,会在收尾跑完之前把锁和工作树留在盘上 ——
+ *  一个"用法错"不该有这种杀伤力。 */
+function quietReject(err) {
+  const p = Promise.reject(err);
+  p.catch(() => {});
+  return p;
+}
+
 /** 每一轮的指纹。**凡是会改变这一轮执行结局的都要进去** —— v1 漏掉后四项时,
  *  改了 timeoutMs / 换了 schema 的重跑会命中复用,把上一版的答案当成这一版。 */
 function computeTurnSpecHash(t) {
-  let promptBody;
-  try { promptBody = t.promptFile ? fs.readFileSync(t.promptFile, "utf8") : t.prompt; }
-  catch (e) { throw new UsageError(`读 promptFile 失败:${e.message}`); }
+  const promptBody = t.promptBody = freezePromptBody(t, "promptFile");
   const ident = {
     v: RECEIPT_VERSION, key: t.key, prompt: promptBody, timeoutMs: t.timeoutMs,
     schema: t.schema === undefined ? null : stableStringify(t.schema),
@@ -2062,6 +2132,10 @@ function normalizeTurn(run, raw) {
   t.reask = re;
 
   t.turnSpecHash = computeTurnSpecHash(t);
+  // ⚠️ `schema` / `outputShape` 只做浅拷贝不够:它们已经在指纹里被 stableStringify 定型,
+  // 而真正发出去的是对象引用 —— 调用方在 await 之前改掉嵌套字段,"算的"与"发的"就分家了。
+  if (t.schema !== undefined) t.schema = JSON.parse(JSON.stringify(t.schema));
+  if (t.outputShape !== undefined) t.outputShape = JSON.parse(JSON.stringify(t.outputShape));
   return t;
 }
 
@@ -2081,6 +2155,16 @@ async function liveTurn(run, t) {
   run.turns.push(rec);
   try {
     await runTurn(run, t);
+  } catch (e) {
+    // 走到这里几乎只有**用法错**(脏树复查、建工作树、分支名)——那意味着这一轮**压根没跑**:
+    // 没发过消息,多半连会话都没开。把它从 turns[] 里撤掉,别留一条 status:"unknown" 的幽灵轮
+    // 去污染顶层结局(顶层取最严重的一轮,unknown 正好是最严重的那个)。
+    run.turns.pop();
+    run.turnKeys.delete(t.key);
+    // 会话根本没开起来时,对话名额界的那个东西不存在 —— 还给别人,别让一段跑不起来的对话
+    // 把 maxConversations 一直占着。下一轮真跑起来时 liveTurn 会重新取。
+    if (!run.opened && run.scopeHeld) { run.bridge._scopeGate.release(); run.scopeHeld = false; }
+    throw e;
   } finally {
     rec.startedAt = run.startedAt;
     rec.endedAt = nowIso();
@@ -2136,39 +2220,49 @@ async function replayTurn(run, t, prev) {
  */
 export async function conversation(bridge, rawSpec, fn) {
   if (typeof fn !== "function") throw new UsageError("conversation(spec, fn):第二个参数必须是回调函数");
-  // ⚠️ 嵌套 conversation 要的是同一把**对话闸**,那才会成环 —— 当场拒。
+  // ⚠️ 嵌套 conversation 要的是**同一座桥的同一把对话闸**,那才会成环 —— 当场拒。
   // 嵌套 **runNode** 是支持的(它只要执行闸,而对话在回调期间不持执行闸)。
+  // **平级的兄弟对话不是嵌套**,必须放行:那是本设计给出的唯一并行办法。
   // 这条判据在 live 与 replay 两条路上完全一致,不许一边禁一边放。
-  if (bridge._inConversation) {
+  const outer = CONV_CTX.getStore();
+  if (outer?.bridges.has(bridge)) {
     throw new UsageError(
-      "不能在 conversation 的回调里再开一段 conversation —— 两段都要对话闸,必然自锁。\n" +
-      "(回调里跑**普通节点**是支持的,那正是「复审发生在两轮之间」这个用法。)",
+      "不能在 conversation 的回调里,对**同一座桥**再开一段 conversation —— 两段都要那把对话闸,必然自锁。\n" +
+      "(回调里跑**普通节点**是支持的,那正是「复审发生在两轮之间」这个用法;\n" +
+      " 平级的兄弟对话也照常支持,那是这里唯一的并行办法。)",
     );
   }
+  const ctx = { bridges: new Set(outer ? [...outer.bridges, bridge] : [bridge]) };
+  return await CONV_CTX.run(ctx, () => conversationBody(bridge, rawSpec, fn));
+}
 
+async function conversationBody(bridge, rawSpec, fn) {
   const run = await prepareRun(bridge, rawSpec, { kind: "conversation" });
   const prev = run.reusedReceipt; // 非 null ⇒ 走回放:不拿任何闸、不开会话、不建 worktree
 
-  const turn = async (raw) => {
-    // ── 同步闸区:这一段到 `run.activeTurn = true` 之间**一个 await 都没有**。
-    //    async 函数体在第一个 await 之前是同步执行的,JS 又是单线程 ⇒ "查 + 置位"是原子的。
+  // ⚠️ 刻意**不是** async 函数:入场被拒时要返回一个"已认领"的 rejected promise(quietReject),
+  //    否则调用方忘了 await 的那次拒绝会变成 unhandled rejection 把整个进程打死 ——
+  //    一个用法错不该有这种杀伤力,而且它会在收尾跑完之前就把锁和工作树留在盘上。
+  const turn = (raw) => {
+    // ── 同步闸区:这一段到 `run.activeTurn = true` 之间**一个 await 都没有**,
+    //    JS 又是单线程 ⇒ "查 + 置位"是原子的。
     //    ⚠️ 谁也别往中间插 await(比如把校验改成 `await validate(...)`)—— 那会当场废掉这道闸,
     //    而它挡的是 `Promise.all([turn(a), turn(b)])` 同时穿过毒化 guard、两轮向同一会话并发 send。
     if (run.sealed) {
-      throw new UsageError(`fn 已经返回了,这一轮("${raw?.key}")来晚了 —— 作用域退出后不能再 turn()`);
+      return quietReject(new UsageError(`fn 已经返回了,这一轮("${raw?.key}")来晚了 —— 作用域退出后不能再 turn()`));
     }
     if (run.poisonedAfter !== null) {
-      throw new UsageError(
+      return quietReject(new UsageError(
         `这段对话在第 "${run.poisonedAfter}" 轮之后已经不能再用了(sessionReusable=false):\n` +
         `那一轮要么可能还在后台跑(abort 未确认),要么会话已经没了 —— 再 send 就是同一会话并发。\n` +
         `要接着聊请另起一段对话。`,
-      );
+      ));
     }
     if (run.activeTurn) {
-      throw new UsageError("同一段对话里不能并发 turn() —— 上一轮还没结束。要并行请开多段对话。");
+      return quietReject(new UsageError("同一段对话里不能并发 turn() —— 上一轮还没结束。要并行请开多段对话。"));
     }
     if (run.turns.length >= MAX_TURNS) {
-      throw new UsageError(`一段对话最多 ${MAX_TURNS} 轮,已经到顶了 —— 请把它切成几段。`);
+      return quietReject(new UsageError(`一段对话最多 ${MAX_TURNS} 轮,已经到顶了 —— 请把它切成几段。`));
     }
     run.activeTurn = true;
     // ── 同步闸区结束 ──
@@ -2178,16 +2272,18 @@ export async function conversation(bridge, rawSpec, fn) {
       return prev ? await replayTurn(run, t, prev) : await liveTurn(run, t);
     })();
     run.inFlight = p.finally(() => { run.activeTurn = false; });
-    return await run.inFlight;
+    // 收尾一定会 `await run.inFlight`,所以 p 的拒绝总有人接 —— 调用方忘了 await 也不炸进程。
+    run.inFlight.catch(() => {});
+    return p;
   };
 
-  bridge._inConversation = true;
   let callbackError = null;
   let threw = false;
   try {
     try {
       await fn(turn);
     } catch (e) { callbackError = e; threw = true; }
+    // ⚠️ 从这里往下一律看 `threw`,**不看 callbackError 真不真** —— `throw null` 也是抛。
 
     // ① 封 admission:此后任何 turn() 立刻 rejected,不产生任何事件、文件、消息
     run.sealed = true;
@@ -2218,13 +2314,12 @@ export async function conversation(bridge, rawSpec, fn) {
       );
     }
 
-    const receipt = await finalizeRun(run, { callbackError });
+    const receipt = await finalizeRun(run, { callbackError, callbackThrew: threw });
     // 回执是记录,异常是控制流 —— 顶层 status 怎么定都不改变"原样重抛回调的异常"。
     // ⚠️ 收尾过程中产生的诊断**不许盖掉它**:回调的异常才是根因。
     if (threw) throw callbackError;
     return receipt;
   } finally {
-    bridge._inConversation = false;
     await releaseRun(run);
   }
 }

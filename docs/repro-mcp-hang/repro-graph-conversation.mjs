@@ -30,7 +30,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { withBridge, UsageError } from "../../skills/agent-bridge-graph/tools/node-core.mjs";
+import { withBridge, finalizeRun, UsageError } from "../../skills/agent-bridge-graph/tools/node-core.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, "../..");
@@ -480,6 +480,164 @@ async function c13() {
   ok("它仍然是 ok", JSON.parse(final).status === "ok");
 }
 
+// ── C17 兄弟对话 ≠ 嵌套对话 ────────────────────────────────────────────────────
+async function c17() {
+  // ⚠️ C11 里两段对话是**同时**起的,那时 A 还停在 prepare、标记还没置上 —— 它是靠时序侥幸绿的。
+  //    这里让 A **确定已经进到回调里**再起 B:嵌套判据若是个桥级布尔,B 必被误判成"嵌套"。
+  console.log("\n[C17] A 已经在回调里时再起一段兄弟对话 —— 必须允许(它不是嵌套)");
+  const outDir = out("c17");
+  let inA;
+  const enteredA = new Promise((r) => { inA = r; });
+  let releaseA;
+  const holdA = new Promise((r) => { releaseA = r; });
+
+  const r = await within(60000, withBridge(async (b) => {
+    const aP = b.conversation(spec({ id: "a", outDir }), async (turn) => {
+      await turn({ key: "a1", prompt: "x", timeoutMs: 30000 });
+      inA();            // ← 此刻 A 确确实实在回调中间
+      await holdA;
+      await turn({ key: "a2", prompt: "y", timeoutMs: 30000 });
+    });
+    await enteredA;
+    // 平级的另一段对话:它**不在** A 的回调里,不该被当成嵌套
+    const rb = await b.conversation(spec({ id: "b", outDir }),
+      async (turn) => { await turn({ key: "b1", prompt: "z", timeoutMs: 30000 }); });
+    releaseA();
+    return { ra: await aP, rb };
+  }, { env: env("okturn"), maxConversations: 4 }), "兄弟对话").catch((e) => e);
+
+  ok("★ 兄弟对话没有被误判成嵌套", !(r instanceof Error), String(r?.message).slice(0, 200));
+  ok("两段都成功", r?.ra?.status === "ok" && r?.rb?.status === "ok");
+
+  // 反面:真嵌套仍然要拒 —— 别为了放行兄弟对话把嵌套一起放了
+  console.log("\n[C17b] 真嵌套仍然必须拒");
+  let inner = null;
+  await withBridge(async (b) => b.conversation(spec({ id: "o", outDir }), async (turn) => {
+    await turn({ key: "k", prompt: "x", timeoutMs: 30000 });
+    try {
+      await b.conversation(spec({ id: "i", outDir }),
+        async (t2) => { await t2({ key: "z", prompt: "y", timeoutMs: 30000 }); });
+    } catch (e) { inner = e; }
+  }), { env: env("okturn") });
+  ok("真嵌套仍被拒", inner instanceof UsageError, String(inner));
+}
+
+// ── C18 两条**抽取时被改掉**的合同(复审抓到的) ─────────────────────────────────
+async function c18() {
+  console.log("\n[C18] open_session 必须要 return_mode:\"ref\"");
+  // ⚠️ 这条曾经在重构里丢过:漏了它,桥就按 full 把**整段正文塞进 JSON-RPC 响应**。
+  //    假后端的产出都很小,所以 200 多条断言全绿也照样发现不了 —— 只能直接查调用参数。
+  let openArgs = null;
+  await withBridge(async (b) => {
+    const orig = b.callTool;
+    b.callTool = (n, a, m) => { if (n === "agent_bridge_open_session") openArgs = a; return orig(n, a, m); };
+    return b.conversation(spec({ id: "cv", outDir: out("c18") }),
+      async (turn) => { await turn({ key: "a", prompt: "x", timeoutMs: 30000 }); });
+  }, { env: env("okturn") });
+  ok("★ 开会话时要了 ref 模式(正文走 textRef,不塞进管道)", openArgs?.return_mode === "ref", JSON.stringify(openArgs));
+
+  console.log("\n[C18b] finalizeRun 收尾自己出错时:**不抛异常,仍然落一张 unknown 回执**");
+  // 旧版所有 finish() 都在那个大 catch 里,收尾抛错会被接住再落一张回执。抽取之后 finalize
+  // 跑在 catch 外面 —— 不补一层就变成"抛异常 + 没有回执"。这里直接考 finalizeRun 的合同。
+  const dir = out("c18b");
+  fs.mkdirSync(path.join(dir, "nodes"), { recursive: true });
+  const rp = path.join(dir, "nodes", "x.receipt.json");
+  const fakeRun = {
+    isConv: false,
+    spec: { id: "x", access: "read" },
+    receipt: { status: "ok", diagnostics: [], error: null },
+    receiptPath: rp,
+    workspace: null, workspaceFinalized: false,
+    nodeT0: 0, t0: 0,
+    closeSession: async () => { throw new Error("收尾炸了"); },
+  };
+  let thrown = null, rec = null;
+  try { rec = await finalizeRun(fakeRun); } catch (e) { thrown = e; }
+  ok("★ 收尾出错不抛异常(只有用法错才抛)", thrown === null, String(thrown?.message));
+  ok("★ 仍然落了回执", fs.existsSync(rp));
+  ok("状态降成 unknown(不诱导重跑)", rec?.status === "unknown", rec?.status);
+  ok("原始结局没丢", /原始结局=ok/.test(String(rec?.error)), String(rec?.error));
+}
+
+// ── C19 复审第二轮抓到的四条 ───────────────────────────────────────────────────
+async function c19() {
+  console.log("\n[C19a] promptFile 冻结:算指纹的字节 = 发出去的字节");
+  // ⚠️ 不冻的话有一条**确定性**的错误复用:指纹按 A 算好,发的是路径,桥要几个 await 之后才读;
+  //    中间把文件改成 B、跑完再改回 A ⇒ 回执是「指纹 H(A) + B 的答案」,下次拿 A 来复用就命中。
+  const outDir = out("c19a");
+  const pf = path.join(RUN_ROOT, "prompt-toctou.txt");
+  fs.writeFileSync(pf, "AAA-original", "utf8");
+  const r = await withBridge(async (b) => b.conversation(spec({ id: "cv", outDir }), async (turn) => {
+    const p = turn({ key: "k", promptFile: pf, timeoutMs: 30000 });  // ← 指纹此刻按 AAA 算好
+    fs.writeFileSync(pf, "BBB-swapped", "utf8");                     // ← 趁它还在拿闸,把内容换掉
+    await p;
+  }), { env: env("echoturn") });
+  const body = readText(path.join(outDir, "nodes", "cv.t-k.md")) || "";
+  ok("★ 发出去的是算指纹时那份内容(不是被换掉的)", body.includes("AAA-original"), body.slice(0, 90));
+  ok("★ 没有把换掉的内容发出去", !body.includes("BBB-swapped"));
+  ok("那一轮仍然成功", r.turns[0].status === "ok", r.turns[0].status);
+  fs.writeFileSync(pf, "AAA-original", "utf8");
+
+  console.log("\n[C19b] 回调 `throw null`:判据是**抛没抛**,不是抛出来的东西真不真");
+  const outB = out("c19b");
+  let gotB = "NOTHROWN";
+  try {
+    await withBridge(async (b) => b.conversation(spec({ id: "cv", outDir: outB }),
+      async (turn) => { await turn({ key: "a", prompt: "x", timeoutMs: 30000 }); throw null; }),
+      { env: env("okturn") });
+  } catch (e) { gotB = e; }
+  ok("抛出来的仍是 null 本身", gotB === null, String(gotB));
+  const rb = readReceipt(outB, "cv");
+  ok("★ 回执不是 ok(falsy 异常也是异常)", rb?.status === "callback_error", rb?.status);
+  await expectUsage("★ 这张回执不许被复用",
+    () => withBridge(async (b) => b.conversation(spec({ id: "cv", outDir: outB, reuseIfSame: true }),
+      async (turn) => { await turn({ key: "a", prompt: "x", timeoutMs: 30000 }); }), { env: env("okturn") }),
+    /不是 ok/);
+
+  console.log("\n[C19c] 回调抛一个**没有 toString** 的东西:不许在收尾途中被二次异常打断");
+  const outC = out("c19c");
+  const weird = Object.create(null);
+  let gotC = null;
+  try {
+    await withBridge(async (b) => b.conversation(spec({ id: "cv", outDir: outC }),
+      async (turn) => { await turn({ key: "a", prompt: "x", timeoutMs: 30000 }); throw weird; }),
+      { env: env("okturn") });
+  } catch (e) { gotC = e; }
+  ok("原样抛回那个东西", gotC === weird);
+  const rc = readReceipt(outC, "cv");
+  ok("★ 收尾照样走完并落了回执", !!rc);
+  ok("★ 会话确实关掉了(没被二次异常拦腰打断)", rc?.closeConfirmed === true, String(rc?.closeConfirmed));
+  ok("状态是 callback_error", rc?.status === "callback_error", rc?.status);
+
+  console.log("\n[C19d] 回调忘了 await 还连发两次:不许把进程打死,也不许留幽灵轮");
+  const outD = out("c19d");
+  const rd = await withBridge(async (b) => b.conversation(spec({ id: "cv", outDir: outD }),
+    async (turn) => {
+      turn({ key: "a", prompt: "AAA", timeoutMs: 30000 });   // ← 故意不 await
+      turn({ key: "b", prompt: "BBB", timeoutMs: 30000 });   // ← 会被串行闸拒,且没人接这个 rejection
+    }), { env: env("echoturn") });
+  ok("★ 进程还活着(rejection 被认领过)", true);
+  ok("★ 忘了 await 的那一轮仍被排空并记下来", rd.turns.length === 1 && rd.turns[0].key === "a", JSON.stringify(rd.turns?.map(t => t.key)));
+  ok("被拒的那轮没留下文件", !fs.existsSync(path.join(outD, "nodes", "cv.t-b.md")));
+  ok("回执落盘", !!readReceipt(outD, "cv"));
+
+  console.log("\n[C19e] 入场时抛用法错的轮:不许在 turns[] 里留一条幽灵");
+  // 造法:key 合法但 promptFile 不存在 —— normalizeTurn 抛在建记录之前;
+  // 再造一条真进了 liveTurn 才抛的(重复 key 走不到那里,所以用 maxTurns 之外的路径),
+  // 这里用 promptFile 不存在已足够证明"抛了就不该留记录"。
+  const outE = out("c19e");
+  let e1 = null;
+  const re = await withBridge(async (b) => b.conversation(spec({ id: "cv", outDir: outE }), async (turn) => {
+    await turn({ key: "good", prompt: "x", timeoutMs: 30000 });
+    try { await turn({ key: "bad", promptFile: path.join(RUN_ROOT, "nope.txt"), timeoutMs: 30000 }); }
+    catch (e) { e1 = e; }
+  }), { env: env("okturn") });
+  ok("抛了 UsageError", e1 instanceof UsageError, String(e1?.message).slice(0, 120));
+  ok("★ turns[] 里只有真跑过的那一轮", re.turns.length === 1 && re.turns[0].key === "good",
+    JSON.stringify(re.turns?.map(t => t.key)));
+  ok("★ 顶层结局没被幽灵轮污染成 unknown", re.status === "ok", re.status);
+}
+
 // ── 零残留 ─────────────────────────────────────────────────────────────────────
 async function c16() {
   console.log("\n[C16] 零残留:跑完之后桥和后端都得死");
@@ -498,7 +656,7 @@ async function c16() {
   try {
     await c1(); await c2(); await c3(); await c4(); await c5();
     await c6(); await c8(); await c9(); await c10(); await c11();
-    await c12(); await c13(); await c16();
+    await c12(); await c13(); await c17(); await c18(); await c19(); await c16();
   } catch (e) {
     fail++;
     console.log(`\n[harness] 用例自身崩了:${e?.stack || e}`);

@@ -797,6 +797,51 @@ async function main() {
   ok("W26 主工作区没有 .graph/ 之外的改动", dirty26.length === 0, dirty26.join(" | ").slice(0, 200));
   ok("W26 工作树已收走", ws26?.removed === true, String(ws26?.removed));
 
+  // ── W27 write 档对话的复用:两档共用同一套 workspace 闸 ─────────────────────
+  // ⚠️ 这条不是补充覆盖率,是**结构性风险**:checkReuse 里对话与节点分了叉,
+  //    对话必须**跳过**节点级的 artifactPath/sha 校验(它顶层压根没这个字段),
+  //    又必须**照样过** write 那几道闸(基线没漂、分支还在、diff 没被换)。分叉写错就在这里露。
+  console.log("\n[W27] write 档对话:指纹一致就复用,基线漂了/分支没了就拒");
+  const runConv27 = (repo, outDir, extra = {}) => withBridge((b) => b.conversation(
+    { agent: "omp", id: "cv", cwd: repo, outDir, access: "write", ...extra },
+    async (turn) => {
+      await turn({ key: "one", prompt: "one", timeoutMs: 60000 });
+      await turn({ key: "two", prompt: "two", timeoutMs: 60000 });
+    },
+  ), { env: { ...BASE_ENV, FAKE_OMP_MODE: "writeturn-perprompt" } });
+
+  const r27 = makeRepo("conv-reuse");
+  const out27 = path.join(r27, ".graph", "run-1");
+  const first27 = await runConv27(r27, out27);
+  ok("W27 首跑 ok", first27.status === "ok", `${first27.status} ${first27.error ?? ""}`);
+  const br27 = first27.workspace?.branch;
+
+  const again27 = await runConv27(r27, out27, { reuseIfSame: true });
+  ok("★ W27 同序列命中复用", again27.reused === true, JSON.stringify(again27.status));
+  ok("W27 复用拿回的是历史 turns", again27.turns?.length === 2);
+  ok("W27 复用没有多造第二条分支",
+    g(["branch", "--list", "graph/*", "--format=%(refname:short)"], r27).out.split("\n").filter(Boolean).length === 1);
+
+  // 基线漂了 —— specHash 里只有字符串 "HEAD",指纹管不住这件事,必须靠 baseCommit 比对拦下
+  fs.writeFileSync(path.join(r27, "README.md"), "moved\n", "utf8");
+  g(["add", "-A"], r27); g(["commit", "-qm", "move base"], r27);
+  let drift27 = null;
+  try { await runConv27(r27, out27, { reuseIfSame: true }); } catch (e) { drift27 = e; }
+  ok("★ W27 基线变了 → 拒绝复用", drift27 instanceof UsageError && /基线变了/.test(drift27.message),
+    String(drift27?.message).slice(0, 160));
+
+  // 分支被删了 —— 交付物没了,只校验文字产出的 sha 会漏掉这条
+  const r27b = makeRepo("conv-reuse-2");
+  const out27b = path.join(r27b, ".graph", "run-1");
+  const f27b = await runConv27(r27b, out27b);
+  ok("W27 第二个仓首跑 ok", f27b.status === "ok");
+  g(["branch", "-D", f27b.workspace?.branch], r27b);
+  let gone27 = null;
+  try { await runConv27(r27b, out27b, { reuseIfSame: true }); } catch (e) { gone27 = e; }
+  ok("★ W27 分支被删 → 拒绝复用", gone27 instanceof UsageError && /分支/.test(gone27.message),
+    String(gone27?.message).slice(0, 160));
+  ok("W27 首跑那条分支名是对的", typeof br27 === "string" && br27.startsWith("graph/"), String(br27));
+
   // ── W9 零残留 ─────────────────────────────────────────────────────────────
   console.log("\n[W9] 零残留总检");
   for (const [tag, repo] of [["W1", r1], ["W2", r2], ["W6", r6], ["W26", r26]]) {

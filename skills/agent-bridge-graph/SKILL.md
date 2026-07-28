@@ -81,6 +81,42 @@ const out = await withBridge(async (bridge) => {
 | 几家分头查 → 汇总 | `examples/hetero-audit.mjs`(可直接跑,也是本 skill 的真跑 e2e) |
 | 跑一段 → **主 agent 看结果决定下一步** → 再跑一段 | `templates/wave.mjs` |
 | 让 agent 真改代码(隔离 + 出 diff 给你审) | `templates/write-worktree.mjs` |
+| **同一个 agent 要记得上一轮**(复审→修订→再复审) | `templates/review-fix-loop.mjs` + 下面这节 |
+
+### 写法二·补:要**记忆**的时候用 `conversation`
+
+`runNode` 是"开会话 → 发一条 → 关会话",**节点之间没有记忆**。这不是疏漏:回执的 `specHash` 承诺
+"同样的输入 → 同样的执行",节点若能记住上一轮,结果就取决于**看不见的会话状态**。
+
+但**要不要留记忆是你的判断**,不是教条。修订方记得自己上一轮为什么那样写,就不会把刻意的决定"修"回去。
+要记忆就用 `conversation`——它把记忆**显式圈进一个作用域**,回执、指纹、worktree 隔离一样不少:
+
+```js
+await bridge.conversation(
+  { id: "fix-events", agent: "claude", access: "write", cwd, outDir },   // ← 顶层**没有** timeoutMs
+  async (turn) => {
+    const r1 = await turn({ key: "draft", prompt: FIRST, timeoutMs: 600000 });
+    if (!r1.sessionReusable) return;                       // ← 会话还能不能接着用,工具说了算
+
+    const rev = await bridge.runNode({ id: "review-1", agent: "codex", ... });  // 换引擎复审
+    await turn({ key: "fix", prompt: fixPrompt(rev), timeoutMs: 600000 });      // 它记得 r1
+  },
+);
+```
+
+**一段对话 = 一个 id + 一个会话 + 一棵 worktree + 一条分支 + N 轮**,作用域退出统一收尾。
+`runNode` 就是它的 **N=1**,两条路共用同一份实现。
+
+| 记住这几条 | 为什么 |
+|---|---|
+| **`timeoutMs` 在每一轮上,不在顶层** | 顶层再来一个预算就多一处"两个说了算的谁管谁";顶层传了会**当场报错**,不是静默忽略 |
+| **每轮一个产出** `nodes/<id>.t-<key>.md` | `key` 就是文件名,段内唯一 |
+| **`r.sessionReusable === false` 就别再问了** | 那一轮要么可能还在后台跑(abort 未确认)、要么会话已经没了。工具会**直接拒**后续 `turn()`,不靠你自觉 |
+| **write:一段 = 一条分支,收尾提交一次** | 对"反复修同一份东西"更干净,但它不能再当 N 个独立可合并的产出用 |
+| **回调里可以跑别的 `runNode`**(轮与轮之间) | 那正是"复审发生在两轮之间"。但**不能嵌套 `conversation`**——会自锁,当场拒 |
+| **轮与轮不许并发** | `Promise.all([turn(a), turn(b)])` 第二个会被当场拒。要并行就开多段对话 |
+| **最多 20 轮** | 超了响亮报错,不静默截断 |
+| **复用是整段的**:`reuseIfSame` 要求轮序列一模一样 | 改了任何一轮的 prompt/timeoutMs ⇒ **整段拒**,且**不会自动重跑**。轮序列变了就换新 `id` |
 
 ### 写法三:分波——要主 agent 中途拿主意时
 
@@ -115,15 +151,21 @@ const out = await withBridge(async (bridge) => {
 7. **遇到没预料到的情况就停下报告**,别写"看不懂就再跑一遍"的重试。
    尤其 **`unknown` 不是"一种失败"**,是"不知道后端干没干"——重跑可能让同一件事做两遍,停下等人。
 8. **委托 agent 改了文件,主 agent 仍要自己 `git diff` + 跑测试再报告**,不盲信。
-9. ⚠️ **节点之间没有记忆** —— 每个 `runNode` 都是「开会话 → 发一条 → 关会话」,下一个节点是
-   **全新上下文**(节点内唯一的多轮是 `reask`,且只为格式不合格)。这是刻意的:回执的 `specHash`
-   承诺「同样的输入 → 同样的执行」,节点要是能记住上一轮,结果就取决于**看不见的会话状态**,
-   指纹当场变成谎言、`reuseIfSame` 会复用一个复现不出来的结果。
-   **所以复审→修订这类多轮任务,"记忆"必须显式化成输入**(三样缺一不可,见
-   `templates/review-fix-loop.mjs`):①上一轮的产出(`baseRef` 指向它的分支)②上一轮节点
-   **自己的回答** `<outDir>/nodes/<id>.md`(那是它外化出来的推理,最接近记忆的东西)
-   ③**主 agent 的裁定**——复审意见**不能原样转发**,哪条认哪条驳得有人拍板,否则修订节点
-   会把你上一轮明确驳回过的意见也一并"修好"。
+9. ⚠️ **`runNode` 之间没有记忆**(`conversation` 才有)—— 每个 `runNode` 都是「开会话 → 发一条 →
+   关会话」,下一个节点是**全新上下文**(节点内唯一的多轮是 `reask`,且只为格式不合格)。
+   这不是疏漏:回执的 `specHash` 承诺「同样的输入 → 同样的执行」,节点要是能记住上一轮,结果就
+   取决于**看不见的会话状态**,指纹当场变成谎言。
+   **但"所以不该有记忆"是把属性讲成了教条 —— 要不要留记忆是你的判断**,两条路都在:
+
+   | 你想要的 | 用哪条 | 代价 |
+   |---|---|---|
+   | 每个环节各自可复现、可单独复用、可并行 | **`runNode`** + 把记忆**显式化成输入**(见下) | 得自己把前情喂进去 |
+   | 同一个 agent 记得自己上一轮为什么那样写 | **`conversation`**(写法二·补) | 整段一条分支、复用是整段的 |
+
+   走 `runNode` 时,"记忆"必须显式化成输入(三样缺一不可,见 `templates/review-fix-loop.mjs`):
+   ①上一轮的产出(`baseRef` 指向它的分支)②上一轮节点**自己的回答** `<outDir>/nodes/<id>.md`
+   (那是它外化出来的推理,最接近记忆的东西)③**主 agent 的裁定**——复审意见**不能原样转发**,
+   哪条认哪条驳得有人拍板,否则修订节点会把你上一轮明确驳回过的意见也一并"修好"。
 
 ## 改代码的环节:`access:"write"` = git worktree
 
@@ -219,7 +261,18 @@ bridge.runNode({ id: "implement", agent: "claude", cwd: REPO, outDir,
 <out-dir>/nodes/<id>.diff            ← 只有 write 环节才有:这次改动的完整 patch
 <out-dir>/nodes/<id>.scene/          ← 只有非正常收场才有:session.log / answer.txt / status.json
 <repo>/.graph/wt/<run>/<id>/         ← write 环节的隔离工作树(跑完即删,请 gitignore `.graph/`)
+
+对话(conversation)多一层「轮」,产出与现场都按轮分开:
+<out-dir>/nodes/<id>.t-<key>.md      ← **每一轮**的完整产出
+<out-dir>/nodes/<id>.t-<key>.scene/  ← 那一轮的现场(只有非正常收场才有)
+<out-dir>/nodes/<id>.receipt.json    ← **仍然只有一张**:kind:"conversation" + turns[]
 ```
+
+**对话的回执顶层没有逐轮字段**(`artifactPath`/`charCount`/… 全在 `turns[]` 里),
+顶层 `status` 取**各轮里最严重的那一个**(严重度就是退出码那个序:
+`contract_error` < `backend_failed` < `timeout` < `unknown`)。
+——不取"第一个非 ok"是因为它会被后面更坏的轮遮住;不取"最后一轮"是因为"第 2 轮挂了、
+第 3 轮碰巧成了"会报成功。全轮都成了但**你的回调自己抛了异常** ⇒ `callback_error`,不许被复用。
 
 **回执的 `specHash` 是输入指纹**——把 agent / 型号 / effort / access / cwd / 提问原文 / 角色文件内容 /
 `schema` / `outputShape` / **`timeoutMs`** / **`reask`** / **`baseRef`** 全算进去(凡是会改变执行结局的都算,
