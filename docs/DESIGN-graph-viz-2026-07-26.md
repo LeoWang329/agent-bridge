@@ -263,7 +263,7 @@ codex 建议加一把 `<out-dir>/viz.writer.lock`，配 ownerToken / 陈旧锁 f
 <out-dir>/nodes/.runs/<graphId>/                  ← 本次 graph 的全部 viz 产物,只有开 viz 才有
         ├── transcript.jsonl    事件流(§3.1③)
         └── <seq>-<id>/         每个节点一份不可变归档(事件里**没有**字段指向这个目录,见下)
-            ├── input.json          冻结的 spec 字段(**只是快照,不兼任资产目录** —— 见下)
+            ├── input.json          冻结的 spec 字段(**只是快照,不兼任资产目录**;键集与序列化见 EVENTS.md)
             ├── prompt.md           冻结的 user 侧原文(**同时就是 attempt 1 的输入**,见下)
             ├── role.md             冻结的 system 侧原文(有才写)
             ├── attempt-<n>.input.md    **n ≥ 2 才有**(attempt 1 的输入就是上面的 prompt.md)
@@ -598,8 +598,10 @@ scene:
 2. **超限走同一个 `boundedSummary()`**——⚠️ **但只对「人类文本」字段**：形状固定：
 
    ```
-   { name, code, totalBytes, sha256, head, tail, omittedBytes }
+   { totalBytes, sha256, head, tail, omittedBytes }
    ```
+
+   ⚠️ **`name` 与 `code` 已删**（2026-07-28）：`name` 就是它所挂的那个字段名，而它永远挂在那个字段上——**位置本身已经说明了它是谁**；`code` 只有一个取值（"太长了"），是个死字段。这套设计已经因为"没有消费者的字段"栽过好几次（`pid` / `archiveRef` / `halt`），不再留新的。
 
    ⚠️ **必须同时留头和尾**：只截头是这类实现最常见的错——**报错的根因往往在最后一行**（`... caused by: EACCES`），只留开头等于把最有用的那段丢掉。`sha256` 让"页面上这段"与"真实那段"可对证。
 
