@@ -42,7 +42,15 @@ import { fileURLToPath } from "node:url";
 import { performance } from "node:perf_hooks";
 import { AsyncLocalStorage } from "node:async_hooks";
 
-export const RECEIPT_VERSION = 1;
+/**
+ * 回执版本。**复用闸是严格等值比较**(`prev.receiptVersion !== RECEIPT_VERSION` 直接拒)。
+ *
+ * ⚠️ **1 → 2 是破坏性变更:磁盘上所有 v1 回执就此失去 `reuseIfSame` 资格。**
+ * 不升不行 —— v2 新增了 `turns[].attempts[]` 与几个相对 `*Ref`,而一张缺 `attempts` 的
+ * v1 回执若被当成"支持新 UI 的回执",页面只能显示空。那是又一次「字段缺失＝静默降级」,
+ * 这个仓库已经栽过三次。**宁可让旧回执响亮地失去复用资格,也不要它静默地显示成空白。**
+ */
+export const RECEIPT_VERSION = 2;
 
 /** 单次 wait 请求的上限。短的是「单次请求」不是任务本身 —— 超时了就再 wait,任务在后台继续跑。
  *  压掉「长请求 × 机器重载 → 客户端 teardown 整个 MCP 连接」这个最危险组合的暴露面。 */
@@ -1158,8 +1166,25 @@ export async function prepareRun(bridge, rawSpec, { kind = "node" } = {}) {
     // 只不过路径投影回 `<id>.md` / `<id>.scene`,保证既有断言逐字节不变。
     artifactPathFor: (key) => (isConv ? path.join(nodesDir, `${spec.id}.t-${key}.md`) : artifactPath),
     sceneDirFor: (key) => (isConv ? path.join(nodesDir, `${spec.id}.t-${key}.scene`) : sceneDir),
+    /** **每次尝试恒写一份产出原件**,与 viz 开关无关。
+     *
+     *  ⚠️ 早先每次尝试都覆盖该轮那一个 `artifactPath` —— 于是第一次的产出被第二次冲掉,
+     *  而第一次那份**正是「打回重说」这个自动决策的唯一依据**:没有它,事后谁也说不清
+     *  当初为什么判它不合格。这是**数据丢失**,不是"少存一份"。
+     *
+     *  ⚠️ `<n>` 在**每一轮内**从 1 重新开始,所以对话必须带 `.t-<key>` 这一段:
+     *  否则 `draft` 轮的第 1 次与 `fix` 轮的第 1 次会写进同一个文件,后写的把前一份审计原件盖掉。
+     *  投影按**调用的是哪个 API** 分派,不按 `key` 的字面量分派 —— 一段对话里的某一轮
+     *  完全可以也叫 `main`,它照样写 `<id>.t-main.a<n>.md`。 */
+    attemptArtifactPathFor: (key, n) => (isConv
+      ? path.join(nodesDir, `${spec.id}.t-${key}.a${n}.md`)
+      : path.join(nodesDir, `${spec.id}.a${n}.md`)),
     turnRec: null,     // 这一轮往哪儿写。runNode 时**就是回执本身**
     currentKey: null,
+    /** 这个节点的观测适配器(见 `viz-node.mjs`)。**viz 关着时恒为 null**,
+     *  于是全模块的插桩点都是 `if (run.viz)` 一句 —— 没有第二条代码路径。 */
+    viz: null,
+    nodeSeq: null,
     scopeHeld: false,
     turns: [],
     poisonedAfter: null,
@@ -1274,6 +1299,8 @@ export async function prepareRun(bridge, rawSpec, { kind = "node" } = {}) {
     contextUsage: null, reaskCount: 0, durationMs: null,
     startedAt: run.startedAt, endedAt: null, diagnostics: [], error: null, scene: null,
     sessionId: null, abortConfirmed: null, closeConfirmed: null, artifactSha256: null,
+    // v2:**每次尝试各自一条**。第一次的产出不再被第二次覆盖(见 attemptArtifactPathFor)。
+    attempts: [],
     // read 环节恒为 null;write 环节在入场时填 worktree 信息,收尾时被 finalizeWorktree 的结果填满
     // (branch / baseCommit / headCommit / filesChanged / diffPath / committed / removed)。
     access: spec.access, workspace: null,
@@ -1285,7 +1312,7 @@ export async function prepareRun(bridge, rawSpec, { kind = "node" } = {}) {
     // 逐轮才有的那几样在对话的**顶层回执**上没有意义 —— 留着就是一排恒为 null 的字段,
     // 而"没有消费者的字段"这个坑本仓踩过好几次。它们全在 turns[] 里各归各轮。
     for (const k of ["artifactPath", "charCount", "byteCount", "artifactSha256",
-                     "reaskCount", "contextUsage", "abortConfirmed", "scene"]) {
+                     "reaskCount", "contextUsage", "abortConfirmed", "scene", "attempts"]) {
       delete run.receipt[k];
     }
   } else {
@@ -1396,7 +1423,17 @@ async function checkReuse(run) {
     throw new UsageError(`回执已存在:${receiptPath}(要覆盖请加 force,要按指纹复用请加 reuseIfSame)`);
   }
   if (!prev || prev.receiptVersion !== RECEIPT_VERSION) {
-    throw new UsageError(`回执存在但版本对不上(无法安全复用):${receiptPath}`);
+    const got = prev ? JSON.stringify(prev.receiptVersion) : "(回执读不出来或不是合法 JSON)";
+    throw new UsageError(
+      `回执存在但版本对不上,不能安全复用:${receiptPath}\n` +
+      `  这张回执是 v${got},当前是 v${RECEIPT_VERSION}。\n` +
+      (prev && prev.receiptVersion === 1
+        ? `  v1 → v2 加了 turns[].attempts[](每次尝试各一份产出与输入指纹)与几个相对 ref。\n` +
+          `  **旧回执里没有这些字段**,拿它当"支持新 UI 的回执"用,页面上那一段只会是空白 ——\n` +
+          `  所以这里响亮地拒掉,而不是静默降级。\n`
+        : "") +
+      `  处置:加 force 重跑一次(会覆盖上次那次执行的产出)。`,
+    );
   }
   if (prev.specHash !== spec.specHash) {
     throw new UsageError(
@@ -1577,8 +1614,44 @@ export async function runTurn(run, t) {
   const receipt = run.turnRec;
   const artifactPath = run.artifactPathFor(t.key);
   run.currentKey = t.key;
+
+  /** 此刻在飞的那次尝试(没有就是 null)。
+   *
+   *  ⚠️ **它的结局必须收在一处。** 这个循环里有十一个 `return await finish(...)`,
+   *  在每一处各写一遍"顺手把这次尝试也记上"= 迟早漏一个,而漏掉的那一次会**永远悬着**:
+   *  `node:attempt` 发过、`node:attempt-settled` 永远不来,页面只能把它显示成"还在跑"。
+   *  所以下面把它挂进 `finish` —— **只要收了这一轮,就一定收了在飞的那次尝试。** */
+  let liveAttempt = null;
+
+  /** 轮的结局 → 这一次尝试的结局(§5.6 四档判定表)。 */
+  const attemptStatusFor = (turnStatus, att) => {
+    if (turnStatus === "ok") {
+      // ⚠️ `no-output` 是「**已经确认**产出是零字节」,不是「没拿到」——
+      //    没拿到走的是 `failed`(见下),两者的区别是一句真话与一句谎话。
+      return att.byteCount === 0 ? "no-output" : "accepted";
+    }
+    if (turnStatus === "contract_error") return "rejected";
+    // timeout / backend_failed / unknown 一律 failed。
+    // ⚠️ 「拿不到 textRef」也落在这里而**不是** `no-output`:拿不到不等于对方没说话,
+    //    运行时无法证明"它确实什么都没输出",只能证明"我取不回来"。
+    return "failed";
+  };
+
+  /** 落下一次尝试的结局。**幂等** —— reask 那条路会先显式收一次,`finish` 再来就 no-op。 */
+  const settleAttempt = async (att, status, reason = null) => {
+    if (!att || att.settled) return;
+    att.settled = true;
+    att.status = status;
+    att.durationMs = Math.round(monoNow() - att.t0);
+    if (status === "rejected" && reason != null) att.rejectedReason = reason;
+    if (run.viz) await run.viz.attemptSettled(t, att);
+  };
+
   // 让搬过来的这几百行**一个字符都不用改**:里面仍然写 `finish(...)`。
-  const finish = (status, extra) => settleTurn(run, status, extra);
+  const finish = async (status, extra) => {
+    if (liveAttempt) await settleAttempt(liveAttempt, attemptStatusFor(status, liveAttempt));
+    return settleTurn(run, status, extra);
+  };
 
   // --- 并发闸:到这里才排队。前面几步(体检/幂等)都是本地 I/O,不占桥的连接,不该被排队拖慢。
   await bridge._gate.acquire();
@@ -1685,6 +1758,24 @@ export async function runTurn(run, t) {
       }
       if (t.schema) msgArgs.schema = t.schema;
 
+      // ⚠️ **记账点锚死在这里**:剩余预算检查**通过之后**、`send_message` **紧之前**。
+      //    一进 `while` 就写 `attempts[]` 会凭空造出一次**从未发送**的假尝试 ——
+      //    上面那道 `remaining() <= 0` 的出口明说"还没来得及发第 N 轮",而那句话是真的。
+      const n = attempt + 1;
+      liveAttempt = {
+        n,
+        // 悲观默认:**任何**提前 return 都会留下一条 `failed`,而不是一条永远悬着的尝试。
+        status: "failed",
+        inputSha256: sha256Text(msgArgs.message),
+        inputRef: null,          // 只有开了 viz 才有归档可指(见 §3.1a 的隐私口径)
+        artifactPath: null, artifactSha256: null, charCount: null, byteCount: null,
+        rejectedReason: null, durationMs: null,
+        settled: false, t0: monoNow(),
+      };
+      receipt.attempts.push(liveAttempt);
+      // 先把输入归档、再发引用它的事件 —— 顺序反了页面会读到 404 并当成"文件丢了"。
+      if (run.viz) await run.viz.attemptStarted(t, liveAttempt, msgArgs.message);
+
       const ack = await bridge.callTool("agent_bridge_send_message", msgArgs, budget());
       // 必须**明确**被接收。桥对 send 的回执里 accepted 应为 true;拿到别的形状说明我们不认识
       // 这个返回 → 按 unknown 停下,不猜。
@@ -1771,8 +1862,18 @@ export async function runTurn(run, t) {
       }
 
       // --- 结果落盘(字节直传;必须在 close_session 之前 —— 关会话会删 textRef)
+      const attemptPath = run.attemptArtifactPathFor(t.key, liveAttempt.n);
+      /** 把刚落到该轮 `artifactPath` 的那份字节,再留一份**本次尝试的审计原件**。
+       *
+       *  ⚠️ **落在 `readFileSync` 之前**是刻意的:源码里存在"文件已经复制成功、后续本地处理
+       *  才失败"这个窗口(读不回来 → 判 `unknown`)。在那个窗口里磁盘上**确实躺着**一份证据,
+       *  这一次尝试的 `output` 就该是 `present`;把它一律写死成 `unavailable`,
+       *  等于把一份**已经保住的**证据说成没保住。 */
+      const keepAudit = () => { if (copyBytes(artifactPath, attemptPath)) liveAttempt.artifactPath = attemptPath; };
+
       let text = null;
       if (settled.textRef && copyBytes(settled.textRef, artifactPath)) {
+        keepAudit();
         try { text = fs.readFileSync(artifactPath, "utf8"); }
         catch (e) { receipt.diagnostics.push(`产出已复制但读不回来:${e.message}`); }
       }
@@ -1783,6 +1884,7 @@ export async function runTurn(run, t) {
           if (r?.textRef) {
             run.lastTextRef = r.textRef;
             if (copyBytes(r.textRef, artifactPath)) {
+              keepAudit();
               try { text = fs.readFileSync(artifactPath, "utf8"); } catch {}
             }
           }
@@ -1800,6 +1902,11 @@ export async function runTurn(run, t) {
       if (!receipt.artifactSha256) {
         return await finish("unknown", { error: `产出已落盘但算不出内容指纹(读不回来):${artifactPath}` });
       }
+      // 这一次尝试的产出与该轮 `artifactPath` 是**同一份字节**(上面 `keepAudit` 就是从它拷的),
+      // 所以指纹直接沿用 —— 再算一遍只是把同样的字节读第二次。
+      liveAttempt.charCount = receipt.charCount;
+      liveAttempt.byteCount = receipt.byteCount;
+      if (liveAttempt.artifactPath) liveAttempt.artifactSha256 = receipt.artifactSha256;
 
       // --- 契约校验:codex 走后端强制(桥回 json / schemaError),其余四家走弱检查
       let bad = null;
@@ -1813,11 +1920,15 @@ export async function runTurn(run, t) {
       if (!bad) return await finish("ok");
 
       // 不合格:按声明打回重说一次,再不行就停(**绝不无限重试**)
+      // ⚠️ 两条路都要**带着原因**收掉这一次尝试 —— `rejectedReason` 是"当初为什么判它不合格"
+      //    的唯一记录,而它正是「打回重说」这个自动决策的依据。靠 `finish` 兜底会丢掉这句话。
+      await settleAttempt(liveAttempt, "rejected", bad);
       if (attempt < t.reask && remaining() > 0) {
         receipt.diagnostics.push(`第 ${attempt + 1} 次输出不合格,打回重说:${bad}`);
         receipt.reaskCount = attempt + 1;
         lastReason = bad;
         attempt++;
+        liveAttempt = null; // 这一次已经收了;下一圈会新建一条
         continue;
       }
       return await finish("contract_error", {
@@ -2155,6 +2266,7 @@ async function liveTurn(run, t) {
     artifactPath: null, artifactSha256: null, charCount: null, byteCount: null,
     reaskCount: 0, durationMs: null, startedAt: null, endedAt: null,
     contextUsage: null, abortConfirmed: null, scene: null, error: null, diagnostics: [],
+    attempts: [], // v2:这一轮的每次尝试各一条(`n` 在**每一轮内**从 1 重新开始)
   };
   // 首轮才取对话闸。**不在 prepare 取** —— 那时一个会话都还没有,占的是个空名额:
   // 回调若在第一次 turn() 之前先去等一件长事,就会白白把别的对话堵在门外。

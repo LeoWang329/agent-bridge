@@ -19,8 +19,13 @@
 //   T7 用法错      多组合     → 全部当场 UsageError(含 force+reuseIfSame 冲突、同 id 并发)
 //   T8 未知状态    silent     → 后端不回话 → 超时路径;桥中途被杀 → unknown(不是 backend_failed)
 //   T9 总预算      okturn     → open 之后预算就耗尽时,不会先发消息再发现超时
+//   T10 零残留总检 —— 本轮采到的所有后端 pid 跑完必须全死
+//   T11 后端自己多开一轮 —— 中间那次「假结束」不许当答案
+//   T12 v2 attempts[]  echoturn → 每次尝试各留一份**审计原件**(第 1 次不被第 2 次覆盖),
+//                                 外加 v1 旧回执必须**响亮**失去复用资格(不是静默降级)
 
 import { spawn, spawnSync } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -504,6 +509,80 @@ function samplePids(tag) {
   return found;
 }
 
+/** 每次尝试各留一份**审计原件**(回执 v2 的 `attempts[]`)。
+ *
+ *  ⚠️ 这个用例的判别力全靠 `echoturn`:它把收到的提问原样回显,而两次尝试**发的提问不同**
+ *  (第 2 次是「上一条回复不符合约定 + 纠正要求」)。于是"第一次的产出有没有被第二次冲掉"
+ *  变成一句**能证伪**的话 —— 用 `okturn` 两次回同样的字,这条断言就永远是绿的,等于没做。 */
+async function t12_attempts() {
+  console.log("\n[T12] 每次尝试各留一份审计原件(v2 attempts[])");
+  const outDir = path.join(RUN_ROOT, "t12");
+  const PROMPT = "第一次的提问-唯一串-alpha";
+  const { code, timedOut } = await runCli(
+    ["--id", "n12", "--agent", "omp", "--cwd", REPO, "--prompt", PROMPT,
+     "--timeout-ms", "30000", "--out-dir", outDir, "--require-keys", "findings"],
+    { FAKE_OMP_MODE: "echoturn" },
+  );
+  ok("没有卡住", !timedOut);
+  ok("退出码 2(contract_error)", code === 2, `拿到 ${code}`);
+  const r = readReceipt(outDir, "n12");
+  ok("回执版本升到 2", r?.receiptVersion === 2, `拿到 ${r?.receiptVersion}`);
+  const as = r?.attempts || [];
+  ok("两次尝试各一条", as.length === 2, `拿到 ${as.length}`);
+  ok("n 是 1-based 且递增", as[0]?.n === 1 && as[1]?.n === 2);
+  ok("两条都是 rejected", as.every((a) => a.status === "rejected"));
+  ok("两条都带 rejectedReason(当初为什么判它不合格)",
+     as.every((a) => typeof a.rejectedReason === "string" && a.rejectedReason.length > 0));
+  ok("inputSha256 恒有且是 hex64", as.every((a) => /^[0-9a-f]{64}$/.test(a.inputSha256 || "")));
+  ok("两次的输入不同(第 2 次是打回重说的正文)", as[0].inputSha256 !== as[1].inputSha256);
+  ok("第 1 次的 inputSha256 就是原提问的指纹",
+     as[0].inputSha256 === crypto.createHash("sha256").update(PROMPT, "utf8").digest("hex"));
+
+  // ★ 本用例的要害:两份原件**各自独立存在**,第一次那份没有被第二次覆盖。
+  const p1 = as[0]?.artifactPath, p2 = as[1]?.artifactPath;
+  ok("两次各有自己的产出文件", !!p1 && !!p2 && p1 !== p2, `${p1} / ${p2}`);
+  ok("两个文件都真在盘上", !!p1 && fs.existsSync(p1) && !!p2 && fs.existsSync(p2));
+  const c1 = p1 ? fs.readFileSync(p1, "utf8") : "";
+  const c2 = p2 ? fs.readFileSync(p2, "utf8") : "";
+  ok("★ 第 1 次的产出**没有被第 2 次覆盖**(它回显的仍是原提问)", c1.includes(PROMPT), c1.slice(0, 120));
+  ok("★ 第 2 次的产出是打回重说那条(内容确实不同)",
+     c2 !== c1 && /不符合约定的输出格式/.test(c2), c2.slice(0, 120));
+  ok("文件名带 .a<N> 这一段", /\.a1\.md$/.test(p1 || "") && /\.a2\.md$/.test(p2 || ""), `${p1} / ${p2}`);
+  // 该轮的 artifactPath 仍是"最后一次"那份 —— 与 a2 同字节,但**不是**同一个文件
+  ok("该轮 artifactPath 仍指向 <id>.md(与 a2 同字节)",
+     /n12\.md$/.test(r?.artifactPath || "") && fs.readFileSync(r.artifactPath, "utf8") === c2);
+
+  // ---- 回执升版的迁移代价:一张 v1 旧回执必须**响亮**地失去复用资格 ----
+  // ⚠️ 这是升版的全部理由。一张缺 attempts[] 的旧回执若被当成"支持新 UI 的回执",
+  //    页面上那一段只会是空白 —— 又一次「字段缺失＝静默降级」,本仓已栽过三次。
+  const v1Dir = path.join(RUN_ROOT, "t12b");
+  fs.mkdirSync(path.join(v1Dir, "nodes"), { recursive: true });
+  const artifact = path.join(v1Dir, "nodes", "old.md");
+  fs.writeFileSync(artifact, "上一版跑出来的产出\n");
+  const v1 = {
+    receiptVersion: 1, id: "old", specHash: "deadbeefdeadbeefdeadbeefdeadbeef",
+    agent: "omp", model: null, effort: null, status: "ok",
+    artifactPath: artifact, artifactSha256: crypto.createHash("sha256").update(fs.readFileSync(artifact)).digest("hex"),
+    charCount: 10, byteCount: 10, contextUsage: null, reaskCount: 0, durationMs: 1,
+    startedAt: new Date().toISOString(), endedAt: new Date().toISOString(),
+    diagnostics: [], error: null, scene: null, sessionId: null,
+    abortConfirmed: null, closeConfirmed: true, access: "read", workspace: null,
+  };
+  fs.writeFileSync(path.join(v1Dir, "nodes", "old.receipt.json"), JSON.stringify(v1, null, 2));
+  const v1run = await runCli(
+    ["--id", "old", "--agent", "omp", "--cwd", REPO, "--prompt", "go",
+     "--timeout-ms", "30000", "--out-dir", v1Dir, "--reuse-if-same"],
+    { FAKE_OMP_MODE: "okturn" },
+  );
+  ok("v1 回执:退出码 5(用法错,不是静默复用)", v1run.code === 5, `拿到 ${v1run.code}`);
+  ok("v1 回执:报错说清是版本对不上", /版本对不上/.test(v1run.err + v1run.out));
+  ok("v1 回执:报错说清 v1→v2 加了什么、为什么不能静默降级",
+     /attempts/.test(v1run.err + v1run.out) && /空白|静默/.test(v1run.err + v1run.out));
+  ok("v1 回执:给了处置办法(force)", /force/.test(v1run.err + v1run.out));
+  // 负对照:**没有**去复用那份旧产出(它一个字节都没被当成本次结果)
+  ok("v1 回执:确实没有静默复用", !fs.existsSync(path.join(v1Dir, "nodes", "old.a1.md")));
+}
+
 /** 零残留总检:本轮采到的所有后端 pid,跑完之后必须全死。
  *  这才是"零残留"的证据,而不是写在注释里的一句声明。 */
 async function t10_no_residue() {
@@ -535,6 +614,7 @@ async function main() {
   await t8b_stubborn_backend();
   await t9_total_budget();
   await t11_backend_multiturn();
+  await t12_attempts();
   await sleep(1500); // 给最后一批收尾动作一点时间,再做残留总检
   await t10_no_residue();
 
