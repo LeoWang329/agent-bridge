@@ -1059,15 +1059,27 @@ function makeSemaphore(max) {
   };
 }
 
-/**
- * 跑一个环节的完整生命周期,一步不落:
- *   开会话 → 发任务(非阻塞) → 短切片 wait 循环到 deadline → cp 结果 → 校验 → (必要时打回重说一次) → 关会话 → 写回执
+/** 一次运行的可变状态。
  *
- * **不为环节失败抛异常**,返回带 status 的回执:
- *   ok | contract_error | backend_failed | timeout | unknown
- * 只有用法错(spec 非法)抛 UsageError。
+ *  ⚠️ **为什么必须是一个对象,不能继续用闭包里的 `let`**:`prepare / turn / finalize` 原本是
+ *  同一个函数体里的三段,拆成三个函数之后,`sessionId` / `openOutcome` / `workspace` 这些 `let`
+ *  就不再被共享 —— 每个函数各自捕获一份副本。而"收工作区时读到的 `openOutcome` 必须是开会话
+ *  那一刻写下的那个"正是**删不删 worktree** 的判据(见 finalizeRun)。放进同一个对象里,
+ *  共享是**结构上的事实**,不是"碰巧调用顺序对了"。
+ *
+ *  ⚠️ 时钟与现场保留挂成 `run.remaining()` 这样的闭包,而不是 `remainingOf(run)` 这样的自由函数:
+ *  这样搬进 `runTurn` 的那几百行**一个字符都不用改**(里面仍写 `remaining()` / `budget()` / `finish()`)。
+ *  改动越少,行为漂移的机会越少 —— 这次重构的硬指标是"`runNode` 行为零变化"。
  */
-export async function runNode(bridge, rawSpec) {
+
+/**
+ * ① 准备:规范化 spec → 进程内防撞 → 锁文件 → 仓库体检 + 脏树查 → 幂等/复用闸。
+ *
+ * **这一段里没有一件事需要预算**,所以它全部排在并发闸之前(与今天一致)。
+ * 命中复用时把结果放在 `run.reusedReceipt` 上返回,资源已在返回前收干净。
+ * 抛错(用法错/复用闸不过)时同样先收干净再抛。
+ */
+export async function prepareRun(bridge, rawSpec) {
   const spec = normalizeSpec(rawSpec);
   ensureDir(spec.outDir);
   const nodesDir = path.join(spec.outDir, "nodes");
@@ -1076,23 +1088,73 @@ export async function runNode(bridge, rawSpec) {
   const artifactPath = path.join(nodesDir, `${spec.id}.md`);
   const receiptPath = path.join(nodesDir, `${spec.id}.receipt.json`);
   const sceneDir = path.join(nodesDir, `${spec.id}.scene`);
-  // ⚠️ 计时**从拿到并发闸之后**才起算(见下面的 startClock)——排队等待不算进环节预算。
-  // 否则扇出 20 个、闸开 4 个时,排在后面的会带着一个已经烧掉大半的 timeoutMs 开跑,
-  // 于是"同一张任务单,排第几位决定它超不超时"——那不是超时,那是抽签。
-  let startedAt = nowIso();
-  let t0 = monoNow();
-  let deadline = t0 + spec.timeoutMs;
-  const startClock = () => { startedAt = nowIso(); t0 = monoNow(); deadline = t0 + spec.timeoutMs; };
-  /** 本环节还剩多少总预算。**每一次 RPC 都受它约束** —— 否则 open/send 卡住就能把「总上限」顶穿。 */
-  const remaining = () => deadline - monoNow();
-  /** 上一次 RPC 的期限**是不是由本环节的总预算决定的**(而不是那类调用的默认上限)。
-   *  用来精确区分两种本地超时,不靠事后比 `remaining()<=0`——那是个竞态:
-   *  计时器到点时剩余量可能还是个微小正数,同一件事会时而判 timeout、时而判 unknown。 */
-  let rpcDeadlineFromBudget = false;
-  /** 给某次 RPC 的预算:总预算与该类调用默认上限的较小值。 */
-  const budget = (cap = RPC_TIMEOUT_MS) => {
-    const ms = Math.min(cap, Math.max(0, remaining()));
-    rpcDeadlineFromBudget = ms < cap;
+  // `runId` 只是给人看的标签。**资源唯一性不能只靠它** —— 它取自 outDir 的目录名,
+  // 而 `D:/a/run-1` 与 `D:/b/run-1` 的目录名一模一样:两次运行会映射到同一条 worktree 路径
+  // 和同一个分支名。默认情况下第二个撞上"目录已存在/分支已存在"报 UsageError(还算安全),
+  // 但只要有一边带 `force:true`,就会把另一边**正在写**的工作树连同分支一起删掉 —— 静默丢代码。
+  // 拼上 outDir 全路径的短哈希,让「不同 outDir = 不同资源」成为事实而不是巧合。
+  const runId = path.basename(spec.outDir);
+  const runKey = `${gitSafeSlug(runId)}-${sha256Text(realpathSafe(spec.outDir)).slice(0, 8)}`;
+
+  const run = {
+    bridge, spec, nodesDir, artifactPath, receiptPath, sceneDir, runKey,
+    diffPath: path.join(nodesDir, `${spec.id}.diff`),
+    lockPath: path.join(nodesDir, `${spec.id}.lock`),
+    lockFd: null, active: null, activeKey: null,
+    repoRoot: null, baseCommit: null,
+    gateHeld: false,
+    workspaceFinalized: false, // 收过工作区没有。**不能靠 workspace.removed 推断** ——
+                               // "提交失败所以故意留着目录"也是 removed:false,那种情况绝不能再收一次。
+    workspace: null,           // write 环节的 worktree 信息(read 环节恒为 null)
+    opened: false,             // 首轮入场(worktree + open_session)做过没有
+    clockStarted: false,
+    sessionId: null,
+    logFile: null,
+    lastTextRef: null,
+    /** open_session 这一步的结局。**「没拿到 sessionId」≠「后端没起来」** ——
+     *  请求可能已经发出去、桥那边真把会话建起来了,只是响应超时或管道断了,我们没拿到句柄。
+     *  收工作区时把这两种情况混为一谈,就会在后端可能还活着的时候把工作树删掉。
+     *    "not-attempted" 请求压根没发(还没发预算就耗尽了)
+     *    "refused"       桥**明确回报**开不起来 —— 确定没有后端(最常见:后端没装/起不来)
+     *    "unknown"       发出去了但结局不明(本地超时 / 断管 / 返回形状不认识)
+     *    "opened"        拿到了 sessionId */
+    openOutcome: "not-attempted",
+    receipt: null,
+    reusedReceipt: null,
+    // ⚠️ 计时**从拿到并发闸之后**才起算(见 startClock)——排队等待不算进环节预算。
+    // 否则扇出 20 个、闸开 4 个时,排在后面的会带着一个已经烧掉大半的 timeoutMs 开跑,
+    // 于是"同一张任务单,排第几位决定它超不超时"——那不是超时,那是抽签。
+    startedAt: nowIso(),
+    t0: monoNow(),
+    nodeT0: null,   // 整个环节的起点(= 首轮起钟那一刻)。durationMs 用它,不用最后一轮的 t0。
+    deadline: 0,
+    /** 上一次 RPC 的期限**是不是由本轮的预算决定的**(而不是那类调用的默认上限)。
+     *  用来精确区分两种本地超时,不靠事后比 `remaining()<=0`——那是个竞态:
+     *  计时器到点时剩余量可能还是个微小正数,同一件事会时而判 timeout、时而判 unknown。 */
+    rpcDeadlineFromBudget: false,
+  };
+  run.deadline = run.t0 + (spec.timeoutMs ?? 0);
+
+  /** 起钟。**每一轮在自己被 admit 的那一刻**用自己的 `timeoutMs` 起算(对话方案 §2.1);
+   *  `runNode` 只有一轮,所以它与今天逐字节相同。 */
+  run.startClock = (ms) => {
+    run.startedAt = nowIso();
+    run.t0 = monoNow();
+    run.deadline = run.t0 + ms;
+    // 回执的 startedAt 说的是**这个环节什么时候开跑**,只认第一轮 —— 后面的轮各自起钟,
+    // 但不该把环节的起点往后推。
+    if (!run.clockStarted) {
+      run.clockStarted = true;
+      run.nodeT0 = run.t0;
+      if (run.receipt) run.receipt.startedAt = run.startedAt;
+    }
+  };
+  /** 本轮还剩多少预算。**每一次 RPC 都受它约束** —— 否则 open/send 卡住就能把「总上限」顶穿。 */
+  run.remaining = () => run.deadline - monoNow();
+  /** 给某次 RPC 的预算:本轮预算与该类调用默认上限的较小值。 */
+  run.budget = (cap = RPC_TIMEOUT_MS) => {
+    const ms = Math.min(cap, Math.max(0, run.remaining()));
+    run.rpcDeadlineFromBudget = ms < cap;
     return ms;
   };
 
@@ -1105,22 +1167,23 @@ export async function runNode(bridge, rawSpec) {
     throw new UsageError(`同一个 outDir 里的环节 id "${spec.id}" 正在并发运行 —— id 必须唯一`);
   }
   active.add(activeKey);
+  run.active = active;
+  run.activeKey = activeKey;
 
   // 跨 bridge / 跨进程的防撞:原子创建锁文件(wx = 已存在就失败)。
   // 上面那个 Set 只看得见自己这个 bridge;两个 withBridge、两个 node 进程照样能撞同一份产出。
-  const lockPath = path.join(nodesDir, `${spec.id}.lock`);
-  let lockFd = null;
+  const lockPath = run.lockPath;
   try {
-    lockFd = fs.openSync(lockPath, "wx");
-    fs.writeFileSync(lockFd, `${process.pid} ${nowIso()}\n`, "utf8");
+    run.lockFd = fs.openSync(lockPath, "wx");
+    fs.writeFileSync(run.lockFd, `${process.pid} ${nowIso()}\n`, "utf8");
   } catch (e) {
     active.delete(activeKey);
-    // ⚠️ openSync 成功、writeFileSync 才失败(磁盘满等)时,**外层 finally 还没生效** ——
+    // ⚠️ openSync 成功、writeFileSync 才失败(磁盘满等)时,**外层的收尾还没接管** ——
     // 不在这里收就会同时泄漏一个 fd 和一把永远解不开的锁。
-    if (lockFd !== null) {
-      try { fs.closeSync(lockFd); } catch {}
+    if (run.lockFd !== null) {
+      try { fs.closeSync(run.lockFd); } catch {}
       try { fs.rmSync(lockPath, { force: true }); } catch {}
-      lockFd = null;
+      run.lockFd = null;
     }
     if (e.code === "EEXIST") {
       throw new UsageError(
@@ -1131,591 +1194,658 @@ export async function runNode(bridge, rawSpec) {
     throw new UsageError(`无法创建环节锁文件 ${lockPath}:${e.message}`);
   }
 
-  let gateHeld = false;
-  let workspaceFinalized = false; // 收过工作区没有。**不能靠 workspace.removed 推断** ——
-                                  // "提交失败所以故意留着目录"也是 removed:false,那种情况绝不能再收一次。
-  let workspace = null;      // write 环节的 worktree 信息(read 环节恒为 null)
-  let repoRoot = null;
-  let baseCommit = null;
-  // `runId` 只是给人看的标签。**资源唯一性不能只靠它** —— 它取自 outDir 的目录名,
-  // 而 `D:/a/run-1` 与 `D:/b/run-1` 的目录名一模一样:两次运行会映射到同一条 worktree 路径
-  // 和同一个分支名。默认情况下第二个撞上"目录已存在/分支已存在"报 UsageError(还算安全),
-  // 但只要有一边带 `force:true`,就会把另一边**正在写**的工作树连同分支一起删掉 —— 静默丢代码。
-  // 拼上 outDir 全路径的短哈希,让「不同 outDir = 不同资源」成为事实而不是巧合。
-  const runId = path.basename(spec.outDir);
-  const runKey = `${gitSafeSlug(runId)}-${sha256Text(realpathSafe(spec.outDir)).slice(0, 8)}`;
-  const diffPath = path.join(nodesDir, `${spec.id}.diff`);
+  run.receipt = {
+    receiptVersion: RECEIPT_VERSION,
+    id: spec.id, specHash: spec.specHash,
+    agent: spec.agent, model: spec.model ?? null, effort: spec.effort ?? null,
+    status: "unknown", artifactPath: null, charCount: null, byteCount: null,
+    contextUsage: null, reaskCount: 0, durationMs: null,
+    startedAt: run.startedAt, endedAt: null, diagnostics: [], error: null, scene: null,
+    sessionId: null, abortConfirmed: null, closeConfirmed: null, artifactSha256: null,
+    // read 环节恒为 null;write 环节在入场时填 worktree 信息,收尾时被 finalizeWorktree 的结果填满
+    // (branch / baseCommit / headCommit / filesChanged / diffPath / committed / removed)。
+    access: spec.access, workspace: null,
+  };
 
+  /** 现场保留(三件套):桥干净退出会删掉本次 run 的日志目录、close_session 会删 textRef,
+   *  所以**必须在关会话/关桥之前**把现场 cp 出来。缺哪件就在 diagnostics 里说明原因。 */
+  run.saveScene = async (tag, dir = run.sceneDir) => {
+    const receipt = run.receipt;
+    try {
+      ensureDir(dir);
+      const files = [];
+      if (run.logFile) {
+        if (copyBytes(run.logFile, path.join(dir, "session.log"))) files.push("session.log");
+        else receipt.diagnostics.push(`现场:复制 session.log 失败(${run.logFile})`);
+      } else receipt.diagnostics.push("现场:没有 logFile 可复制(会话可能没开起来)");
+
+      // 超时/失败时答案可能仍然拿得到(abort 之后 textRef 往往还在)—— 尽力取一次
+      if (!run.lastTextRef && run.sessionId) {
+        try {
+          const r = await run.bridge.callTool("agent_bridge_result", { session_id: run.sessionId }, FINALIZE_BUDGET_MS / 3);
+          if (r?.textRef) run.lastTextRef = r.textRef;
+        } catch (e) { receipt.diagnostics.push(`现场:补取 result 失败(${e.name})`); }
+      }
+      if (run.lastTextRef) {
+        if (copyBytes(run.lastTextRef, path.join(dir, "answer.txt"))) files.push("answer.txt");
+        else receipt.diagnostics.push(`现场:复制 answer.txt 失败(${run.lastTextRef})`);
+      }
+
+      if (run.sessionId) {
+        try {
+          const st = await run.bridge.callTool("agent_bridge_status", { session_id: run.sessionId }, FINALIZE_BUDGET_MS / 3);
+          writeAtomic(path.join(dir, "status.json"), JSON.stringify(st, null, 2) + "\n");
+          files.push("status.json");
+        } catch (e) { receipt.diagnostics.push(`现场:取 status 失败(${e.name})`); }
+      }
+      const scene = { dir, tag, savedAt: nowIso(), files };
+      receipt.scene = scene;
+      return scene;
+    } catch (e) {
+      receipt.diagnostics.push(`保留现场失败:${e.message}`);
+      return null;
+    }
+  };
+
+  run.closeSession = async () => {
+    const receipt = run.receipt;
+    if (!run.sessionId) return;
+    try {
+      const r = await run.bridge.callTool("agent_bridge_close_session", { session_id: run.sessionId }, FINALIZE_BUDGET_MS / 2);
+      // **看返回内容,不是"没抛异常就算成"**:`null` / `{closed:false}` 都不是关成功了
+      receipt.closeConfirmed = r?.closed === true;
+      if (!receipt.closeConfirmed) {
+        receipt.diagnostics.push(`关会话未被确认(返回:${JSON.stringify(r).slice(0, 200)})`);
+      }
+    } catch (e) {
+      receipt.closeConfirmed = false;
+      receipt.diagnostics.push(`关会话失败(${e.name}):${e.message}`);
+    } finally {
+      // 记下"刚关过一个会话":桥要到 3 秒后才对收不掉的后端补刀,bridge.close() 得把这个窗口等完。
+      // close **没被确认**时(本地超时/断管),这个时刻不可信 —— 桥可能稍后才处理那条 close,
+      // 标记出来,让 bridge.close() 在 bulk 响应时重新起算窗口。
+      noteSessionClosed(run.bridge, receipt.closeConfirmed === true);
+    }
+  };
+
+  let reused = null;
   try {
     // --- write 环节的仓库体检(只读探查)。**排在幂等闸之前** —— 复用时要拿 baseCommit 去比对。
     if (spec.access === "write") {
       const info = await inspectRepo(spec.cwd, spec.baseRef);
-      repoRoot = info.repoRoot;
-      baseCommit = info.baseCommit;
+      run.repoRoot = info.repoRoot;
+      run.baseCommit = info.baseCommit;
       // ⚠️ 脏树闸也**排在幂等闸之前** —— 否则它只保护"真跑",不保护"复用":
       // 同一个脏工作区下,新跑会被拒绝,而命中复用却照样交货,且调用方分不出这两种情况。
       // 复用出来的结果同样是对着 HEAD 做的、同样看不见那些未提交改动,该拦就得一起拦。
-      await assertCleanBase({ repoRoot, spec, baseCommit, nodesDir });
+      await assertCleanBase({ repoRoot: run.repoRoot, spec, baseCommit: run.baseCommit, nodesDir });
     }
 
     // --- 幂等闸
     if (fs.existsSync(receiptPath) && !spec.force) {
-      let prev = null;
-      try { prev = JSON.parse(fs.readFileSync(receiptPath, "utf8")); } catch {}
-      if (!spec.reuseIfSame) {
-        throw new UsageError(`回执已存在:${receiptPath}(要覆盖请加 force,要按指纹复用请加 reuseIfSame)`);
-      }
-      if (!prev || prev.receiptVersion !== RECEIPT_VERSION) {
-        throw new UsageError(`回执存在但版本对不上(无法安全复用):${receiptPath}`);
-      }
-      if (prev.specHash !== spec.specHash) {
+      reused = await checkReuse(run);
+    }
+  } catch (e) {
+    await releaseRun(run);
+    throw e;
+  }
+  if (reused) {
+    await releaseRun(run);
+    run.reusedReceipt = reused;
+  }
+  return run;
+}
+
+/** 幂等闸:上一张回执还能不能当成这一次的结果。
+ *  ⚠️ **每一条不匹配都是 `throw new UsageError`,没有一条回退去重跑** —— 静默重跑会把
+ *  "上一版任务的结果"和"这一版"混在一起,是最难查的一类错。要重跑请显式加 `force`。 */
+async function checkReuse(run) {
+  const { spec, receiptPath, artifactPath, diffPath, runKey } = run;
+  let prev = null;
+  try { prev = JSON.parse(fs.readFileSync(receiptPath, "utf8")); } catch {}
+  if (!spec.reuseIfSame) {
+    throw new UsageError(`回执已存在:${receiptPath}(要覆盖请加 force,要按指纹复用请加 reuseIfSame)`);
+  }
+  if (!prev || prev.receiptVersion !== RECEIPT_VERSION) {
+    throw new UsageError(`回执存在但版本对不上(无法安全复用):${receiptPath}`);
+  }
+  if (prev.specHash !== spec.specHash) {
+    throw new UsageError(
+      `回执已存在但任务单变了(旧 ${prev.specHash} ≠ 新 ${spec.specHash}):${receiptPath}\n` +
+      `复用会把上一版任务的结果当成这一版。要重跑请加 force。`,
+    );
+  }
+  // 只有成功的回执才值得复用 —— 复用一张失败回执等于把上次的失败凭空延续下去
+  if (prev.status !== "ok") {
+    throw new UsageError(`回执存在但上次是 ${prev.status}(不是 ok),不复用失败结果。要重跑请加 force。`);
+  }
+  // 产出还在不在?回执说 ok 但文件被删/被截断的话,复用就是在骗下游。
+  // 而且产出路径必须就是**本次算出来的**那个,不能听信回执里写的任意路径。
+  if (prev.artifactPath !== artifactPath) {
+    throw new UsageError(`回执里的产出路径与本次不一致(${prev.artifactPath} ≠ ${artifactPath}),不复用。`);
+  }
+  const st = statSafe(artifactPath);
+  if (!st || !st.isFile() || st.size === 0) {
+    throw new UsageError(`回执说成功,但产出文件缺失或为空:${artifactPath}。要重跑请加 force。`);
+  }
+  // 内容指纹:只查"非空"挡不住产出被**换成另一份非空文件**。
+  // **这道闸不是可选的** —— 写成 `if (prev.artifactSha256)` 会让"回执里没这个字段"
+  // (旧回执 / 字段被删 / 上次算哈希失败写了 null)**静默跳过校验**,等于没有这道闸。
+  if (!/^[0-9a-f]{64}$/.test(prev.artifactSha256 || "")) {
+    throw new UsageError(
+      `回执里没有合法的产出内容指纹(artifactSha256),无法确认产出还是当初那份:${receiptPath}。要重跑请加 force。`,
+    );
+  }
+  const nowSha = await sha256File(artifactPath);
+  if (nowSha !== prev.artifactSha256) {
+    throw new UsageError(`产出文件内容与回执记录的不一致(可能被改过或被覆盖):${artifactPath}。要重跑请加 force。`);
+  }
+  // write 环节还要多一道:**指纹管不住基线漂移**。baseRef 通常是 "HEAD",
+  // 它今天和上周解析到的是两个 commit,而 specHash 里只有字符串 "HEAD" —— 一模一样。
+  // 不比对解析后的 baseCommit,就会把"对着上周代码改出来的结果"当成这次的答案。
+  if (spec.access === "write") {
+    const pw = prev.workspace;
+    if (pw?.baseCommit !== run.baseCommit) {
+      throw new UsageError(
+        `回执可复用,但基线变了(旧 ${pw?.baseCommit ?? "(无记录)"} ≠ 今 ${run.baseCommit}):${receiptPath}\n` +
+        `上次的改动是对着另一份代码做的,复用等于把过期的 diff 当成本次结果。要重跑请加 force。`,
+      );
+    }
+    // write 环节的**交付物是分支和 diff**,不只是那段文字。只校验文字产出的 sha 就复用,
+    // 等于宣称"上次那份改动还在" —— 而分支可能早被 `git branch -D` 掉了,diff 文件可能被换过。
+    // 这道闸与 artifactSha256 是同一个道理,不能只做一半。
+    //
+    // ⚠️ **按 outcome 分派,而不是 `if (pw?.committed)`**。后者是同一族缺陷的第三次出现:
+    // 字段缺失(null/undefined)时条件为假,**整段校验被静默跳过** —— 而字段缺失恰恰说明
+    // 上次收尾出过问题,正是最该拦住的那种回执。这里两个分支都要求 outcome 是**明确的字面量**,
+    // 缺字段 / 旧回执 / 手改过的回执一律落到最后那个 else,结构上没有"跳过"这条路可走。
+    if (pw?.outcome === "delivered") {
+      // 交付物齐全的那条路:分支、head、diff 三样逐个坐实,每一条都**不是可选的**。
+      //
+      // ⚠️ **先查字段齐不齐,再查对不对**,顺序不能反。缺字段说明上次收尾没走完;
+      // 若先做等值比较,`diffPath: null` 会被报成"路径不一致",把"上次就没写完"
+      // 说成"有人动过你的文件" —— 两种根因完全不同,报错指错方向比不报还费事。
+      const missing = [];
+      if (!pw.branch) missing.push("branch");
+      if (!/^[0-9a-f]{40}$/.test(pw.headCommit || "")) missing.push("headCommit");
+      if (!pw.diffPath) missing.push("diffPath");
+      if (!/^[0-9a-f]{64}$/.test(pw.diffSha256 || "")) missing.push("diffSha256");
+      // 「四样齐全」里的**改动清单**也要查:回执缺它/它不是数组,交付物同样是残的,
+      // 而且下游拿它 `.map`/`.length` 会直接崩。`changesKnown:false` 更是自相矛盾
+      // ——都不确知有没有改动了,凭什么说 delivered。
+      if (pw.changesKnown !== true) missing.push("changesKnown");
+      if (!Array.isArray(pw.filesChanged)) missing.push("filesChanged");
+      if (missing.length) {
         throw new UsageError(
-          `回执已存在但任务单变了(旧 ${prev.specHash} ≠ 新 ${spec.specHash}):${receiptPath}\n` +
-          `复用会把上一版任务的结果当成这一版。要重跑请加 force。`,
+          `回执声称已交付(outcome=delivered),却缺字段:${missing.join("、")}(${receiptPath})\n` +
+          `字段不全说明上次收尾那几步没走完 —— 交付物是残的,不复用。要重跑请加 force。`,
         );
       }
-      // 只有成功的回执才值得复用 —— 复用一张失败回执等于把上次的失败凭空延续下去
-      if (prev.status !== "ok") {
-        throw new UsageError(`回执存在但上次是 ${prev.status}(不是 ok),不复用失败结果。要重跑请加 force。`);
-      }
-      // 产出还在不在?回执说 ok 但文件被删/被截断的话,复用就是在骗下游。
-      // 而且产出路径必须就是**本次算出来的**那个,不能听信回执里写的任意路径。
-      if (prev.artifactPath !== artifactPath) {
-        throw new UsageError(`回执里的产出路径与本次不一致(${prev.artifactPath} ≠ ${artifactPath}),不复用。`);
-      }
-      const st = statSafe(artifactPath);
-      if (!st || !st.isFile() || st.size === 0) {
-        throw new UsageError(`回执说成功,但产出文件缺失或为空:${artifactPath}。要重跑请加 force。`);
-      }
-      // 内容指纹:只查"非空"挡不住产出被**换成另一份非空文件**。
-      // **这道闸不是可选的** —— 写成 `if (prev.artifactSha256)` 会让"回执里没这个字段"
-      // (旧回执 / 字段被删 / 上次算哈希失败写了 null)**静默跳过校验**,等于没有这道闸。
-      if (!/^[0-9a-f]{64}$/.test(prev.artifactSha256 || "")) {
+      // 字段齐了,再看是不是**本次**该有的那份 —— 不能听信回执里写的任意分支名/路径。
+      const expectBranch = `graph/${runKey}/${spec.id}`;
+      if (pw.branch !== expectBranch) {
         throw new UsageError(
-          `回执里没有合法的产出内容指纹(artifactSha256),无法确认产出还是当初那份:${receiptPath}。要重跑请加 force。`,
+          `回执里的分支名与本次算出来的不一致(回执 ${JSON.stringify(pw.branch)} ≠ 本次 ${expectBranch}):${receiptPath}。要重跑请加 force。`,
         );
       }
-      const nowSha = await sha256File(artifactPath);
-      if (nowSha !== prev.artifactSha256) {
-        throw new UsageError(`产出文件内容与回执记录的不一致(可能被改过或被覆盖):${artifactPath}。要重跑请加 force。`);
+      if (pw.diffPath !== diffPath) {
+        throw new UsageError(
+          `回执里的 diff 路径与本次算出来的不一致(回执 ${JSON.stringify(pw.diffPath)} ≠ 本次 ${diffPath}):${receiptPath}。要重跑请加 force。`,
+        );
       }
-      // write 环节还要多一道:**指纹管不住基线漂移**。baseRef 通常是 "HEAD",
-      // 它今天和上周解析到的是两个 commit,而 specHash 里只有字符串 "HEAD" —— 一模一样。
-      // 不比对解析后的 baseCommit,就会把"对着上周代码改出来的结果"当成这次的答案。
-      if (spec.access === "write") {
-        const pw = prev.workspace;
-        if (pw?.baseCommit !== baseCommit) {
-          throw new UsageError(
-            `回执可复用,但基线变了(旧 ${pw?.baseCommit ?? "(无记录)"} ≠ 今 ${baseCommit}):${receiptPath}\n` +
-            `上次的改动是对着另一份代码做的,复用等于把过期的 diff 当成本次结果。要重跑请加 force。`,
-          );
-        }
-        // write 环节的**交付物是分支和 diff**,不只是那段文字。只校验文字产出的 sha 就复用,
-        // 等于宣称"上次那份改动还在" —— 而分支可能早被 `git branch -D` 掉了,diff 文件可能被换过。
-        // 这道闸与 artifactSha256 是同一个道理,不能只做一半。
-        //
-        // ⚠️ **按 outcome 分派,而不是 `if (pw?.committed)`**。后者是同一族缺陷的第三次出现:
-        // 字段缺失(null/undefined)时条件为假,**整段校验被静默跳过** —— 而字段缺失恰恰说明
-        // 上次收尾出过问题,正是最该拦住的那种回执。这里两个分支都要求 outcome 是**明确的字面量**,
-        // 缺字段 / 旧回执 / 手改过的回执一律落到最后那个 else,结构上没有"跳过"这条路可走。
-        if (pw?.outcome === "delivered") {
-          // 交付物齐全的那条路:分支、head、diff 三样逐个坐实,每一条都**不是可选的**。
-          //
-          // ⚠️ **先查字段齐不齐,再查对不对**,顺序不能反。缺字段说明上次收尾没走完;
-          // 若先做等值比较,`diffPath: null` 会被报成"路径不一致",把"上次就没写完"
-          // 说成"有人动过你的文件" —— 两种根因完全不同,报错指错方向比不报还费事。
-          const missing = [];
-          if (!pw.branch) missing.push("branch");
-          if (!/^[0-9a-f]{40}$/.test(pw.headCommit || "")) missing.push("headCommit");
-          if (!pw.diffPath) missing.push("diffPath");
-          if (!/^[0-9a-f]{64}$/.test(pw.diffSha256 || "")) missing.push("diffSha256");
-          // 「四样齐全」里的**改动清单**也要查:回执缺它/它不是数组,交付物同样是残的,
-          // 而且下游拿它 `.map`/`.length` 会直接崩。`changesKnown:false` 更是自相矛盾
-          // ——都不确知有没有改动了,凭什么说 delivered。
-          if (pw.changesKnown !== true) missing.push("changesKnown");
-          if (!Array.isArray(pw.filesChanged)) missing.push("filesChanged");
-          if (missing.length) {
-            throw new UsageError(
-              `回执声称已交付(outcome=delivered),却缺字段:${missing.join("、")}(${receiptPath})\n` +
-              `字段不全说明上次收尾那几步没走完 —— 交付物是残的,不复用。要重跑请加 force。`,
-            );
-          }
-          // 字段齐了,再看是不是**本次**该有的那份 —— 不能听信回执里写的任意分支名/路径。
-          const expectBranch = `graph/${runKey}/${spec.id}`;
-          if (pw.branch !== expectBranch) {
-            throw new UsageError(
-              `回执里的分支名与本次算出来的不一致(回执 ${JSON.stringify(pw.branch)} ≠ 本次 ${expectBranch}):${receiptPath}。要重跑请加 force。`,
-            );
-          }
-          if (pw.diffPath !== diffPath) {
-            throw new UsageError(
-              `回执里的 diff 路径与本次算出来的不一致(回执 ${JSON.stringify(pw.diffPath)} ≠ 本次 ${diffPath}):${receiptPath}。要重跑请加 force。`,
-            );
-          }
-          const head = await git(["rev-parse", "--verify", `refs/heads/${pw.branch}^{commit}`], repoRoot);
-          if (!head.ok) {
-            throw new UsageError(`回执说改动在分支 ${pw.branch} 上,但那条分支已经不存在了:${receiptPath}。要重跑请加 force。`);
-          }
-          if (head.stdout.trim() !== pw.headCommit) {
-            throw new UsageError(
-              `分支 ${pw.branch} 已经不指向回执记的那个提交(回执 ${pw.headCommit} ≠ 现在 ${head.stdout.trim()}):${receiptPath}。要重跑请加 force。`,
-            );
-          }
-          const dst = statSafe(pw.diffPath);
-          // ⚠️ **不拿 `size === 0` 当失败。** HEAD 前进了但净改动为零(agent 建了空提交、
-          // 或提交完又 revert)时 diff 本来就是 0 字节,而首跑那边判的是 delivered ——
-          // 两边判据不一致就会出现"首跑成功、复用必拒"这种同一结局前后打架。
-          // 「内容还是不是当初那份」由 sha 负责,它对空文件同样有效。
-          if (!dst || !dst.isFile()) {
-            throw new UsageError(`回执说导出过 diff,但文件不在了:${pw.diffPath}。要重跑请加 force。`);
-          }
-          if (await sha256File(pw.diffPath) !== pw.diffSha256) {
-            throw new UsageError(`diff 文件内容与回执记录的不一致(可能被改过):${pw.diffPath}。要重跑请加 force。`);
-          }
-        } else if (pw?.outcome === "no-changes") {
-          // "确知一个字都没改"也是一种合法的成功。它没有分支、没有 diff 可查,
-          // 但**必须坐实当初真的探测成功过** —— 否则 `changesKnown:false`(探测失败、什么都没结论)
-          // 也会被当成"没改动"复用掉,那正是第 1 轮修掉的那个错换了个地方重演。
-          if (pw.changesKnown !== true || !Array.isArray(pw.filesChanged) || pw.filesChanged.length !== 0) {
-            throw new UsageError(
-              `回执说"没有改动",但它自己的记录对不上(changesKnown=${JSON.stringify(pw.changesKnown)}, ` +
-              `filesChanged=${JSON.stringify(pw.filesChanged)}):${receiptPath}。要重跑请加 force。`,
-            );
-          }
-        } else {
-          throw new UsageError(
-            `回执是 ok,但 write 环节的交付结论无法确认(workspace.outcome=${JSON.stringify(pw?.outcome)}):${receiptPath}\n` +
-            `只有 "delivered"(改动已落到分支)与 "no-changes"(确知没改动)两种结论可以复用;\n` +
-            `缺这个字段说明它是旧版回执或上次收尾没走完 —— 不复用。要重跑请加 force。`,
-          );
-        }
+      const head = await git(["rev-parse", "--verify", `refs/heads/${pw.branch}^{commit}`], run.repoRoot);
+      if (!head.ok) {
+        throw new UsageError(`回执说改动在分支 ${pw.branch} 上,但那条分支已经不存在了:${receiptPath}。要重跑请加 force。`);
       }
-      return { ...prev, reused: true };
+      if (head.stdout.trim() !== pw.headCommit) {
+        throw new UsageError(
+          `分支 ${pw.branch} 已经不指向回执记的那个提交(回执 ${pw.headCommit} ≠ 现在 ${head.stdout.trim()}):${receiptPath}。要重跑请加 force。`,
+        );
+      }
+      const dst = statSafe(pw.diffPath);
+      // ⚠️ **不拿 `size === 0` 当失败。** HEAD 前进了但净改动为零(agent 建了空提交、
+      // 或提交完又 revert)时 diff 本来就是 0 字节,而首跑那边判的是 delivered ——
+      // 两边判据不一致就会出现"首跑成功、复用必拒"这种同一结局前后打架。
+      // 「内容还是不是当初那份」由 sha 负责,它对空文件同样有效。
+      if (!dst || !dst.isFile()) {
+        throw new UsageError(`回执说导出过 diff,但文件不在了:${pw.diffPath}。要重跑请加 force。`);
+      }
+      if (await sha256File(pw.diffPath) !== pw.diffSha256) {
+        throw new UsageError(`diff 文件内容与回执记录的不一致(可能被改过):${pw.diffPath}。要重跑请加 force。`);
+      }
+    } else if (pw?.outcome === "no-changes") {
+      // "确知一个字都没改"也是一种合法的成功。它没有分支、没有 diff 可查,
+      // 但**必须坐实当初真的探测成功过** —— 否则 `changesKnown:false`(探测失败、什么都没结论)
+      // 也会被当成"没改动"复用掉,那正是第 1 轮修掉的那个错换了个地方重演。
+      if (pw.changesKnown !== true || !Array.isArray(pw.filesChanged) || pw.filesChanged.length !== 0) {
+        throw new UsageError(
+          `回执说"没有改动",但它自己的记录对不上(changesKnown=${JSON.stringify(pw.changesKnown)}, ` +
+          `filesChanged=${JSON.stringify(pw.filesChanged)}):${receiptPath}。要重跑请加 force。`,
+        );
+      }
+    } else {
+      throw new UsageError(
+        `回执是 ok,但 write 环节的交付结论无法确认(workspace.outcome=${JSON.stringify(pw?.outcome)}):${receiptPath}\n` +
+        `只有 "delivered"(改动已落到分支)与 "no-changes"(确知没改动)两种结论可以复用;\n` +
+        `缺这个字段说明它是旧版回执或上次收尾没走完 —— 不复用。要重跑请加 force。`,
+      );
     }
+  }
+  return { ...prev, reused: true };
+}
 
-    // --- 并发闸:到这里才排队。前面几步(体检/幂等)都是本地 I/O,不占桥的连接,不该被排队拖慢。
-    await bridge._gate.acquire();
-    gateHeld = true;
-    startClock(); // 预算从**真正开跑**这一刻起算,不含排队时间
+/** 结束**这一轮**:定状态 +(非 ok 时)立刻冻结现场。
+ *
+ *  ⚠️ 它**不关会话、不收工作区、不写回执** —— 那三件是**环节级**的,归 `finalizeRun`。
+ *  现场必须在这里就冻住:桥的 `textRef` 是**会话级的单一路径**,每轮结果覆盖同一个文件,
+ *  延到整段收尾再取,拿到的就是**后面某一轮**的答案,却被标成"这一轮失败的现场"。 */
+async function settleTurn(run, status, extra = {}) {
+  const receipt = run.receipt;
+  Object.assign(receipt, extra);
+  receipt.status = status;
+  if (status !== "ok") await run.saveScene(extra._sceneTag || status);
+  delete receipt._sceneTag;
+  return receipt;
+}
 
-    // --- write 环节:建隔离工作区
-    if (spec.access === "write") {
-      // ⚠️ 脏树**再查一次**。上面那次跑在排队之前,而扇出时一个环节可能在闸外等上几分钟;
-      // 这中间用户完全可能动了主树。只查一次 = 拿一个几分钟前的结论给现在放行。
-      // (基线 commit 不重新解析:一次运行里各环节钉在各自开跑前解析的那个 commit 上,
-      //  重解析会让"排在后面"变成"基于另一份代码",反而更难解释。)
-      await assertCleanBase({ repoRoot, spec, baseCommit, nodesDir });
-      const branch = await makeBranchName(repoRoot, runKey, spec.id);
-      // 与 dirtyEntries 的排除项共用同一个常量 —— 两处写死会各自漂,漂了就变成"自己把主树弄脏、
-      // 再被自己的脏树闸拦下"这种最难查的自伤。
-      const wtPath = path.join(repoRoot, ...WT_ROOT_REL.split("/"), runKey, spec.id);
-      workspace = await createWorktree({ repoRoot, wtPath, branch, baseCommit, force: spec.force });
+/**
+ * ③ 一轮:(首轮)入场 → send → wait 切片 → 校验 → 不合格则打回重说(≤1) → 复制产出 → 算 SHA。
+ *
+ * **入场(拿闸 / 起钟 / 脏树复查 / worktree / open_session)挂在第一轮上**:
+ * 顶层不一定有 `timeoutMs`(对话就没有),预算要到 `turn()` 才知道,所以拿闸那一刻必须已经有它。
+ * `runNode` 只有一轮、且那一轮的 `timeoutMs` 就是 `spec.timeoutMs` ⇒ 因果顺序与今天逐字节相同。
+ */
+export async function runTurn(run, t) {
+  const { bridge, spec, receipt, remaining, budget, artifactPath } = run;
+  // 让搬过来的这几百行**一个字符都不用改**:里面仍然写 `finish(...)`。
+  const finish = (status, extra) => settleTurn(run, status, extra);
+
+  // --- 并发闸:到这里才排队。前面几步(体检/幂等)都是本地 I/O,不占桥的连接,不该被排队拖慢。
+  await bridge._gate.acquire();
+  run.gateHeld = true;
+  run.startClock(t.timeoutMs); // 预算从**真正开跑**这一刻起算,不含排队时间
+
+  // --- write 环节:建隔离工作区(只在首轮)
+  if (!run.opened && spec.access === "write") {
+    // ⚠️ 脏树**再查一次**。上面那次跑在排队之前,而扇出时一个环节可能在闸外等上几分钟;
+    // 这中间用户完全可能动了主树。只查一次 = 拿一个几分钟前的结论给现在放行。
+    // (基线 commit 不重新解析:一次运行里各环节钉在各自开跑前解析的那个 commit 上,
+    //  重解析会让"排在后面"变成"基于另一份代码",反而更难解释。)
+    await assertCleanBase({ repoRoot: run.repoRoot, spec, baseCommit: run.baseCommit, nodesDir: run.nodesDir });
+    const branch = await makeBranchName(run.repoRoot, run.runKey, spec.id);
+    // 与 dirtyEntries 的排除项共用同一个常量 —— 两处写死会各自漂,漂了就变成"自己把主树弄脏、
+    // 再被自己的脏树闸拦下"这种最难查的自伤。
+    const wtPath = path.join(run.repoRoot, ...WT_ROOT_REL.split("/"), run.runKey, spec.id);
+    run.workspace = await createWorktree({
+      repoRoot: run.repoRoot, wtPath, branch, baseCommit: run.baseCommit, force: spec.force,
+    });
+    receipt.workspace = { ...run.workspace };
+  }
+
+  /** 超时收场:**先 abort 打断这一轮**(桥的 wait 超时本身不打断,任务还在后台烧),
+   *  abort 成没成如实记录 —— 不能未确认就在回执里写"已 abort"。 */
+  const finishTimeout = async (why) => {
+    if (run.sessionId) {
+      try {
+        const r = await bridge.callTool("agent_bridge_abort", { session_id: run.sessionId }, FINALIZE_BUDGET_MS / 2);
+        // 同上:必须看返回里确实说打断了。`{aborted:false}` 意味着那一轮**还在后台跑**,
+        // 谎报"已 abort"会让调用方以为现场已经静止。
+        receipt.abortConfirmed = r?.aborted === true;
+        if (!receipt.abortConfirmed) {
+          receipt.diagnostics.push(`abort 未被确认(返回:${JSON.stringify(r).slice(0, 200)})——那一轮可能仍在后台运行`);
+        }
+      } catch (e) {
+        receipt.abortConfirmed = false;
+        receipt.diagnostics.push(`abort 失败(${e.name}):${e.message}`);
+      }
     }
+    return await finish("timeout", {
+      error: `${why}(abort ${receipt.abortConfirmed === true ? "已确认" : receipt.abortConfirmed === false ? "未确认" : "无需执行"})`,
+    });
+  };
 
-    const receipt = {
-      receiptVersion: RECEIPT_VERSION,
-      id: spec.id, specHash: spec.specHash,
-      agent: spec.agent, model: spec.model ?? null, effort: spec.effort ?? null,
-      status: "unknown", artifactPath: null, charCount: null, byteCount: null,
-      contextUsage: null, reaskCount: 0, durationMs: null,
-      startedAt, endedAt: null, diagnostics: [], error: null, scene: null,
-      sessionId: null, abortConfirmed: null, closeConfirmed: null, artifactSha256: null,
-      // read 环节恒为 null;write 环节在 finish() 里被 finalizeWorktree 的结果填满
-      // (branch / baseCommit / headCommit / filesChanged / diffPath / committed / removed)。
-      access: spec.access, workspace: workspace ? { ...workspace } : null,
-    };
-
-    let sessionId = null;
-    let logFile = null;
-    let lastTextRef = null;
-    /** open_session 这一步的结局。**「没拿到 sessionId」≠「后端没起来」** ——
-     *  请求可能已经发出去、桥那边真把会话建起来了,只是响应超时或管道断了,我们没拿到句柄。
-     *  收工作区时把这两种情况混为一谈,就会在后端可能还活着的时候把工作树删掉。
-     *    "not-attempted" 请求压根没发(还没发预算就耗尽了)
-     *    "refused"       桥**明确回报**开不起来 —— 确定没有后端(最常见:后端没装/起不来)
-     *    "unknown"       发出去了但结局不明(本地超时 / 断管 / 返回形状不认识)
-     *    "opened"        拿到了 sessionId */
-    let openOutcome = "not-attempted";
-
-    /** 现场保留(三件套):桥干净退出会删掉本次 run 的日志目录、close_session 会删 textRef,
-     *  所以**必须在关会话/关桥之前**把现场 cp 出来。缺哪件就在 diagnostics 里说明原因。 */
-    const saveScene = async (tag) => {
-      try {
-        ensureDir(sceneDir);
-        const files = [];
-        if (logFile) {
-          if (copyBytes(logFile, path.join(sceneDir, "session.log"))) files.push("session.log");
-          else receipt.diagnostics.push(`现场:复制 session.log 失败(${logFile})`);
-        } else receipt.diagnostics.push("现场:没有 logFile 可复制(会话可能没开起来)");
-
-        // 超时/失败时答案可能仍然拿得到(abort 之后 textRef 往往还在)—— 尽力取一次
-        if (!lastTextRef && sessionId) {
-          try {
-            const r = await bridge.callTool("agent_bridge_result", { session_id: sessionId }, FINALIZE_BUDGET_MS / 3);
-            if (r?.textRef) lastTextRef = r.textRef;
-          } catch (e) { receipt.diagnostics.push(`现场:补取 result 失败(${e.name})`); }
-        }
-        if (lastTextRef) {
-          if (copyBytes(lastTextRef, path.join(sceneDir, "answer.txt"))) files.push("answer.txt");
-          else receipt.diagnostics.push(`现场:复制 answer.txt 失败(${lastTextRef})`);
-        }
-
-        if (sessionId) {
-          try {
-            const st = await bridge.callTool("agent_bridge_status", { session_id: sessionId }, FINALIZE_BUDGET_MS / 3);
-            writeAtomic(path.join(sceneDir, "status.json"), JSON.stringify(st, null, 2) + "\n");
-            files.push("status.json");
-          } catch (e) { receipt.diagnostics.push(`现场:取 status 失败(${e.name})`); }
-        }
-        receipt.scene = { dir: sceneDir, tag, savedAt: nowIso(), files };
-      } catch (e) {
-        receipt.diagnostics.push(`保留现场失败:${e.message}`);
-      }
-    };
-
-    const closeSession = async () => {
-      if (!sessionId) return;
-      try {
-        const r = await bridge.callTool("agent_bridge_close_session", { session_id: sessionId }, FINALIZE_BUDGET_MS / 2);
-        // **看返回内容,不是"没抛异常就算成"**:`null` / `{closed:false}` 都不是关成功了
-        receipt.closeConfirmed = r?.closed === true;
-        if (!receipt.closeConfirmed) {
-          receipt.diagnostics.push(`关会话未被确认(返回:${JSON.stringify(r).slice(0, 200)})`);
-        }
-      } catch (e) {
-        receipt.closeConfirmed = false;
-        receipt.diagnostics.push(`关会话失败(${e.name}):${e.message}`);
-      } finally {
-        // 记下"刚关过一个会话":桥要到 3 秒后才对收不掉的后端补刀,bridge.close() 得把这个窗口等完。
-        // close **没被确认**时(本地超时/断管),这个时刻不可信 —— 桥可能稍后才处理那条 close,
-        // 标记出来,让 bridge.close() 在 bulk 响应时重新起算窗口。
-        noteSessionClosed(bridge, receipt.closeConfirmed === true);
-      }
-    };
-
-    /** 超时收场:**先 abort 打断这一轮**(桥的 wait 超时本身不打断,任务还在后台烧),
-     *  abort 成没成如实记录 —— 不能未确认就在回执里写"已 abort"。 */
-    const finishTimeout = async (why) => {
-      if (sessionId) {
-        try {
-          const r = await bridge.callTool("agent_bridge_abort", { session_id: sessionId }, FINALIZE_BUDGET_MS / 2);
-          // 同上:必须看返回里确实说打断了。`{aborted:false}` 意味着那一轮**还在后台跑**,
-          // 谎报"已 abort"会让调用方以为现场已经静止。
-          receipt.abortConfirmed = r?.aborted === true;
-          if (!receipt.abortConfirmed) {
-            receipt.diagnostics.push(`abort 未被确认(返回:${JSON.stringify(r).slice(0, 200)})——那一轮可能仍在后台运行`);
-          }
-        } catch (e) {
-          receipt.abortConfirmed = false;
-          receipt.diagnostics.push(`abort 失败(${e.name}):${e.message}`);
-        }
-      }
-      return await finish("timeout", {
-        error: `${why}(abort ${receipt.abortConfirmed === true ? "已确认" : receipt.abortConfirmed === false ? "未确认" : "无需执行"})`,
-      });
-    };
-
-    /** 统一收尾:**先保现场 → 关会话 → 收工作区 → 最后原子写回执**。顺序不能换。 */
-    const finish = async (status, extra = {}) => {
-      Object.assign(receipt, extra);
-      receipt.status = status;
-      if (status !== "ok") await saveScene(extra._sceneTag || status);
-      delete receipt._sceneTag;
-      await closeSession();
-      // 收工作区排在**关会话之后**:后端进程还活着时它可能还握着 worktree 里的文件句柄,
-      // Windows 上那会让 `git worktree remove` 直接失败。
-      // **不受 remaining() 约束** —— 环节可能正是因为预算耗尽才走到这里,
-      // 而"把已经改出来的代码保住"不能因为超时就放弃。
-      if (workspace && !workspaceFinalized) {
-        workspaceFinalized = true;
-        const fin = await finalizeWorktree({
-          repoRoot, ws: workspace, diffPath, nodeId: spec.id, runKey,
-          // 「后端确定不会再往这棵树里写了」。三种情况成立:关会话被确认、请求压根没发出去、
-          // 或桥**明确回报**开不起来(后者最常见:后端没装/起不来;若也按"关闭未确认"保留,
-          // 每次失败都白留一棵空工作树和一条空分支,越攒越多)。
-          // ⚠️ 判据是 openOutcome 而**不是** `sessionId === null` —— 后者把"桥说没建成"
-          // 和"我们没拿到句柄但它可能已经建成了"混成一谈,于是在后端可能还活着时删树。
-          closeConfirmed: receipt.closeConfirmed === true
-            || openOutcome === "not-attempted" || openOutcome === "refused",
-        });
-        const { notes, ...rest } = fin;
-        workspace = rest;
-        receipt.workspace = rest;
-        for (const n of notes) receipt.diagnostics.push(`工作区:${n}`);
-        // **write 环节的交付物不只是那段文字,还包括"改动确实落到了分支上"。**
-        // 有改动却没提交、或压根不知道有没有改动 —— 这时报 ok,调用方(以及 reuseIfSame 的
-        // "只复用 ok"那道闸)就会把一个**没有产出的 write 环节**当成功,并在此之上继续往下建。
-        // 降级成 unknown 而不是某种失败:我们确实不知道后端干了多少,按纪律停下等人、不诱导重跑。
-        // (不补 saveScene:会话已关,现场三件套只能取到残缺的一份;真正的证据是**被保留下来的
-        //  worktree 与分支**,路径就在 diagnostics 里。)
-        // 判据只有一个:finalizeWorktree 给出的 outcome。**不在这里拿 committed/filesChanged
-        // 自己再推一遍** —— 同一件事在两处各推一次,迟早推出两种结论(第 3 轮复审就是这么被抓到的:
-        // 提交成功但 diff/head 没拿到时,这里按 `committed` 判成功,回执里却缺字段)。
-        // ⚠️ **不限于原本是 `ok` 的情况。** `backend_failed` / `timeout` 在本工具的契约里是
-        // "可以安全换个人重跑"的档;而重跑通常带 `force`,`force` 会把**正因为说不清才被保留下来**的
-        // 那棵工作树连同分支一起删掉。工作区状态不明时宣称"可安全重跑",等于亲手安排了一次数据销毁。
-        // 所以只要 outcome 不明,顶层一律按 unknown(停下等人),原始结局记进 diagnostics 不丢信息。
-        if (rest.outcome !== "delivered" && rest.outcome !== "no-changes") {
-          const was = receipt.status;
-          receipt.status = "unknown";
-          if (was !== "ok") {
-            receipt.diagnostics.push(
-              `原始结局是 ${was},但工作区状态无法确认 —— 已按 unknown 处理(${was} 会被理解成"可安全重跑",` +
-              `而重跑加 force 会删掉这棵保留下来的工作树)`,
-            );
-          }
-          receipt.error = `${receipt.error ? `${receipt.error};` : ""}write 环节的交付物没能确认落到分支上` +
-            `(outcome=${rest.outcome})——工作区已保留:${rest.path},详见 diagnostics`;
-        }
-      }
-      receipt.endedAt = nowIso();
-      receipt.durationMs = Math.round(monoNow() - t0);
-      try {
-        writeAtomic(receiptPath, JSON.stringify(receipt, null, 2) + "\n");
-      } catch (e) {
-        // 回执落盘是成功的**前提**:回执写不下去,下一次就无法靠它做幂等判断。
-        // 绝不能"退出 0 但没有回执"。
-        receipt.status = "unknown";
-        receipt.error = `回执写入失败(${e.message});原始结局=${status}${receipt.error ? `;${receipt.error}` : ""}`;
-      }
-      return receipt;
-    };
-
-    try {
-      // --- 开会话
+  try {
+    // --- 开会话(只在首轮)
+    if (!run.opened) {
       const openArgs = {
         agent: spec.agent,
         // write 环节跑在自己的 worktree 里,**不是**调用方给的 cwd —— 这就是隔离本身。
         // ⚠️ 隔离的是写:桥没有 OS 沙箱,有 shell 的环节技术上仍能 `../..` 读回主工作区。
-        cwd: workspace ? workspace.path : spec.cwd,
+        cwd: run.workspace ? run.workspace.path : spec.cwd,
         access: spec.access,
-        // 结果走 textRef + cp,不把几 MB 正文塞进 JSON-RPC 管道
-        return_mode: "ref",
         name: `graph-${spec.id}-${spec.specHash.slice(0, 6)}`,
       };
       if (spec.model) openArgs.model = spec.model;
       if (spec.effort) openArgs.effort = spec.effort;
       if (spec.roleFile) openArgs.append_system_prompt_file = spec.roleFile;
 
-      if (remaining() <= 0) return await finish("timeout", { error: `还没开会话,总预算 ${spec.timeoutMs}ms 就已耗尽` });
+      if (remaining() <= 0) return await finish("timeout", { error: `还没开会话,总预算 ${t.timeoutMs}ms 就已耗尽` });
       let opened;
       try {
         // 一旦发出去,结局就默认按**不明**记 —— 只有下面两条路能把它改掉。
-        openOutcome = "unknown";
+        run.openOutcome = "unknown";
         opened = await bridge.callTool("agent_bridge_open_session", openArgs, budget());
       } catch (e) {
         // 桥**明确回报**的错(BridgeReportedError)= 会话确定没建起来,后端确定没在跑;
         // 其余(本地 RPC 超时、断管)= 请求可能已经生效,只是我们不知道 —— 维持 "unknown"。
-        if (e instanceof BridgeReportedError) openOutcome = "refused";
+        if (e instanceof BridgeReportedError) run.openOutcome = "refused";
         throw e;
       }
-      sessionId = opened?.session?.id ?? null;
-      if (sessionId) openOutcome = "opened";
-      logFile = opened?.session?.logFile ?? null;
-      receipt.sessionId = sessionId;
-      if (!sessionId) {
+      run.sessionId = opened?.session?.id ?? null;
+      if (run.sessionId) run.openOutcome = "opened";
+      run.logFile = opened?.session?.logFile ?? null;
+      receipt.sessionId = run.sessionId;
+      if (!run.sessionId) {
         // 桥没抛错、却也没给 session id —— 这不是"桥明确说后端不行",是我们不认识的返回形状。
         // 按 unknown 停下(可能后端其实开起来了,只是我们没拿到句柄)。
         return await finish("unknown", { error: `开会话返回里没有 session id(形状不认识):${JSON.stringify(opened).slice(0, 500)}` });
       }
+      run.opened = true;
+    }
 
-      let attempt = 0;
-      let lastReason = null;
+    let attempt = 0;
+    let lastReason = null;
 
-      while (true) {
-        if (remaining() <= 0) {
-          return await finish("timeout", { error: `总预算 ${spec.timeoutMs}ms 耗尽(还没来得及发第 ${attempt + 1} 轮)` });
+    while (true) {
+      if (remaining() <= 0) {
+        return await finish("timeout", { error: `总预算 ${t.timeoutMs}ms 耗尽(还没来得及发第 ${attempt + 1} 轮)` });
+      }
+
+      // --- 发消息(默认非阻塞,立刻拿 ack)
+      const msgArgs = { session_id: run.sessionId };
+      if (attempt === 0) {
+        if (t.promptFile) msgArgs.message_file = t.promptFile;
+        else msgArgs.message = t.prompt;
+      } else {
+        msgArgs.message =
+          `上一条回复不符合约定的输出格式:${lastReason}\n` +
+          `请**只输出**符合要求的 JSON 本体,不要任何解释文字、不要 markdown 代码围栏。`;
+      }
+      if (t.schema) msgArgs.schema = t.schema;
+
+      const ack = await bridge.callTool("agent_bridge_send_message", msgArgs, budget());
+      // 必须**明确**被接收。桥对 send 的回执里 accepted 应为 true;拿到别的形状说明我们不认识
+      // 这个返回 → 按 unknown 停下,不猜。
+      if (ack && ack.accepted === false) {
+        return await finish("backend_failed", { error: `后端拒收消息:${JSON.stringify(ack).slice(0, 500)}` });
+      }
+      if (!ack || ack.accepted !== true) {
+        return await finish("unknown", { error: `send 返回了不认识的形状(无法确认任务是否已开始):${JSON.stringify(ack).slice(0, 500)}` });
+      }
+
+      // --- 短切片 wait 循环(超时不中断 turn,任务继续在后台跑,再 wait 即可接着等)
+      let settled = null;
+      let nonTerminalSettles = 0; // 桥说"结束了"但状态仍是非终态的次数(后端自己多轮),记进回执供事后看
+      while (!settled) {
+        const remain = remaining();
+        if (remain <= 0) break;
+        // 本地 RPC 预算必须**略大于**告诉桥的 timeout_ms,否则两个计时器同时到点、本地那个先响,
+        // 会把一次正常的「桥回 timedOut」变成 RpcTimeoutError。容差**含在**总预算里,不额外相加。
+        const tolerance = Math.min(2000, remain / 2);
+        const slice = Math.min(WAIT_SLICE_MS, remain - tolerance);
+        if (slice <= 0) break; // 剩下的时间不够做一次有意义的等待了
+        // slice 被总预算卡住(而不是被 5 分钟切片上限卡住)时,这一次的本地超时就等于"环节预算用完"
+        run.rpcDeadlineFromBudget = slice < WAIT_SLICE_MS;
+        const w = await bridge.callTool(
+          "agent_bridge_wait",
+          { session_ids: [run.sessionId], mode: "all", timeout_ms: Math.max(1, Math.floor(slice)) },
+          slice + tolerance,
+        );
+        if (w?.timedOut) {
+          const snap = w.pendingSnapshots?.[0];
+          if (snap && snap.contextUsage !== undefined) receipt.contextUsage = snap.contextUsage ?? null;
+          continue; // 还在跑,接着等
         }
-
-        // --- 发消息(默认非阻塞,立刻拿 ack)
-        const msgArgs = { session_id: sessionId };
-        if (attempt === 0) {
-          if (spec.promptFile) msgArgs.message_file = spec.promptFile;
-          else msgArgs.message = spec.prompt;
-        } else {
-          msgArgs.message =
-            `上一条回复不符合约定的输出格式:${lastReason}\n` +
-            `请**只输出**符合要求的 JSON 本体,不要任何解释文字、不要 markdown 代码围栏。`;
+        const got = w?.results?.[0] ?? null;
+        if (!got) {
+          return await finish("unknown", { error: `wait 返回了没预料到的形状:${JSON.stringify(w).slice(0, 800)}` });
         }
-        if (spec.schema) msgArgs.schema = spec.schema;
-
-        const ack = await bridge.callTool("agent_bridge_send_message", msgArgs, budget());
-        // 必须**明确**被接收。桥对 send 的回执里 accepted 应为 true;拿到别的形状说明我们不认识
-        // 这个返回 → 按 unknown 停下,不猜。
-        if (ack && ack.accepted === false) {
-          return await finish("backend_failed", { error: `后端拒收消息:${JSON.stringify(ack).slice(0, 500)}` });
-        }
-        if (!ack || ack.accepted !== true) {
-          return await finish("unknown", { error: `send 返回了不认识的形状(无法确认任务是否已开始):${JSON.stringify(ack).slice(0, 500)}` });
-        }
-
-        // --- 短切片 wait 循环(超时不中断 turn,任务继续在后台跑,再 wait 即可接着等)
-        let settled = null;
-        let nonTerminalSettles = 0; // 桥说"结束了"但状态仍是非终态的次数(后端自己多轮),记进回执供事后看
-        while (!settled) {
-          const remain = remaining();
-          if (remain <= 0) break;
-          // 本地 RPC 预算必须**略大于**告诉桥的 timeout_ms,否则两个计时器同时到点、本地那个先响,
-          // 会把一次正常的「桥回 timedOut」变成 RpcTimeoutError。容差**含在**总预算里,不额外相加。
-          const tolerance = Math.min(2000, remain / 2);
-          const slice = Math.min(WAIT_SLICE_MS, remain - tolerance);
-          if (slice <= 0) break; // 剩下的时间不够做一次有意义的等待了
-          // slice 被总预算卡住(而不是被 5 分钟切片上限卡住)时,这一次的本地超时就等于"环节预算用完"
-          rpcDeadlineFromBudget = slice < WAIT_SLICE_MS;
-          const w = await bridge.callTool(
-            "agent_bridge_wait",
-            { session_ids: [sessionId], mode: "all", timeout_ms: Math.max(1, Math.floor(slice)) },
-            slice + tolerance,
-          );
-          if (w?.timedOut) {
-            const snap = w.pendingSnapshots?.[0];
-            if (snap && snap.contextUsage !== undefined) receipt.contextUsage = snap.contextUsage ?? null;
-            continue; // 还在跑,接着等
+        // 桥说"这一轮结束了",可它同时报会话还在 `running`/`starting`。两句话对不上时以**状态**为准:
+        // 这不是"不认识的状态",而是**认识的非终态** —— 认识的非终态该做的事是接着等,不是放弃。
+        //
+        // 为什么会对不上(真机根因,omp + deepseek-v4-pro 实测):后端把一次委托拆成多个内部 turn,
+        // 干完一段就 turn_end、紧接着自己 turn_start 继续。桥在 turn_end 处就认为可以收结果了,
+        // 而它是**先判定已结束、再 await 去取正文**的(waitSessions 的 summarize),后端恰好在那个
+        // await 窗口里重开了下一轮。此时收下的正文只是刚吐出的头几个字符 —— 当成答案就是**假成功**。
+        if (got.status === "running" || got.status === "starting") {
+          nonTerminalSettles++;
+          if (nonTerminalSettles === 1) {
+            receipt.diagnostics.push(
+              `桥报「已结束」但会话仍是 "${got.status}"(后端在自己开下一轮),按非终态继续等`,
+            );
           }
-          const got = w?.results?.[0] ?? null;
-          if (!got) {
-            return await finish("unknown", { error: `wait 返回了没预料到的形状:${JSON.stringify(w).slice(0, 800)}` });
-          }
-          // 桥说"这一轮结束了",可它同时报会话还在 `running`/`starting`。两句话对不上时以**状态**为准:
-          // 这不是"不认识的状态",而是**认识的非终态** —— 认识的非终态该做的事是接着等,不是放弃。
-          //
-          // 为什么会对不上(真机根因,omp + deepseek-v4-pro 实测):后端把一次委托拆成多个内部 turn,
-          // 干完一段就 turn_end、紧接着自己 turn_start 继续。桥在 turn_end 处就认为可以收结果了,
-          // 而它是**先判定已结束、再 await 去取正文**的(waitSessions 的 summarize),后端恰好在那个
-          // await 窗口里重开了下一轮。此时收下的正文只是刚吐出的头几个字符 —— 当成答案就是**假成功**。
-          if (got.status === "running" || got.status === "starting") {
-            nonTerminalSettles++;
-            if (nonTerminalSettles === 1) {
-              receipt.diagnostics.push(
-                `桥报「已结束」但会话仍是 "${got.status}"(后端在自己开下一轮),按非终态继续等`,
-              );
-            }
-            // 这种 wait 是**立刻**返回的,不歇一下会变成空转打桥。歇一小会儿再问,节奏与桥自己的轮询一致。
-            // 歇多久也**夹在总预算里**:否则最后一次歇息会让实际耗时越出 timeoutMs 最多 250ms,
-            // 和"timeoutMs 是硬上限"这个说法对不上(T9 立的就是这条规矩)。
-            await sleep(Math.min(250, Math.max(0, remaining())));
-            continue;
-          }
-          settled = got;
-        }
-
-        // --- 总时长用尽:先 abort 打断这一轮(wait 超时本身不打断,任务还在后台烧),再收尾。
-        //     abort 成没成要**如实记录**,不能未确认就在回执里写"已 abort"。
-        if (!settled) return await finishTimeout(`超过 ${spec.timeoutMs}ms 未完成`);
-
-        if (settled.contextUsage !== undefined) receipt.contextUsage = settled.contextUsage ?? null;
-        if (settled.textRef) lastTextRef = settled.textRef;
-
-        // 「跑完了」在桥这里表现为会话回到 idle。**只认列举出来的终态**:
-        // failed/closed/gone = 桥明确回报的失败;idle = 正常收场;其它(如 running 漏出来)= 不认识 → unknown。
-        if (settled.gone || settled.status === "failed" || settled.status === "closed") {
-          return await finish("backend_failed", {
-            _sceneTag: `turn-${settled.status}`,
-            error: `会话以 ${settled.status} 收场:${settled.error ?? settled.lastError ?? "(无错误详情)"}`,
-          });
-        }
-        // 跑到这里 status 只可能是 idle,或者一个我们**压根没见过**的值(running/starting 已在循环里当非终态处理了)
-        if (settled.status !== "idle") {
-          return await finish("unknown", {
-            error: `wait 说这个会话已结束,但状态是不认识的 "${settled.status}"(不敢当成功):${JSON.stringify(settled).slice(0, 500)}`,
-          });
-        }
-        if (nonTerminalSettles > 0) {
-          receipt.diagnostics.push(`后端自己多开了 ${nonTerminalSettles} 轮,等到真正结束才收结果`);
-        }
-
-        // --- 结果落盘(字节直传;必须在 close_session 之前 —— 关会话会删 textRef)
-        let text = null;
-        if (settled.textRef && copyBytes(settled.textRef, artifactPath)) {
-          try { text = fs.readFileSync(artifactPath, "utf8"); }
-          catch (e) { receipt.diagnostics.push(`产出已复制但读不回来:${e.message}`); }
-        }
-        if (text === null) {
-          // 拿不到 textRef:再 result 一次(不设 max_chars 拿全文)
-          try {
-            const r = await bridge.callTool("agent_bridge_result", { session_id: sessionId }, budget());
-            if (r?.textRef) {
-              lastTextRef = r.textRef;
-              if (copyBytes(r.textRef, artifactPath)) {
-                try { text = fs.readFileSync(artifactPath, "utf8"); } catch {}
-              }
-            }
-          } catch (e) { receipt.diagnostics.push(`补取 result 失败(${e.name}):${e.message}`); }
-        }
-        if (text === null) {
-          return await finish("unknown", { error: "本轮完成了,但取不到任何答案正文(textRef 拿不到或复制失败)" });
-        }
-        receipt.artifactPath = artifactPath;
-        receipt.charCount = typeof settled.charCount === "number" ? settled.charCount : text.length;
-        receipt.byteCount = typeof settled.byteCount === "number" ? settled.byteCount : Buffer.byteLength(text, "utf8");
-        receipt.artifactSha256 = await sha256File(artifactPath);
-        // 算不出产出的哈希 = 刚写下的文件读不回来,本地落盘完整性有问题。
-        // 这时不能报 ok:否则会写出一张**没有指纹**的成功回执,让下次复用绕过内容校验。
-        if (!receipt.artifactSha256) {
-          return await finish("unknown", { error: `产出已落盘但算不出内容指纹(读不回来):${artifactPath}` });
-        }
-
-        // --- 契约校验:codex 走后端强制(桥回 json / schemaError),其余四家走弱检查
-        let bad = null;
-        if (spec.schema) {
-          if (settled.schemaError) bad = `codex 强制格式未通过:${settled.schemaError.error ?? JSON.stringify(settled.schemaError)}`;
-        } else if (spec.outputShape) {
-          const chk = weakCheck(text, spec.outputShape);
-          if (!chk.ok) bad = chk.reason;
-        }
-
-        if (!bad) return await finish("ok");
-
-        // 不合格:按声明打回重说一次,再不行就停(**绝不无限重试**)
-        if (attempt < spec.reask && remaining() > 0) {
-          receipt.diagnostics.push(`第 ${attempt + 1} 次输出不合格,打回重说:${bad}`);
-          receipt.reaskCount = attempt + 1;
-          lastReason = bad;
-          attempt++;
+          // 这种 wait 是**立刻**返回的,不歇一下会变成空转打桥。歇一小会儿再问,节奏与桥自己的轮询一致。
+          // 歇多久也**夹在总预算里**:否则最后一次歇息会让实际耗时越出 timeoutMs 最多 250ms,
+          // 和"timeoutMs 是硬上限"这个说法对不上(T9 立的就是这条规矩)。
+          await sleep(Math.min(250, Math.max(0, remaining())));
           continue;
         }
-        return await finish("contract_error", {
-          error: bad + (remaining() <= 0 && attempt < spec.reask ? "(预算已耗尽,没能打回重说)" : ""),
+        settled = got;
+      }
+
+      // --- 总时长用尽:先 abort 打断这一轮(wait 超时本身不打断,任务还在后台烧),再收尾。
+      //     abort 成没成要**如实记录**,不能未确认就在回执里写"已 abort"。
+      if (!settled) return await finishTimeout(`超过 ${t.timeoutMs}ms 未完成`);
+
+      if (settled.contextUsage !== undefined) receipt.contextUsage = settled.contextUsage ?? null;
+      if (settled.textRef) run.lastTextRef = settled.textRef;
+
+      // 「跑完了」在桥这里表现为会话回到 idle。**只认列举出来的终态**:
+      // failed/closed/gone = 桥明确回报的失败;idle = 正常收场;其它(如 running 漏出来)= 不认识 → unknown。
+      if (settled.gone || settled.status === "failed" || settled.status === "closed") {
+        return await finish("backend_failed", {
+          _sceneTag: `turn-${settled.status}`,
+          error: `会话以 ${settled.status} 收场:${settled.error ?? settled.lastError ?? "(无错误详情)"}`,
         });
       }
-    } catch (e) {
-      if (e instanceof UsageError) throw e;
-      const detail = `${e?.name || "Error"}:${e?.message || String(e)}`;
+      // 跑到这里 status 只可能是 idle,或者一个我们**压根没见过**的值(running/starting 已在循环里当非终态处理了)
+      if (settled.status !== "idle") {
+        return await finish("unknown", {
+          error: `wait 说这个会话已结束,但状态是不认识的 "${settled.status}"(不敢当成功):${JSON.stringify(settled).slice(0, 500)}`,
+        });
+      }
+      if (nonTerminalSettles > 0) {
+        receipt.diagnostics.push(`后端自己多开了 ${nonTerminalSettles} 轮,等到真正结束才收结果`);
+      }
 
-      // **失败分类的要害**,三档:
-      // ① 桥「明确回报」的错 → backend_failed(=调用方可安全换人重跑)。
-      // ② 本地 RPC 超时**且总预算已耗尽** → 就是这个环节的 timeout(不是什么神秘状态):
-      //    我们给的时间用光了,该走 abort + 保现场的超时路径。
-      // ③ 其余(总预算还有余量却不响应、管道断)→ unknown:分不清后端到底干没干,
-      //    停下等人,**绝不**报成可重试的失败去诱导重跑。
-      if (e instanceof BridgeReportedError) {
-        return await finish("backend_failed", { error: detail });
+      // --- 结果落盘(字节直传;必须在 close_session 之前 —— 关会话会删 textRef)
+      let text = null;
+      if (settled.textRef && copyBytes(settled.textRef, artifactPath)) {
+        try { text = fs.readFileSync(artifactPath, "utf8"); }
+        catch (e) { receipt.diagnostics.push(`产出已复制但读不回来:${e.message}`); }
       }
-      if (e instanceof RpcTimeoutError && (rpcDeadlineFromBudget || remaining() <= 0)) {
-        return await finishTimeout(`总预算 ${spec.timeoutMs}ms 耗尽(${detail})`);
+      if (text === null) {
+        // 拿不到 textRef:再 result 一次(不设 max_chars 拿全文)
+        try {
+          const r = await bridge.callTool("agent_bridge_result", { session_id: run.sessionId }, budget());
+          if (r?.textRef) {
+            run.lastTextRef = r.textRef;
+            if (copyBytes(r.textRef, artifactPath)) {
+              try { text = fs.readFileSync(artifactPath, "utf8"); } catch {}
+            }
+          }
+        } catch (e) { receipt.diagnostics.push(`补取 result 失败(${e.name}):${e.message}`); }
       }
-      return await finish("unknown", {
-        error: `${detail}(无法确认后端是否已经开始/完成了工作,故按未知状态停下)`,
+      if (text === null) {
+        return await finish("unknown", { error: "本轮完成了,但取不到任何答案正文(textRef 拿不到或复制失败)" });
+      }
+      receipt.artifactPath = artifactPath;
+      receipt.charCount = typeof settled.charCount === "number" ? settled.charCount : text.length;
+      receipt.byteCount = typeof settled.byteCount === "number" ? settled.byteCount : Buffer.byteLength(text, "utf8");
+      receipt.artifactSha256 = await sha256File(artifactPath);
+      // 算不出产出的哈希 = 刚写下的文件读不回来,本地落盘完整性有问题。
+      // 这时不能报 ok:否则会写出一张**没有指纹**的成功回执,让下次复用绕过内容校验。
+      if (!receipt.artifactSha256) {
+        return await finish("unknown", { error: `产出已落盘但算不出内容指纹(读不回来):${artifactPath}` });
+      }
+
+      // --- 契约校验:codex 走后端强制(桥回 json / schemaError),其余四家走弱检查
+      let bad = null;
+      if (t.schema) {
+        if (settled.schemaError) bad = `codex 强制格式未通过:${settled.schemaError.error ?? JSON.stringify(settled.schemaError)}`;
+      } else if (t.outputShape) {
+        const chk = weakCheck(text, t.outputShape);
+        if (!chk.ok) bad = chk.reason;
+      }
+
+      if (!bad) return await finish("ok");
+
+      // 不合格:按声明打回重说一次,再不行就停(**绝不无限重试**)
+      if (attempt < t.reask && remaining() > 0) {
+        receipt.diagnostics.push(`第 ${attempt + 1} 次输出不合格,打回重说:${bad}`);
+        receipt.reaskCount = attempt + 1;
+        lastReason = bad;
+        attempt++;
+        continue;
+      }
+      return await finish("contract_error", {
+        error: bad + (remaining() <= 0 && attempt < t.reask ? "(预算已耗尽,没能打回重说)" : ""),
       });
     }
-  } finally {
-    // ⚠️ 建了 worktree 却没走到 finish() 的路径(UsageError 抛在中途、或桥本身崩了):
-    // 这里必须兜底,否则每次异常都在磁盘上留一个工作树和一条分支,越攒越多。
-    // 与 finish() 里那次是幂等关系:finalize 成功后 workspace.removed=true,不会重复删。
-    if (workspace && !workspaceFinalized) {
-      workspaceFinalized = true;
-      // 走到这条兜底路径 = 没经过 finish(),会话大概率没被正常关过 → 按"关闭未确认"对待,
-      // **保留**工作区不删。这里宁可留脏也不能删掉可能还在被写的树。
-      try {
-        workspace = await finalizeWorktree({
-          repoRoot, ws: workspace, diffPath, nodeId: spec.id, runKey, closeConfirmed: false,
-        });
-      } catch {}
+  } catch (e) {
+    if (e instanceof UsageError) throw e;
+    const detail = `${e?.name || "Error"}:${e?.message || String(e)}`;
+
+    // **失败分类的要害**,三档:
+    // ① 桥「明确回报」的错 → backend_failed(=调用方可安全换人重跑)。
+    // ② 本地 RPC 超时**且总预算已耗尽** → 就是这个环节的 timeout(不是什么神秘状态):
+    //    我们给的时间用光了,该走 abort + 保现场的超时路径。
+    // ③ 其余(总预算还有余量却不响应、管道断)→ unknown:分不清后端到底干没干,
+    //    停下等人,**绝不**报成可重试的失败去诱导重跑。
+    if (e instanceof BridgeReportedError) {
+      return await finish("backend_failed", { error: detail });
     }
-    if (gateHeld) bridge._gate.release();
-    active.delete(activeKey);
-    try { if (lockFd !== null) fs.closeSync(lockFd); } catch {}
-    try { fs.rmSync(lockPath, { force: true }); } catch {}
+    if (e instanceof RpcTimeoutError && (run.rpcDeadlineFromBudget || remaining() <= 0)) {
+      return await finishTimeout(`总预算 ${t.timeoutMs}ms 耗尽(${detail})`);
+    }
+    return await finish("unknown", {
+      error: `${detail}(无法确认后端是否已经开始/完成了工作,故按未知状态停下)`,
+    });
+  }
+}
+
+/**
+ * ④ 收尾(**环节级**):关会话 → 收工作区 → 定顶层 status → 原子写回执。顺序不能换。
+ *
+ * 现场已经在 `settleTurn` 里冻过了,这里**不再补取**。
+ */
+export async function finalizeRun(run) {
+  const { spec, receipt } = run;
+  // 这一轮**自己**的结局。下面工作区那道闸可能把 receipt.status 改写成 unknown,
+  // 而回执写失败时报的"原始结局"说的是改写**之前**那个 —— 先存下来,别事后去读已经被改过的值。
+  const turnStatus = receipt.status;
+  await run.closeSession();
+  // 收工作区排在**关会话之后**:后端进程还活着时它可能还握着 worktree 里的文件句柄,
+  // Windows 上那会让 `git worktree remove` 直接失败。
+  // **不受 remaining() 约束** —— 环节可能正是因为预算耗尽才走到这里,
+  // 而"把已经改出来的代码保住"不能因为超时就放弃。
+  if (run.workspace && !run.workspaceFinalized) {
+    run.workspaceFinalized = true;
+    const fin = await finalizeWorktree({
+      repoRoot: run.repoRoot, ws: run.workspace, diffPath: run.diffPath, nodeId: spec.id, runKey: run.runKey,
+      // 「后端确定不会再往这棵树里写了」。三种情况成立:关会话被确认、请求压根没发出去、
+      // 或桥**明确回报**开不起来(后者最常见:后端没装/起不来;若也按"关闭未确认"保留,
+      // 每次失败都白留一棵空工作树和一条空分支,越攒越多)。
+      // ⚠️ 判据是 openOutcome 而**不是** `sessionId === null` —— 后者把"桥说没建成"
+      // 和"我们没拿到句柄但它可能已经建成了"混成一谈,于是在后端可能还活着时删树。
+      closeConfirmed: receipt.closeConfirmed === true
+        || run.openOutcome === "not-attempted" || run.openOutcome === "refused",
+    });
+    const { notes, ...rest } = fin;
+    run.workspace = rest;
+    receipt.workspace = rest;
+    for (const n of notes) receipt.diagnostics.push(`工作区:${n}`);
+    // **write 环节的交付物不只是那段文字,还包括"改动确实落到了分支上"。**
+    // 有改动却没提交、或压根不知道有没有改动 —— 这时报 ok,调用方(以及 reuseIfSame 的
+    // "只复用 ok"那道闸)就会把一个**没有产出的 write 环节**当成功,并在此之上继续往下建。
+    // 降级成 unknown 而不是某种失败:我们确实不知道后端干了多少,按纪律停下等人、不诱导重跑。
+    // (不补 saveScene:会话已关,现场三件套只能取到残缺的一份;真正的证据是**被保留下来的
+    //  worktree 与分支**,路径就在 diagnostics 里。)
+    // 判据只有一个:finalizeWorktree 给出的 outcome。**不在这里拿 committed/filesChanged
+    // 自己再推一遍** —— 同一件事在两处各推一次,迟早推出两种结论(第 3 轮复审就是这么被抓到的:
+    // 提交成功但 diff/head 没拿到时,这里按 `committed` 判成功,回执里却缺字段)。
+    // ⚠️ **不限于原本是 `ok` 的情况。** `backend_failed` / `timeout` 在本工具的契约里是
+    // "可以安全换个人重跑"的档;而重跑通常带 `force`,`force` 会把**正因为说不清才被保留下来**的
+    // 那棵工作树连同分支一起删掉。工作区状态不明时宣称"可安全重跑",等于亲手安排了一次数据销毁。
+    // 所以只要 outcome 不明,顶层一律按 unknown(停下等人),原始结局记进 diagnostics 不丢信息。
+    if (rest.outcome !== "delivered" && rest.outcome !== "no-changes") {
+      const was = receipt.status;
+      receipt.status = "unknown";
+      if (was !== "ok") {
+        receipt.diagnostics.push(
+          `原始结局是 ${was},但工作区状态无法确认 —— 已按 unknown 处理(${was} 会被理解成"可安全重跑",` +
+          `而重跑加 force 会删掉这棵保留下来的工作树)`,
+        );
+      }
+      receipt.error = `${receipt.error ? `${receipt.error};` : ""}write 环节的交付物没能确认落到分支上` +
+        `(outcome=${rest.outcome})——工作区已保留:${rest.path},详见 diagnostics`;
+    }
+  }
+  receipt.endedAt = nowIso();
+  // ⚠️ 用**环节**的起点(首轮起钟那一刻),不是最后一轮的 t0 —— 多轮时后者只算得出最后一轮的耗时。
+  receipt.durationMs = Math.round(monoNow() - (run.nodeT0 ?? run.t0));
+  try {
+    writeAtomic(run.receiptPath, JSON.stringify(receipt, null, 2) + "\n");
+  } catch (e) {
+    // 回执落盘是成功的**前提**:回执写不下去,下一次就无法靠它做幂等判断。
+    // 绝不能"退出 0 但没有回执"。
+    receipt.status = "unknown";
+    receipt.error = `回执写入失败(${e.message});原始结局=${turnStatus}${receipt.error ? `;${receipt.error}` : ""}`;
+  }
+  return receipt;
+}
+
+/** 无条件释放这一次占用的东西。**一件都不许漏** —— 漏了下一个同 id 的环节永远起不来。 */
+export async function releaseRun(run) {
+  // ⚠️ 建了 worktree 却没走到 finalizeRun() 的路径(UsageError 抛在中途、或桥本身崩了):
+  // 这里必须兜底,否则每次异常都在磁盘上留一个工作树和一条分支,越攒越多。
+  // 与 finalizeRun() 里那次是幂等关系:finalize 成功后 workspaceFinalized=true,不会重复删。
+  if (run.workspace && !run.workspaceFinalized) {
+    run.workspaceFinalized = true;
+    // 走到这条兜底路径 = 没经过 finalizeRun(),会话大概率没被正常关过 → 按"关闭未确认"对待,
+    // **保留**工作区不删。这里宁可留脏也不能删掉可能还在被写的树。
+    try {
+      run.workspace = await finalizeWorktree({
+        repoRoot: run.repoRoot, ws: run.workspace, diffPath: run.diffPath,
+        nodeId: run.spec.id, runKey: run.runKey, closeConfirmed: false,
+      });
+    } catch {}
+  }
+  if (run.gateHeld) { run.bridge._gate.release(); run.gateHeld = false; }
+  if (run.active && run.activeKey) run.active.delete(run.activeKey);
+  try { if (run.lockFd !== null) fs.closeSync(run.lockFd); } catch {}
+  run.lockFd = null;
+  try { fs.rmSync(run.lockPath, { force: true }); } catch {}
+}
+
+/**
+ * 跑一个环节的完整生命周期,一步不落:
+ *   开会话 → 发任务(非阻塞) → 短切片 wait 循环到 deadline → cp 结果 → 校验 → (必要时打回重说一次) → 关会话 → 写回执
+ *
+ * **不为环节失败抛异常**,返回带 status 的回执:
+ *   ok | contract_error | backend_failed | timeout | unknown
+ * 只有用法错(spec 非法)抛 UsageError。
+ *
+ * ⚠️ 它就是 `prepare → runTurn ×1 → finalize`,**N=1 的那条路**。别为单轮留第二份实现 ——
+ * "同一件事两处各写一遍,迟早漂成两种行为",本仓在 `artifactSha256` / `diffPath` / `committed`
+ * 上已经栽过三次。
+ */
+export async function runNode(bridge, rawSpec) {
+  const run = await prepareRun(bridge, rawSpec);
+  if (run.reusedReceipt) return run.reusedReceipt;
+  try {
+    await runTurn(run, {
+      key: "main",
+      prompt: run.spec.prompt, promptFile: run.spec.promptFile,
+      timeoutMs: run.spec.timeoutMs,
+      schema: run.spec.schema, outputShape: run.spec.outputShape, reask: run.spec.reask,
+    });
+    return await finalizeRun(run);
+  } finally {
+    // ⚠️ **执行闸在这里放,不在 runTurn 结束时放。** `runNode` 的 close_session /
+    // finalizeWorktree / 写回执都排在轮之后,提前放闸会让"同时活着的会话数"越过 maxConcurrent
+    // ——W8 量的就是这个。(对话的每一轮按轮放闸,那是另一种 lease,见对话方案 §1.1。)
+    await releaseRun(run);
   }
 }
 
