@@ -50,6 +50,10 @@ const MODE = process.env.FAKE_OMP_MODE || "pipebreak";
 /** 所有"往 cwd 里写文件"的模式。写完之后各自还会再干点别的(自己提交 / 切走 HEAD / 弄坏 git 链接)。 */
 const WRITE_MODES = [
   "writeturn", "writeturn-break", "writeturn-commit", "writeturn-detach",
+  // 文件名**按 prompt 取**,于是同一棵工作树上跑 N 轮会留下 N 个不同的文件。
+  // 用来考"一段对话 = 一条分支,N 轮的改动**全都在里面**"——固定文件名的 writeturn
+  // 每轮互相覆盖,只能证明"最后一轮在",证不出前几轮的改动没丢。[对话方案 §10]
+  "writeturn-perprompt",
   // 只建一个**空提交**,一个文件都不写:HEAD 前进了但净改动为零。
   // 用来考"首跑判 delivered、复用却因为 diff 是 0 字节而拒绝"这种前后打架。[W24]
   "writeturn-emptycommit",
@@ -157,6 +161,11 @@ process.stdin.on("data", d => {
               gg(["-c", "user.name=fake-agent", "-c", "user.email=fake@agent.local",
                   "commit", "--allow-empty", "--no-verify", "-m", "empty commit by agent"]);
               note = "EMPTYCOMMIT_OK";
+            } else if (MODE === "writeturn-perprompt") {
+              // 每一轮一个自己的文件 —— 名字取自 prompt,于是 N 轮留下 N 处改动、互不覆盖
+              const slug = (body.match(/[A-Za-z0-9._-]+/) || ["turn"])[0].slice(0, 40);
+              fs.writeFileSync(path.join(process.cwd(), `wrote-${slug}.txt`), `${body}\n`, "utf8");
+              note = "WROTE_OK";
             } else {
               fs.writeFileSync(path.join(process.cwd(), "wrote-by-node.txt"), `${body}\n`, "utf8");
               // 路径里带空格的那种文件 —— 用来验证 name-status 是按 TAB 切而不是按空白切

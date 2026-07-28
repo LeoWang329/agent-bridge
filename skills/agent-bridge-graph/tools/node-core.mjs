@@ -170,10 +170,26 @@ function requireString(v, field) {
   return v;
 }
 
-/** 规范化 + 校验一张任务单。返回带 specHash 的 spec。**所有可预知的错都在这里变成 UsageError**。 */
-export function normalizeSpec(raw) {
+/** 规范化 + 校验一张任务单。返回带 specHash 的 spec。**所有可预知的错都在这里变成 UsageError**。
+ *
+ *  `kind:"conversation"` 走对话档:**逐轮才有的那几样(prompt / timeoutMs / schema /
+ *  outputShape / reask)不许出现在顶层**。它们出现在顶层 = 调用方以为自己给整段定了规矩,
+ *  而实际每轮各定各的 —— 静默忽略比报错坏得多(同 send_message.timeout_ms 在 wait:false
+ *  下静默无效那个教训)。**这两档共用同一个函数**,不为对话另抄一份校验。 */
+export function normalizeSpec(raw, { kind = "node" } = {}) {
   if (!raw || typeof raw !== "object") throw new UsageError("任务单必须是一个对象");
   const s = { ...raw };
+  const isConv = kind === "conversation";
+  if (isConv) {
+    for (const k of ["prompt", "promptFile", "timeoutMs", "schema", "outputShape", "reask"]) {
+      if (s[k] !== undefined) {
+        throw new UsageError(
+          `${k} 是**每一轮**的参数,不能放在 conversation 的顶层任务单上 —— 请写进 turn({ ${k}: … })。\n` +
+          `(顶层再来一个预算/格式,就多出一处"两个说了算的谁管谁"的解释,而每轮各自声明已经够用。)`,
+        );
+      }
+    }
+  }
 
   for (const k of ["id", "agent", "cwd", "outDir"]) {
     if (s[k] === undefined || s[k] === null || s[k] === "") throw new UsageError(`任务单缺必填字段:${k}`);
@@ -186,21 +202,23 @@ export function normalizeSpec(raw) {
     throw new UsageError(`agent 必须是 omp|codex|claude|cursor|kimi,拿到:${s.agent}`);
   }
 
-  // prompt / promptFile 二选一
-  const hasPrompt = typeof s.prompt === "string" && s.prompt.length > 0;
-  const hasFile = s.promptFile !== undefined && s.promptFile !== null && s.promptFile !== "";
-  if (hasPrompt === hasFile) throw new UsageError("prompt 和 promptFile 必须二选一(不能都给、也不能都不给)");
-  if (hasFile) {
-    s.promptFile = path.resolve(requireString(s.promptFile, "promptFile"));
-    const st = statSafe(s.promptFile);
-    if (!st) throw new UsageError(`promptFile 不存在:${s.promptFile}`);
-    if (!st.isFile()) throw new UsageError(`promptFile 不是普通文件:${s.promptFile}`);
-  }
+  if (!isConv) {
+    // prompt / promptFile 二选一
+    const hasPrompt = typeof s.prompt === "string" && s.prompt.length > 0;
+    const hasFile = s.promptFile !== undefined && s.promptFile !== null && s.promptFile !== "";
+    if (hasPrompt === hasFile) throw new UsageError("prompt 和 promptFile 必须二选一(不能都给、也不能都不给)");
+    if (hasFile) {
+      s.promptFile = path.resolve(requireString(s.promptFile, "promptFile"));
+      const st = statSafe(s.promptFile);
+      if (!st) throw new UsageError(`promptFile 不存在:${s.promptFile}`);
+      if (!st.isFile()) throw new UsageError(`promptFile 不是普通文件:${s.promptFile}`);
+    }
 
-  // timeoutMs 必填 —— 「wait 必传超时」这条纪律从此由代码保证,不再靠人记
-  const t = Number(s.timeoutMs);
-  if (!Number.isFinite(t) || t <= 0) throw new UsageError(`timeoutMs 必须是正数(毫秒),拿到:${s.timeoutMs}`);
-  s.timeoutMs = Math.floor(t);
+    // timeoutMs 必填 —— 「wait 必传超时」这条纪律从此由代码保证,不再靠人记
+    const t = Number(s.timeoutMs);
+    if (!Number.isFinite(t) || t <= 0) throw new UsageError(`timeoutMs 必须是正数(毫秒),拿到:${s.timeoutMs}`);
+    s.timeoutMs = Math.floor(t);
+  }
 
   s.cwd = path.resolve(s.cwd);
   const cwdStat = statSafe(s.cwd);
@@ -270,9 +288,11 @@ export function normalizeSpec(raw) {
   }
 
   // 契约不合格时「打回重说」的次数 —— 全系统唯一的 retry,且只在环节内部、不改变流程往下怎么走。
-  const re = s.reask === undefined ? 1 : Number(s.reask);
-  if (![0, 1].includes(re)) throw new UsageError(`reask 只能是 0 或 1,拿到:${s.reask}`);
-  s.reask = re;
+  if (!isConv) {
+    const re = s.reask === undefined ? 1 : Number(s.reask);
+    if (![0, 1].includes(re)) throw new UsageError(`reask 只能是 0 或 1,拿到:${s.reask}`);
+    s.reask = re;
+  }
 
   // 严格布尔:`Boolean("false")` 是 true —— 从命令行/配置文件流过来的字符串会把开关**反着**打开
   for (const k of ["force", "reuseIfSame"]) {
@@ -283,6 +303,7 @@ export function normalizeSpec(raw) {
   // 不靠隐式优先级替人做决定。
   if (s.force && s.reuseIfSame) throw new UsageError("force 与 reuseIfSame 语义冲突,不能同时设置");
 
+  s.kind = isConv ? "conversation" : "node";
   s.specHash = computeSpecHash(s);
   return s;
 }
@@ -458,6 +479,18 @@ export async function startBridge(opts = {}) {
     throw new UsageError(`maxConcurrent 必须是 ≥1 的整数,拿到:${JSON.stringify(opts.maxConcurrent)}`);
   }
   const gate = makeSemaphore(maxConcurrent);
+  // 第二把闸,界的是**跨轮活着的会话**(一段对话从首轮到收尾一直持着一个)。
+  // ⚠️ **不能与执行闸合成一把**:对话在回调期间(轮与轮之间)不持执行闸,好让回调里嵌套的
+  // runNode 拿得到 —— 那正是"复审发生在两轮之间"这个头号用法。合成一把要么自锁,
+  // 要么活会话数无上限(开 20 段对话 = 20 个常驻后端)。
+  // ⚠️ 也**不是**"全局活会话上限":4 段对话停在轮间 + 4 个独立 runNode 在跑 = 桥里 8 个会话。
+  // 真实上限是 maxConversations + maxConcurrent。
+  const maxConversations = opts.maxConversations === undefined ? maxConcurrent : opts.maxConversations;
+  if (!Number.isSafeInteger(maxConversations) || maxConversations < 1) {
+    await teardown();
+    throw new UsageError(`maxConversations 必须是 ≥1 的整数,拿到:${JSON.stringify(opts.maxConversations)}`);
+  }
+  const scopeGate = makeSemaphore(maxConversations);
 
   const bridge = {
     callTool,
@@ -466,10 +499,14 @@ export async function startBridge(opts = {}) {
     get lateResponses() { return state.lateResponses; },
     get pid() { return child.pid; },
     get maxConcurrent() { return maxConcurrent; },
+    get maxConversations() { return maxConversations; },
     _activeNodes: state.activeNodes,
     _gate: gate,
+    _scopeGate: scopeGate,
+    _inConversation: false, // 嵌套 conversation 会在对话闸上成环 —— 同步标记,当场拒
     doctor: (timeoutMs = RPC_TIMEOUT_MS) => callTool("agent_bridge_doctor", {}, timeoutMs),
     runNode: (spec) => runNode(bridge, spec),
+    conversation: (spec, fn) => conversation(bridge, spec, fn),
     async close() {
       if (state.closed) return;
       state.closed = true;
@@ -1079,8 +1116,8 @@ function makeSemaphore(max) {
  * 命中复用时把结果放在 `run.reusedReceipt` 上返回,资源已在返回前收干净。
  * 抛错(用法错/复用闸不过)时同样先收干净再抛。
  */
-export async function prepareRun(bridge, rawSpec) {
-  const spec = normalizeSpec(rawSpec);
+export async function prepareRun(bridge, rawSpec, { kind = "node" } = {}) {
+  const spec = normalizeSpec(rawSpec, { kind });
   ensureDir(spec.outDir);
   const nodesDir = path.join(spec.outDir, "nodes");
   ensureDir(nodesDir);
@@ -1096,8 +1133,22 @@ export async function prepareRun(bridge, rawSpec) {
   const runId = path.basename(spec.outDir);
   const runKey = `${gitSafeSlug(runId)}-${sha256Text(realpathSafe(spec.outDir)).slice(0, 8)}`;
 
+  const isConv = spec.kind === "conversation";
   const run = {
+    isConv,
     bridge, spec, nodesDir, artifactPath, receiptPath, sceneDir, runKey,
+    // 一轮的产出/现场落在哪。**单轮节点不是特例,是 N=1** —— 它走的是同一条路,
+    // 只不过路径投影回 `<id>.md` / `<id>.scene`,保证既有断言逐字节不变。
+    artifactPathFor: (key) => (isConv ? path.join(nodesDir, `${spec.id}.t-${key}.md`) : artifactPath),
+    sceneDirFor: (key) => (isConv ? path.join(nodesDir, `${spec.id}.t-${key}.scene`) : sceneDir),
+    turnRec: null,     // 这一轮往哪儿写。runNode 时**就是回执本身**
+    currentKey: null,
+    scopeHeld: false,
+    turns: [],
+    poisonedAfter: null,
+    turnKeys: new Set(),
+    activeTurn: false, // §3.1 串行闸:同步查+置位,不许有第二轮同时进来
+    sealed: false,     // fn 返回后封 admission
     diffPath: path.join(nodesDir, `${spec.id}.diff`),
     lockPath: path.join(nodesDir, `${spec.id}.lock`),
     lockFd: null, active: null, activeKey: null,
@@ -1206,11 +1257,25 @@ export async function prepareRun(bridge, rawSpec) {
     // (branch / baseCommit / headCommit / filesChanged / diffPath / committed / removed)。
     access: spec.access, workspace: null,
   };
+  if (isConv) {
+    run.receipt.kind = "conversation";
+    run.receipt.turns = [];
+    run.receipt.poisonedAfter = null;
+    // 逐轮才有的那几样在对话的**顶层回执**上没有意义 —— 留着就是一排恒为 null 的字段,
+    // 而"没有消费者的字段"这个坑本仓踩过好几次。它们全在 turns[] 里各归各轮。
+    for (const k of ["artifactPath", "charCount", "byteCount", "artifactSha256",
+                     "reaskCount", "contextUsage", "abortConfirmed", "scene"]) {
+      delete run.receipt[k];
+    }
+  } else {
+    // runNode:这一轮**就是**回执本身,于是顶层字段一个都不用投影(§2.2)
+    run.turnRec = run.receipt;
+  }
 
   /** 现场保留(三件套):桥干净退出会删掉本次 run 的日志目录、close_session 会删 textRef,
    *  所以**必须在关会话/关桥之前**把现场 cp 出来。缺哪件就在 diagnostics 里说明原因。 */
-  run.saveScene = async (tag, dir = run.sceneDir) => {
-    const receipt = run.receipt;
+  run.saveScene = async (tag, rec = run.receipt, dir = run.sceneDir) => {
+    const receipt = rec; // 现场与它的诊断都记在**这一轮**名下(runNode 时它就是回执本身)
     try {
       ensureDir(dir);
       const files = [];
@@ -1290,8 +1355,11 @@ export async function prepareRun(bridge, rawSpec) {
     throw e;
   }
   if (reused) {
-    await releaseRun(run);
     run.reusedReceipt = reused;
+    // ⚠️ 对话命中复用时**不在这里放锁**:回放要把回调整段跑一遍(里面可能还有嵌套节点),
+    // 这段时间同一个 id 不该被第二个进程同时开工。由 conversation() 的收尾统一释放。
+    // `runNode` 保持今天的行为(复用即返回,锁当场还回去)。
+    if (!run.isConv) await releaseRun(run);
   }
   return run;
 }
@@ -1319,6 +1387,23 @@ async function checkReuse(run) {
   if (prev.status !== "ok") {
     throw new UsageError(`回执存在但上次是 ${prev.status}(不是 ok),不复用失败结果。要重跑请加 force。`);
   }
+  if (run.isConv) {
+    // ⚠️ **`kind` 这道闸只属于 conversation()。** `runNode` 的复用闸绝不能开始查它 ——
+    // 历史回执没有这个键,加上去等于把所有旧回执一次判死。**按调用的是哪个 API 分派,
+    // 不按回执里有没有某个字段分派。**
+    if (prev.kind !== "conversation") {
+      throw new UsageError(
+        `回执存在但它不是一段对话(kind=${JSON.stringify(prev.kind)}):${receiptPath}\n` +
+        `同一个 id 先后当过节点和对话 —— 这两种产出形状不一样,不能互相复用。要重跑请加 force。`,
+      );
+    }
+    if (!Array.isArray(prev.turns) || prev.turns.length === 0) {
+      throw new UsageError(`回执说是对话且成功,却没有 turns[] —— 没有任何可比对的判据:${receiptPath}。要重跑请加 force。`);
+    }
+    // 逐轮的产出与指纹在回放时一轮一轮比对(见 replayTurn),这里只坐实整段的前提。
+    // write 的那几道闸对两档是同一套,继续往下走。
+    if (spec.access !== "write") return { ...prev, reused: true };
+  } else {
   // 产出还在不在?回执说 ok 但文件被删/被截断的话,复用就是在骗下游。
   // 而且产出路径必须就是**本次算出来的**那个,不能听信回执里写的任意路径。
   if (prev.artifactPath !== artifactPath) {
@@ -1339,6 +1424,7 @@ async function checkReuse(run) {
   const nowSha = await sha256File(artifactPath);
   if (nowSha !== prev.artifactSha256) {
     throw new UsageError(`产出文件内容与回执记录的不一致(可能被改过或被覆盖):${artifactPath}。要重跑请加 force。`);
+  }
   }
   // write 环节还要多一道:**指纹管不住基线漂移**。baseRef 通常是 "HEAD",
   // 它今天和上周解析到的是两个 commit,而 specHash 里只有字符串 "HEAD" —— 一模一样。
@@ -1440,12 +1526,19 @@ async function checkReuse(run) {
  *  现场必须在这里就冻住:桥的 `textRef` 是**会话级的单一路径**,每轮结果覆盖同一个文件,
  *  延到整段收尾再取,拿到的就是**后面某一轮**的答案,却被标成"这一轮失败的现场"。 */
 async function settleTurn(run, status, extra = {}) {
-  const receipt = run.receipt;
-  Object.assign(receipt, extra);
-  receipt.status = status;
-  if (status !== "ok") await run.saveScene(extra._sceneTag || status);
-  delete receipt._sceneTag;
-  return receipt;
+  const rec = run.turnRec;
+  Object.assign(rec, extra);
+  rec.status = status;
+  if (status !== "ok") await run.saveScene(extra._sceneTag || status, rec, run.sceneDirFor(run.currentKey));
+  delete rec._sceneTag;
+  // 这一轮之后这个会话还能不能接着用。**由工具判,不靠回调自觉** ——
+  // 破了这条的后果是两个 turn 在同一会话里并发,远超"回调写得不好"。
+  // ⚠️ 只给对话加:`runNode` 的回执**不许多出新字段**,那是既有调用方与 reuseIfSame 的合同。
+  if (run.isConv) {
+    rec.sessionReusable = status === "ok" || status === "contract_error"
+      || (status === "timeout" && rec.abortConfirmed === true);
+  }
+  return rec;
 }
 
 /**
@@ -1456,7 +1549,12 @@ async function settleTurn(run, status, extra = {}) {
  * `runNode` 只有一轮、且那一轮的 `timeoutMs` 就是 `spec.timeoutMs` ⇒ 因果顺序与今天逐字节相同。
  */
 export async function runTurn(run, t) {
-  const { bridge, spec, receipt, remaining, budget, artifactPath } = run;
+  const { bridge, spec, remaining, budget } = run;
+  // 这一轮往哪儿写。`runNode` 时 `turnRec` **就是回执本身**,于是下面几百行搬过来之后
+  // 写进去的还是那张回执、字段一个不变;对话时它是 `turns[]` 里的那一条。
+  const receipt = run.turnRec;
+  const artifactPath = run.artifactPathFor(t.key);
+  run.currentKey = t.key;
   // 让搬过来的这几百行**一个字符都不用改**:里面仍然写 `finish(...)`。
   const finish = (status, extra) => settleTurn(run, status, extra);
 
@@ -1479,7 +1577,7 @@ export async function runTurn(run, t) {
     run.workspace = await createWorktree({
       repoRoot: run.repoRoot, wtPath, branch, baseCommit: run.baseCommit, force: spec.force,
     });
-    receipt.workspace = { ...run.workspace };
+    run.receipt.workspace = { ...run.workspace }; // 工作区是**环节级**的:N 轮共享一棵树、一条分支
   }
 
   /** 超时收场:**先 abort 打断这一轮**(桥的 wait 超时本身不打断,任务还在后台烧),
@@ -1534,7 +1632,7 @@ export async function runTurn(run, t) {
       run.sessionId = opened?.session?.id ?? null;
       if (run.sessionId) run.openOutcome = "opened";
       run.logFile = opened?.session?.logFile ?? null;
-      receipt.sessionId = run.sessionId;
+      run.receipt.sessionId = run.sessionId; // 会话是**环节级**的:一段对话共用一个
       if (!run.sessionId) {
         // 桥没抛错、却也没给 session id —— 这不是"桥明确说后端不行",是我们不认识的返回形状。
         // 按 unknown 停下(可能后端其实开起来了,只是我们没拿到句柄)。
@@ -1729,8 +1827,27 @@ export async function runTurn(run, t) {
  *
  * 现场已经在 `settleTurn` 里冻过了,这里**不再补取**。
  */
-export async function finalizeRun(run) {
+export async function finalizeRun(run, { callbackError = null } = {}) {
   const { spec, receipt } = run;
+  if (run.isConv) {
+    receipt.turns = run.turns;
+    receipt.poisonedAfter = run.poisonedAfter;
+    receipt.status = worstTurnStatus(run.turns);
+    if (callbackError) {
+      const detail = `${callbackError?.name || "Error"}:${callbackError?.message || String(callbackError)}`;
+      if (receipt.status === "ok") {
+        // 全轮都成了、回调自己炸了 —— 绝不能落一张 ok 回执:那等于把一次崩掉的编排缓存起来,
+        // 下次 reuseIfSame 还会命中它。
+        receipt.status = "callback_error";
+        receipt.error = detail;
+      } else {
+        // 轮先挂了、回调多半是因此才炸的(`r1.text.trim()` 之类)——轮的结局更接近根因,
+        // 不许被 callback_error 盖掉。⚠️ **但这件事不许因此消失**:进程一退,
+        // 回执里就再也没有"回调也炸了"这个事实。
+        receipt.diagnostics.push(`回调抛出异常(顶层结局已由第 ${receipt.status} 的那一轮决定):${detail}`);
+      }
+    }
+  }
   // 这一轮**自己**的结局。下面工作区那道闸可能把 receipt.status 改写成 unknown,
   // 而回执写失败时报的"原始结局"说的是改写**之前**那个 —— 先存下来,别事后去读已经被改过的值。
   const turnStatus = receipt.status;
@@ -1795,6 +1912,24 @@ export async function finalizeRun(run) {
   return receipt;
 }
 
+/** 一段对话的顶层结局 = **各轮里最严重的那一个**。
+ *
+ *  ⚠️ 既不是"第一个非 ok"也不是"最后一轮",两者都会遮住真相:
+ *   - 取第一个:第 1 轮 `contract_error`(后端好好的、可以改改 prompt 重跑)会遮住第 2 轮
+ *     那个 `abortConfirmed:false` 的超时(**那一轮可能还在后台跑**)—— 顶层报成"安全可重跑"。
+ *   - 取最后一个:"第 2 轮挂了、第 3 轮碰巧成了"会报成功。
+ *  取最严重的一次把两个方向一起修掉,而且 **N=1 时与今天恒等** ⇒ `runNode` 零变化。
+ *
+ *  严重度序**直接用仓里已有的 `STATUS_EXIT`**,不另发明一套:
+ *  ok(0) < contract_error(2) < backend_failed(3) < timeout(4) < unknown(6)。
+ *  认不出来的状态一律按最严重处理(**不认识 ≠ 没事**)。 */
+function worstTurnStatus(turns) {
+  const sev = (s) => (Object.prototype.hasOwnProperty.call(STATUS_EXIT, s) ? STATUS_EXIT[s] : STATUS_EXIT.unknown);
+  let worst = "ok";
+  for (const t of turns) if (sev(t.status) > sev(worst)) worst = t.status;
+  return worst;
+}
+
 /** 无条件释放这一次占用的东西。**一件都不许漏** —— 漏了下一个同 id 的环节永远起不来。 */
 export async function releaseRun(run) {
   // ⚠️ 建了 worktree 却没走到 finalizeRun() 的路径(UsageError 抛在中途、或桥本身崩了):
@@ -1812,6 +1947,7 @@ export async function releaseRun(run) {
     } catch {}
   }
   if (run.gateHeld) { run.bridge._gate.release(); run.gateHeld = false; }
+  if (run.scopeHeld) { run.bridge._scopeGate.release(); run.scopeHeld = false; }
   if (run.active && run.activeKey) run.active.delete(run.activeKey);
   try { if (run.lockFd !== null) fs.closeSync(run.lockFd); } catch {}
   run.lockFd = null;
@@ -1845,6 +1981,250 @@ export async function runNode(bridge, rawSpec) {
     // ⚠️ **执行闸在这里放,不在 runTurn 结束时放。** `runNode` 的 close_session /
     // finalizeWorktree / 写回执都排在轮之后,提前放闸会让"同时活着的会话数"越过 maxConcurrent
     // ——W8 量的就是这个。(对话的每一轮按轮放闸,那是另一种 lease,见对话方案 §1.1。)
+    await releaseRun(run);
+  }
+}
+
+// ───────────────────────── 多轮对话(可选的记忆) ─────────────────────────
+// 真理源:docs/DESIGN-graph-conversation-2026-07-28.md
+//
+// 一段对话 = 一个 id + 一个会话 + 一棵 worktree + 一条分支 + N 轮,作用域退出时统一收尾。
+// `runNode` 是它的 **N=1**,两条路共用 prepare / runTurn / finalize —— 别为单轮留第二份实现。
+
+/** 一段对话最多几轮。超了**响亮报错,不静默截断**。
+ *  理由:viz 的 `node:settled` 要内联一份有界的轮摘要,N 无上限就顶穿事件的行上限。
+ *  20 对"复审→修订"这类用法足够宽(实测 2~6 轮)。 */
+const MAX_TURNS = 20;
+
+/** 每一轮的指纹。**凡是会改变这一轮执行结局的都要进去** —— v1 漏掉后四项时,
+ *  改了 timeoutMs / 换了 schema 的重跑会命中复用,把上一版的答案当成这一版。 */
+function computeTurnSpecHash(t) {
+  let promptBody;
+  try { promptBody = t.promptFile ? fs.readFileSync(t.promptFile, "utf8") : t.prompt; }
+  catch (e) { throw new UsageError(`读 promptFile 失败:${e.message}`); }
+  const ident = {
+    v: RECEIPT_VERSION, key: t.key, prompt: promptBody, timeoutMs: t.timeoutMs,
+    schema: t.schema === undefined ? null : stableStringify(t.schema),
+    outputShape: t.outputShape === undefined ? null : stableStringify(t.outputShape),
+    reask: t.reask,
+  };
+  return crypto.createHash("sha256").update(stableStringify(ident)).digest("hex").slice(0, 32);
+}
+
+/** 规范化一轮的参数。校验口径与 `normalizeSpec` 里逐轮那几样**保持一致**(同样的错同样的话)。 */
+function normalizeTurn(run, raw) {
+  if (!raw || typeof raw !== "object") throw new UsageError("turn(...) 的参数必须是一个对象");
+  const t = { ...raw };
+
+  if (t.key === undefined || t.key === null || t.key === "") throw new UsageError("turn 缺必填字段:key");
+  requireString(t.key, "key");
+  if (!/^[A-Za-z0-9._-]+$/.test(t.key)) throw new UsageError(`key 只能用字母数字和 . _ -(拿来做文件名):${t.key}`);
+  if (Buffer.byteLength(t.key, "utf8") > 200) throw new UsageError(`key 太长(超过 200 字节,拿来做文件名):${t.key}`);
+  if (run.turnKeys.has(t.key)) {
+    throw new UsageError(`同一段对话里 key 重复了:"${t.key}" —— 每一轮的 key 必须唯一(它就是那一轮的产出文件名)`);
+  }
+
+  const hasPrompt = typeof t.prompt === "string" && t.prompt.length > 0;
+  const hasFile = t.promptFile !== undefined && t.promptFile !== null && t.promptFile !== "";
+  if (hasPrompt === hasFile) throw new UsageError("prompt 和 promptFile 必须二选一(不能都给、也不能都不给)");
+  if (hasFile) {
+    t.promptFile = path.resolve(requireString(t.promptFile, "promptFile"));
+    const st = statSafe(t.promptFile);
+    if (!st) throw new UsageError(`promptFile 不存在:${t.promptFile}`);
+    if (!st.isFile()) throw new UsageError(`promptFile 不是普通文件:${t.promptFile}`);
+  }
+
+  const ms = Number(t.timeoutMs);
+  if (!Number.isFinite(ms) || ms <= 0) throw new UsageError(`timeoutMs 必须是正数(毫秒),拿到:${t.timeoutMs}`);
+  t.timeoutMs = Math.floor(ms);
+
+  if (t.schema !== undefined && run.spec.agent !== "codex") {
+    throw new UsageError(
+      `schema(强制输出格式)只有 codex 支持,当前 agent=${run.spec.agent}。` +
+      `别的后端请改用 outputShape(工具做弱检查:能否 parse + 顶层必需键在不在)。`,
+    );
+  }
+  if (t.outputShape !== undefined) {
+    if (typeof t.outputShape !== "object" || t.outputShape === null) throw new UsageError("outputShape 必须是对象");
+    const rk = t.outputShape.requiredKeys;
+    if (rk !== undefined && !(Array.isArray(rk) && rk.every((k) => typeof k === "string"))) {
+      throw new UsageError("outputShape.requiredKeys 必须是字符串数组");
+    }
+  }
+  for (const k of ["schema", "outputShape"]) {
+    if (t[k] === undefined) continue;
+    try { JSON.stringify(t[k]); }
+    catch (e) { throw new UsageError(`${k} 必须是可序列化的纯 JSON 值(${e.message})`); }
+  }
+
+  const re = t.reask === undefined ? 1 : Number(t.reask);
+  if (![0, 1].includes(re)) throw new UsageError(`reask 只能是 0 或 1,拿到:${t.reask}`);
+  t.reask = re;
+
+  t.turnSpecHash = computeTurnSpecHash(t);
+  return t;
+}
+
+/** 真跑一轮。 */
+async function liveTurn(run, t) {
+  const rec = {
+    key: t.key, status: "unknown", sessionReusable: false, turnSpecHash: t.turnSpecHash,
+    artifactPath: null, artifactSha256: null, charCount: null, byteCount: null,
+    reaskCount: 0, durationMs: null, startedAt: null, endedAt: null,
+    contextUsage: null, abortConfirmed: null, scene: null, error: null, diagnostics: [],
+  };
+  // 首轮才取对话闸。**不在 prepare 取** —— 那时一个会话都还没有,占的是个空名额:
+  // 回调若在第一次 turn() 之前先去等一件长事,就会白白把别的对话堵在门外。
+  // 顺序恒为 scope → exec(执行闸在 runTurn 里取),于是不存在"持 exec 等 scope",依赖图无环。
+  if (!run.scopeHeld) { await run.bridge._scopeGate.acquire(); run.scopeHeld = true; }
+  run.turnRec = rec;
+  run.turns.push(rec);
+  try {
+    await runTurn(run, t);
+  } finally {
+    rec.startedAt = run.startedAt;
+    rec.endedAt = nowIso();
+    rec.durationMs = Math.round(monoNow() - run.t0);
+    // ⚠️ **执行闸按轮放**:回调期间不持有,好让回调里嵌套的 runNode 拿得到 ——
+    // 那正是"复审发生在两轮之间"这个头号用法。(`runNode` 是另一种 lease:持到写完回执,
+    // 因为它的 close/finalize 都排在轮之后,提前放会让活会话数越过 maxConcurrent。)
+    if (run.gateHeld) { run.bridge._gate.release(); run.gateHeld = false; }
+  }
+  // 毒化:这一轮之后会话不能再用了 ⇒ 整段封口(判据在工具里,不靠回调自觉)
+  if (rec.sessionReusable !== true && run.poisonedAfter === null) run.poisonedAfter = t.key;
+  return rec;
+}
+
+/** 回放校验一轮:**不发任何消息**,只把本轮参数与旧回执里对应的那一轮逐项比对。 */
+async function replayTurn(run, t, prev) {
+  const i = run.turns.length;
+  const old = prev.turns[i];
+  const bail = (why) => new UsageError(
+    `回放不匹配(第 ${i + 1} 轮,key="${t.key}"):${why}\n` +
+    `⚠️ **整段不复用,也不会自动重跑一遍** —— 与 runNode 的复用闸同一口径。\n` +
+    `轮序列变了就换一个新 id;确实要覆盖上次那一次执行就加 force(且别同时传 reuseIfSame)。`,
+  );
+  if (!old) throw bail(`旧回执只有 ${prev.turns.length} 轮,这次多出来了`);
+  if (old.key !== t.key) throw bail(`旧回执这一位是 "${old.key}"`);
+  if (old.status !== "ok") throw bail(`旧回执这一轮是 ${old.status},不是 ok`);
+  if (old.turnSpecHash !== t.turnSpecHash) throw bail("这一轮的任务单变了(prompt / timeoutMs / schema / outputShape / reask 有一样不同)");
+
+  const p = run.artifactPathFor(t.key);
+  if (old.artifactPath !== p) throw bail(`旧回执里的产出路径与本次算出来的不一致(${old.artifactPath} ≠ ${p})`);
+  const st = statSafe(p);
+  if (!st || !st.isFile() || st.size === 0) throw bail(`产出文件缺失或为空:${p}`);
+  // 与 runNode 的复用闸同一个道理:只查"非空"挡不住产出被**换成另一份非空文件**,
+  // 而"字段缺失就跳过校验"这个坑本仓踩过三次 —— 这里要求指纹**必须是合法的 64 位 hex**。
+  if (!/^[0-9a-f]{64}$/.test(old.artifactSha256 || "")) throw bail(`旧回执里没有合法的产出内容指纹:${p}`);
+  if (await sha256File(p) !== old.artifactSha256) throw bail(`产出文件内容与回执记录的不一致(可能被改过):${p}`);
+
+  run.turns.push(old);
+  return old;
+}
+
+/**
+ * 一段多轮对话。`fn` 拿到的 `turn` 就是"再说一句"。
+ *
+ *   await bridge.conversation({ id, agent, access, cwd, outDir }, async (turn) => {
+ *     const r1 = await turn({ key: "draft", prompt: FIRST, timeoutMs: 600000 });
+ *     if (!r1.sessionReusable) return;              // ← 会话还能不能接着用,工具说了算
+ *     const rev = await bridge.runNode({ … });      // ← 两轮之间跑别的节点:支持,不自锁
+ *     const r2 = await turn({ key: "fix", prompt: fixPrompt(rev), timeoutMs: 600000 });
+ *   });
+ *
+ * **不为某一轮失败抛异常**(同 `runNode`),失败进 `turnResult.status`;只有**用法错**抛。
+ */
+export async function conversation(bridge, rawSpec, fn) {
+  if (typeof fn !== "function") throw new UsageError("conversation(spec, fn):第二个参数必须是回调函数");
+  // ⚠️ 嵌套 conversation 要的是同一把**对话闸**,那才会成环 —— 当场拒。
+  // 嵌套 **runNode** 是支持的(它只要执行闸,而对话在回调期间不持执行闸)。
+  // 这条判据在 live 与 replay 两条路上完全一致,不许一边禁一边放。
+  if (bridge._inConversation) {
+    throw new UsageError(
+      "不能在 conversation 的回调里再开一段 conversation —— 两段都要对话闸,必然自锁。\n" +
+      "(回调里跑**普通节点**是支持的,那正是「复审发生在两轮之间」这个用法。)",
+    );
+  }
+
+  const run = await prepareRun(bridge, rawSpec, { kind: "conversation" });
+  const prev = run.reusedReceipt; // 非 null ⇒ 走回放:不拿任何闸、不开会话、不建 worktree
+
+  const turn = async (raw) => {
+    // ── 同步闸区:这一段到 `run.activeTurn = true` 之间**一个 await 都没有**。
+    //    async 函数体在第一个 await 之前是同步执行的,JS 又是单线程 ⇒ "查 + 置位"是原子的。
+    //    ⚠️ 谁也别往中间插 await(比如把校验改成 `await validate(...)`)—— 那会当场废掉这道闸,
+    //    而它挡的是 `Promise.all([turn(a), turn(b)])` 同时穿过毒化 guard、两轮向同一会话并发 send。
+    if (run.sealed) {
+      throw new UsageError(`fn 已经返回了,这一轮("${raw?.key}")来晚了 —— 作用域退出后不能再 turn()`);
+    }
+    if (run.poisonedAfter !== null) {
+      throw new UsageError(
+        `这段对话在第 "${run.poisonedAfter}" 轮之后已经不能再用了(sessionReusable=false):\n` +
+        `那一轮要么可能还在后台跑(abort 未确认),要么会话已经没了 —— 再 send 就是同一会话并发。\n` +
+        `要接着聊请另起一段对话。`,
+      );
+    }
+    if (run.activeTurn) {
+      throw new UsageError("同一段对话里不能并发 turn() —— 上一轮还没结束。要并行请开多段对话。");
+    }
+    if (run.turns.length >= MAX_TURNS) {
+      throw new UsageError(`一段对话最多 ${MAX_TURNS} 轮,已经到顶了 —— 请把它切成几段。`);
+    }
+    run.activeTurn = true;
+    // ── 同步闸区结束 ──
+    const p = (async () => {
+      const t = normalizeTurn(run, raw); // 到这里都还没有任何副作用
+      run.turnKeys.add(t.key);
+      return prev ? await replayTurn(run, t, prev) : await liveTurn(run, t);
+    })();
+    run.inFlight = p.finally(() => { run.activeTurn = false; });
+    return await run.inFlight;
+  };
+
+  bridge._inConversation = true;
+  let callbackError = null;
+  let threw = false;
+  try {
+    try {
+      await fn(turn);
+    } catch (e) { callbackError = e; threw = true; }
+
+    // ① 封 admission:此后任何 turn() 立刻 rejected,不产生任何事件、文件、消息
+    run.sealed = true;
+    // ② 排空在途轮:回调忘了 await 时可能还有一轮在跑。它有自己的钟,必然终止。
+    if (run.inFlight) { try { await run.inFlight; } catch {} }
+
+    if (prev) {
+      // ── 回放:**只读收尾**。不关不存在的会话、不 finalize 工作区、**绝不改 canonical 回执** ──
+      // 改了就是在毁掉自己刚验证过的那份缓存:轻则把历史耗时覆盖成本次验证的时间,
+      // 重则一次回放期的回调 bug 把一张 ok 回执永久改写成失败。
+      if (threw) throw callbackError;
+      if (run.turns.length !== prev.turns.length) {
+        throw new UsageError(
+          `回放不匹配:旧回执有 ${prev.turns.length} 轮,这次只消费了 ${run.turns.length} 轮 —— 整段不复用。\n` +
+          `⚠️ 回放**不是事务**:回调里别的副作用(嵌套节点、写文件)已经发生了,拒绝不会回滚它们。\n` +
+          `所以回放模式下的回调必须是可重放的:嵌套节点一律带 reuseIfSame,绝不用 force。`,
+        );
+      }
+      return { ...prev, reused: true };
+    }
+
+    if (run.turns.length === 0) {
+      // ⚠️ 回调已经抛出的异常才是根因,零轮检查只是"你什么都没干"的兜底诊断 —— **兜底不许盖根因**。
+      if (threw) throw callbackError;
+      throw new UsageError(
+        "这段对话一轮都没跑(回调一次 turn() 都没调)。**不写空回执** —— " +
+        "一张 turns:[] 的回执会让下次的复用闸面对一个没有任何判据的对象。",
+      );
+    }
+
+    const receipt = await finalizeRun(run, { callbackError });
+    // 回执是记录,异常是控制流 —— 顶层 status 怎么定都不改变"原样重抛回调的异常"。
+    // ⚠️ 收尾过程中产生的诊断**不许盖掉它**:回调的异常才是根因。
+    if (threw) throw callbackError;
+    return receipt;
+  } finally {
+    bridge._inConversation = false;
     await releaseRun(run);
   }
 }

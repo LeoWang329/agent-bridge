@@ -755,9 +755,51 @@ async function main() {
   ok("改动落到了那条分支上", !!rec25?.workspace?.branch
     && g(["show", `${rec25.workspace.branch}:wrote-by-node.txt`], r25).out.includes("SPACE_BASENAME"));
 
+  // ── W26 write 档的多轮对话:一段 = 一棵树、一条分支、提交一次 ─────────────────
+  // 真理源:docs/DESIGN-graph-conversation-2026-07-28.md §10「write 一段一条分支」
+  console.log("\n[W26] 一段对话 = 一棵工作树 + 一条分支,N 轮的改动全在里面");
+  const r26 = makeRepo("conv-write");
+  const out26 = path.join(r26, ".graph", "run-1");
+  const rec26 = await withBridge((b) => b.conversation(
+    { agent: "omp", id: "cv", cwd: r26, outDir: out26, access: "write" },
+    async (turn) => {
+      for (const k of ["alpha", "beta", "gamma"]) {
+        const r = await turn({ key: k, prompt: k, timeoutMs: 60000 });
+        ok(`W26 第 "${k}" 轮 ok`, r.status === "ok", `${r.status} ${r.error ?? ""}`);
+      }
+    },
+  ), { env: { ...BASE_ENV, FAKE_OMP_MODE: "writeturn-perprompt" } });
+
+  ok("W26 顶层 ok", rec26.status === "ok", `${rec26.status} ${rec26.error ?? ""}`);
+  ok("W26 kind=conversation", rec26.kind === "conversation");
+  ok("W26 三轮都在 turns 里", rec26.turns?.length === 3, String(rec26.turns?.length));
+  const ws26 = rec26.workspace;
+  ok("W26 outcome=delivered", ws26?.outcome === "delivered", JSON.stringify(ws26)?.slice(0, 160));
+  // ★ 一段对话**只留一条分支** —— 不是 N 轮 N 条
+  const br26 = g(["branch", "--list", "graph/*", "--format=%(refname:short)"], r26);
+  ok("★ W26 只有一条分支", br26.out.split("\n").filter(Boolean).length === 1, br26.out);
+  ok("W26 那条分支就是回执记的", br26.out.trim() === ws26?.branch, `${br26.out} vs ${ws26?.branch}`);
+  // ★ 三轮的改动**全都在里面**(固定文件名的 writeturn 会互相覆盖,证不出这一条)
+  for (const k of ["alpha", "beta", "gamma"]) {
+    ok(`★ W26 第 "${k}" 轮的改动在分支上`,
+      g(["show", `${ws26?.branch}:wrote-${k}.txt`], r26).out.includes(k));
+  }
+  ok("W26 filesChanged 有三项", (ws26?.filesChanged || []).length === 3, JSON.stringify(ws26?.filesChanged));
+  // ★ 收尾时**提交一次**,不是每轮一次
+  const cnt26 = g(["rev-list", "--count", `${ws26?.baseCommit}..${ws26?.branch}`], r26);
+  ok("★ W26 只提交了一次(不是每轮一次)", cnt26.out === "1", cnt26.out);
+  ok("W26 每轮各有自己的产出文件", ["alpha", "beta", "gamma"].every(
+    (k) => fs.existsSync(path.join(out26, "nodes", `cv.t-${k}.md`))));
+  // ⚠️ 这个仓刻意没有 .gitignore(要证明产品自己排除 `.graph/`),所以裸 `git status` 一定会
+  // 看到那个未跟踪的 outDir —— 断言要按**产品同一口径**排除它,否则考的是夹具不是产品。
+  const dirty26 = g(["status", "--porcelain"], r26).out.split("\n")
+    .filter((l) => l.trim() && !/\.graph\//.test(l));
+  ok("W26 主工作区没有 .graph/ 之外的改动", dirty26.length === 0, dirty26.join(" | ").slice(0, 200));
+  ok("W26 工作树已收走", ws26?.removed === true, String(ws26?.removed));
+
   // ── W9 零残留 ─────────────────────────────────────────────────────────────
   console.log("\n[W9] 零残留总检");
-  for (const [tag, repo] of [["W1", r1], ["W2", r2], ["W6", r6]]) {
+  for (const [tag, repo] of [["W1", r1], ["W2", r2], ["W6", r6], ["W26", r26]]) {
     const list = g(["worktree", "list", "--porcelain"], repo);
     ok(`${tag} 仓库没有遗留 worktree 注册`, (list.out.match(/^worktree /gm) || []).length === 1, list.out.slice(0, 200));
     const wtDir = path.join(repo, ".graph", "wt");

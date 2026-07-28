@@ -338,8 +338,10 @@ turnSpecHash = H(key, prompt 正文, timeoutMs, schema, outputShape, reask)
 - **`turn()` 不抛异常**（同 `runNode`）：失败进 `turnResult.status`。只有**用法错**（串行闸、毒化后仍调、`key` 非法/重复、超 `maxTurns`、`fn` 返回后迟到调用）才抛
 - 顶层 `status` 见 §2.4；`error` 在 `callback_error` 时装回调异常的 `name + message`（**不新开字段**）
 - **轮级不设 `rejectedReason`**：契约打回的原因就在 `attempts[].rejectedReason` 里，轮级再放一份是第二个副本（§9）
-- **`turns[].attempts[]` 必须持久化**（v4 补，MAJOR）：viz 的回放兜底**唯一**能拿到 attempt 证据的地方就是终态里的这份摘要——复用命中时**不发任何 attempt 事件**（viz 设计 §1120）。不落盘，"attempt 1 被打回、attempt 2 成功"这段历史在下一次回放时就彻底没了。
-  ⚠️ **`runNode` 的节点级 `attempts[]` 不由本方案添加**——它是 viz 施工清单第 5 项（viz 设计 §1078，`RECEIPT_VERSION` 也是因它升到 2）。这里加的是 `turns[]` 里面的那份，而 `turns[]` 只存在于 `kind:"conversation"` 的回执上，**碰不到旧形状**。
+- **`attempts[]` 归 viz 施工第 5 项一次加两级**（v4 定，实施时改口径）：codex 说得对——viz 的回放兜底**唯一**能拿到 attempt 证据的地方就是终态里这份摘要（复用命中时**不发任何 attempt 事件**，viz 设计 §1120）。
+  但**现在就在轮级单独加一份是错的**：节点级那份还不存在（viz 施工清单第 5 项，viz 设计 §1078，`RECEIPT_VERSION` 升到 2 就是因为它），现在先造一个轮级的，等 viz 那份落地时就是**两份各自演化的形状**——本仓栽过三次的那个坑。
+  ⚠️ **而且抽取之后它已经是一处改动了**：attempt 循环只剩 `runTurn` 一个地方，那里把 `attempts[]` 写进 `turnRec` 就同时满足两级——`runNode` 的 `turnRec` **就是回执本身**（顶层 `attempts[]`），对话的 `turnRec` 是 `turns[]` 里那一条（`turns[].attempts[]`）。**一次写，两级都有，不可能漂。**
+  所以本方案**不加**，改成把这条依赖写死：viz 第 5 项落地时必须一并覆盖两级，验收里加"对话的每一轮都有自己的 `attempts[]`"。
 - **`maxTurns = 20`**，超过当场 `UsageError`。理由：`node:settled` 要内联一份有界的轮摘要（§6），而 N 无上限就顶穿事件的行上限。20 对"复审→修订"这类用法足够宽（实测 2~6 轮），**而且超了是响亮报错、不是静默截断**
 - v1 **不给 CLI 暴露对话**（`node-turn.mjs` 只跑单节点），所以不新增退出码
 
@@ -465,7 +467,7 @@ v3 让两条路共用同一套八步，于是回放会去写回执——**那是
 | **BLOCKER** | 八步收尾没分出 replay 路径 ⇒ 回放会反写、甚至把 `ok` 毁成 `callback_error` | **认**（`runNode` 命中复用是 `return {...prev, reused:true}`，`1293`，一个字节不写）。**也是 v3 新造的回归** | §7.2 replay 专用四步只读收尾 |
 | MAJOR | `poisonedAfter` 会被"第一个非 ok"遮住，顶层 status 不再表达重跑安全性 | **认问题，改 remedy**——codex 的两个选项（毒化结局不可被遮 / 消费者先查 `poisonedAfter`）前者会把 `runNode` 的 `timeout` 改成 `unknown`、后者要求所有下游改代码 | §2.4 第 2 级改成**取最严重的一轮**，严重度序**直接用仓里的 `STATUS_EXIT`**（`1723-1729`）。N=1 恒等 ⇒ `runNode` 零变化，且"前遮后""后遮前"一起修掉。另补：第 2 级生效时回调异常仍须进 `diagnostics` |
 | MAJOR | `_scopeGate` 在 prepare 取（那时还没会话）；且它不是全局活会话上限 | **认** | §1.1 改成**首个 live turn 才取**、顺序 `scope → exec`、回放/零轮不取；并如实写明总上限 = `scope + exec` |
-| MAJOR | `TurnSummary.attempts[]` 有消费者但回执里没有持久生产源 | **认** | §5 给 `turns[]` 加 `attempts[]` + §4 复用闸逐项校验 attempt 产出；并写明 `runNode` 的节点级那份属 viz 施工第 5 项，不由本方案加 |
+| MAJOR | `TurnSummary.attempts[]` 有消费者但回执里没有持久生产源 | **认问题，改落点**——现在只加轮级那一份，会和 viz 第 5 项将来加的节点级那份变成两个各自演化的形状 | §5：**归 viz 施工第 5 项一次加两级**。抽取之后 attempt 循环只剩 `runTurn` 一处，写进 `turnRec` 就同时覆盖 `runNode` 的顶层与对话的 `turns[]`——一次写、两级都有、不可能漂 |
 
 **第 2 轮里我驳回的三处，本轮 codex 的复核结果：**
 
@@ -522,7 +524,8 @@ v3 让两条路共用同一套八步，于是回放会去写回执——**那是
 - **write 一段一条分支**：三轮各改一个文件，断言**只有一条分支**、三处改动都在里面、`outcome === "delivered"`
 - **回放不写回执**（BLOCKER 4）：先跑一段成功对话记下回执的 `endedAt` / `durationMs` 与文件 mtime → 回放命中 → 断言**三者一字未变**
 - **回放期回调抛异常不毁缓存**：回放全部匹配但回调最后抛异常 → 断言异常被重抛，**且盘上那张回执仍是 `ok`、内容与回放前逐字节相同**
-- **replay 复用**：同 key/prompt 序列 → 复用且**不开会话、不拿任何闸、不建 worktree**；改第 1 轮 prompt → 拒**整段**；改第 2 轮 prompt → 同样拒整段；少一轮/多一轮 → 拒；某一轮**最终产出**被换过 → 拒；某一轮**某次 attempt 的产出**被换过 → 也要拒（§4 逐项校验）
+- **replay 复用**：同 key/prompt 序列 → 复用且**不开会话、不拿任何闸、不建 worktree**；改第 1 轮 prompt → 拒**整段**；改第 2 轮 prompt → 同样拒整段；少一轮/多一轮 → 拒；某一轮**最终产出**被换过 → 拒
+  （**某次 attempt 的产出被换过 → 也要拒**：随 viz 施工第 5 项一起加，见 §5）
 - **回放拒绝不自动重跑**：上一条每种拒绝之后，断言**没有开过会话**（证明没有偷偷转 live）
 
 **零残留**
