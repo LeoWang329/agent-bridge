@@ -281,8 +281,14 @@ async function t7_usage_errors() {
     ok("错误提示指向 outputShape", /outputShape/.test(e1?.message || ""));
     await expectUsage("漏传 timeoutMs → UsageError(这条纪律由代码保证)",
       { id: "b2", agent: "omp", cwd: REPO, prompt: "x", outDir });
-    await expectUsage("v1 拒绝 access:write",
-      { id: "b3", agent: "omp", cwd: REPO, prompt: "x", timeoutMs: 1000, outDir, access: "write" });
+    // ⚠️ 这里**曾经**断言"v1 拒绝 access:write" —— write 早已正式支持(见 repro-graph-worktree.mjs),
+    // 那条断言之所以还绿,是因为 cwd 指向本仓、而本仓恰好脏 → **脏树闸**抛了 UsageError,
+    // 于是它**因为错误的原因**通过。树一旦干净,那条用例会拿本仓真的建一棵 worktree 和一条分支。
+    // 换成当前真实存在的用法错:read 环节不许传 write 专属参数。
+    await expectUsage("read 环节传 baseRef → UsageError(write 专属)",
+      { id: "b3", agent: "omp", cwd: REPO, prompt: "x", timeoutMs: 1000, outDir, baseRef: "HEAD" });
+    await expectUsage("read 环节传 allowDirtyBase → UsageError(write 专属)",
+      { id: "b3b", agent: "omp", cwd: REPO, prompt: "x", timeoutMs: 1000, outDir, allowDirtyBase: true });
     await expectUsage("force 与 reuseIfSame 同传 → 拒绝(不靠隐式优先级)",
       { id: "b4", agent: "omp", cwd: REPO, prompt: "x", timeoutMs: 1000, outDir, force: true, reuseIfSame: true });
     await expectUsage("cwd 是文件而不是目录 → UsageError",
