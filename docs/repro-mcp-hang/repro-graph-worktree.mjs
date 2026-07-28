@@ -872,6 +872,30 @@ async function main() {
     JSON.stringify(rec28.turns?.map((t) => t.key)));
   ok("W28 顶层没被没跑成的那轮污染", rec28.status === "ok", `${rec28.status} ${rec28.error ?? ""}`);
 
+  // ── W28b 零轮那句话不许归错类 ───────────────────────────────────────────────
+  // 同样是「调过 turn() 但 turns[] 是空的」,可原因**不是**参数校验 —— 是开过头之后才失败。
+  // 早先只在 normalizeTurn 一处记原因,于是这条路上收尾会说
+  //   「每次都死在参数校验上……最后一次失败的原因是:(没记到)」—— 两句都是假话。
+  // 口径必须是「最后一次**没进去**的原因」,而不是「最后一次**校验**错」。
+  console.log("\n[W28b] 零轮诊断:开过头才失败的那种,不许说成参数校验、不许说没记到");
+  const r28b = makeRepo("conv-zeroturn-reason");
+  let err28b = null;
+  try {
+    await withBridge((b) => b.conversation(
+      { agent: "omp", id: "cv", cwd: r28b, outDir: path.join(r28b, ".graph", "run-1"), access: "write" },
+      async (turn) => {
+        fs.writeFileSync(path.join(r28b, "dirty.txt"), "x\n", "utf8");
+        try { await turn({ key: "draft", prompt: "one", timeoutMs: 60000 }); } catch { /* 吞掉 */ }
+      },
+    ), { env: { ...BASE_ENV, FAKE_OMP_MODE: "writeturn-perprompt" } });
+  } catch (e) { err28b = e; }
+  const m28b = String(err28b?.message ?? "");
+  ok("W28b 抛的是用法错", err28b instanceof UsageError, m28b.slice(0, 80));
+  ok("★ W28b 没说成「一次 turn() 都没调」", !/一次 turn\(\) 都没调/.test(m28b), m28b.slice(0, 120));
+  ok("★ W28b 没归类成「死在参数校验上」", !/参数校验/.test(m28b), m28b.slice(0, 120));
+  ok("★ W28b 没说「没记到」", !/没记到/.test(m28b), m28b.slice(0, 120));
+  ok("★ W28b 报出了真实原因(脏树)", /改动|干净|dirty\.txt/.test(m28b), m28b.slice(0, 240));
+
   // ── W9 零残留 ─────────────────────────────────────────────────────────────
   console.log("\n[W9] 零残留总检");
   for (const [tag, repo] of [["W1", r1], ["W2", r2], ["W6", r6], ["W26", r26]]) {

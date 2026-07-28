@@ -1166,7 +1166,8 @@ export async function prepareRun(bridge, rawSpec, { kind = "node" } = {}) {
     turnKeys: new Set(),
     turnCalls: 0,            // 回调调用过几次 turn()。**与 turns.length 是两回事**:入场被拒的
                              // 那几次不进 turns[],但它们证明"编排不是空转"。
-    lastAdmissionError: null, // 最后一次死在参数校验上的用法错(回调吞了它时,收尾还得说得出话)
+    lastTurnFailure: null,   // 最后一次「调了 turn() 却没进 turns[]」的真实原因(校验错 / 四道闸 /
+                             // 开过头才失败,一律记)。回调吞了异常时,收尾靠它说人话。
     activeTurn: false, // §3.1 串行闸:同步查+置位,不许有第二轮同时进来
     sealed: false,     // fn 返回后封 admission
     diffPath: path.join(nodesDir, `${spec.id}.diff`),
@@ -2261,25 +2262,30 @@ async function conversationBody(bridge, rawSpec, fn) {
     // 是**假话** —— 它起过,只是参数写错了。两者的处置完全不同(一个去看那次 turn() 的参数,
     // 一个去看编排那段 JS 为什么空转),所以下面收尾时要能分辨。
     run.turnCalls += 1;
+    // 记下"这一次为什么没进去"。⚠️ 口径是**最后一次失败的真实原因**,不是"最后一次校验错" ——
+    // 早先只在 normalizeTurn 那一处记,于是被并发闸/毒化闸拒掉的那些次一个字都留不下,
+    // 收尾合成的那句会说"每次都死在参数校验上……原因:(没记到)",两句都是假话。
+    // 所以凡是**调用了 turn() 却没能进 turns[]** 的路径,都要在这里留下痕迹。
+    const rejectTurn = (err) => { run.lastTurnFailure = err; return quietReject(err); };
     // ── 同步闸区:这一段到 `run.activeTurn = true` 之间**一个 await 都没有**,
     //    JS 又是单线程 ⇒ "查 + 置位"是原子的。
     //    ⚠️ 谁也别往中间插 await(比如把校验改成 `await validate(...)`)—— 那会当场废掉这道闸,
     //    而它挡的是 `Promise.all([turn(a), turn(b)])` 同时穿过毒化 guard、两轮向同一会话并发 send。
     if (run.sealed) {
-      return quietReject(new UsageError(`fn 已经返回了,这一轮("${raw?.key}")来晚了 —— 作用域退出后不能再 turn()`));
+      return rejectTurn(new UsageError(`fn 已经返回了,这一轮("${raw?.key}")来晚了 —— 作用域退出后不能再 turn()`));
     }
     if (run.poisonedAfter !== null) {
-      return quietReject(new UsageError(
+      return rejectTurn(new UsageError(
         `这段对话在第 "${run.poisonedAfter}" 轮之后已经不能再用了(sessionReusable=false):\n` +
         `那一轮要么可能还在后台跑(abort 未确认),要么会话已经没了 —— 再 send 就是同一会话并发。\n` +
         `要接着聊请另起一段对话。`,
       ));
     }
     if (run.activeTurn) {
-      return quietReject(new UsageError("同一段对话里不能并发 turn() —— 上一轮还没结束。要并行请开多段对话。"));
+      return rejectTurn(new UsageError("同一段对话里不能并发 turn() —— 上一轮还没结束。要并行请开多段对话。"));
     }
     if (run.turns.length >= MAX_TURNS) {
-      return quietReject(new UsageError(`一段对话最多 ${MAX_TURNS} 轮,已经到顶了 —— 请把它切成几段。`));
+      return rejectTurn(new UsageError(`一段对话最多 ${MAX_TURNS} 轮,已经到顶了 —— 请把它切成几段。`));
     }
     run.activeTurn = true;
     // ── 同步闸区结束 ──
@@ -2287,12 +2293,11 @@ async function conversationBody(bridge, rawSpec, fn) {
       let t;
       try {
         t = normalizeTurn(run, raw); // 到这里都还没有任何副作用
-      } catch (e) {
-        run.lastAdmissionError = e; // 回调若把它吞了,收尾还得说得出是哪一项写错了
-        throw e;
-      }
+      } catch (e) { run.lastTurnFailure = e; throw e; }
       run.turnKeys.add(t.key);
-      return prev ? await replayTurn(run, t, prev) : await liveTurn(run, t);
+      try {
+        return prev ? await replayTurn(run, t, prev) : await liveTurn(run, t);
+      } catch (e) { run.lastTurnFailure = e; throw e; } // 开过头才失败的那些也算(脏树复查、建工作树…)
     })();
     run.inFlight = p.finally(() => { run.activeTurn = false; });
     // 收尾一定会 `await run.inFlight`,所以 p 的拒绝总有人接 —— 调用方忘了 await 也不炸进程。
@@ -2333,11 +2338,13 @@ async function conversationBody(bridge, rawSpec, fn) {
       if (threw) throw callbackError;
       // 两种「零轮」的处置完全不同,所以报两句不同的话(事件层据此分 zero-turn / turn-validation)。
       if (run.turnCalls > 0) {
+        // ⚠️ 只说得出口的事:调了几次、最后一次为什么没进去。**别替它归类**
+        //    ——"每次都死在参数校验上"就曾经是假话(并发闸/毒化闸拒掉的那些也在这个计数里)。
         throw new UsageError(
-          `这段对话调用了 ${run.turnCalls} 次 turn(),但没有一轮进得去 —— 每次都死在参数校验上,` +
+          `这段对话调用了 ${run.turnCalls} 次 turn(),但没有一轮进得去 —— 每次都被拒了,` +
           `而回调把异常吞了(\`try { await turn(...) } catch {}\`),于是外面什么都没看见。\n` +
-          `最后一次失败的原因是:${run.lastAdmissionError?.message ?? "(没记到)"}\n` +
-          `⚠️ 别在回调里静默吞 turn() 的用法错 —— 那会让"参数写错了"看起来像"编排空转"。`,
+          `最后一次没进去的原因是:${run.lastTurnFailure?.message ?? "(没记到)"}\n` +
+          `⚠️ 别在回调里静默吞 turn() 的用法错 —— 那会让"这一轮被拒了"看起来像"编排空转"。`,
         );
       }
       throw new UsageError(
