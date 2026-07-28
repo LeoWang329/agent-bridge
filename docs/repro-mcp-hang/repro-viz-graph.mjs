@@ -121,8 +121,9 @@ console.log("\nG4 nodeSeq");
 {
   const out = freshOut();
   const scope = createGraphScope({ outDir: out, maxConcurrent: 4 });
-  ok("G4.1 从 1 起", scope.nextNodeSeq() === 1);
-  ok("G4.2 递增", scope.nextNodeSeq() === 2 && scope.nextNodeSeq() === 3);
+  // ⚠️ **从 0 起、步长 1**,与信封的 seq 一样稠密 —— 空洞 = 记录损坏,不是"有个节点悄悄跑了"。
+  ok("G4.1 从 0 起", scope.nextNodeSeq() === 0);
+  ok("G4.2 步长 1", scope.nextNodeSeq() === 1 && scope.nextNodeSeq() === 2);
   // 同 id 带 force 顺序重跑是合法的 —— 两次各自成号,归档互不覆盖
   const a1 = scope.archiveFor(4, "same");
   const a2 = scope.archiveFor(5, "same");

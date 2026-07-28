@@ -203,6 +203,12 @@ export function createGraphScope({ outDir, maxConcurrent }) {
   function onRecordingFailed(info) {
     if (recordingFailure) return;
     recordingFailure = info;
+    // ⚠️ recorder 一坏,后面每条 emit 都静默 no-op —— 那是**对的**(观测层无权改业务结局),
+    //    但开发期看不见根因会非常难查:一条不合 schema 的事件会让整份 transcript 只剩前几行。
+    //    所以留一个诊断出口。**默认关**:它是给写插桩的人用的,不是给终端用户看的。
+    if (process.env.AGENT_BRIDGE_VIZ_DEBUG) {
+      console.error(`[viz] 记录损坏 @seq=${info.atSeq}: ${info.error?.message ?? info.error}`);
+    }
     // 控制通道(§8.1)由上层接管 —— 这里只广播,不决定怎么送出去。
     for (const fn of listeners) { try { fn(info); } catch { /* 通知失败不改这里的结局 */ } }
   }
@@ -234,8 +240,14 @@ export function createGraphScope({ outDir, maxConcurrent }) {
       }
     },
 
-    /** 分配一个 `nodeSeq`。⚠️ **不能只用 `<id>`**:同一个 graph 里带 `force` 顺序重跑同一个 id 是合法的。 */
-    nextNodeSeq() { return ++nodeSeqCounter; },
+    /** 分配一个 `nodeSeq`。**从 0 起、步长 1**,与 `seq` 一样稠密 —— 空洞 = 记录损坏。
+     *
+     *  ⚠️ **两个节点级入口(`runNode` 与 `conversation`)共用这一个计数器**,不是各发一套号:
+     *  分家会让 `(graphId, nodeSeq)` 这个主键在同一个 graph 里撞车,页面把一段对话和一个
+     *  普通节点叠成同一格,而它们的归档目录名 `<nodeSeq>-<id>/` 也会互相覆盖。
+     *
+     *  ⚠️ **不能只用 `<id>` 当目录名**:同一个 graph 里带 `force` 顺序重跑同一个 id 是合法的。 */
+    nextNodeSeq() { return nodeSeqCounter++; },
 
     /** 建这个节点的归档目录。 */
     archiveFor(nodeSeq, id) { return createNodeArchive({ graphId, canonicalOutDir }, nodeSeq, id); },

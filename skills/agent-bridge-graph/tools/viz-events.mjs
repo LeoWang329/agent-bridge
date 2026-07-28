@@ -101,6 +101,11 @@ export class RecordingError extends Error {
 
 /** 结构字符串:超限 → `recording-failed`,**不许悄悄换成 BoundedSummary**(§3.4)。 */
 const S = (limit) => ({ k: "str", limit });
+/** **必需但可 null** 的结构字符串。
+ *  ⚠️ 与"可缺席"是两回事,别混:`model` 是必需键、值可以是 null(=后端用默认模型);
+ *  `group` 是可缺席键、不传时**整个键不出现**(**不是** null)。
+ *  混了会让页面把"没指定模型"和"这个字段还没实现"看成同一件事。 */
+const NS = (limit) => ({ k: "str", limit, nullable: true });
 /** 可降级字符串(§3.4 那四个,一个不多)。 */
 const DEG = { k: "deg" };
 /** 固定长度的 hex。形状不对 → `recording-failed`。 */
@@ -184,9 +189,12 @@ export const EVENT_SCHEMAS = {
   "node:observed": OBJ({
     nodeSeq: NUM("uint"),
     id: S(200),
-    agent: S(200),
+    agent: ENUM("omp", "codex", "claude", "cursor", "kimi"),
     access: ENUM("read", "write"),
     cwd: S(512),
+    // 未显式指定 → **null**(后端用默认模型)。必需键、可 null。
+    model: NS(200),
+    effort: NS(200),
     spec: ASSET,
     prompt: ASSET,
     role: ASSET,
@@ -194,9 +202,8 @@ export const EVENT_SCHEMAS = {
     inferredDeps: ARR(S(200), 200, "trunc", "inferredDepsTruncated"),
     inferredDepsTruncated: BOOL,
   }, {
+    // 使用者自己传的分组标签。不传 → **整个键不出现**(不是 null)。
     group: S(200),
-    model: S(200),
-    effort: S(200),
   }),
 
   // §5.3 六档封闭枚举。⚠️ `turn-validation` 与 `zero-turn` 只可能出现在对话节点上。
@@ -231,6 +238,9 @@ export const EVENT_SCHEMAS = {
     nodeSeq: NUM("uint"), turnKey: S(200), n: NUM("uint1"),
     status: ENUM("accepted", "rejected", "no-output", "failed"),
     output: ASSET,
+    // 死在 `send_message` 或等待阶段时为 null;`charCount` 拿不到时也为 null。
+    durationMs: NUM("uint?"),
+    charCount: NUM("uint?"),
   }, { rejectedReason: DEG }),
 
   // §5.7 唯一可以整条丢的事件。`tail` 天生有界(240 UTF-16 code unit),**不许降级**。
@@ -317,6 +327,7 @@ function checkNum(v, dom, path) {
 function boundValue(v, d, path) {
   switch (d.k) {
     case "str": {
+      if (d.nullable && v === null) return null;
       if (typeof v !== "string") throw new RecordingError(`要字符串,拿到 ${typeof v}`, { path });
       const n = utf8Len(v);
       // ⚠️ 结构字段永远保持原类型。超限说明上游给了一个不合合同的值(比如 600 字节的分支名),

@@ -137,7 +137,8 @@ console.log("\nW2 BoundedSummary(§3.3)");
 
   // 四个可降级字段各测一次(§3.4:一个不多一个不少)
   const pr = boundPayload("node:attempt-settled",
-    { nodeSeq: 1, turnKey: "main", n: 1, status: "rejected", output: asset(), rejectedReason: big });
+    { nodeSeq: 1, turnKey: "main", n: 1, status: "rejected", output: asset(),
+      durationMs: 5, charCount: 10, rejectedReason: big });
   ok("W2.16 rejectedReason 同档降级", typeof pr.rejectedReason === "object");
   const pe = boundPayload("node:turn-settled", {
     nodeSeq: 1, turnKey: "main", status: "ok", sessionReusable: true, output: asset(),
@@ -227,7 +228,7 @@ console.log("\nW5 数组上限与截断");
   const many = Array.from({ length: 250 }, (_, i) => `nodes/x${i}.md`);
   const p = boundPayload("node:observed", {
     nodeSeq: 1, id: "a", agent: "codex", access: "read", cwd: "D:/r",
-    spec: asset(), prompt: asset(), role: na,
+    model: null, effort: null, spec: asset(), prompt: asset(), role: na,
     declaredDeps: [], inferredDeps: many, inferredDepsTruncated: false,
   });
   ok("W5.1 截到 200 项", p.inferredDeps.length === 200);
@@ -246,7 +247,7 @@ console.log("\nW5 数组上限与截断");
   throwsRecording("W5.5 declaredDeps 超 200 → 报错不截断", () =>
     boundPayload("node:observed", {
       nodeSeq: 1, id: "a", agent: "codex", access: "read", cwd: "D:/r",
-      spec: asset(), prompt: asset(), role: na,
+      model: null, effort: null, spec: asset(), prompt: asset(), role: na,
       declaredDeps: many, inferredDeps: [], inferredDepsTruncated: false,
     }), /条数超限/);
 
@@ -320,6 +321,28 @@ console.log("\nW6 schema 严格性(「漏字段写不出来」)");
   // 但 turns[] 里**没有** not-started(没跑起来的轮不进 turns[])
   throwsRecording("W6.14 turns[] 里不许有 not-started", () =>
     boundPayload("node:settled", settled({ turns: [turnSummary({ status: "not-started" })] })), /封闭枚举/);
+
+  // ⚠️ **「可 null」与「可缺席」是两回事,别混。** 这条曾经真的写错过:
+  //    `model` 被当成"可缺席的非空串",于是一个不指定模型的节点(model:null)
+  //    直接把整份 transcript 判成记录损坏 —— 而页面侧混了则会把
+  //    「没指定模型」和「这个字段还没实现」看成同一件事。
+  const obsBase = {
+    nodeSeq: 1, id: "a", agent: "codex", access: "read", cwd: "D:/r",
+    model: null, effort: null, spec: asset(), prompt: asset(), role: na,
+    declaredDeps: [], inferredDeps: [], inferredDepsTruncated: false,
+  };
+  const pNull = boundPayload("node:observed", obsBase);
+  ok("W6.15a model/effort 是**必需但可 null**", pNull.model === null && pNull.effort === null);
+  ok("W6.15b group 不传 → **整个键不出现**(不是 null)", !("group" in pNull));
+  const pGroup = boundPayload("node:observed", { ...obsBase, group: "round-2" });
+  ok("W6.15c group 传了就在", pGroup.group === "round-2");
+  throwsRecording("W6.15d 但 model 这个**键**不能缺席", () => {
+    const x = { ...obsBase }; delete x.model; return boundPayload("node:observed", x);
+  }, /必需字段缺席/);
+  throwsRecording("W6.15e group 不能是 null(它没有 null 这个取值)",
+    () => boundPayload("node:observed", { ...obsBase, group: null }), /要字符串/);
+  throwsRecording("W6.15f agent 是封闭枚举",
+    () => boundPayload("node:observed", { ...obsBase, agent: "gpt" }), /封闭枚举/);
 
   throwsRecording("W6.15 未知事件类型", () => boundPayload("node:queued", { nodeSeq: 1 }), /未知事件类型/);
   throwsRecording("W6.16 run:final.counts 多一个键", () =>

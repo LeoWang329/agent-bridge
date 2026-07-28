@@ -41,6 +41,8 @@ import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { performance } from "node:perf_hooks";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { createGraphScope, NOT_APPLICABLE } from "./viz-graph.mjs";
+import { createNodeViz, toTurnSummaries } from "./viz-node.mjs";
 
 /**
  * 回执版本。**复用闸是严格等值比较**(`prev.receiptVersion !== RECEIPT_VERSION` 直接拒)。
@@ -95,6 +97,17 @@ function noteSessionClosed(bridge, confirmed) {
 const monoNow = () => performance.now();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const nowIso = () => new Date().toISOString();
+
+/** 给一个 `UsageError` 打上「是哪一关拦下的」。
+ *
+ *  ⚠️ **在抛出点打标,不在捕获点猜。** `phase` 的全部价值是"该去看哪儿"
+ *  (撞 id → 先分辨是不是有人在跑;workspace-setup → 去看残留),猜错就把人指到错的地方。
+ *  ⚠️ **只补第一个**:内层已经标过的不覆盖 —— 同关同义的两个抛点共用一个 phase 是对的,
+ *  但外层的粗粒度标签不许盖掉内层的精确标签。 */
+async function taggedPhase(phase, fn) {
+  try { return await fn(); }
+  catch (e) { if (e instanceof UsageError && !e.phase) e.phase = phase; throw e; }
+}
 
 /** 用法错(spec 非法、文件不存在、后端不支持某能力)。与「环节失败」区分:后者进回执不抛。 */
 export class UsageError extends Error {
@@ -312,9 +325,92 @@ export function normalizeSpec(raw, { kind = "node" } = {}) {
   // 不靠隐式优先级替人做决定。
   if (s.force && s.reuseIfSame) throw new UsageError("force 与 reuseIfSame 语义冲突,不能同时设置");
 
+  // A 档拓扑:调用方声明的依赖。**系统既不校验也不执行** —— 执行路径上没有任何代码读它。
+  s.declaredDeps = normalizeDeps(s.deps);
+  delete s.deps;
+
   s.kind = isConv ? "conversation" : "node";
-  s.specHash = computeSpecHash(s);
+  s.specHash = computeSpecHash(s); // 顺带把 promptBody / roleBody 冻在这一刻
+
+  // B 档拓扑:扫**冻结后的正文**。
+  // ⚠️ 对话节点在这一刻**一个字的正文都没有**(提问是逐轮的),所以恒 `[]`。
+  //    这**不等于**"这个节点没有推断出来的依赖" —— 那会把"这一层没得扫"
+  //    伪装成"扫过了,没有"。对话的推断边由逐轮的 `node:turn.inferredDeps` 给出,
+  //    而那恰恰是对话的头号用法(第 2 轮的提问通常就是照着另一个节点的产出写的)。
+  const inf = inferDeps(isConv ? "" : s.promptBody, s.id);
+  s.inferredDeps = inf.deps;
+  s.inferredDepsTruncated = inf.truncated;
   return s;
+}
+
+/** `declaredDeps` 上限。**超了当场 `UsageError`,不截断** —— 声明是**用户写的**,
+ *  截掉就是改用户的意思;而让一个注解把整个 run 的记录报废更荒唐。 */
+const MAX_DECLARED_DEPS = 200;
+/** `inferredDeps` 上限。推断是**我们猜的**,截掉只损失猜测 —— 但**必须说出来**。 */
+const MAX_INFERRED_DEPS = 200;
+
+/** A 档:校验并规范化调用方声明的 `deps`。
+ *
+ *  ⚠️ **不校验它指向的节点存不存在。** 那是拓扑的事;在入口拒绝会让"先声明、后创建"
+ *  这种完全合法的写法跑不起来。 */
+function normalizeDeps(raw) {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) throw new UsageError(`deps 必须是字符串数组,拿到 ${typeof raw}`);
+  if (raw.length > MAX_DECLARED_DEPS) {
+    throw new UsageError(
+      `deps 最多 ${MAX_DECLARED_DEPS} 项,拿到 ${raw.length} 项。\n` +
+      `(这是**用法错**,不是记录故障 —— 所以当场拒绝,而不是截断到 200 再悄悄跑下去。)`,
+    );
+  }
+  const out = [];
+  const seen = new Set();
+  for (const d of raw) {
+    if (typeof d !== "string" || d === "") throw new UsageError(`deps 每项必须是非空字符串,拿到 ${JSON.stringify(d)}`);
+    if (!/^[A-Za-z0-9._-]+$/.test(d)) {
+      throw new UsageError(`deps 每项只能用字母数字和 . _ -(与 id 同一字符集),拿到:${JSON.stringify(d)}`);
+    }
+    if (seen.has(d)) continue; // 去重后**保持声明顺序**
+    seen.add(d);
+    out.push(d);
+  }
+  return out;
+}
+
+/**
+ * B 档:从**冻结后的正文**里扫出"这段话引用了哪些别的节点的产出"。
+ *
+ * ⚠️ **输入必须是冻结后的正文,不是原文件** —— 文件可能在排队期间被改,
+ * 拿改后的文件推断,得到的边描述的是一份**没被派发过**的输入。
+ *
+ * ⚠️ 这是**启发式**:会漏也会多。页面上它与 `declaredDeps` 必须画得不一样
+ * (推断边虚线 + 可点开"为什么推断出这条边"),因为把推断当事实展示
+ * 是这个页面最容易造成的误导。
+ *
+ * @returns {{deps: string[], truncated: boolean}}
+ */
+export function inferDeps(text, selfId) {
+  const out = [];
+  const seen = new Set();
+  let truncated = false;
+  if (typeof text !== "string" || text.length === 0) return { deps: out, truncated };
+  // `/` 与 `\` 两种分隔符都认;`<id>` 与 spec.id 同一字符集。
+  const re = /nodes[/\\]([A-Za-z0-9._-]+)\.md/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    // **只认相对形式** —— 绝对路径不是本图的边(它指向另一个 out-dir)。
+    // 判据:往回走到分隔符之前那一段,看它是不是以 `/`、`\` 或盘符开头。
+    const lineStart = text.lastIndexOf("\n", m.index) + 1;
+    const before = text.slice(lineStart, m.index);
+    const token = before.split(/[\s"'`(<\[]/).pop() || "";
+    if (token.startsWith("/") || token.startsWith("\\") || /^[A-Za-z]:[/\\]/.test(token)) continue;
+    const id = m[1];
+    if (id === selfId) continue;      // 去掉自依赖
+    if (seen.has(id)) continue;       // 去重,按首次出现顺序排
+    seen.add(id);
+    if (out.length >= MAX_INFERRED_DEPS) { truncated = true; break; }
+    out.push(id);
+  }
+  return { deps: out, truncated };
 }
 
 /** 把「要发出去的那段正文」**在算指纹的同一刻定死**,之后一律发这份字节。
@@ -345,6 +441,9 @@ function computeSpecHash(s) {
     try { roleBody = fs.readFileSync(s.roleFile, "utf8"); }
     catch (e) { throw new UsageError(`读 roleFile 失败:${e.message}`); }
   }
+  // 与 prompt 同一个理由:**冻在算指纹的这一刻**。归档里那份 `role.md` 必须就是
+  // 真派发出去的那份字节,否则事件在撒谎(它描述的是一份从未被派发过的输入)。
+  s.roleBody = s.roleFile ? roleBody : null;
   const ident = {
     v: RECEIPT_VERSION,
     agent: s.agent, model: s.model ?? null, effort: s.effort ?? null,
@@ -591,11 +690,79 @@ export async function startBridge(opts = {}) {
  *  那个窗口 —— 那时没有可校验身份的目标,我们**宁可漏收也不乱杀**(见 close() 里的说明)。 */
 export async function withBridge(fn, opts = {}) {
   const bridge = await startBridge(opts);
+
+  // ── viz 初始化。**在用户回调之前做完,任何一步失败都 fail-fast。**
+  //    (回调之前失败没有业务结局可改;回调之后失败有 —— 那时一律降级成资产状态,
+  //     绝不外溢,见 viz-node.mjs 里那条 `guard`。)
+  let scope = null;
+  if (opts.viz) {
+    try {
+      scope = createGraphScope({ outDir: opts.outDir, maxConcurrent: bridge.maxConcurrent });
+    } catch (e) {
+      await bridge.close();
+      throw new UsageError(`viz 起不来:${e.message}`);
+    }
+    bridge._viz = scope;
+    // `seq === 0`,且**排在用户回调之前**。
+    await scope.emit("run:started", { outDir: scope.canonicalOutDir, maxConcurrent: bridge.maxConcurrent });
+  }
+
+  const t0 = monoNow();
+  let callbackThrew = false;
   try {
     return await fn(bridge);
+  } catch (e) {
+    callbackThrew = true;
+    throw e;
   } finally {
-    await bridge.close();
+    // ── 收尾协议(§8.3)。**每一步各自 try/catch,前一步失败绝不跳过后面的步骤。**
+    //    ① 封 admission:此后迟到的节点级调用一律拒,它们不属于这次 run ——
+    //       放行的话它们会在 `run:final` 写完之后往 transcript 里追加事件,
+    //       而"`run:final` 是最后一条"这条保证当场作废。
+    if (scope) bridge._vizSealed = true;
+    let closeFailed = false;
+    try {
+      await bridge.close();
+    } catch (e) {
+      closeFailed = true;
+      if (!callbackThrew) throw e;      // 回调自己抛了的话,**根因优先**,不许被收尾的异常盖掉
+    } finally {
+      if (scope) {
+        try {
+          // ② 定 result。⚠️ **只由三样决定,不看节点回执** —— 观测台不裁决业务成败。
+          //    "回调正常返回、排空期间看到 failed/unknown 回执" 仍是 completed:
+          //    节点结局不是 run 结局(`allSettled` 甚至看不出那个 contract_error
+          //    是不是回调有意接住并处理掉的)。
+          await scope.emit("run:final", {
+            result: (callbackThrew || closeFailed) ? "failed" : "completed",
+            counts: bridge._vizCounts ?? EMPTY_COUNTS(),
+            durationMs: Math.max(0, Math.round(monoNow() - t0)),
+          });
+        } catch { /* 观测失败不改收尾结局 */ }
+        // ③ 关 transcript。⚠️ `close()` 抛错**不等于**写失败:`run:final` 已确认落盘时
+        //    页面就该显示"已结束"。所以这里的异常吞掉,**不**转 recording-failed。
+        try { scope.close(); } catch { /* 见上 */ }
+      }
+    }
   }
+}
+
+/** `run:final.counts` 的九个键。**固定键集,全部恒在。**
+ *  ⚠️ `callback_error` 最容易被漏掉,而漏了它,每一个"轮都好好的、编排那段 JS 自己炸了"
+ *  的节点都会让恒等式差 1 —— 于是一次**正常**记录被判成"记录不完整"。 */
+const EMPTY_COUNTS = () => ({
+  observed: 0, rejected: 0, ok: 0, contract_error: 0,
+  backend_failed: 0, timeout: 0, unknown: 0, callback_error: 0, reused: 0,
+});
+
+/** 记一笔计数。⚠️ **数的是节点,不是轮** —— 一个 12 轮的节点仍然只占一格。 */
+function vizCount(bridge, bucket, alsoReused = false) {
+  if (!bridge?._viz) return;
+  if (!bridge._vizCounts) bridge._vizCounts = EMPTY_COUNTS();
+  if (bucket in bridge._vizCounts) bridge._vizCounts[bucket] += 1;
+  // ⚠️ `reused` 是 `ok` 的**子集**,不是并列的桶(复用返回的就是一张 status:"ok" 的旧回执)。
+  //    所以九项加起来不等于总数 —— 恒等式里没有它。
+  if (alsoReused) bridge._vizCounts.reused += 1;
 }
 
 /** 弱检查(非 codex 后端用):只做「能不能 parse + 顶层必需键在不在」。
@@ -1141,11 +1308,32 @@ function makeSemaphore(max) {
  * 命中复用时把结果放在 `run.reusedReceipt` 上返回,资源已在返回前收干净。
  * 抛错(用法错/复用闸不过)时同样先收干净再抛。
  */
-export async function prepareRun(bridge, rawSpec, { kind = "node" } = {}) {
+export async function prepareRun(bridge, rawSpec, { kind = "node", hold = null } = {}) {
   const spec = normalizeSpec(rawSpec, { kind });
+
+  // ── viz:outDir 闸。**必须早于任何落盘**(早于 ensureDir、早于快照、早于建 `<id>.lock`)——
+  //    否则"拒绝"之前已经在别人的目录里留了垃圾。
+  const scope = bridge?._viz || null;
+  if (scope) {
+    try {
+      scope.assertSameOutDir(spec.outDir, kind === "conversation" ? "conversation()" : "runNode()");
+    } catch (e) { throw new UsageError(e.message); }
+  }
+
   ensureDir(spec.outDir);
   const nodesDir = path.join(spec.outDir, "nodes");
   ensureDir(nodesDir);
+
+  // ── viz:分配 `nodeSeq` 并建本节点的归档目录。
+  //    ⚠️ **同步分配,中间不让出事件循环** —— 这样号与调用顺序一致;
+  //    并且**拿到号的调用一定会发 `node:observed`**,所以走 `node:rejected` 的节点照样有号。
+  let viz = null;
+  if (scope) viz = createNodeViz(scope, scope.nextNodeSeq(), spec);
+  // ⚠️ **立刻交给调用方**:`prepareRun` 后面几关(lock / preflight / reuse-check)都可能抛,
+  //    而那时调用方还没拿到 `run`,拿不到 viz 就发不出 `node:rejected` ——
+  //    于是这个节点在页面上会**只有一条 `node:observed`、永远等不到终态**,
+  //    被 §10.1 合成一个假的 `abandoned`。
+  if (hold) hold.viz = viz;
 
   const artifactPath = path.join(nodesDir, `${spec.id}.md`);
   const receiptPath = path.join(nodesDir, `${spec.id}.receipt.json`);
@@ -1183,8 +1371,8 @@ export async function prepareRun(bridge, rawSpec, { kind = "node" } = {}) {
     currentKey: null,
     /** 这个节点的观测适配器(见 `viz-node.mjs`)。**viz 关着时恒为 null**,
      *  于是全模块的插桩点都是 `if (run.viz)` 一句 —— 没有第二条代码路径。 */
-    viz: null,
-    nodeSeq: null,
+    viz,
+    nodeSeq: viz ? viz.nodeSeq : null,
     scopeHeld: false,
     turns: [],
     poisonedAfter: null,
@@ -1255,13 +1443,21 @@ export async function prepareRun(bridge, rawSpec, { kind = "node" } = {}) {
     return ms;
   };
 
+  // ── viz:`node:observed`。**排在并发撞车检查与建 `<id>.lock` 之前** ——
+  //    输入三件套(spec / prompt / role)的资产状态由它承担,而不能挂在 `node:settled` 上:
+  //    这个节点接下来完全可能直接走 `node:rejected`,**那条路上没有 `node:settled` 可挂**。
+  if (viz) { await viz.observed(); vizCount(bridge, "observed"); }
+
   // 同一个 <outDir,id> 在同一个 bridge 里并发跑 = 两个环节写同一个产出,后写者覆盖前者,
   // 而两张回执都可能声称成功。当场拒绝(这是调用方的 id 用重了,属用法错)。
   const activeKey = JSON.stringify([spec.outDir, spec.id]);
   let active = ACTIVE_NODES.get(bridge);
   if (!active) { active = new Set(); ACTIVE_NODES.set(bridge, active); }
   if (active.has(activeKey)) {
-    throw new UsageError(`同一个 outDir 里的环节 id "${spec.id}" 正在并发运行 —— id 必须唯一`);
+    throw Object.assign(
+      new UsageError(`同一个 outDir 里的环节 id "${spec.id}" 正在并发运行 —— id 必须唯一`),
+      { phase: "lock" },
+    );
   }
   active.add(activeKey);
   run.active = active;
@@ -1283,12 +1479,12 @@ export async function prepareRun(bridge, rawSpec, { kind = "node" } = {}) {
       run.lockFd = null;
     }
     if (e.code === "EEXIST") {
-      throw new UsageError(
+      throw Object.assign(new UsageError(
         `环节 "${spec.id}" 的锁文件已存在:${lockPath}\n` +
         `要么另一个进程正在跑同一个环节(id 撞了),要么上次异常退出留下了它 —— 确认没人在跑后删掉它再来。`,
-      );
+      ), { phase: "lock" });
     }
-    throw new UsageError(`无法创建环节锁文件 ${lockPath}:${e.message}`);
+    throw Object.assign(new UsageError(`无法创建环节锁文件 ${lockPath}:${e.message}`), { phase: "lock" });
   }
 
   run.receipt = {
@@ -1391,12 +1587,13 @@ export async function prepareRun(bridge, rawSpec, { kind = "node" } = {}) {
       // ⚠️ 脏树闸也**排在幂等闸之前** —— 否则它只保护"真跑",不保护"复用":
       // 同一个脏工作区下,新跑会被拒绝,而命中复用却照样交货,且调用方分不出这两种情况。
       // 复用出来的结果同样是对着 HEAD 做的、同样看不见那些未提交改动,该拦就得一起拦。
-      await assertCleanBase({ repoRoot: run.repoRoot, spec, baseCommit: run.baseCommit, nodesDir });
+      await taggedPhase("preflight", () =>
+        assertCleanBase({ repoRoot: run.repoRoot, spec, baseCommit: run.baseCommit, nodesDir }));
     }
 
     // --- 幂等闸
     if (fs.existsSync(receiptPath) && !spec.force) {
-      reused = await checkReuse(run);
+      reused = await taggedPhase("reuse-check", () => checkReuse(run));
     }
   } catch (e) {
     await releaseRun(run);
@@ -1597,6 +1794,13 @@ async function settleTurn(run, status, extra = {}) {
     rec.sessionReusable = status === "ok" || status === "contract_error"
       || (status === "timeout" && rec.abortConfirmed === true);
   }
+  // 这一轮的耗时。**在这里定而不是等 liveTurn 的 finally** —— 事件要带着它出去,
+  // 而两处用的是同一个公式(`monoNow() - run.t0`),不会分家。
+  rec.durationMs = Math.round(monoNow() - run.t0);
+  // ⚠️ 排在**释放执行闸之前**:定完 status、(非 ok 时)冻结完现场、归档完产出之后。
+  //    这一条是**该轮产出与现场唯一的公布渠道** —— 一段 6 轮的对话在第 6 轮被强杀时,
+  //    前 5 轮的产出全靠它,`node:settled` 那份 `turns[]` 永远不会来。
+  if (run.viz) await run.viz.turnSettled({ key: run.currentKey }, rec);
   return rec;
 }
 
@@ -1607,13 +1811,52 @@ async function settleTurn(run, status, extra = {}) {
  * 顶层不一定有 `timeoutMs`(对话就没有),预算要到 `turn()` 才知道,所以拿闸那一刻必须已经有它。
  * `runNode` 只有一轮、且那一轮的 `timeoutMs` 就是 `spec.timeoutMs` ⇒ 因果顺序与今天逐字节相同。
  */
+/** 宣布「这一轮被受理了」。**必须排在取任何闸之前** ——
+ *  `node:turn` 已发、`node:started` 未发 这个区间**就是**「这一轮在等名额、一个字都还没发给 AI」,
+ *  发晚了那段等待就从页面上消失了。
+ *
+ *  ⚠️ **幂等,且幂等标志挂在这一轮身上**:对话在 `liveTurn` 里先取对话闸,所以它要更早宣布;
+ *  `runNode` 没有那道闸,由 `runTurn` 自己宣布。两处调用**同一个函数**,不留第二份实现。 */
+async function announceTurn(run, t) {
+  if (!run.viz || t.announced) return;
+  t.announced = true;
+  await run.viz.turnStarted(t);
+}
+
+/**
+ * 用一条 `node:turn-settled{status:"not-started"}` 闭合「没能开始的那一轮」。
+ *
+ * ⚠️ **这条不变式(`node:turn` 与 `node:turn-settled` 一一对应)比"少一档 status"值钱。**
+ * 少一个终态 = 那一轮永远悬着,页面只能把它合成 `abandoned`,于是"这个节点还在跑吗"整个判不出来。
+ * ⚠️ **不为它新造事件类型** —— 多一个事件类型 = 页面多一条解析路径,而两条路径迟早只有一条被改。
+ * ⚠️ 它**不进 `turns[]`**:那是复用判据,塞一条从没跑过的轮进去,下一次回放就会拿它去比对
+ * 一份**根本不存在的产出**,把一张好回执判死。**事件流记"发生过什么",`turns[]` 记"哪几轮真跑了"
+ * —— 两者都为真,页面必须同时接受。**
+ */
+async function closeNotStartedTurn(run, t, e) {
+  if (!run.viz || !t?.announced) return;
+  await run.viz.turnSettled(t, {
+    status: "not-started",
+    sessionReusable: false,
+    artifactPath: null, scene: null, charCount: null,
+    durationMs: Math.round(monoNow() - (run.t0 ?? monoNow())),
+    error: e instanceof Error ? e.message : String(e),
+  });
+}
+
 export async function runTurn(run, t) {
   const { bridge, spec, remaining, budget } = run;
+  await announceTurn(run, t);
   // 这一轮往哪儿写。`runNode` 时 `turnRec` **就是回执本身**,于是下面几百行搬过来之后
   // 写进去的还是那张回执、字段一个不变;对话时它是 `turns[]` 里的那一条。
   const receipt = run.turnRec;
   const artifactPath = run.artifactPathFor(t.key);
   run.currentKey = t.key;
+  // 推断边**记进回执**,不只是发进事件。
+  // ⚠️ 少了这一步,**复用命中的节点整段推断边会凭空消失**:命中复用时一条 `node:turn`
+  //    都不发,页面只能从 `node:settled.turns[].inferredDeps` 拿 —— 而那份来自回执。
+  receipt.inferredDeps = t.inferredDeps ?? [];
+  receipt.inferredDepsTruncated = t.inferredDepsTruncated ?? false;
 
   /** 此刻在飞的那次尝试(没有就是 null)。
    *
@@ -1654,9 +1897,13 @@ export async function runTurn(run, t) {
   };
 
   // --- 并发闸:到这里才排队。前面几步(体检/幂等)都是本地 I/O,不占桥的连接,不该被排队拖慢。
+  const queuedFrom = monoNow();
   await bridge._gate.acquire();
   run.gateHeld = true;
   run.startClock(t.timeoutMs); // 预算从**真正开跑**这一刻起算,不含排队时间
+  // 「**这一轮**拿到执行名额、开始烧预算」。⚠️ 不是「这个节点第一次开跑」——
+  // 每一轮各自排队、各自起钟,所以一个节点有几轮就有几条。
+  if (run.viz) await run.viz.turnGateAcquired(t, monoNow() - queuedFrom);
 
   // --- write 环节:建隔离工作区(只在首轮)
   if (!run.opened && spec.access === "write") {
@@ -1664,14 +1911,20 @@ export async function runTurn(run, t) {
     // 这中间用户完全可能动了主树。只查一次 = 拿一个几分钟前的结论给现在放行。
     // (基线 commit 不重新解析:一次运行里各环节钉在各自开跑前解析的那个 commit 上,
     //  重解析会让"排在后面"变成"基于另一份代码",反而更难解释。)
-    await assertCleanBase({ repoRoot: run.repoRoot, spec, baseCommit: run.baseCommit, nodesDir: run.nodesDir });
-    const branch = await makeBranchName(run.repoRoot, run.runKey, spec.id);
+    await taggedPhase("preflight", () =>
+      assertCleanBase({ repoRoot: run.repoRoot, spec, baseCommit: run.baseCommit, nodesDir: run.nodesDir }));
+    const branch = await taggedPhase("workspace-setup", () => makeBranchName(run.repoRoot, run.runKey, spec.id));
     // 与 dirtyEntries 的排除项共用同一个常量 —— 两处写死会各自漂,漂了就变成"自己把主树弄脏、
     // 再被自己的脏树闸拦下"这种最难查的自伤。
     const wtPath = path.join(run.repoRoot, ...WT_ROOT_REL.split("/"), run.runKey, spec.id);
-    run.workspace = await createWorktree({
+    // ⚠️ **发在 `git worktree add` 紧之前**。中断时它决定了页面说「**可能**已经开始创建,
+    //    位置未确认」还是「**还没开始创建,不会有工作副本**」—— 这两句话必须相反:
+    //    把后者并进前者,就是让用户去找一个可以证明不存在的目录。
+    if (run.viz) await run.viz.workspaceIntent({ path: wtPath, branch, baseCommit: run.baseCommit });
+    run.workspace = await taggedPhase("workspace-setup", () => createWorktree({
       repoRoot: run.repoRoot, wtPath, branch, baseCommit: run.baseCommit, force: spec.force,
-    });
+    }));
+    if (run.viz) await run.viz.workspaceCreated({ path: wtPath, branch, baseCommit: run.baseCommit });
     run.receipt.workspace = { ...run.workspace }; // 工作区是**环节级**的:N 轮共享一棵树、一条分支
   }
 
@@ -1807,6 +2060,8 @@ export async function runTurn(run, t) {
         if (w?.timedOut) {
           const snap = w.pendingSnapshots?.[0];
           if (snap && snap.contextUsage !== undefined) receipt.contextUsage = snap.contextUsage ?? null;
+          // 活进度。**快照取不到就不发**;节流 5 秒 —— 它是唯一允许整条丢的事件。
+          if (run.viz) await run.viz.progress(t, snap, monoNow());
           continue; // 还在跑,接着等
         }
         const got = w?.results?.[0] ?? null;
@@ -2061,7 +2316,82 @@ export async function finalizeRun(run, { callbackError = null, callbackThrew = f
     receipt.status = "unknown";
     receipt.error = `回执写入失败(${e.message});原始结局=${turnStatus}${receipt.error ? `;${receipt.error}` : ""}`;
   }
+  // ── viz:节点终态。**排在归档 receipt.json 写完之后**(见 viz.settled 里那一步)。
+  if (run.viz) {
+    // `diff` 三态皆可:read 节点、以及 `outcome === "no-changes"` 的 write 节点 → not-applicable。
+    // ⚠️ 这两种是**先天不适用**,不是"给不出" —— 标成 unavailable 就是把"从来不适用"
+    //    谎报成"本该拿得到、现在拿不到"。
+    let diffAsset = NOT_APPLICABLE;
+    const wsOutcome = receipt.workspace?.outcome;
+    if (spec.access === "write" && wsOutcome !== "no-changes" && receipt.workspace?.diffPath) {
+      diffAsset = await run.viz.putDiff(receipt.workspace.diffPath);
+    }
+    // `outcome` 是 write 节点交付结论的**唯一权威判据**,页面不得自己拿 committed/filesChanged 再推一遍。
+    if (spec.access === "write") receipt.outcome = wsOutcome ?? "unknown";
+    receipt.execution = run.reusedReceipt ? "reused" : "fresh";
+    const summaries = toTurnSummaries(run.isConv ? run.turns : [projectMainTurn(run, receipt)], run.viz);
+    await run.viz.settled(receipt, summaries, diffAsset);
+    vizCount(run.bridge, receipt.status, false);
+  }
   return receipt;
+}
+
+/**
+ * 本地闸拒绝 / 准备失败 → `node:rejected`。
+ *
+ * ⚠️ **只在「这个节点确实以抛异常结束、并且没有写出回执」那一刻发一条。**
+ * 只要有一轮真的跑起来过,节点就一定写回执、一定以 `node:settled` 收场 ——
+ * 哪怕后面某次 `turn()` 又抛了校验错、哪怕回调自己炸了(那时是 `status:"callback_error"`)。
+ * **同一个 `UsageError`,落在哪一层取决于「这个节点有没有回执」。**
+ */
+async function rejectNode(bridge, viz, e, fallbackPhase = "lock") {
+  if (!viz || !(e instanceof UsageError)) return;
+  // ⚠️ `phase` 与 `error` 是**两个独立的事实**:`error` 恒是抛出去那个异常的消息(根因优先),
+  //    `phase` 是"哪一关拦下的"。渲染时不许互相推断,这里也不许互相推断。
+  await viz.rejected(e.phase || fallbackPhase, e);
+  vizCount(bridge, "rejected");
+}
+
+/**
+ * 复用命中的节点也要有终态,否则页面上它永远停在 `node:observed`。
+ *
+ * ⚠️ **归档时机在复用闸之后**:那道闸刚刚逐项坐实了每一轮的产出 sha、diff sha、
+ * 基线 commit 与分支现状,所以归档下来的是**刚被验证过**的东西。
+ */
+async function emitReusedSettled(run) {
+  const prev = run.reusedReceipt, viz = run.viz;
+  const turnRecs = Array.isArray(prev.turns) ? prev.turns : [projectMainTurn(run, prev)];
+  for (const tr of turnRecs) {
+    if (tr.artifactPath) await viz.putTurnOutput(tr.key, tr.artifactPath, 1);
+    // ⚠️ 复用一张**原运行没开 viz** 的回执时,输入原文当初压根没落盘,只剩指纹。
+    //    那是**当时的选择,不是故障** —— `fingerprint-only` 这个 code 没有任何"出错了"的含义。
+    for (const a of tr.attempts || []) if (!a.inputRef) viz.markFingerprintOnly(tr.key, a.n);
+  }
+  let diffAsset = NOT_APPLICABLE;
+  const wo = prev.workspace?.outcome;
+  if (run.spec.access === "write" && wo !== "no-changes" && prev.workspace?.diffPath) {
+    diffAsset = await viz.putDiff(prev.workspace.diffPath);
+  }
+  // ⚠️ `execution:"reused"` 是**正交标记,不是 status** —— 复用返回的就是旧回执的 `status:"ok"`。
+  const receipt = { ...prev, execution: "reused" };
+  if (run.spec.access === "write") receipt.outcome = wo ?? "unknown";
+  await viz.settled(receipt, toTurnSummaries(turnRecs, viz), diffAsset);
+  // `reused` 是 `ok` 的子集:两个桶都要 +1。
+  vizCount(run.bridge, prev.status, true);
+}
+
+/** `runNode` 的回执 → 那一轮的记录。**投影,不是第二份实现**:
+ *  单轮节点的回执顶层字段**就是** `main` 这一轮的字段(§2.2 的兼容投影)。 */
+function projectMainTurn(run, receipt) {
+  return {
+    key: "main",
+    status: receipt.status, sessionReusable: false,
+    turnSpecHash: run.spec.specHash,
+    artifactPath: receipt.artifactPath, charCount: receipt.charCount,
+    durationMs: receipt.durationMs, attempts: receipt.attempts || [],
+    inferredDeps: receipt.inferredDeps ?? [],
+    inferredDepsTruncated: receipt.inferredDepsTruncated ?? false,
+  };
 }
 
 /** 一段对话的顶层结局 = **各轮里最严重的那一个**。
@@ -2119,16 +2449,41 @@ export async function releaseRun(run) {
  * 上已经栽过三次。
  */
 export async function runNode(bridge, rawSpec) {
-  const run = await prepareRun(bridge, rawSpec);
-  if (run.reusedReceipt) return run.reusedReceipt;
+  const hold = {};
+  let run;
   try {
-    await runTurn(run, {
-      key: "main",
-      prompt: run.spec.prompt, promptBody: run.spec.promptBody,
-      timeoutMs: run.spec.timeoutMs,
-      schema: run.spec.schema, outputShape: run.spec.outputShape, reask: run.spec.reask,
-    });
+    run = await prepareRun(bridge, rawSpec, { hold });
+  } catch (e) {
+    await rejectNode(bridge, hold.viz, e);
+    throw e;
+  }
+  if (run.reusedReceipt) {
+    // 复用命中也要有终态 —— 否则页面上这个节点永远停在 `node:observed`。
+    if (run.viz) await emitReusedSettled(run);
+    return run.reusedReceipt;
+  }
+  // ⚠️ 单轮节点**不是特例,是 N=1**:它那一轮的 `key` 恒为 `"main"`,归档布局里
+  //    同样有 `turns/main/`,事件流里同样有 `node:turn` 与 `node:turn-settled`。
+  //    **不留"没有轮的旧路径"** —— 留一条,页面就要为两种布局各写一遍解析,而两套迟早只有一套被改。
+  const mainTurn = {
+    key: "main",
+    prompt: run.spec.prompt, promptBody: run.spec.promptBody,
+    timeoutMs: run.spec.timeoutMs,
+    schema: run.spec.schema, outputShape: run.spec.outputShape, reask: run.spec.reask,
+    turnSpecHash: run.spec.specHash,
+    // 单轮节点这一轮的正文**就是**节点的正文,所以推断边直接沿用 —— 同一段正文
+    // 扫两遍只会得到同一份结果,而两处各扫一遍迟早会漂成两种算法。
+    inferredDeps: run.spec.inferredDeps, inferredDepsTruncated: run.spec.inferredDepsTruncated,
+  };
+  try {
+    await runTurn(run, mainTurn);
     return await finalizeRun(run);
+  } catch (e) {
+    // 入场那几关(二次脏树复查 / 算分支名 / 建工作树)抛出来的 —— 单轮节点一旦不过
+    // 就当场结束。**先闭合那一轮**(它的 `node:turn` 已经发出去了),再发节点级的 `node:rejected`。
+    await closeNotStartedTurn(run, mainTurn, e);
+    await rejectNode(bridge, run.viz, e);
+    throw e;
   } finally {
     // ⚠️ **执行闸在这里放,不在 runTurn 结束时放。** `runNode` 的 close_session /
     // finalizeWorktree / 写回执都排在轮之后,提前放闸会让"同时活着的会话数"越过 maxConcurrent
@@ -2251,7 +2606,14 @@ function normalizeTurn(run, raw) {
   if (![0, 1].includes(re)) throw new UsageError(`reask 只能是 0 或 1,拿到:${t.reask}`);
   t.reask = re;
 
-  t.turnSpecHash = computeTurnSpecHash(t);
+  t.turnSpecHash = computeTurnSpecHash(t); // 顺带把 promptBody 冻在这一刻
+  // B 档拓扑:**同一个算法、同一段代码**,只是输入换成这一轮的正文。
+  // 对话的推断边主要来自这里 —— 第 2 轮的提问通常就是照着另一个节点的产出写的。
+  {
+    const inf = inferDeps(t.promptBody, run.spec.id);
+    t.inferredDeps = inf.deps;
+    t.inferredDepsTruncated = inf.truncated;
+  }
   // ⚠️ `schema` / `outputShape` 只做浅拷贝不够:它们已经在指纹里被 stableStringify 定型,
   // 而真正发出去的是对象引用 —— 调用方在 await 之前改掉嵌套字段,"算的"与"发的"就分家了。
   if (t.schema !== undefined) t.schema = JSON.parse(JSON.stringify(t.schema));
@@ -2268,6 +2630,8 @@ async function liveTurn(run, t) {
     contextUsage: null, abortConfirmed: null, scene: null, error: null, diagnostics: [],
     attempts: [], // v2:这一轮的每次尝试各一条(`n` 在**每一轮内**从 1 重新开始)
   };
+  // ⚠️ 先宣布、再取闸:对话闸也是一道闸,等它的那段时间同样属于「这一轮在排队」。
+  await announceTurn(run, t);
   // 首轮才取对话闸。**不在 prepare 取** —— 那时一个会话都还没有,占的是个空名额:
   // 回调若在第一次 turn() 之前先去等一件长事,就会白白把别的对话堵在门外。
   // 顺序恒为 scope → exec(执行闸在 runTurn 里取),于是不存在"持 exec 等 scope",依赖图无环。
@@ -2286,6 +2650,8 @@ async function liveTurn(run, t) {
     // 永远等不到自己的终态;页面按 key 建 map 会把前一条直接盖掉。
     // key 是这一轮的**身份**(也是产出文件名),用过就不能再用,哪怕那一轮没跑成。
     // (EVENTS.md 复审 BLOCKER 1 顺着文档指回来的实现问题。)
+    // ⚠️ **在释放执行闸之前**把这一轮闭合掉 —— 它有开头(`node:turn`)就必须有结尾。
+    await closeNotStartedTurn(run, t, e);
     // 会话根本没开起来时,对话名额界的那个东西不存在 —— 还给别人,别让一段跑不起来的对话
     // 把 maxConversations 一直占着。下一轮真跑起来时 liveTurn 会重新取。
     if (!run.opened && run.scopeHeld) { run.bridge._scopeGate.release(); run.scopeHeld = false; }
@@ -2362,7 +2728,14 @@ export async function conversation(bridge, rawSpec, fn) {
 }
 
 async function conversationBody(bridge, rawSpec, fn) {
-  const run = await prepareRun(bridge, rawSpec, { kind: "conversation" });
+  const hold = {};
+  let run;
+  try {
+    run = await prepareRun(bridge, rawSpec, { kind: "conversation", hold });
+  } catch (e) {
+    await rejectNode(bridge, hold.viz, e);
+    throw e;
+  }
   const prev = run.reusedReceipt; // 非 null ⇒ 走回放:不拿任何闸、不开会话、不建 worktree
 
   // ⚠️ 刻意**不是** async 函数:入场被拒时要返回一个"已认领"的 rejected promise(quietReject),
@@ -2419,6 +2792,9 @@ async function conversationBody(bridge, rawSpec, fn) {
 
   let callbackError = null;
   let threw = false;
+  // 「这个节点有没有终态事件」。⚠️ **它就是 `node:rejected` 与 `node:settled` 的分界判据**
+  //    (§5.3:同一个 `UsageError` 落在哪一层,取决于这个节点有没有回执)。
+  let settledEmitted = false;
   try {
     try {
       await fn(turn);
@@ -2436,12 +2812,14 @@ async function conversationBody(bridge, rawSpec, fn) {
       // 重则一次回放期的回调 bug 把一张 ok 回执永久改写成失败。
       if (threw) throw callbackError;
       if (run.turns.length !== prev.turns.length) {
-        throw new UsageError(
+        throw Object.assign(new UsageError(
           `回放不匹配:旧回执有 ${prev.turns.length} 轮,这次只消费了 ${run.turns.length} 轮 —— 整段不复用。\n` +
           `⚠️ 回放**不是事务**:回调里别的副作用(嵌套节点、写文件)已经发生了,拒绝不会回滚它们。\n` +
           `所以回放模式下的回调必须是可重放的:嵌套节点一律带 reuseIfSame,绝不用 force。`,
-        );
+        ), { phase: "reuse-check" });
       }
+      // 复用命中的对话**一条 `node:turn` 都不发** —— 它的终态与推断边全靠这一条。
+      if (run.viz) { await emitReusedSettled(run); settledEmitted = true; }
       return { ...prev, reused: true };
     }
 
@@ -2452,24 +2830,34 @@ async function conversationBody(bridge, rawSpec, fn) {
       if (run.turnCalls > 0) {
         // ⚠️ 只说得出口的事:调了几次、最后一次为什么没进去。**别替它归类**
         //    ——"每次都死在参数校验上"就曾经是假话(并发闸/毒化闸拒掉的那些也在这个计数里)。
-        throw new UsageError(
+        throw Object.assign(new UsageError(
           `这段对话调用了 ${run.turnCalls} 次 turn(),但没有一轮进得去 —— 每次都被拒了,` +
           `而回调把异常吞了(\`try { await turn(...) } catch {}\`),于是外面什么都没看见。\n` +
           `最后一次没进去的原因是:${run.lastTurnFailure?.message ?? "(没记到)"}\n` +
           `⚠️ 别在回调里静默吞 turn() 的用法错 —— 那会让"这一轮被拒了"看起来像"编排空转"。`,
-        );
+        // 判据写死:`turnCalls > 0` 且 `turns[]` 为空。⚠️ 枚举名比语义窄 ——
+        // 它涵盖参数不合法**与**用法/状态不允许(并发/来晚/毒化后/超 20 轮)两类。
+        ), { phase: "turn-validation" });
       }
-      throw new UsageError(
+      throw Object.assign(new UsageError(
         "这段对话一轮都没跑(回调一次 turn() 都没调)。**不写空回执** —— " +
         "一张 turns:[] 的回执会让下次的复用闸面对一个没有任何判据的对象。",
-      );
+      ), { phase: "zero-turn" });
     }
 
     const receipt = await finalizeRun(run, { callbackError, callbackThrew: threw });
+    settledEmitted = true;
     // 回执是记录,异常是控制流 —— 顶层 status 怎么定都不改变"原样重抛回调的异常"。
     // ⚠️ 收尾过程中产生的诊断**不许盖掉它**:回调的异常才是根因。
     if (threw) throw callbackError;
     return receipt;
+  } catch (e) {
+    // ⚠️ **判据是「这个节点有没有终态」,不是「抛的是什么」。**
+    //    有回执的节点(哪怕回调自己炸了)走的是 `node:settled{status:"callback_error"}`;
+    //    只有一轮都没跑起来的才发 `node:rejected`。两条路都发 = 那个节点被数两次,
+    //    §5.10 的恒等式当场作废。
+    if (!settledEmitted) await rejectNode(bridge, run.viz, e, "zero-turn");
+    throw e;
   } finally {
     await releaseRun(run);
   }
