@@ -1771,15 +1771,23 @@ function writeOf(n, status){
           worktree:ws, diff:{s:'unlogged'}};
 }
 
-/** 依赖 id → nodeSeq。⚠️ **id 可以重复**，取「本节点之前出现的、最近的那一个」。 */
+/**
+ * 依赖 id → nodeSeq。**id 可以重复**（唯一键是 nodeSeq），所以必须挑一个。
+ *
+ * 规则：先在**本节点之前**找最近的那一个；找不到再往后取**第一个**。
+ * ⚠️ 后半条不是凑数：`Promise.all` 扇出里,被依赖的那个节点**可能观测在后**
+ * （谁先进 `runNode` 谁先拿号，与依赖方向无关）。只往前找的实现会把这种边**静默丢掉** ——
+ * 用户写了一句依赖，页面上什么都没有，而且不报错。
+ */
 function resolveDep(R, id, beforeSeq){
-  let best = null;
+  let best = null, after = null;
   for (const s of R.order){
-    if (s >= beforeSeq) break;
     const n = R.nodes.get(s);
-    if (n && n.id === id) best = s;
+    if (!n || n.id !== id) continue;
+    if (s < beforeSeq) best = s;
+    else if (after == null) after = s;
   }
-  return best;
+  return best != null ? best : after;
 }
 
 /** 事件流 → 一个 scene（与静态演示场景**同一个形状**，走同一个渲染器）。 */
@@ -2226,6 +2234,21 @@ function skeletonGraph(){
 }
 
 let QOPEN = false;
+/* 一条边的 SVG。**声明 = 实线、推断 = 虚线**,这不是装饰:
+   UIREQ 原话是「把推断当事实展示是这个页面最容易造成的误导」。
+   ⚠️ 单独抽出来是为了它**能被测**:回归里会拿一份把虚线去掉的变体跑一遍,
+   断言那几条守它的断言真的会变红 —— 不然守着这件事本身是假绿。 */
+function edgeSvg(e, i, x1, y1, x2, y2){
+  const dx = Math.max(34, (x2-x1)/2);
+  const d = 'M'+x1+' '+y1+' C'+(x1+dx)+' '+y1+' '+(x2-dx)+' '+y2+' '+x2+' '+y2;
+  const inf = e.kind==='inferred';
+  return '<path d="'+d+'" data-edge="'+i+'" stroke="'+(inf?'var(--faint)':'var(--ink-soft)')+'"'+
+    ' stroke-width="'+(inf?1.4:1.8)+'"'+(inf?' stroke-dasharray="5 5"':'')+
+    ' marker-end="url(#'+(inf?'mi':'md')+')" opacity="'+(inf?.8:.72)+'"></path>'+
+    (e.warn ? '<circle cx="'+((x1+x2)/2)+'" cy="'+((y1+y2)/2)+'" r="7" fill="var(--c-timeout)" data-edge="'+i+'"></circle>'+
+              '<text x="'+((x1+x2)/2)+'" y="'+((y1+y2)/2+3.6)+'" text-anchor="middle" font-size="10" font-weight="700" fill="var(--on-solid)" data-edge="'+i+'" style="pointer-events:none">!</text>' : '');
+}
+
 function renderGraph(sc, sel){
   const L = layout(sc);
   const cv = $('#gcanvas');
@@ -2247,15 +2270,7 @@ function renderGraph(sc, sel){
   const edges = sc.edges.filter(e => L.shown.some(n=>n.seq===e.a) && L.shown.some(n=>n.seq===e.b));
   const paths = edges.map((e,i) => {
     const a = L.shown.find(n=>n.seq===e.a), b = L.shown.find(n=>n.seq===e.b);
-    const x1 = a._x + COLW, y1 = a._y + nodeH(a)/2, x2 = b._x, y2 = b._y + nodeH(b)/2;
-    const dx = Math.max(34, (x2-x1)/2);
-    const d = 'M'+x1+' '+y1+' C'+(x1+dx)+' '+y1+' '+(x2-dx)+' '+y2+' '+x2+' '+y2;
-    const inf = e.kind==='inferred';
-    return '<path d="'+d+'" data-edge="'+i+'" stroke="'+(inf?'var(--faint)':'var(--ink-soft)')+'"'+
-      ' stroke-width="'+(inf?1.4:1.8)+'"'+(inf?' stroke-dasharray="5 5"':'')+
-      ' marker-end="url(#'+(inf?'mi':'md')+')" opacity="'+(inf?.8:.72)+'"></path>'+
-      (e.warn ? '<circle cx="'+((x1+x2)/2)+'" cy="'+((y1+y2)/2)+'" r="7" fill="var(--c-timeout)" data-edge="'+i+'"></circle>'+
-                '<text x="'+((x1+x2)/2)+'" y="'+((y1+y2)/2+3.6)+'" text-anchor="middle" font-size="10" font-weight="700" fill="var(--on-solid)" data-edge="'+i+'" style="pointer-events:none">!</text>' : '');
+    return edgeSvg(e, i, a._x + COLW, a._y + nodeH(a)/2, b._x, b._y + nodeH(b)/2);
   }).join('');
 
   const defs = '<defs>'+
@@ -2502,7 +2517,10 @@ function statusBlock(n){
 const WT = {
   cleaned:          ['已清理', '收尾时确认删除成功。'],
   unconfirmed:      ['收尾时未确认清理', '这是收尾那一刻的快照，不是现在的事实 —— 那个目录现在可能已经被别的东西清掉了，可去核对。'],
-  kept:             ['系统已为你保留', '结论是「交付状态不明」时，系统刻意没删这份副本，因为里面可能有还没进分支的代码。路径在此，去核对。'],
+  /* ⚠️ 这一档的判据是「收尾时它**还在**」，不是「结论不明」——
+        两种成因都会落到这里：①删除试过了、没成功；②关会话没被确认，系统**刻意**没删
+        （后端可能还在写，删了就是丢代码）。别把文案写死成其中一种。 */
+  kept:             ['收尾时这份副本还在', '要么删除没成功，要么关会话没被确认、系统刻意留着它（里面可能有还没进分支的代码）。路径在此，去核对。'],
   not_started:      ['不会有', '创建动作还没开始，不用去找。'],
   unconfirmed_create:['未确认建成', '可能已经开始建，位置未确认 —— 可能不存在。'],
   failed:           ['建不起来', '创建失败；常见原因是上次残留清不掉，那东西可能还在。'],
@@ -2566,7 +2584,11 @@ function writeBlock(n){
     '<div class="kv"><span class="k">工作副本</span><span class="v"><b>'+esc(ws[0])+'</b>'+
       '<div style="color:var(--faint);font-size:11.5px;line-height:1.55;margin-top:3px">'+esc(ws[1])+'</div>'+
       (w.worktree && w.worktree.why ? '<div style="color:var(--faint);font-size:11.5px;line-height:1.55;margin-top:3px">'+esc(w.worktree.why)+'</div>' : '')+
-      (w.worktree && w.worktree.path && w.worktree.state!=='kept'
+      /* ⚠️ 判据是「上面那段有没有已经把路径印出来」，**不是**工作副本处于哪一档。
+            早先这里写的是 `state!=='kept'` —— 于是 `delivered` + 收尾没删成 的组合下，
+            文案说着「路径在此，去核对」，却一个路径都不给。会去核对的人扑一次空，
+            这一栏后面说什么都不算数了。 */
+      (w.worktree && w.worktree.path && w.outcome !== 'unknown'
         ? '<div style="margin-top:6px"><code class="path">'+esc(w.worktree.path)+'</code>'+copyBtn('复制路径', w.worktree.path)+'</div>' : '')+
     '</span></div></div>');
   return '<div class="sec">'+o.join('')+'</div>';

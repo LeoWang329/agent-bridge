@@ -13,6 +13,8 @@
 //   V7 零轮两档      —— zero-turn 与 turn-validation **必须分得开**
 //   V8 数据面        —— SSE 线格式(含 tx 逐字节透传)/ /file 的四道闸(400/403/404/405 分得开)
 //   V9 强杀路径      —— 没有 run:final 时,管道 EOF 必须变成 control{owner-ended};健康路径不发
+//   V10 两万条回放   —— 回放期间服务端仍响应别的请求(**同步整文件读会在这一条上红**)
+//   V11 干净工作树   —— 在**新建的临时 git 仓库**里跑:本仓库 .graph/ 已 gitignore,在这儿测恒绿
 //
 // 每个场景跑完都过一遍**全局不变式**:seq 与 nodeSeq 稠密 / 每节点恰好一个终态 /
 // turn↔turn-settled 一一对应 / run:final 恒等式且是最后一条 / id 只在 observed /
@@ -635,6 +637,136 @@ async function v9_owner_ended() {
 }
 
 /* ============================================================ */
+/**
+ * V10 大 transcript 回放期间,服务端仍然活着。
+ *
+ * ⚠️ 这一条是为了钉死「异步流式回放」这四个字。
+ * **没有它,一个 readFileSync 实现能过全部其它用例** —— 小样例下同步读也就几毫秒,看不出差别;
+ * 真到两小时的运行上,页面一连上去整个服务就僵住,而日志上一切正常。
+ *
+ * 判据刻意**不用时间阈值**(会在负载机器上抖),而用**顺序**:
+ * 回放还没放完的时候,另一个 HTTP 请求就该已经拿到响应了。
+ * 同步读做不到这件事 —— 它要等整份文件解析完才回到事件循环。
+ */
+async function v10_big_replay() {
+  console.log("\n[V10] 两万条回放期间,另一个请求照样被及时响应");
+  const outDir = freshOut();
+  const graphId = "gr-v10";
+  const root = path.join(outDir, "nodes", ".runs", graphId);
+  fs.mkdirSync(root, { recursive: true });
+
+  const N = 20001;   // 比「两万」多一条 —— 别让实现刚好按整数边界截断
+  const mk = (seq, event, payload) =>
+    JSON.stringify({ v: 1, seq, ts: 1000 + seq, graphId, event, payload }) + "\n";
+  const out = fs.createWriteStream(path.join(root, "transcript.jsonl"));
+  out.write(mk(0, "run:started", { outDir, maxConcurrent: 4 }));
+  out.write(mk(1, "node:observed", { nodeSeq: 0, id: "big", agent: "omp", access: "read", cwd: REPO,
+    model: null, effort: null, spec: { state: "not-applicable" }, prompt: { state: "not-applicable" },
+    role: { state: "not-applicable" }, declaredDeps: [], inferredDeps: [], inferredDepsTruncated: false }));
+  out.write(mk(2, "node:turn", { nodeSeq: 0, turnKey: "main", input: { state: "not-applicable" },
+    timeoutMs: 600000, reask: 1, inferredDeps: [], inferredDepsTruncated: false }));
+  out.write(mk(3, "node:started", { nodeSeq: 0, turnKey: "main", queuedMs: 10 }));
+  for (let i = 4; i < N; i++) {
+    // 带中文 —— 多字节字符是「分块读之后拼串」最容易踩坏的地方。
+    out.write(mk(i, "node:progress", { nodeSeq: 0, turnKey: "main", status: "running",
+      charCount: i, tail: "第 " + i + " 段:正在读 src/transport/sse.ts 与它的三处调用点" }));
+  }
+  await new Promise((r) => out.end(r));
+
+  const { fork } = await import("node:child_process");
+  const serve = path.join(REPO, "skills", "agent-bridge-graph", "viz", "serve.mjs");
+  const child = fork(serve, [], { stdio: ["ignore", "ignore", "inherit", "ipc"],
+    env: { ...process.env, VIZ_OUT_DIR: outDir, VIZ_GRAPH_ID: graphId, VIZ_PORT: "0" }, windowsHide: true });
+  const url = await new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error("viewer 没报出端口")), 15000);
+    child.once("exit", (c) => { clearTimeout(t); reject(new Error("viewer 提前退出 " + c)); });
+    child.on("message", (m) => { if (m && m.kind === "viz-listening") { clearTimeout(t); resolve(m.url); } });
+  });
+
+  let txCount = 0, firstTxAt = 0, lastTxAt = 0, badChar = false;
+  let sideDoneAt = 0, txAtSide = 0;
+  const started = Date.now();
+  const done = new Promise((resolve) => {
+    let buf = "";
+    const req = http.get(url + "events", (res) => {
+      res.setEncoding("utf8");
+      res.on("data", (d) => {
+        buf += d;
+        let i;
+        while ((i = buf.indexOf("\n\n")) !== -1) {
+          const raw = buf.slice(0, i); buf = buf.slice(i + 2);
+          if (!raw.startsWith("event: tx")) continue;
+          txCount++; lastTxAt = Date.now(); if (!firstTxAt) firstTxAt = lastTxAt;
+          if (sideDoneAt && !txAtSide) txAtSide = txCount;   // 旁路响应落地那一刻,已经放了多少帧
+          // U+FFFD 出现 = 某一次分块把一个多字节字符劈成了两半
+          if (raw.indexOf("�") !== -1) badChar = true;
+        }
+      });
+    });
+    req.on("error", () => {});
+    setTimeout(() => { try { req.destroy(); } catch { /* 已经断了 */ } resolve(); }, 20000);
+  });
+
+  // 等第一帧到手(说明回放确实开始了)再发旁路请求 —— 否则它可能抢在回放开始之前完成,什么都测不到。
+  await new Promise((r) => {
+    const w = setInterval(() => { if (firstTxAt) { clearInterval(w); r(); } }, 5);
+    setTimeout(() => { clearInterval(w); r(); }, 5000);
+  });
+  const side = await httpReq(url);
+  const sideAt = Date.now();
+  sideDoneAt = sideAt;
+  await done;
+
+  ok("V10 两万条一条不少地回放到位", txCount === N, txCount + " vs " + N);
+  ok("V10 旁路请求成功", side.status === 200, String(side.status));
+  ok("V10 ★ 旁路请求在回放**放完之前**就拿到了响应(同步整文件读做不到)",
+    sideAt < lastTxAt, "旁路 +" + (sideAt - started) + "ms,最后一帧 +" + (lastTxAt - started) + "ms");
+  // ⚠️ 上面那条只差几十毫秒时会抖。**再加一条不看时钟的**:旁路响应落地时,
+  //    后面还应该有相当一批帧没发出去。同步读的实现在这里必然是 0(它一帧都还没开始发)。
+  ok("V10 ★ 旁路响应落地时,回放还剩一大截没发完",
+    txAtSide > 0 && txCount - txAtSide > N / 4,
+    "旁路时已发 " + txAtSide + " / " + txCount);
+  ok("V10 ★ 多字节字符没被分块拼坏(没有 U+FFFD)", !badChar);
+  try { child.kill(); } catch { /* 已经退了 */ }
+}
+
+/* ============================================================ */
+/**
+ * V11 viz 的产物不弄脏工作树。
+ *
+ * ⚠️ **必须在一个新建的临时 git 仓库里跑。** 本仓库的 .graph/ 早就写进 .gitignore 了,
+ * 在这里跑这条断言**永远是绿的** —— 它测不到任何东西。
+ * 合同是 EVENTS.md §10.9 第 1 条:**viewer 不写任何 pid / state 文件**,判活只有那条生命管道。
+ */
+async function v11_clean_tree() {
+  console.log("\n[V11] viz 不往工作树里落任何东西");
+  const repo = path.join(RUN_ROOT, "cleanrepo");
+  fs.mkdirSync(repo, { recursive: true });
+  const git = (...a) => spawnSync("git", a, { cwd: repo, encoding: "utf8" });
+  git("init", "-q");
+  git("config", "user.email", "t@t");
+  git("config", "user.name", "t");
+  fs.writeFileSync(path.join(repo, "README.md"), "# 干净仓库\n");
+  git("add", "-A"); git("commit", "-qm", "init");
+  ok("V11 起点是干净的", git("status", "--porcelain").stdout.trim() === "");
+
+  // out-dir 放在**仓库外面** —— 这样"仓库里多出任何东西"就一定是别人漏下来的。
+  const outDir = freshOut();
+  const restore = envFor("okturn");
+  try {
+    await withBridge(async (b) => {
+      await b.runNode({ id: "clean", agent: "omp", cwd: repo, outDir, prompt: "hi", timeoutMs: 30000 });
+    }, { viz: true, outDir });
+  } finally { restore(); }
+
+  const dirty = git("status", "--porcelain").stdout.trim();
+  ok("V11 ★ 跑完之后工作树仍然干净(viewer 不写 pid/state,桥也不往 cwd 落东西)",
+    dirty === "", dirty.split("\n").slice(0, 6).join(" | "));
+  const stray = fs.readdirSync(repo).filter((f) => f !== ".git" && f !== "README.md");
+  ok("V11 ★ 目录里也没有未跟踪的残留", stray.length === 0, stray.join(", "));
+}
+
+/* ============================================================ */
 async function main() {
   console.log(`[harness] 运行目录 ${RUN_ROOT}`);
   await v1_single();
@@ -646,6 +778,8 @@ async function main() {
   await v7_zero_turn();
   await v8_dataplane();
   await v9_owner_ended();
+  await v10_big_replay();
+  await v11_clean_tree();
   console.log(`\n${"=".repeat(56)}`);
   console.log(`  graph-viz: ${pass} passed, ${fail} failed`);
   console.log(`${"=".repeat(56)}\n`);
