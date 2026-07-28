@@ -13,13 +13,48 @@ import { withBridge, runNode, normalizeSpec, UsageError, STATUS_EXIT } from "./n
 | `withBridge(fn, opts?)` | 起**一个**私有桥进程 → 跑你的编排 → **收尾一定会跑**(异常路径也跑;能安全回收的都收干净,唯一的例外见下方收尾说明)。日常用这个 |
 | `startBridge(opts?)` | 手动起桥(**你自己负责 `close()`**)。除非有特殊生命周期需求,否则用 `withBridge` |
 | `bridge.runNode(spec)` | 跑一个环节,返回回执。等价于 `runNode(bridge, spec)` |
+| `bridge.conversation(spec, fn)` | 跑**一段多轮对话**(有记忆),返回回执。见下 |
 | `bridge.doctor()` | 后端体检(只查版本号,不验登录) |
 | `bridge.callTool(name, args, timeoutMs?)` | 逃生舱:直接调任意 `agent_bridge_*` MCP 工具 |
-| `normalizeSpec(spec)` | 只校验+算指纹,不执行(想先验参数时用) |
+| `normalizeSpec(spec, {kind}?)` | 只校验+算指纹,不执行(想先验参数时用);`kind:"conversation"` 走对话档 |
+| `prepareRun` / `runTurn` / `finalizeRun` / `releaseRun` | `runNode` 与 `conversation` 共用的四段。**一般不直接用**,导出是为了让两条路只有一份实现 |
 | `UsageError` | 用法错的类型(与「环节失败」区分:后者进回执不抛) |
-| `STATUS_EXIT` | `status` → 退出码的映射表 |
+| `STATUS_EXIT` | `status` → 退出码的映射表,**也是对话顶层结局的严重度序** |
 
-`opts`:`{ bridgePath?, env?, initTimeoutMs?, onStderr? }`。
+`opts`:`{ bridgePath?, env?, initTimeoutMs?, onStderr?, maxConcurrent?, maxConversations? }`。
+
+### `bridge.conversation(spec, fn)`
+
+`runNode` 是「开会话 → 发一条 → 关会话」,**没有记忆**;`conversation` 把记忆圈进一个作用域。
+**`runNode` 就是它的 N=1**,两条路共用 `prepareRun / runTurn / finalizeRun`。
+
+```js
+const receipt = await bridge.conversation(
+  { id, agent, cwd, outDir, access?, model?, effort?, roleFile?,
+    force?, reuseIfSame?, baseRef?, allowDirtyBase? },   // ← 顶层**不接受** timeoutMs / prompt /
+  async (turn) => {                                      //    schema / outputShape / reask(当场报错)
+    const r = await turn({ key, prompt | promptFile, timeoutMs,
+                           schema?, outputShape?, reask? });
+    // r: { key, status, sessionReusable, turnSpecHash, artifactPath, artifactSha256,
+    //      charCount, byteCount, reaskCount, durationMs, startedAt, endedAt,
+    //      contextUsage, abortConfirmed, scene, error, diagnostics }
+  },
+);
+```
+
+| 规矩 | 由什么保证 |
+|---|---|
+| `turn()` **不为失败抛异常**(同 `runNode`),失败进 `status` | — |
+| **轮与轮不许并发** | `turn()` 入口一道**同步**串行闸,第二个当场 `UsageError` |
+| `sessionReusable === false` ⇒ 整段**毒化**,后续 `turn()` 一律拒 | 判据在工具里,不靠回调自觉;拒的位置在占 key / 建文件 / 发消息**之前** |
+| 顶层 `status` = **各轮里最严重的那一个**(序见 `STATUS_EXIT`) | 不取"第一个非 ok"(会被后面更坏的轮遮住),也不取"最后一轮" |
+| 全轮 ok 但**回调自己抛了** ⇒ `callback_error`,不许被复用 | 判据是"抛没抛",`throw null` 也算 |
+| 回调里可以跑 `runNode`;**不能对同一座桥再开 `conversation`** | 执行闸按**轮**持有(回调期间不持有);对话闸整段持有,嵌套会成环 |
+| **最多 20 轮**;超了响亮报错 | `node:settled` 要内联一份有界的轮摘要 |
+| `reuseIfSame` 是**整段**复用:轮序列要一模一样 | 不匹配一律 `UsageError`,**不会自动重跑**(与 `runNode` 复用闸同一口径) |
+
+**两把闸**:`maxConcurrent`(默认 4)界"同时有几轮在烧后端";`maxConversations`(默认同值)界
+"同时有几段对话持着活会话"。⚠️ **总活会话上限是两者之和**,不是其中之一。
 桥本体默认按本文件相对位置找(`../../../scripts/agent-bridge.mjs`),
 装在别处或走软链时用环境变量 **`AGENT_BRIDGE_MJS`** 指绝对路径。
 

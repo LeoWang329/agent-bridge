@@ -531,3 +531,39 @@ v3 让两条路共用同一套八步，于是回放会去写回执——**那是
 **零残留**
 
 - 对话跑完（含异常路径、含回放路径）断言桥 pid 与后端进程都已死
+
+---
+
+## 11. 施工结论（2026-07-28 落地）
+
+| 提交 | 内容 |
+|---|---|
+| `7b9fe76` | 抽取 `prepareRun` / `runTurn` / `settleTurn` / `finalizeRun` / `releaseRun`（`runNode` 行为零变化） |
+| `6e0d0af` | `conversation()`：读档 + write 档 + replay，含 `repro-graph-conversation.mjs` 与 W26 |
+| `3e423b9` | 实现复审的 3 BLOCKER + 4 MAJOR |
+
+**实现复审分两路跑**（重构一路、新功能一路），两边各自都抓到了真问题。
+**其中两条是抽取时被改掉的既有行为**——不是新功能的锅，也不是 220 条断言能发现的：
+
+| 级别 | 发现 | 为什么全绿也发现不了 |
+|---|---|---|
+| MAJOR | `open_session` 丢了 `return_mode:"ref"` | 假后端产出都很小，full 与 ref 在测试里没有可观察差别。只能**直接查调用参数**（C18） |
+| MAJOR | `finalizeRun` 跑到了原来那个大 catch 外面 ⇒ 收尾抛错变成「抛异常 + 没有回执」 | 收尾在假后端下从不出错。改成**直接考合同**：手搓一个 `closeSession` 必抛的 run 喂给 `finalizeRun`（C18b） |
+| **BLOCKER** | 嵌套判据用桥级布尔：**兄弟对话被误判成嵌套**，先结束的又会清零标志放过真嵌套 | C11 两段对话**同 tick** 起，恰好都在标志置位前穿过检查——靠时序侥幸绿。C17 让 A 确定进入回调后再起 B，稳定复现 |
+| **BLOCKER** | `promptFile` 的 TOCTOU：指纹按 A 算、发的是**路径**、桥几个 await 之后才读 ⇒ 回放把 B 的答案当 A 的复用 | 测试从不在 in-flight 时改提问文件。**这是 `runNode` 既有的洞**，抽取后两档共用一条路，一并根治 |
+| **BLOCKER** | `throw null` ⇒ 落一张可复用的 `ok` 回执 | 判据写成了 `if (callbackError)`；`throw Object.create(null)` 还会让 `String(x)` 二次抛异常、把收尾拦腰打断 |
+| MAJOR | `runTurn` 抛用法错时留下一条 `status:"unknown"` 的幽灵轮，污染顶层结局 | — |
+| MAJOR | 忘了 await 的第二次 `turn()` 返回的 rejected promise 没人接 ⇒ Node 默认直接退进程 | — |
+
+⚠️ **`promptFile` 那条的修法值得记**：第一版想「复制一份快照再发那个路径」，**行不通**——
+桥要求 `message_file` 必须在**会话 cwd 里面**，而 read 档的 cwd 是用户工作区
+（往里写盘直接破了只读承诺）、write 档的是 worktree（写进去会混进这次的 diff）。
+两边都不能写，所以正确解法是**根本不发路径、发字节**：在算指纹的同一刻把正文读出来，之后一律发这份。
+
+**回归**：`repro-graph-node` 74 + `repro-graph-worktree` 176 + `repro-graph-conversation` 137 = **387**。
+
+**留给 viz 施工第 5 项的**：`attempts[]` 一次加两级（§5）。抽取之后 attempt 循环只剩 `runTurn` 一处，
+写进 `turnRec` 就同时覆盖 `runNode` 的顶层与对话的 `turns[]`。
+
+**hermetic 考不了的那条**：「记忆真的在」需要真后端 + nonce（假后端没有记忆，让它「记住」只能靠夹具作弊）。
+`repro-graph-conversation.mjs` 的头注释里已如实写明，那条属于真 e2e。
