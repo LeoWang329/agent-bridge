@@ -182,6 +182,15 @@ function controlFramesFor(c) {
       kind: "owner-final", result: state.ownerFinal.result, endedAt: state.ownerFinal.endedAt,
     }));
   }
+  // ⚠️ 页面判「运行状态」的四档里,第 3、4 档(`log_broken_unknown` / `no_finish`)都要求知道
+  //    **owner 已经结束**。没有这一帧,页面分不开「还在跑、暂时没消息」与「跑完了、就是没有 final」,
+  //    只能一直显示"运行中" —— 一次被强杀的运行会永远装作还活着。
+  //    「已结束」不等于「成功完成」:drain 失败照样算结束(见 ownerEnded 的注释)。
+  //
+  // ⚠️ **transcript 里已经有 run:final 时不发**:那一档由 transcript 自己说了算(判定第 1 档),
+  //    这一帧一个字的新信息都不带。健康路径**一条 control 帧都不发**是有用的不变量 ——
+  //    它本身就等于一句"没出任何异常"。
+  if (!sawRunFinal && ownerEnded()) c.frame("control", JSON.stringify({ kind: "owner-ended" }));
 }
 
 /** 把一条控制消息广播给所有**已经转 live** 的客户端;还在回放的那些等回放完再补。 */

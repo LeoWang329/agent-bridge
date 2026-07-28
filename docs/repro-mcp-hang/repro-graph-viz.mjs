@@ -12,6 +12,7 @@
 //   V6 复用命中      —— execution:"reused" + **一条 node:turn 都不发** + 推断边仍在
 //   V7 零轮两档      —— zero-turn 与 turn-validation **必须分得开**
 //   V8 数据面        —— SSE 线格式(含 tx 逐字节透传)/ /file 的四道闸(400/403/404/405 分得开)
+//   V9 强杀路径      —— 没有 run:final 时,管道 EOF 必须变成 control{owner-ended};健康路径不发
 //
 // 每个场景跑完都过一遍**全局不变式**:seq 与 nodeSeq 稠密 / 每节点恰好一个终态 /
 // turn↔turn-settled 一一对应 / run:final 恒等式且是最后一条 / id 只在 observed /
@@ -308,11 +309,16 @@ async function v4_dup_id() {
   const restore = envFor("okturn");
   try {
     await withBridge(async (b) => {
-      const p1 = b.runNode({ id: "same", agent: "omp", cwd: REPO, outDir, prompt: "a", timeoutMs: 30000 });
-      const p2 = b.runNode({ id: "same", agent: "omp", cwd: REPO, outDir, prompt: "b", timeoutMs: 30000 })
-        .catch((e) => ({ _err: e }));
-      const [, r2] = await Promise.all([p1, p2]);
-      ok("V4 第二个被拒(UsageError)", r2?._err instanceof UsageError);
+      // ⚠️ **谁抢到锁是不确定的** —— 两个调用在同一个 tick 里发出,先到 prepareRun 的那个赢。
+      //    早先这里写死"第二个会被拒",于是另一半的时候 p1 抛出去、整个 harness 当场炸掉:
+      //    一条**间歇性假红**。判据要写成"恰好一个被拒",不是"第几个被拒"。
+      const grab = (prompt) => b.runNode({ id: "same", agent: "omp", cwd: REPO, outDir, prompt, timeoutMs: 30000 })
+        .then((r) => ({ ok: r }), (e) => ({ _err: e }));
+      const rs = await Promise.all([grab("a"), grab("b")]);
+      const errs = rs.filter((r) => r._err);
+      ok("V4 恰好一个被拒", errs.length === 1, `被拒 ${errs.length} 个`);
+      ok("V4 被拒的那个是 UsageError", errs[0]?._err instanceof UsageError);
+      ok("V4 另一个照常拿到回执", rs.find((r) => !r._err)?.ok?.status === "ok");
     }, { viz: true, outDir });
   } finally { restore(); }
 
@@ -573,6 +579,62 @@ async function v8_dataplane() {
 }
 
 /* ============================================================ */
+/**
+ * V9 强杀路径:transcript 里**没有** run:final,管道 EOF ⟹ 服务端必须发 owner-ended。
+ *
+ * 为什么单独造场景而不是复用前面那些:前面每一条都是有序收场,transcript 里都有 run:final,
+ * 那一档由 transcript 自己说了算。**只有拿不到 run:final 时,页面才无从判断
+ * 「还在跑、暂时没消息」与「跑完了、就是没有 final」** —— 这一帧就是为那个岔口存在的。
+ * 不测它,no_finish 与 log_broken_unknown 两档在页面上永远走不到。
+ */
+async function v9_owner_ended() {
+  console.log("\n[V9] 强杀(无 run:final)→ control{owner-ended}");
+  const outDir = freshOut();
+  const graphId = "gr-v9-" + Date.now().toString(36);
+  const root = path.join(outDir, "nodes", ".runs", graphId);
+  fs.mkdirSync(root, { recursive: true });
+  // 一份**只写到一半**的 transcript:开了头,没有结尾。
+  const mk = (seq, event, payload) => JSON.stringify({ v: 1, seq, ts: 1000 + seq, graphId, event, payload });
+  fs.writeFileSync(path.join(root, "transcript.jsonl"),
+    mk(0, "run:started", { outDir, maxConcurrent: 4 }) + "\n" +
+    mk(1, "node:observed", { nodeSeq: 0, id: "cut", agent: "omp", access: "read", cwd: REPO,
+      model: null, effort: null, spec: { state: "not-applicable" }, prompt: { state: "not-applicable" },
+      role: { state: "not-applicable" }, declaredDeps: [], inferredDeps: [], inferredDepsTruncated: false }) + "\n");
+
+  const { fork } = await import("node:child_process");
+  const serve = path.join(REPO, "skills", "agent-bridge-graph", "viz", "serve.mjs");
+  const child = fork(serve, [], {
+    stdio: ["ignore", "ignore", "inherit", "ipc"],
+    env: { ...process.env, VIZ_OUT_DIR: outDir, VIZ_GRAPH_ID: graphId, VIZ_PORT: "0" },
+    windowsHide: true,
+  });
+  const url = await new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error("viewer 没报出端口")), 15000);
+    child.once("exit", (c) => { clearTimeout(t); reject(new Error("viewer 提前退出 " + c)); });
+    child.on("message", (m) => { if (m?.kind === "viz-listening") { clearTimeout(t); resolve(m.url); } });
+  });
+
+  // 先确认**还活着的时候不发**这一帧 —— 否则一条恒发的帧测不出任何东西。
+  const before = await sseCollect(url, 1500);
+  ok("V9 owner 还在时不发 owner-ended",
+    !before.frames.some((f) => f.event === "control" && /owner-ended/.test(f.data || "")));
+
+  // 管道 EOF = owner 结束。**这是判活的唯一合同。**
+  child.disconnect();
+  await new Promise((r) => setTimeout(r, 1200));
+
+  const after = await sseCollect(url, 2000);
+  const ctrl = after.frames.filter((f) => f.event === "control").map((f) => JSON.parse(f.data));
+  ok("V9 ★ 管道 EOF 之后必须发 owner-ended", ctrl.some((c) => c.kind === "owner-ended"),
+    JSON.stringify(ctrl));
+  ok("V9 没有 run:final 时也不伪造 owner-final", !ctrl.some((c) => c.kind === "owner-final"));
+  ok("V9 事件照常回放(结束不等于把已有的记录丢掉)",
+    after.frames.filter((f) => f.event === "tx").length === 2);
+
+  try { child.kill(); } catch { /* 已经退了 */ }
+}
+
+/* ============================================================ */
 async function main() {
   console.log(`[harness] 运行目录 ${RUN_ROOT}`);
   await v1_single();
@@ -583,6 +645,7 @@ async function main() {
   await v6_reuse();
   await v7_zero_turn();
   await v8_dataplane();
+  await v9_owner_ended();
   console.log(`\n${"=".repeat(56)}`);
   console.log(`  graph-viz: ${pass} passed, ${fail} failed`);
   console.log(`${"=".repeat(56)}\n`);
