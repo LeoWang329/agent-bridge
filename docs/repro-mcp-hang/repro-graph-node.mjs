@@ -263,7 +263,24 @@ async function t6_script() {
     return rs;
   }, { env: { ...BASE_ENV, FAKE_OMP_MODE: "slowturn" } });
   ok("3 个慢节点全 ok", slow.every((r) => r.status === "ok"), slow.map((r) => r.status).join(" "));
-  ok(`真并发:3×2.5s 的活在 ${nodeWall}ms 内跑完(串行要 7.5s+)`, nodeWall < 6000, `${nodeWall}ms — 像是被串行执行了`);
+
+  // ⚠️ **判据必须自校准,不能用绝对毫秒数。** 这里真正要证的是"并发而不是串行",
+  // 而单个节点的墙钟里除了那 2.5s 还有开会话/关会话的开销 —— 那部分随机器、随
+  // Defender 的心情浮动(这台 Windows 上实测三个节点要 ~6.9s,写死 `< 6000` 就永远红)。
+  // 调大阈值是"改断言来将就";正确做法是**先量一个单节点**,再要求三个并发的墙钟
+  // 明显低于"串行三次"。串行 ≈ 3×solo,并发 ≈ solo + 一点点。取 2× 当分界:
+  // 既容得下冷启开销的抖动,又离 3× 足够远 —— 真串行了一定判红。
+  const outDir3 = path.join(RUN_ROOT, "t6c");
+  let soloWall = 0;
+  await withBridge(async (bridge) => {
+    const t0 = Date.now();
+    const r = await runNode(bridge, { id: "solo", agent: "omp", cwd: REPO, prompt: "go-solo",
+                                      timeoutMs: 30000, outDir: outDir3 });
+    soloWall = Date.now() - t0;
+    ok("基准单节点 ok(否则下面那条比值没有意义)", r.status === "ok", r.status);
+  }, { env: { ...BASE_ENV, FAKE_OMP_MODE: "slowturn" } });
+  ok(`真并发:3 个节点 ${nodeWall}ms vs 单个 ${soloWall}ms —— 串行的话应该接近 3 倍`,
+     nodeWall < soloWall * 2, `${nodeWall}ms >= 2×${soloWall}ms — 像是被串行执行了`);
 }
 
 async function t7_usage_errors() {
