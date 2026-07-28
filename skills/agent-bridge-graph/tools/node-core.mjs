@@ -694,7 +694,7 @@ export async function withBridge(fn, opts = {}) {
   // ── viz 初始化。**在用户回调之前做完,任何一步失败都 fail-fast。**
   //    (回调之前失败没有业务结局可改;回调之后失败有 —— 那时一律降级成资产状态,
   //     绝不外溢,见 viz-node.mjs 里那条 `guard`。)
-  let scope = null;
+  let scope = null, viewer = null, recordingFailed = false;
   if (opts.viz) {
     try {
       scope = createGraphScope({ outDir: opts.outDir, maxConcurrent: bridge.maxConcurrent });
@@ -703,6 +703,25 @@ export async function withBridge(fn, opts = {}) {
       throw new UsageError(`viz 起不来:${e.message}`);
     }
     bridge._viz = scope;
+    // 生命管道:fork viewer,拿 IPC 当控制通道。**起不来就 fail-fast**(仍在回调之前)。
+    try {
+      viewer = await startViewer(scope, opts);
+      bridge.vizUrl = viewer.url;
+    } catch (e) {
+      try { scope.close(); } catch { /* 起不来时的清理失败不改结论 */ }
+      await bridge.close();
+      throw new UsageError(`viz viewer 起不来:${e.message}`);
+    }
+    // recorder 一坏就立刻从控制通道说出去 —— transcript 写不下去之后,它是唯一还能说话的通道。
+    scope.onRecordingFailed((info) => {
+      recordingFailed = true;
+      viewer?.send({
+        kind: "recording-failed",
+        atSeq: info.atSeq,
+        lastGoodOffset: info.lastGoodOffset ?? 0,
+        error: String(info.error?.message ?? info.error),
+      });
+    });
     // `seq === 0`,且**排在用户回调之前**。
     await scope.emit("run:started", { outDir: scope.canonicalOutDir, maxConcurrent: bridge.maxConcurrent });
   }
@@ -728,23 +747,81 @@ export async function withBridge(fn, opts = {}) {
       if (!callbackThrew) throw e;      // 回调自己抛了的话,**根因优先**,不许被收尾的异常盖掉
     } finally {
       if (scope) {
+        // ② 定 result。⚠️ **只由三样决定,不看节点回执** —— 观测台不裁决业务成败。
+        //    "回调正常返回、排空期间看到 failed/unknown 回执" 仍是 completed:
+        //    节点结局不是 run 结局(`allSettled` 甚至看不出那个 contract_error
+        //    是不是回调有意接住并处理掉的)。
+        const result = (callbackThrew || closeFailed) ? "failed" : "completed";
+        // ③ 写 run:final 并**确认落盘**(`await append` 成功就是确认,不需要第二个 flush 概念)。
+        let finalLanded = false;
         try {
-          // ② 定 result。⚠️ **只由三样决定,不看节点回执** —— 观测台不裁决业务成败。
-          //    "回调正常返回、排空期间看到 failed/unknown 回执" 仍是 completed:
-          //    节点结局不是 run 结局(`allSettled` 甚至看不出那个 contract_error
-          //    是不是回调有意接住并处理掉的)。
-          await scope.emit("run:final", {
-            result: (callbackThrew || closeFailed) ? "failed" : "completed",
+          finalLanded = await scope.emit("run:final", {
+            result,
             counts: bridge._vizCounts ?? EMPTY_COUNTS(),
             durationMs: Math.max(0, Math.round(monoNow() - t0)),
           });
-        } catch { /* 观测失败不改收尾结局 */ }
-        // ③ 关 transcript。⚠️ `close()` 抛错**不等于**写失败:`run:final` 已确认落盘时
-        //    页面就该显示"已结束"。所以这里的异常吞掉,**不**转 recording-failed。
+        } catch { /* emit 本来就不抛 */ }
+        // ④ 关 transcript。⚠️ 它**不再宣布 recording failure**:viewer 的判定第 1 档是
+        //    "transcript 里有 run:final 就按它算",所以"关 fd 失败也转 recording-failed"
+        //    这条分支**永远显示不出来**。关 fd 失败只是清理诊断。
         try { scope.close(); } catch { /* 见上 */ }
+        // ⑤ 关生命管道 —— **无条件**。
+        //    ⚠️ 两件事的条件性不一样,必须分开记:**发 `owner-final` 是条件性的,关管道是无条件的。**
+        //    把"关管道"写进"writer 已损坏"的分支里,健康路径就**永远不关管道** ——
+        //    于是同一个脚本顺序跑多波时,第一波的 viewer 永远等不到 EOF、`ownerEnded` 永远为 false、
+        //    进程赖着不走。
+        //    而**有** `owner-final` 时**完整消息必须先于 EOF**:反过来 viewer 就只剩
+        //    "EOF 且没有 final",会把一次受控收场显示成事故。
+        if (viewer) {
+          if (recordingFailed || !finalLanded) {
+            viewer.send({ kind: "owner-final", result, endedAt: Date.now() });
+          }
+          viewer.disconnect();
+        }
       }
     }
   }
+}
+
+/**
+ * 起 viewer 子进程,并把 IPC 通道当**生命管道**用。
+ *
+ * ⚠️ **管道必须由 `withBridge` 自己在收尾时显式关闭,不能等整个 Node 进程退出** ——
+ * 同一个脚本顺序跑多波时,第一波的 viewer 会永远等不到 EOF。
+ */
+async function startViewer(scope, opts) {
+  const serve = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "viz", "serve.mjs");
+  if (!statSafe(serve)) throw new Error(`找不到 viewer:${serve}`);
+  const { fork } = await import("node:child_process");
+  const child = fork(serve, [], {
+    // `ipc` 就是那条生命管道 —— `fork` 自带,天然是消息边界。
+    stdio: ["ignore", "inherit", "inherit", "ipc"],
+    env: {
+      ...process.env,
+      VIZ_OUT_DIR: scope.canonicalOutDir,
+      VIZ_GRAPH_ID: scope.graphId,
+      VIZ_PORT: String(opts.vizPort ?? 0),
+    },
+    windowsHide: true,
+  });
+  child.unref?.();
+  // 等它真的在听 —— 起不来要在用户回调之前就知道。
+  const url = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("viewer 15 秒内没报出端口")), 15000);
+    child.once("error", (e) => { clearTimeout(timer); reject(e); });
+    child.once("exit", (code) => { clearTimeout(timer); reject(new Error(`viewer 提前退出(code=${code})`)); });
+    child.on("message", (m) => {
+      if (m?.kind === "viz-listening") { clearTimeout(timer); resolve(m.url); }
+    });
+  });
+  // ⚠️ **URL/port 是打印给人看的信息,不进 transcript**(已删 `viz:started`):
+  //    页面能收到事件本身就证明 viewer 起来了。
+  console.error(`[viz] 观测台 ${url}  (graph ${scope.graphId})`);
+  return {
+    url, child,
+    send(msg) { try { if (child.connected) child.send(msg); } catch { /* 管道已断 */ } },
+    disconnect() { try { if (child.connected) child.disconnect(); } catch { /* 已断 */ } },
+  };
 }
 
 /** `run:final.counts` 的九个键。**固定键集,全部恒在。**

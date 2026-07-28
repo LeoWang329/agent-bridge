@@ -457,13 +457,21 @@ export function createEventWriter({ file, graphId, onRecordingFailed = null }) {
   const fd = fs.openSync(file, "wx");
 
   let seq = 0;
-  let failed = null;        // { atSeq, error }
+  let failed = null;        // { atSeq, lastGoodOffset, error }
   let closed = false;
   let chain = Promise.resolve(); // append 的串行链
+  /** transcript 里「最后一个完整换行之后」的排他字节偏移 ——
+   *  即 `[0, lastGoodOffset)` 这段字节**全部是完整的行**。
+   *
+   *  ⚠️ **只在一整行(含 `\n`)的全部字节都写完时一次性推进**,靠**累加已写字节**维护。
+   *  ⚠️ **短写之后物理 EOF 会比它大,但绝不许推进它;失败时更不许拿 `stat().size` 去重算** ——
+   *  那正好会把半行算进"可信边界",而所有关于"末尾半行"的处理都建立在
+   *  "可信边界只到完整行"之上。 */
+  let lastGoodOffset = 0;
 
   function fail(atSeq, error) {
     if (failed) return failed;
-    failed = { atSeq, error };
+    failed = { atSeq, lastGoodOffset, error };
     // 一旦损坏就**永不再写**:半行留在 EOF,读侧按 §2.1 跳过它;
     // 再写下去那半行就变成**非末尾**的坏行 —— 那是历史损坏,性质更坏。
     if (onRecordingFailed) {
@@ -479,8 +487,10 @@ export function createEventWriter({ file, graphId, onRecordingFailed = null }) {
     // 盘写满那一刻,而那时重试只是往一条**已经截断的行**后面再糊几个字节。
     // 正确处置是:让那半行留在 EOF(读侧容错),然后**再也不写**。
     if (n !== buf.length) {
+      // ⚠️ 这里**不推进** `lastGoodOffset` —— 盘上多出来的那半行永远不属于可信边界。
       throw new RecordingError(`短写:只落了 ${n} / ${buf.length} 字节,transcript 尾部已截断`);
     }
+    lastGoodOffset += buf.length; // 整行落定,一次性推进
   }
 
   /**
@@ -527,6 +537,7 @@ export function createEventWriter({ file, graphId, onRecordingFailed = null }) {
     append,
     get seq() { return seq; },
     get failed() { return failed; },
+    get lastGoodOffset() { return lastGoodOffset; },
     /** ⚠️ `close()` 抛错**不等于**写失败:`run:final` 已确认落盘时,页面就该显示"已结束"。
      *  所以这里的异常**不**转 `recording-failed`,原样抛给调用方由它决定怎么记。 */
     close() {

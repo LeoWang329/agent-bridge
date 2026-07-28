@@ -11,9 +11,15 @@
 //   V5 跨 outDir     —— 当场拒 + **外来目录零文件**
 //   V6 复用命中      —— execution:"reused" + **一条 node:turn 都不发** + 推断边仍在
 //   V7 零轮两档      —— zero-turn 与 turn-validation **必须分得开**
-//   V8 全局不变式    —— seq 稠密 / turn↔turn-settled 一一对应 / run:final 恒等式 / final 是最后一条
+//   V8 数据面        —— SSE 线格式(含 tx 逐字节透传)/ /file 的四道闸(400/403/404/405 分得开)
+//
+// 每个场景跑完都过一遍**全局不变式**:seq 与 nodeSeq 稠密 / 每节点恰好一个终态 /
+// turn↔turn-settled 一一对应 / run:final 恒等式且是最后一条 / id 只在 observed /
+// turnKey 恰好在六种事件上。
 
 import { spawnSync } from "node:child_process";
+import crypto from "node:crypto";
+import http from "node:http";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -436,6 +442,136 @@ async function v7_zero_turn() {
   }
 }
 
+/* ============================================================
+   V8 数据面:SSE 线格式与 /file 的四道闸
+   ============================================================ */
+
+/** 极简 SSE 客户端:收满 `wantFrames` 帧或超时就返回解析好的帧。 */
+function sseCollect(url, ms = 4000) {
+  return new Promise((resolve) => {
+    const frames = [];
+    let head = null, buf = "";
+    const req = http.get(url + "events", (res) => {
+      head = res.headers;
+      res.setEncoding("utf8");
+      res.on("data", (d) => {
+        buf += d;
+        let i;
+        // 一帧 = 若干行 + 一个空行。**空行就是帧结束。**
+        while ((i = buf.indexOf("\n\n")) !== -1) {
+          const raw = buf.slice(0, i);
+          buf = buf.slice(i + 2);
+          if (raw.startsWith(":")) { frames.push({ comment: raw }); continue; }
+          const m = /^event: (.+)\ndata: ([\s\S]*)$/.exec(raw);
+          if (m) frames.push({ event: m[1], data: m[2] });
+        }
+      });
+    });
+    req.on("error", () => {});
+    setTimeout(() => { try { req.destroy(); } catch {} resolve({ frames, head }); }, ms);
+  });
+}
+
+function httpReq(url, opts = {}) {
+  return new Promise((resolve) => {
+    const req = http.request(url, opts, (res) => {
+      const chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }));
+    });
+    req.on("error", (e) => resolve({ status: 0, headers: {}, body: Buffer.from(String(e)) }));
+    req.end();
+  });
+}
+
+async function v8_dataplane() {
+  console.log("\n[V8] 数据面:SSE 线格式 / /file 四道闸");
+  const outDir = freshOut();
+  const restore = envFor("okturn");
+  let url = null;
+  try {
+    await withBridge(async (b) => {
+      url = b.vizUrl;
+      await b.runNode({ id: "dp", agent: "omp", cwd: REPO, outDir, prompt: "hi", timeoutMs: 30000 });
+    }, { viz: true, outDir });
+  } finally { restore(); }
+  ok("V8 withBridge 暴露了 viewer 的 URL", typeof url === "string" && url.startsWith("http://127.0.0.1:"));
+  if (!url) return;
+
+  const { lines, graphId } = readTranscript(outDir);
+  const { frames, head } = await sseCollect(url);
+
+  // ⚠️ Content-Type 不是 text/event-stream,浏览器原生 EventSource **直接判错**,
+  //    页面一个事件都收不到,而服务端日志上看起来一切正常。
+  ok("V8 Content-Type 是 text/event-stream; charset=utf-8",
+    (head?.["content-type"] || "").includes("text/event-stream"), head?.["content-type"]);
+  ok("V8 Cache-Control 含 no-transform", (head?.["cache-control"] || "").includes("no-transform"));
+  ok("V8 带 X-Accel-Buffering: no", head?.["x-accel-buffering"] === "no");
+  ok("V8 不发 Content-Length", !("content-length" in (head || {})));
+
+  const named = frames.filter((f) => f.event);
+  ok("V8 第一帧是 hello", named[0]?.event === "hello", named[0]?.event);
+  const hello = JSON.parse(named[0].data);
+  ok("V8 hello 带 graphId 与 v", hello.graphId === graphId && hello.v === 1);
+
+  const tx = named.filter((f) => f.event === "tx");
+  ok("V8 回放拿到了全部事件", tx.length === lines.length, `${tx.length} vs ${lines.length}`);
+  // ★ tx 的 data 是**原样透传** —— viewer 是搬运工,不是第二个 writer。
+  const rawLines = fs.readFileSync(path.join(outDir, "nodes", ".runs", graphId, "transcript.jsonl"), "utf8")
+    .split("\n").filter(Boolean);
+  ok("V8 ★ tx 的 data 与 transcript 那一行**逐字节相同**(不重新序列化)",
+    tx.every((f, i) => f.data === rawLines[i]), tx[0]?.data?.slice(0, 60));
+
+  // 控制槽:正常收场时 transcript 里有 run:final,不需要 owner-final
+  const ctrl = named.filter((f) => f.event === "control");
+  ok("V8 健康路径不发任何 control 帧(判定第 1 档按 transcript 说的算)", ctrl.length === 0,
+    ctrl.map((c) => c.data).join("; "));
+
+  // ---- /file 的四道闸 ----
+  const st = lines.find((l) => l.event === "node:settled").payload;
+  const ref = st.artifact.ref;
+  const okRes = await httpReq(`${url}file?ref=${encodeURIComponent(ref)}`);
+  ok("V8 /file 合法 ref → 200", okRes.status === 200, String(okRes.status));
+  ok("V8 /file Content-Type 恒为 text/plain(绝不按扩展名回 html)",
+    (okRes.headers["content-type"] || "").includes("text/plain"));
+  ok("V8 /file 带 nosniff 与 no-store",
+    okRes.headers["x-content-type-options"] === "nosniff" && okRes.headers["cache-control"] === "no-store");
+  ok("V8 /file Content-Length 是**本次响应体**的字节数",
+    Number(okRes.headers["content-length"]) === okRes.body.length);
+  // ★ 页面靠这个头与事件里的 sha256 对证
+  ok("V8 ★ X-Graph-Sha256 与事件里的 sha256 一致", okRes.headers["x-graph-sha256"] === st.artifact.sha256);
+  ok("V8 ★ 响应体不是 JSON 包装(页面可直接算 SHA 对证)",
+    crypto.createHash("sha256").update(okRes.body).digest("hex") === st.artifact.sha256);
+
+  const head200 = await httpReq(`${url}file?ref=${encodeURIComponent(ref)}`, { method: "HEAD" });
+  ok("V8 HEAD 同样处理且带 X-Graph-Sha256",
+    head200.status === 200 && head200.headers["x-graph-sha256"] === st.artifact.sha256 && head200.body.length === 0);
+
+  const post = await httpReq(`${url}file?ref=${encodeURIComponent(ref)}`, { method: "POST" });
+  ok("V8 其它方法 405", post.status === 405);
+  // 缺了 Allow 就不是一个合法的 405
+  ok("V8 405 必须带 Allow: GET, HEAD", (post.headers.allow || "").replace(/\s/g, "") === "GET,HEAD", post.headers.allow);
+
+  ok("V8 缺 ref → 400", (await httpReq(`${url}file`)).status === 400);
+  ok("V8 含 .. → 400", (await httpReq(`${url}file?ref=${encodeURIComponent(`nodes/.runs/${graphId}/../../x`)}`)).status === 400);
+  ok("V8 绝对路径 → 400", (await httpReq(`${url}file?ref=${encodeURIComponent("D:/x/y.md")}`)).status === 400);
+  // ⚠️ **收到 out-dir 就不够**:canonical 区就在 out-dir 里,但它不在归档范围内
+  ok("V8 ★ canonical 区的 ref → 403(收到 out-dir 是不够的)",
+    (await httpReq(`${url}file?ref=${encodeURIComponent("nodes/dp.md")}`)).status === 403);
+  ok("V8 ★ 越界到 out-dir 根 → 403",
+    (await httpReq(`${url}file?ref=${encodeURIComponent(".env")}`)).status === 403);
+  // 目录必须拒(这正是 scene 要做成容器、每个子文件各自带 ref 的原因)
+  ok("V8 ★ 目录 → 403(不是 200 也不是 404)",
+    (await httpReq(`${url}file?ref=${encodeURIComponent(`nodes/.runs/${graphId}/0-dp/turns`)}`)).status === 403);
+  // ⚠️ 403 与 404 必须分开:合成一档,一次越界尝试与一份真丢了的产出就长得一样,
+  //    而这两件事的处置完全相反。
+  ok("V8 ★ 范围内但不存在 → 404(与 403 分开)",
+    (await httpReq(`${url}file?ref=${encodeURIComponent(`nodes/.runs/${graphId}/0-dp/no-such-file.md`)}`)).status === 404);
+
+  ok("V8 / 返回页面", (await httpReq(url)).status === 200);
+  ok("V8 未知路径 404", (await httpReq(`${url}nope`)).status === 404);
+}
+
 /* ============================================================ */
 async function main() {
   console.log(`[harness] 运行目录 ${RUN_ROOT}`);
@@ -446,6 +582,7 @@ async function main() {
   await v5_cross_outdir();
   await v6_reuse();
   await v7_zero_turn();
+  await v8_dataplane();
   console.log(`\n${"=".repeat(56)}`);
   console.log(`  graph-viz: ${pass} passed, ${fail} failed`);
   console.log(`${"=".repeat(56)}\n`);
