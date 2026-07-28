@@ -1,0 +1,2191 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>graph 观测台 · 只读实时观察</title>
+<style>
+/* ============================================================
+   graph 观测台 · 只读实时观测
+   零外部请求 · 系统字体 · 内联 SVG · 浅/深色跟随系统(可手动覆盖)
+   token / 卡片 / 连接 / 主题 与「圆桌观察台」「Loop 观察台」同源
+   ============================================================ */
+
+:root{
+  --bg:#eef1f5; --canvas:#f6f8fb; --surface:#ffffff; --surface-2:#f1f4f8;
+  /* --faint 是全站 10–11.5px 小字的颜色,必须过 4.5:1(#7d8b9b 只有 3.48:1) */
+  --ink:#16202c; --ink-soft:#4a5765; --faint:#5c6b7c; --line:#e2e8f0; --line-2:#cdd6e2;
+
+  --accent:#3061d6;      /* 一般强调 / 链接 / 运行中 */
+  --c-ok:#0f875b;        /* 顺利跑完 */
+  --c-contract:#c2610c;  /* 输出格式不合格 */
+  --c-timeout:#b0730a;   /* 超时 */
+  --c-fail:#c23d3d;      /* 引擎报错 */
+  --c-reject:#5a6b80;    /* 被拒绝:中性,利落,不像事故 */
+  --c-alert:#8a5600;     /* unknown:警戒(斜纹),不是"更红" */
+  --c-lost:#3a4552;      /* abandoned:线索断了 */
+  --c-unlog:#6b5aa6;     /* 记录不完整 */
+
+  --e-codex:#5457d6; --e-omp:#0f875b; --e-claude:#c2610c; --e-cursor:#2b8ca6; --e-kimi:#a34b8f;
+
+  --shadow:0 1px 2px rgba(16,32,48,.05), 0 6px 18px -12px rgba(16,32,48,.22);
+  --shadow-lift:0 2px 6px rgba(16,32,48,.07), 0 14px 34px -18px rgba(16,32,48,.30);
+  --radius:12px;
+  --mono: ui-monospace,"Cascadia Code","SFMono-Regular","JetBrains Mono",Consolas,"Liberation Mono",monospace;
+  --sans: system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue","PingFang SC","Microsoft YaHei","Noto Sans CJK SC",sans-serif;
+
+  --on-solid:#ffffff;              /* 实底徽标上的字色 */
+  /* 警戒斜纹:unknown 专用。明暗两种主题下都是同一套配色——警戒不跟随主题 */
+  --hz-ink:#1a1206; --hz-edge:#6d4400; --hz-warn:#f2c14e;
+  /* 原型演示外壳:不属于产品界面,固定深色,不随产品主题变化 */
+  --proto-bg:#11161d; --proto-fg:#93a3b6; --proto-line:#222c38; --proto-ink:#0b0f15;
+  --proto-btn-fg:#b9c6d6; --proto-btn-bg:#171e27; --proto-btn-line:#2a3644;
+  --proto-btn-hover:#3d4c5e; --proto-on:#e7eef6;
+}
+:root[data-theme="dark"]{
+  --bg:#0b0f15; --canvas:#0e131b; --surface:#141b24; --surface-2:#1a222e;
+  --ink:#e7eef6; --ink-soft:#a4b2c2; --faint:#8798a9; --line:#232d3a; --line-2:#313d4d;
+  --accent:#6e97f7; --c-ok:#42cf95; --c-contract:#f0953f; --c-timeout:#f2c14e; --c-fail:#ef6a6a;
+  --c-reject:#8695a8; --c-alert:#e8b34a; --c-lost:#c3ccd8; --c-unlog:#b0a2e8;
+  --e-codex:#8f92f2; --e-omp:#42cf95; --e-claude:#f0953f; --e-cursor:#5cc0dd; --e-kimi:#e089c6;
+  --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 22px -14px rgba(0,0,0,.7);
+  --shadow-lift:0 2px 6px rgba(0,0,0,.5), 0 18px 40px -20px rgba(0,0,0,.8);
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]):not([data-theme="dark"]){
+    --bg:#0b0f15; --canvas:#0e131b; --surface:#141b24; --surface-2:#1a222e;
+    --ink:#e7eef6; --ink-soft:#a4b2c2; --faint:#8798a9; --line:#232d3a; --line-2:#313d4d;
+    --accent:#6e97f7; --c-ok:#42cf95; --c-contract:#f0953f; --c-timeout:#f2c14e; --c-fail:#ef6a6a;
+    --c-reject:#8695a8; --c-alert:#e8b34a; --c-lost:#c3ccd8; --c-unlog:#b0a2e8;
+    --e-codex:#8f92f2; --e-omp:#42cf95; --e-claude:#f0953f; --e-cursor:#5cc0dd; --e-kimi:#e089c6;
+    --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 22px -14px rgba(0,0,0,.7);
+    --shadow-lift:0 2px 6px rgba(0,0,0,.5),0 18px 40px -20px rgba(0,0,0,.8);
+  }
+}
+
+*{box-sizing:border-box}
+html,body{margin:0;height:100%}
+body{
+  background:radial-gradient(1200px 480px at 50% -180px, color-mix(in oklab,var(--accent) 7%, var(--bg)), transparent 70%), var(--bg);
+  color:var(--ink); font:14px/1.6 var(--sans);
+  -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility;
+  display:flex; flex-direction:column; overflow:hidden;
+}
+a{color:var(--accent)}
+::selection{background:color-mix(in oklab,var(--accent) 26%, transparent)}
+button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:pointer}
+.num{font-family:var(--mono); font-variant-numeric:tabular-nums}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.scroll{scrollbar-width:thin;scrollbar-color:var(--line-2) transparent}
+.scroll::-webkit-scrollbar{width:9px;height:9px}
+.scroll::-webkit-scrollbar-thumb{background:var(--line-2);border-radius:6px;border:2px solid var(--canvas)}
+.scroll::-webkit-scrollbar-track{background:transparent}
+
+/* ---------- 原型演示外壳(不属于产品界面) ---------- */
+.protobar{
+  flex:0 0 auto; display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+  padding:7px 16px; background:var(--proto-bg); color:var(--proto-fg);
+  border-bottom:1px solid var(--proto-line); font:11.5px/1 var(--mono);
+}
+.protobar .pb-tag{
+  color:var(--proto-ink); background:var(--proto-fg); border-radius:4px; padding:3px 6px; font-weight:700; letter-spacing:.04em;
+}
+.protobar .pb-hint{opacity:.75}
+.protobar .pb-sp{flex:1 1 auto}
+.scenes{display:flex;flex-wrap:wrap;gap:5px}
+.scene-btn{
+  font:11.5px/1 var(--mono); color:var(--proto-btn-fg); padding:5px 9px; border-radius:6px;
+  border:1px solid var(--proto-btn-line); background:var(--proto-btn-bg); white-space:nowrap;
+}
+.scene-btn:hover{border-color:var(--proto-btn-hover);color:var(--proto-on)}
+.scene-btn[aria-pressed="true"]{background:var(--proto-on);color:var(--proto-bg);border-color:var(--proto-on);font-weight:700}
+
+/* ---------- 应用外框 ---------- */
+.app{flex:1 1 auto;min-height:0;display:flex;flex-direction:column}
+
+/* ---------- A 顶栏 ---------- */
+.topbar{
+  flex:0 0 auto; background:color-mix(in oklab,var(--surface) 88%, transparent);
+  backdrop-filter:saturate(1.4) blur(10px); border-bottom:1px solid var(--line);
+}
+.topbar-inner{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:11px 20px}
+.brand{display:flex;align-items:center;gap:9px;font-weight:650;font-size:14px;white-space:nowrap;margin:0;letter-spacing:0}
+.brand .glyph{
+  width:26px;height:26px;border-radius:8px;flex:0 0 auto;display:grid;place-items:center;color:var(--on-solid);
+  background:linear-gradient(150deg,var(--e-codex),var(--accent));box-shadow:inset 0 0 0 1px rgba(255,255,255,.15);
+}
+.brand .glyph svg{width:15px;height:15px}
+.runid{font:11.5px/1 var(--mono);color:var(--faint);border-left:1px solid var(--line-2);padding-left:11px;white-space:nowrap}
+.tb-sp{flex:1 1 auto}
+
+.runpill{
+  display:inline-flex;align-items:center;gap:7px;font-size:12.5px;font-weight:650;
+  padding:5px 11px;border-radius:999px;border:1px solid var(--line);background:var(--surface-2);color:var(--ink-soft);
+  max-width:46ch;
+}
+.runpill .dotp{width:7px;height:7px;border-radius:50%;background:var(--faint);flex:0 0 auto}
+.runpill[data-r="running"]{color:var(--accent);border-color:color-mix(in oklab,var(--accent) 40%,var(--line));background:color-mix(in oklab,var(--accent) 10%,var(--surface))}
+.runpill[data-r="running"] .dotp{background:var(--accent);animation:pulse 1.8s ease-in-out infinite}
+.runpill[data-r="ended"]{color:var(--c-ok);border-color:color-mix(in oklab,var(--c-ok) 40%,var(--line));background:color-mix(in oklab,var(--c-ok) 10%,var(--surface))}
+.runpill[data-r="ended"] .dotp{background:var(--c-ok)}
+.runpill[data-r="ended_failed"]{color:var(--c-fail);border-color:color-mix(in oklab,var(--c-fail) 40%,var(--line));background:color-mix(in oklab,var(--c-fail) 10%,var(--surface))}
+.runpill[data-r="ended_failed"] .dotp{background:var(--c-fail)}
+.runpill[data-r="no_finish"]{
+  color:var(--surface);background:var(--c-lost);border-color:var(--c-lost);
+}
+.runpill[data-r="no_finish"] .dotp{background:var(--surface);opacity:.85}
+.runpill[data-r="log_broken_ended"],.runpill[data-r="log_broken_unknown"]{
+  color:var(--surface);background:var(--c-unlog);border-color:var(--c-unlog);
+}
+.runpill[data-r="log_broken_ended"] .dotp,.runpill[data-r="log_broken_unknown"] .dotp{background:var(--surface);opacity:.85}
+.runpill[data-r="waiting"]{color:var(--faint)}
+.runpill[data-r="replaying"]{color:var(--accent);border-color:color-mix(in oklab,var(--accent) 40%,var(--line));background:color-mix(in oklab,var(--accent) 10%,var(--surface))}
+.runpill[data-r="replaying"] .dotp{background:var(--accent);animation:pulse 1.4s ease-in-out infinite}
+
+.counts{display:flex;align-items:center;gap:2px;flex-wrap:wrap}
+.count{
+  display:inline-flex;align-items:baseline;gap:5px;padding:4px 9px;border-radius:7px;
+  font:11.5px/1 var(--mono);color:var(--faint);white-space:nowrap;
+}
+.count b{font-size:13px;font-weight:700;color:var(--ink-soft);min-width:1.2em;text-align:right;font-variant-numeric:tabular-nums}
+.count[data-k="running"] b{color:var(--accent)} .count[data-k="queued"] b{color:var(--faint)}
+.count[data-k="ok"] b{color:var(--c-ok)} .count[data-k="fail"] b{color:var(--c-fail)}
+.count[data-k="unknown"] b{color:var(--c-alert)} .count[data-k="abandoned"] b{color:var(--c-lost)}
+.count[data-k="rejected"] b{color:var(--c-reject)} .count[data-k="unlogged"] b{color:var(--c-unlog)}
+.counts-note{font:11px/1.4 var(--mono);color:var(--c-unlog);padding:4px 8px;border:1px dashed color-mix(in oklab,var(--c-unlog) 45%,var(--line));border-radius:7px;background:color-mix(in oklab,var(--c-unlog) 7%,var(--surface))}
+
+.conn{
+  display:inline-flex;align-items:center;gap:7px;font:11.5px/1 var(--mono);color:var(--faint);
+  padding:5px 10px;border:1px solid var(--line);border-radius:999px;background:var(--surface);white-space:nowrap;
+}
+.conn .led{width:8px;height:8px;border-radius:50%;background:var(--faint);flex:0 0 auto}
+.conn[data-s="live"] .led{background:var(--c-ok);box-shadow:0 0 0 3px color-mix(in oklab,var(--c-ok) 26%,transparent)}
+.conn[data-s="live"]{color:var(--ink-soft)}
+.conn[data-s="reconnect"] .led{background:var(--c-timeout);animation:blink 1s steps(2) infinite}
+.conn[data-s="reconnect"]{color:var(--c-timeout);border-color:color-mix(in oklab,var(--c-timeout) 40%,var(--line))}
+.conn[data-s="down"] .led{background:var(--c-fail)}
+.conn[data-s="down"]{color:var(--c-fail);border-color:color-mix(in oklab,var(--c-fail) 40%,var(--line))}
+.conn[data-s="replay"] .led{background:var(--accent);animation:pulse 1.4s ease-in-out infinite}
+.conn[data-s="replay"]{color:var(--accent);border-color:color-mix(in oklab,var(--accent) 40%,var(--line))}
+.theme-toggle{
+  font:11.5px/1 var(--sans);color:var(--ink-soft);display:inline-flex;align-items:center;gap:6px;
+  padding:6px 10px;border:1px solid var(--line);border-radius:999px;background:var(--surface);
+}
+.theme-toggle:hover{border-color:var(--line-2);color:var(--ink)}
+.theme-toggle svg{width:14px;height:14px}
+
+/* ---------- 横幅 ---------- */
+.banners{flex:0 0 auto;padding:0 20px}
+.banners:not(:empty){padding:10px 20px 0}
+.banner{
+  display:flex;gap:11px;align-items:flex-start;padding:11px 14px;border-radius:10px;margin-bottom:8px;
+  border:1px solid var(--line);background:var(--surface-2);color:var(--ink-soft);font-size:13px;
+}
+.banner .b-ic{flex:0 0 auto;width:22px;height:22px;border-radius:50%;display:grid;place-items:center;color:var(--surface);background:var(--faint)}
+.banner .b-ic svg{width:13px;height:13px}
+.banner .b-t{font-weight:650;color:var(--ink)}
+.banner .b-d{margin-top:3px;line-height:1.6;text-wrap:pretty}
+.banner[data-v="lost"]{background:color-mix(in oklab,var(--c-lost) 9%,var(--surface));border-color:color-mix(in oklab,var(--c-lost) 35%,var(--line))}
+.banner[data-v="lost"] .b-ic{background:var(--c-lost)}
+.banner[data-v="unlog"]{background:color-mix(in oklab,var(--c-unlog) 10%,var(--surface));border-color:color-mix(in oklab,var(--c-unlog) 40%,var(--line))}
+.banner[data-v="unlog"] .b-ic{background:var(--c-unlog)}
+.banner[data-v="conn"]{background:color-mix(in oklab,var(--c-timeout) 12%,var(--surface));border-color:color-mix(in oklab,var(--c-timeout) 42%,var(--line))}
+.banner[data-v="conn"] .b-ic{background:var(--c-timeout);animation:pulse 1.6s ease-in-out infinite}
+.banner[data-v="info"] .b-ic{background:var(--accent)}
+.banner[data-v="info"]{background:color-mix(in oklab,var(--accent) 8%,var(--surface));border-color:color-mix(in oklab,var(--accent) 32%,var(--line))}
+
+/* ---------- 工作区 ---------- */
+.workspace{flex:1 1 auto;min-height:0;display:grid;grid-template-columns:minmax(0,1fr) 432px;gap:14px;padding:12px 20px 14px}
+.workspace[data-detail="closed"]{grid-template-columns:minmax(0,1fr) 0}
+@media (min-width:1800px){ .workspace{grid-template-columns:minmax(0,1fr) 500px} }
+
+.panel{background:var(--canvas);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);min-height:0;display:flex;flex-direction:column;overflow:hidden}
+
+/* B 主视图 */
+.viewbar{flex:0 0 auto;display:flex;align-items:center;gap:10px;padding:9px 12px;border-bottom:1px solid var(--line);background:var(--surface)}
+.vtabs{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden;background:var(--surface-2)}
+.vtab{font:12.5px/1 var(--sans);padding:6px 12px;color:var(--ink-soft);border-right:1px solid var(--line)}
+.vtab:last-child{border-right:0}
+.vtab[aria-pressed="true"]{background:var(--surface);color:var(--ink);font-weight:650;box-shadow:inset 0 -2px 0 var(--ink)}
+.vtab[disabled]{opacity:.42;cursor:not-allowed}
+.vb-sp{flex:1 1 auto}
+.legend{display:flex;align-items:center;gap:12px;font:11px/1 var(--mono);color:var(--faint);flex-wrap:wrap}
+.legend i{display:inline-flex;align-items:center;gap:5px;font-style:normal}
+.lg-line{width:22px;height:0;border-top:1.6px solid var(--ink-soft)}
+.lg-dash{width:22px;height:0;border-top:1.6px dashed var(--faint)}
+.zoom{display:inline-flex;align-items:center;gap:1px;border:1px solid var(--line);border-radius:8px;background:var(--surface-2)}
+.zoom button{font:12.5px/1 var(--mono);padding:6px 9px;color:var(--ink-soft)}
+.zoom button:hover{color:var(--ink);background:var(--surface)}
+.zoom .z-val{font:11px/1 var(--mono);color:var(--faint);padding:0 6px;min-width:4ch;text-align:center}
+
+.gwrap{flex:1 1 auto;min-height:0;position:relative;overflow:auto;background:
+  radial-gradient(circle at 1px 1px, var(--line) 1px, transparent 0) 0 0/22px 22px, var(--canvas)}
+.gcanvas{position:relative;transform-origin:0 0;padding:22px}
+.gedges{position:absolute;inset:0;overflow:visible;pointer-events:none}
+.gedges path{fill:none;pointer-events:stroke;cursor:pointer}
+
+/* 环节卡 */
+.nodebox{
+  position:absolute;width:216px;background:var(--surface);border:1px solid var(--line-2);border-radius:10px;
+  padding:9px 10px;box-shadow:var(--shadow);text-align:left;display:block;transition:box-shadow .16s,border-color .16s;
+}
+.nodebox:hover{box-shadow:var(--shadow-lift);border-color:var(--faint)}
+.nodebox[aria-pressed="true"]{border-color:var(--accent);box-shadow:0 0 0 2px color-mix(in oklab,var(--accent) 32%,transparent),var(--shadow-lift)}
+.nb-top{display:flex;align-items:center;gap:7px;min-width:0}
+.nb-id{font-weight:650;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1 1 auto}
+.nb-seq{font:10px/1 var(--mono);color:var(--faint);flex:0 0 auto}
+.nb-bot{display:flex;align-items:center;gap:7px;margin-top:7px;min-width:0;overflow:hidden}
+.nb-st{display:inline-flex;align-items:center;gap:5px;font:11px/1 var(--sans);font-weight:600;padding:3px 7px;border-radius:5px;white-space:nowrap;flex:0 0 auto}
+.nb-t{margin-left:auto;font:10.5px/1 var(--mono);color:var(--faint);font-variant-numeric:tabular-nums;
+  min-width:0;flex:0 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.nb-top>.chip,.nb-bot>.chip{flex:0 0 auto}
+
+.badge{
+  width:20px;height:20px;flex:0 0 auto;border-radius:6px;display:grid;place-items:center;color:var(--on-solid);
+  font:700 10px/1 var(--mono);background:var(--ec,var(--faint));box-shadow:inset 0 0 0 1px rgba(255,255,255,.18);
+}
+.badge.sm{width:17px;height:17px;font-size:10px;border-radius:5px}
+.chip{font:10px/1 var(--mono);padding:3px 5px;border-radius:4px;border:1px solid var(--line);background:var(--surface-2);color:var(--ink-soft);white-space:nowrap}
+.chip.w{color:var(--e-codex);border-color:color-mix(in oklab,var(--e-codex) 38%,var(--line));background:color-mix(in oklab,var(--e-codex) 9%,var(--surface))}
+/* 复用是角标而不是另一种结局:中性徽章 + ↺ 字形,绝不换成另一个状态色 */
+.chip.reuse{color:var(--ink);border-color:var(--ink-soft);background:var(--surface);font-weight:700}
+
+/* 状态视觉:7 档 + 阶段,语义各不相同 */
+.st-discovered{color:var(--faint);background:var(--surface-2);border:1px dashed var(--line-2)}
+.st-queued{color:var(--ink-soft);background:var(--surface-2);border:1px solid var(--line-2)}
+.st-running{color:var(--surface);background:var(--accent)}
+.st-running .dt{width:6px;height:6px;border-radius:50%;background:var(--surface);animation:pulse 1.4s ease-in-out infinite}
+.st-ok{color:var(--c-ok);background:color-mix(in oklab,var(--c-ok) 11%,var(--surface));border:1px solid color-mix(in oklab,var(--c-ok) 30%,var(--line))}
+.st-contract_error{color:var(--c-contract);background:color-mix(in oklab,var(--c-contract) 13%,var(--surface));border:1px solid color-mix(in oklab,var(--c-contract) 42%,var(--line))}
+.st-timeout{color:var(--c-timeout);background:color-mix(in oklab,var(--c-timeout) 13%,var(--surface));border:1px solid color-mix(in oklab,var(--c-timeout) 42%,var(--line))}
+.st-backend_failed{color:var(--surface);background:var(--c-fail)}
+.st-rejected{color:var(--c-reject);background:var(--surface);border:1px solid var(--c-reject);border-style:solid}
+.st-unknown{
+  color:var(--hz-ink);font-weight:750;border:1px solid var(--hz-edge);
+  background:repeating-linear-gradient(-45deg,var(--hz-warn) 0 7px,var(--hz-ink) 7px 8px,var(--hz-warn) 8px 14px);
+}
+.st-abandoned{color:var(--surface);background:var(--c-lost);border:1px dashed var(--surface)}
+.st-unlogged{color:var(--surface);background:var(--c-unlog)}
+
+.nodebox[data-st="discovered"]{border-style:dashed;opacity:.72;box-shadow:none}
+.nodebox[data-st="queued"]{background:var(--surface-2);box-shadow:none}
+.nodebox[data-st="running"]{border-color:color-mix(in oklab,var(--accent) 55%,var(--line));box-shadow:0 0 0 3px color-mix(in oklab,var(--accent) 12%,transparent),var(--shadow-lift)}
+.nodebox[data-st="unknown"]{border-color:var(--c-alert);border-width:1.5px}
+.nodebox[data-st="abandoned"]{border-style:dashed;border-color:var(--c-lost)}
+.nodebox[data-st="backend_failed"]{border-color:color-mix(in oklab,var(--c-fail) 50%,var(--line))}
+.nodebox[data-st="unlogged"]{border-style:dashed;border-color:color-mix(in oklab,var(--c-unlog) 55%,var(--line))}
+
+/* 运行中的产出尾巴 */
+/* 固定 2 行,按行边界收口——绝不在半行处硬切,也绝不撑破卡片 */
+.nb-tail{margin-top:6px;font:10px/1.4 var(--mono);color:var(--faint);
+  display:-webkit-box;-webkit-line-clamp:2;line-clamp:2;-webkit-box-orient:vertical;
+  max-height:28px;overflow:hidden;
+  border-top:1px dashed var(--line);padding-top:5px;overflow-wrap:anywhere}
+
+/* 排队折叠带 */
+.qband{
+  position:absolute;display:flex;flex-direction:column;gap:8px;
+  border:1px solid var(--line-2);border-radius:10px;background:var(--surface-2);padding:11px 12px;
+}
+.qband-h{display:flex;align-items:center;gap:9px;font-size:12.5px;color:var(--ink-soft);flex-wrap:wrap}
+.qband-h b{font-weight:700;color:var(--ink);font-family:var(--mono);font-variant-numeric:tabular-nums}
+.qband-toggle{font:11.5px/1 var(--sans);color:var(--ink-soft);margin-left:auto;padding:4px 9px;border:1px solid var(--line-2);border-radius:7px;background:var(--surface)}
+.qband-toggle:hover{color:var(--accent);border-color:color-mix(in oklab,var(--accent) 40%,var(--line))}
+.qgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(168px,1fr));gap:6px;max-height:260px;overflow:auto}
+.qitem{display:flex;align-items:center;gap:6px;padding:5px 8px;border:1px solid var(--line);border-radius:7px;background:var(--surface);font-size:12.5px;text-align:left;min-width:0}
+.qitem .qi-id{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1 1 auto}
+.qitem .qi-t{font:10px/1 var(--mono);color:var(--faint);flex:0 0 auto;font-variant-numeric:tabular-nums}
+.qitem[aria-pressed="true"]{border-color:var(--accent);box-shadow:0 0 0 2px color-mix(in oklab,var(--accent) 26%,transparent)}
+
+/* 边解释气泡 */
+.edgepop{
+  position:absolute;z-index:9;max-width:300px;background:var(--surface);border:1px solid var(--line-2);
+  border-radius:9px;box-shadow:var(--shadow-lift);padding:10px 12px;font-size:12.5px;color:var(--ink-soft);line-height:1.55;
+}
+.edgepop b{color:var(--ink);display:block;margin-bottom:4px;font-size:12.5px}
+.edgepop code{font-family:var(--mono);font-size:11.5px;background:var(--surface-2);border:1px solid var(--line);border-radius:4px;padding:1px 5px}
+.edgepop .x{position:absolute;top:5px;right:8px;color:var(--faint);font-size:14px;line-height:1}
+
+/* 时间轴 */
+/* 纵向:整块滚动,刻度吸顶、图例吸底。
+   横向:1× 时整程恰好铺满容器;放大后 .tl-inner 按倍数变宽并可左右滚动,
+        标签列吸在左边,否则滚到右边就不知道哪根条是谁的。 */
+.tlwrap{flex:1 1 auto;min-height:0;overflow:auto;padding:0;--lab:clamp(150px,20vw,236px);--tlz:1}
+.tl-inner{width:calc(var(--lab) + (100% - var(--lab)) * var(--tlz));min-width:100%;padding-bottom:10px}
+.tl-axis{position:sticky;top:0;z-index:3;display:flex;background:var(--surface);border-bottom:1px solid var(--line);padding:7px 14px 7px 0}
+.tl-axis .tl-lab{flex:0 0 auto;z-index:4;background:var(--surface)}
+.tl-ticks{flex:1 1 auto;position:relative;height:15px}
+.tl-tick{position:absolute;top:0;font:10px/1 var(--mono);color:var(--faint);transform:translateX(-50%);white-space:nowrap}
+.tl-tick::before{content:"";position:absolute;left:50%;top:16px;width:1px;height:6px;background:var(--line-2)}
+/* width:100% 不能省:.tl-row 是 <button>,而表单控件的 width:auto 在所有浏览器里
+   都是 shrink-to-fit,display:flex 也改不了。缺了它轨道会被压成 0 宽,
+   里面所有 left:X% 的色条就全部塌到最左边。 */
+.tl-row{width:100%;text-align:left;display:flex;align-items:center;gap:0;padding:3px 14px 3px 0;
+  border-bottom:1px solid color-mix(in oklab,var(--line) 55%,transparent)}
+.tl-row:hover{background:color-mix(in oklab,var(--accent) 5%,transparent)}
+.tl-row[aria-pressed="true"]{background:color-mix(in oklab,var(--accent) 10%,transparent)}
+.tl-lab{flex:0 0 auto;width:var(--lab);position:sticky;left:0;z-index:2;background:var(--canvas);
+  border-right:1px solid var(--line);display:flex;align-items:center;gap:7px;padding:0 10px 0 14px;min-width:0}
+.tl-row:hover .tl-lab{background:color-mix(in oklab,var(--accent) 5%,var(--canvas))}
+.tl-row[aria-pressed="true"] .tl-lab{background:color-mix(in oklab,var(--accent) 10%,var(--canvas))}
+.tl-lab .tl-id{font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1 1 auto}
+.tl-track{flex:1 1 auto;min-width:0;position:relative;height:26px}
+.tl-seg{position:absolute;top:5px;height:16px;border-radius:4px}
+.tl-seg.q{background:repeating-linear-gradient(90deg,color-mix(in oklab,var(--faint) 24%,var(--surface)) 0 5px,color-mix(in oklab,var(--faint) 12%,var(--surface)) 5px 10px);border:1px solid var(--line-2)}
+.tl-seg.run{background:var(--sc,var(--accent));opacity:.9}
+.tl-seg.run.dim{opacity:.55}
+.tl-seg.open{border-right:2px dashed var(--surface)}
+/* right:0 把说明文字约束在轨道内 —— 否则窄容器下它会顶出去,凭空撑出一条横向滚动 */
+.tl-note{position:absolute;top:5px;right:0;height:16px;display:flex;align-items:center;font:10px/1 var(--mono);
+  color:var(--faint);padding-left:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* 图例是面板的固定页脚,不在滚动容器里 —— sticky 不会移出文档流,
+   内容不够高时它会停在最后一行下面、把剩余面板高度全留成空白。 */
+.tl-key{flex:0 0 auto;display:flex;gap:14px;align-items:center;flex-wrap:wrap;padding:9px 14px;
+  font:11px/1.5 var(--mono);color:var(--faint);border-top:1px solid var(--line);background:var(--surface)}
+.tl-key[hidden]{display:none}
+
+/* 横向平移:内容真的超出时才给抓手光标,拖动中禁掉选中,免得拖出一片高亮 */
+.gwrap[data-scrollx="1"],.tlwrap[data-scrollx="1"]{cursor:grab}
+.gwrap.panning,.tlwrap.panning{cursor:grabbing;user-select:none;-webkit-user-select:none}
+.tl-key i{display:inline-flex;align-items:center;gap:6px;font-style:normal}
+.tl-key .sw{width:20px;height:11px;border-radius:3px}
+
+/* 空态 */
+.empty{margin:auto;max-width:460px;text-align:center;color:var(--faint);padding:40px 20px}
+.empty .e-ic{width:46px;height:46px;margin:0 auto 15px;border:1.5px dashed var(--line-2);border-radius:14px;display:grid;place-items:center}
+.empty .e-ic svg{width:22px;height:22px;opacity:.7}
+.empty h2{margin:0 0 7px;font-size:15px;font-weight:650;color:var(--ink-soft)}
+.empty p{margin:0 0 10px;font-size:13px;line-height:1.65}
+.empty .dots span{animation:blink 1.4s infinite}
+.empty .dots span:nth-child(2){animation-delay:.2s} .empty .dots span:nth-child(3){animation-delay:.4s}
+
+/* ---------- C 详情面板 ---------- */
+.detail{overflow:hidden}
+.detail[hidden]{display:none}
+.d-scroll{flex:1 1 auto;min-height:0;overflow:auto;padding:0 0 40px}
+.d-head{flex:0 0 auto;position:sticky;top:0;z-index:2;background:var(--surface);border-bottom:1px solid var(--line);padding:12px 14px}
+.d-title{display:flex;align-items:center;gap:8px;min-width:0}
+.d-title .d-id{font-weight:700;font-size:15px;margin:0;letter-spacing:-.01em;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.d-close{margin-left:auto;color:var(--faint);padding:4px 7px;border-radius:6px;font-size:15px;line-height:1}
+.d-close:hover{background:var(--surface-2);color:var(--ink)}
+.d-sub{margin-top:7px;display:flex;align-items:center;gap:7px;flex-wrap:wrap}
+
+.facts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1px;background:var(--line);border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+.fact{background:var(--surface);padding:8px 14px;min-width:0}
+.fact .k{font:10px/1 var(--mono);letter-spacing:.07em;text-transform:uppercase;color:var(--faint);display:block}
+.fact .v{margin-top:4px;font-size:13px;color:var(--ink);overflow-wrap:anywhere}
+.fact .v .u{color:var(--faint);font-size:11.5px;font-family:var(--mono)}
+.fact.wide{grid-column:1/-1}
+.fact .v.unknownv{color:var(--faint);font-style:normal}
+
+.sec{border-bottom:1px solid var(--line);padding:13px 14px}
+.sec-h{display:flex;align-items:center;gap:8px;font-size:12.5px;font-weight:700;color:var(--ink);letter-spacing:.02em;margin:0 0 9px}
+.sec-h .hint{font-weight:400;font-size:11.5px;color:var(--faint);margin-left:auto;font-family:var(--mono)}
+.sec p{margin:0 0 8px;font-size:13px;line-height:1.68;color:var(--ink-soft);text-wrap:pretty}
+.sec p:last-child{margin-bottom:0}
+.sec p b{color:var(--ink)}
+
+.kv{display:flex;gap:10px;font-size:12.5px;padding:6px 0;border-bottom:1px dashed var(--line);align-items:baseline}
+.kv:last-child{border-bottom:0}
+.kv .k{flex:0 0 auto;width:82px;color:var(--faint);font:10.5px/1.5 var(--mono);letter-spacing:.05em}
+.kv .v{flex:1 1 auto;min-width:0;color:var(--ink);overflow-wrap:anywhere}
+
+/* 强调色只留给「运行中 / 选中 / 焦点」三件事;工具按钮一律中性,悬停才升到强调色 */
+.copy{display:inline-flex;align-items:center;gap:5px;font:11px/1 var(--mono);color:var(--ink-soft);
+  border:1px solid var(--line-2);border-radius:6px;padding:3px 7px;background:var(--surface);vertical-align:middle}
+.copy:hover{color:var(--accent);border-color:color-mix(in oklab,var(--accent) 40%,var(--line));background:color-mix(in oklab,var(--accent) 8%,var(--surface))}
+.copy svg{width:11px;height:11px}
+.copy.done{color:var(--c-ok);border-color:color-mix(in oklab,var(--c-ok) 40%,var(--line))}
+.path{font:11.5px/1.55 var(--mono);color:var(--ink);background:var(--surface-2);border:1px solid var(--line);
+  border-radius:6px;padding:6px 8px;overflow-wrap:anywhere;display:block;margin:0 0 7px}
+
+/* 告警块 */
+.alertbox{border-radius:9px;padding:11px 12px;margin:0 0 10px;font-size:12.5px;line-height:1.62}
+.alertbox .ab-t{font-weight:700;display:flex;align-items:center;gap:7px;margin-bottom:6px}
+.alertbox .ab-t svg{width:14px;height:14px;flex:0 0 auto}
+.alertbox[data-v="alert"]{background:color-mix(in oklab,var(--c-alert) 13%,var(--surface));border:1.5px solid var(--c-alert);color:var(--ink)}
+.alertbox[data-v="alert"] .ab-t{color:var(--c-alert)}
+.alertbox[data-v="hazard"]{border:1.5px solid var(--hz-edge);background:color-mix(in oklab,var(--c-alert) 10%,var(--surface));color:var(--ink)}
+.alertbox[data-v="hazard"]::before{content:"";display:block;height:6px;margin:-11px -12px 9px;border-radius:8px 8px 0 0;
+  background:repeating-linear-gradient(-45deg,var(--hz-warn) 0 8px,var(--hz-ink) 8px 9px,var(--hz-warn) 9px 16px)}
+.alertbox[data-v="lost"]{background:color-mix(in oklab,var(--c-lost) 9%,var(--surface));border:1px solid color-mix(in oklab,var(--c-lost) 40%,var(--line));color:var(--ink)}
+.alertbox[data-v="lost"] .ab-t{color:var(--c-lost)}
+.alertbox[data-v="reject"]{background:var(--surface-2);border:1px solid var(--c-reject);color:var(--ink)}
+.alertbox[data-v="reject"] .ab-t{color:var(--c-reject)}
+.alertbox[data-v="ok"]{background:color-mix(in oklab,var(--c-ok) 9%,var(--surface));border:1px solid color-mix(in oklab,var(--c-ok) 32%,var(--line))}
+.alertbox[data-v="ok"] .ab-t{color:var(--c-ok)}
+.alertbox[data-v="quiet"]{background:var(--surface-2);border:1px solid var(--line)}
+.alertbox[data-v="unlog"]{background:color-mix(in oklab,var(--c-unlog) 10%,var(--surface));border:1px solid color-mix(in oklab,var(--c-unlog) 40%,var(--line))}
+.alertbox[data-v="unlog"] .ab-t{color:var(--c-unlog)}
+.alertbox .todo{margin:8px 0 0;padding-left:17px}
+.alertbox .todo li{margin:3px 0}
+
+/* 六态资产 */
+.asset{display:flex;align-items:flex-start;gap:9px;padding:8px 0;border-bottom:1px dashed var(--line);font-size:12.5px}
+.asset:last-child{border-bottom:0}
+.asset .a-n{flex:0 0 auto;width:78px;color:var(--ink-soft);font-weight:600}
+.asset .a-b{flex:1 1 auto;min-width:0}
+.asset .a-why{color:var(--faint);font-size:11.5px;line-height:1.55;margin-top:3px;overflow-wrap:anywhere}
+.asset .a-why code{font-family:var(--mono);font-size:10.5px;background:var(--surface-2);border:1px solid var(--line);border-radius:4px;padding:1px 4px;color:var(--ink-soft)}
+.a-open{display:inline-flex;align-items:center;gap:5px;color:var(--ink);font-size:12.5px;border-bottom:1px solid var(--line-2)}
+.asset:hover .a-open{color:var(--accent);border-bottom-color:currentColor}
+.a-na{color:var(--faint)}
+.a-flag{display:inline-flex;align-items:center;gap:5px;font:10.5px/1 var(--mono);padding:3px 6px;border-radius:5px;white-space:nowrap}
+.a-flag[data-s="unavailable"]{color:var(--c-contract);background:color-mix(in oklab,var(--c-contract) 12%,var(--surface));border:1px solid color-mix(in oklab,var(--c-contract) 40%,var(--line))}
+.a-flag[data-s="pending"]{color:var(--accent);background:color-mix(in oklab,var(--accent) 10%,var(--surface));border:1px solid color-mix(in oklab,var(--accent) 34%,var(--line))}
+.a-flag[data-s="gone"]{color:var(--c-timeout);background:color-mix(in oklab,var(--c-timeout) 12%,var(--surface));border:1px solid color-mix(in oklab,var(--c-timeout) 40%,var(--line))}
+.a-flag[data-s="unlogged"]{color:var(--c-unlog);background:color-mix(in oklab,var(--c-unlog) 11%,var(--surface));border:1px solid color-mix(in oklab,var(--c-unlog) 40%,var(--line))}
+.a-flag[data-s="na"]{color:var(--faint);background:var(--surface-2);border:1px solid var(--line)}
+
+/* 有界摘要 */
+.bounded{border:1px solid var(--line-2);border-radius:8px;overflow:hidden;background:var(--surface-2)}
+.bounded pre{margin:0;padding:9px 11px;font:11.5px/1.6 var(--mono);color:var(--ink);white-space:pre-wrap;overflow-wrap:anywhere;background:var(--surface)}
+.bounded .bd-gap{display:flex;align-items:center;gap:9px;padding:6px 11px;font:10.5px/1.4 var(--mono);color:var(--c-contract);
+  background:repeating-linear-gradient(-45deg,color-mix(in oklab,var(--c-contract) 8%,var(--surface)) 0 8px,transparent 8px 16px);
+  border-top:1px dashed var(--line-2);border-bottom:1px dashed var(--line-2)}
+.bounded .bd-foot{display:flex;gap:12px;flex-wrap:wrap;padding:6px 11px;font:10.5px/1.4 var(--mono);color:var(--faint);background:var(--surface-2)}
+.bounded .bd-lab{font:10px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--faint);padding:5px 11px 0}
+
+/* 尝试分段(可扩展,不写死两段) */
+.segbar{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:10px}
+.seg{font:11.5px/1 var(--sans);padding:6px 11px;border-radius:7px;border:1px solid var(--line);background:var(--surface-2);color:var(--ink-soft);white-space:nowrap}
+.seg[aria-pressed="true"]{background:var(--surface);color:var(--ink);font-weight:650;border-color:var(--ink-soft);box-shadow:inset 0 -2px 0 var(--ink)}
+.seg .sdot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:6px;background:var(--faint);vertical-align:middle}
+.seg[data-r="rejected"] .sdot{background:var(--c-contract)}
+.seg[data-r="accepted"] .sdot{background:var(--c-ok)}
+
+/* 折叠块 */
+.fold{border:1px solid var(--line);border-radius:9px;margin-bottom:9px;background:var(--surface);overflow:hidden}
+.fold>summary{list-style:none;cursor:pointer;padding:9px 11px;display:flex;align-items:center;gap:8px;font-size:12.5px;font-weight:650;color:var(--ink)}
+.fold>summary::-webkit-details-marker{display:none}
+.fold>summary .caret{width:11px;height:11px;flex:0 0 auto;color:var(--faint);transition:transform .15s}
+.fold[open]>summary .caret{transform:rotate(90deg)}
+.fold>summary .sm{margin-left:auto;font:10.5px/1 var(--mono);color:var(--faint);font-weight:400}
+.fold-body{padding:0 11px 11px;border-top:1px solid var(--line);padding-top:10px}
+
+/* Markdown 渲染 */
+.md{font-size:13px;line-height:1.72;color:var(--ink);overflow-wrap:anywhere}
+.md h1,.md h2,.md h3{margin:14px 0 7px;line-height:1.4;font-weight:700}
+.md h1{font-size:15px} .md h2{font-size:14px} .md h3{font-size:13px;color:var(--ink-soft)}
+.md h1:first-child,.md h2:first-child,.md h3:first-child{margin-top:0}
+.md p{margin:0 0 9px;color:var(--ink-soft)}
+.md ul,.md ol{margin:0 0 9px;padding-left:19px;color:var(--ink-soft)}
+.md li{margin:3px 0}
+.md code{font-family:var(--mono);font-size:11.5px;background:var(--surface-2);border:1px solid var(--line);border-radius:4px;padding:1px 4px}
+.md strong{color:var(--ink);font-weight:700}
+.md blockquote{margin:0 0 9px;padding:2px 0 2px 11px;border-left:2px solid var(--line-2);color:var(--faint)}
+.md hr{border:0;border-top:1px solid var(--line);margin:12px 0}
+.codefold{border:1px solid var(--line-2);border-radius:7px;margin:0 0 9px;background:var(--surface-2);overflow:hidden}
+.codefold>summary{list-style:none;cursor:pointer;padding:6px 9px;font:11px/1 var(--mono);color:var(--ink-soft);display:flex;gap:8px;align-items:center}
+.codefold>summary::-webkit-details-marker{display:none}
+.codefold pre{margin:0;padding:9px;font:11.5px/1.6 var(--mono);overflow:auto;max-height:340px;background:var(--surface);border-top:1px solid var(--line)}
+.raw{margin:0;padding:11px;font:11.5px/1.65 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere;background:var(--surface-2);
+  border:1px solid var(--line);border-radius:8px;max-height:420px;overflow:auto;color:var(--ink)}
+.viewswitch{display:inline-flex;border:1px solid var(--line);border-radius:7px;overflow:hidden;margin-left:auto}
+.viewswitch button{font:10.5px/1 var(--mono);padding:5px 8px;color:var(--faint);border-right:1px solid var(--line)}
+.viewswitch button:last-child{border-right:0}
+.viewswitch button[aria-pressed="true"]{background:var(--surface-2);color:var(--ink);font-weight:700}
+.totop{position:sticky;bottom:8px;float:right;margin:6px 0 0;font:10.5px/1 var(--mono);color:var(--faint);
+  border:1px solid var(--line);background:var(--surface);border-radius:999px;padding:5px 10px}
+.totop:hover{color:var(--ink);border-color:var(--line-2)}
+
+/* 改动清单 */
+.difflist{border:1px solid var(--line);border-radius:8px;max-height:236px;overflow:auto;background:var(--surface)}
+.diffrow{display:flex;align-items:center;gap:8px;padding:5px 9px;border-bottom:1px solid color-mix(in oklab,var(--line) 60%,transparent);font:11.5px/1.5 var(--mono)}
+.diffrow:last-child{border-bottom:0}
+.df-t{flex:0 0 auto;width:17px;height:17px;border-radius:4px;display:grid;place-items:center;font:700 10px/1 var(--mono);color:var(--on-solid)}
+.df-t[data-t="A"]{background:var(--c-ok)} .df-t[data-t="M"]{background:var(--accent)}
+.df-t[data-t="D"]{background:var(--c-fail)} .df-t[data-t="R"]{background:var(--c-timeout)}
+.df-p{min-width:0;overflow-wrap:anywhere;color:var(--ink-soft)}
+.difflist .zero{padding:11px;font-size:12.5px;color:var(--faint);text-align:center}
+
+/* 运行中实时 */
+.livewrap{border:1px solid color-mix(in oklab,var(--accent) 32%,var(--line));border-radius:9px;background:color-mix(in oklab,var(--accent) 5%,var(--surface));padding:11px}
+.livehead{display:flex;align-items:center;gap:8px;font-size:12.5px;font-weight:650;color:var(--accent);margin-bottom:8px}
+.livehead .dt{width:7px;height:7px;border-radius:50%;background:var(--accent);animation:pulse 1.4s ease-in-out infinite}
+.livetail{font:11.5px/1.65 var(--mono);color:var(--ink-soft);background:var(--surface);border:1px solid var(--line);
+  border-radius:7px;padding:9px;max-height:132px;overflow:hidden;overflow-wrap:anywhere;position:relative}
+.livetail::after{content:"";position:absolute;left:0;right:0;top:0;height:26px;background:linear-gradient(var(--surface),transparent)}
+.livetail .cursor{display:inline-block;width:7px;height:13px;background:var(--accent);vertical-align:-2px;animation:blink 1s steps(2) infinite}
+.livemeta{display:flex;gap:14px;flex-wrap:wrap;margin-top:8px;font:11px/1 var(--mono);color:var(--faint);font-variant-numeric:tabular-nums}
+
+.appfoot{flex:0 0 auto;padding:8px 20px;border-top:1px solid var(--line);background:var(--surface);
+  display:flex;gap:16px;flex-wrap:wrap;align-items:center;font:11px/1.5 var(--mono);color:var(--faint)}
+.appfoot .ro{color:var(--ink-soft);border:1px solid var(--line);border-radius:5px;padding:3px 7px}
+
+/* ============================================================
+   交互四态:悬停 / 按下 / 键盘焦点 / 禁用 —— 全站统一,无一遗漏
+   ============================================================ */
+:where(button,a,summary,[tabindex="0"]):focus-visible{
+  outline:2px solid var(--accent); outline-offset:2px;
+}
+.nodebox:focus-visible,.qitem:focus-visible,.tl-row:focus-visible,.gwrap:focus-visible{outline-offset:3px}
+.vtab,.seg,.scene-btn,.copy,.qband-toggle,.theme-toggle,.zoom button,.d-close,
+.nodebox,.qitem,.tl-row,.a-open,.totop,.fold>summary,.codefold>summary{
+  transition:background-color .12s ease,border-color .12s ease,color .12s ease,box-shadow .12s ease,transform .1s ease;
+}
+.vtab:active,.seg:active,.scene-btn:active,.copy:active,.qband-toggle:active,
+.theme-toggle:active,.zoom button:active,.d-close:active,.nodebox:active,.qitem:active,.totop:active{transform:translateY(1px)}
+.fold>summary:hover,.codefold>summary:hover{background:var(--surface-2)}
+button[disabled]{opacity:.45;cursor:not-allowed}
+button[disabled]:hover{transform:none}
+
+/* ============================================================
+   加载 / 回放骨架态 —— 刚连上、正在从记录文件完整回放的那几秒
+   ============================================================ */
+.sk-wrap{display:flex;flex-direction:column;gap:18px;min-width:0}
+.sk-cols{display:flex;gap:78px;align-items:flex-start;flex-wrap:wrap}
+.sk-col{display:flex;flex-direction:column;gap:14px}
+.sk{position:relative;overflow:hidden;background:var(--surface-2);border:1px solid var(--line);border-radius:10px}
+.sk-card{width:216px;height:72px}
+.sk-card.tall{height:112px}
+.sk-row{height:26px;border-radius:7px}
+.sk::after{content:"";position:absolute;inset:0;
+  background:linear-gradient(90deg,transparent,color-mix(in oklab,var(--ink) 8%,transparent),transparent);
+  transform:translateX(-100%);animation:sk 1.25s ease-in-out infinite}
+.sk-tl{padding:14px;display:flex;flex-direction:column;gap:9px}
+.sk-tlrow{display:flex;align-items:center;gap:12px}
+.sk-tlrow .sk{height:20px;border-radius:6px}
+@keyframes sk{to{transform:translateX(100%)}}
+
+/* ============================================================
+   窗口退让 —— 桌面两档 1440 / 1920 为主,更窄时不挤压主视图
+   ============================================================ */
+@media (max-width:1279px){
+  .workspace{grid-template-columns:minmax(0,1fr) 372px}
+}
+@media (max-width:1059px){
+  .workspace{grid-template-columns:minmax(0,1fr);grid-template-rows:minmax(200px,1fr) minmax(220px,44%)}
+  .workspace[data-detail="closed"]{grid-template-columns:minmax(0,1fr);grid-template-rows:1fr}
+  .topbar-inner{padding:10px 14px;gap:10px}
+  .banners,.workspace{padding-left:14px;padding-right:14px}
+  .appfoot{padding:8px 14px;gap:12px}
+  /* 图例换行,不隐藏 —— 「实线=声明 / 虚线=推断」是这张图最不能省的一句话 */
+  .viewbar{flex-wrap:wrap}
+  .legend{order:3;width:100%;padding-top:2px}
+}
+
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.45;transform:scale(.88)}}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.15}}
+@keyframes cardIn{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+
+<div class="protobar" data-od-id="prototype-chrome">
+  <span class="pb-tag">原型演示台</span>
+  <span class="pb-hint">以下开关不属于产品界面 —— 产品本身是只读的，没有任何操作按钮</span>
+  <span class="pb-sp"></span>
+  <div class="scenes" id="scenes" role="group" aria-label="原型演示场景切换"></div>
+</div>
+
+<div class="app">
+  <header class="topbar" data-od-id="topbar">
+    <div class="topbar-inner">
+      <h1 class="brand">
+        <span class="glyph" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="5" cy="6" r="2.4"/><circle cx="19" cy="6" r="2.4"/><circle cx="12" cy="18" r="2.4"/><path d="M6.6 7.7 10.8 16M17.4 7.7 13.2 16"/></svg></span>
+        graph 观测台
+      </h1>
+      <span class="runid" id="runId">—</span>
+      <span class="runpill" id="runPill" data-r="waiting" role="status" aria-live="polite" aria-atomic="true"><span class="dotp" aria-hidden="true"></span><span id="runPillText">等待运行开始</span></span>
+      <span class="tb-sp"></span>
+      <div class="counts" id="counts"></div>
+      <span class="conn" id="conn" data-s="live" role="status" aria-live="polite"><span class="led" aria-hidden="true"></span><span id="connText">实时</span></span>
+      <button class="theme-toggle" id="themeBtn" type="button" title="切换浅色 / 深色" aria-label="切换浅色或深色主题">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg>
+        <span id="themeLabel">深色</span>
+      </button>
+    </div>
+  </header>
+
+  <div class="banners" id="banners" data-od-id="banners" role="status" aria-live="polite"></div>
+
+  <main class="workspace" id="workspace" data-detail="closed">
+    <section class="panel" data-od-id="mainview">
+      <div class="viewbar">
+        <div class="vtabs" role="group" aria-label="主视图切换">
+          <button class="vtab" id="tabGraph" type="button" aria-pressed="true">图视图</button>
+          <button class="vtab" id="tabTimeline" type="button" aria-pressed="false">时间轴</button>
+        </div>
+        <div class="legend" id="legend"></div>
+        <span class="vb-sp"></span>
+        <div class="zoom" id="zoomBox" role="group" aria-label="缩放">
+          <button type="button" id="zoomOut" title="缩小" aria-label="缩小图视图"><span aria-hidden="true">−</span></button>
+          <span class="z-val" id="zoomVal" role="status" aria-live="off">100%</span>
+          <button type="button" id="zoomIn" title="放大" aria-label="放大图视图"><span aria-hidden="true">+</span></button>
+          <button type="button" id="zoomFit" title="适应画布" aria-label="缩放至适应画布">适应</button>
+        </div>
+      </div>
+      <div class="gwrap scroll" id="gwrap" tabindex="0" role="region" aria-label="环节关系图，可用方向键滚动"><div class="gcanvas" id="gcanvas"></div></div>
+      <div class="tlwrap scroll" id="tlwrap" tabindex="0" role="region" aria-label="环节时间轴" hidden></div>
+      <div class="tl-key" id="tlKey" hidden></div>
+    </section>
+
+    <aside class="panel detail" id="detail" data-od-id="detail" aria-label="环节详情" hidden></aside>
+  </main>
+
+  <footer class="appfoot" data-od-id="appfoot">
+    <span class="ro">只读观测 · 不提供任何写操作</span>
+    <span>观测台地址以启动器输出的 localhost 地址为准（端口被占用时会自动换一个）</span>
+    <span>关掉最后一个页面后，服务将在 60 秒后退出</span>
+  </footer>
+</div>
+
+<script>
+/* ============================================================
+   1. 常量与词表
+   ============================================================ */
+const ENGINES = {
+  codex:  {short:'Cx', v:'--e-codex'},
+  omp:    {short:'Om', v:'--e-omp'},
+  claude: {short:'Cl', v:'--e-claude'},
+  cursor: {short:'Cu', v:'--e-cursor'},
+  kimi:   {short:'Ki', v:'--e-kimi'},
+};
+
+/* 七档结局 + 三个阶段 + 一个「记录不完整」。short 上卡片，long 进详情。 */
+const STATUS = {
+  discovered:     {short:'已发现',    long:'已发现 · 正在做本地准备'},
+  queued:         {short:'排队中',    long:'排队中 · 已进入本地队列，尚未派给 AI'},
+  running:        {short:'运行中',    long:'运行中 · 已拿到执行名额'},
+  ok:             {short:'完成',      long:'ok · 顺利跑完'},
+  contract_error: {short:'格式不合格', long:'contract_error · 跑完了，但输出格式不合格'},
+  timeout:        {short:'超时',      long:'timeout · 超时被打断'},
+  backend_failed: {short:'引擎报错',   long:'backend_failed · 引擎明确报错'},
+  rejected:       {short:'被拒绝',    long:'被拒绝 · 还没开跑就被本地挡下了'},
+  unknown:        {short:'说不清',    long:'unknown · 这个环节干没干完，说不清'},
+  abandoned:      {short:'未见结局',   long:'abandoned · 没有看到这个环节的结局'},
+  unlogged:       {short:'状态未记录', long:'记录从某处起不完整，这个环节的状态未知'},
+};
+
+/* 「拿不到」的已知原因码 —— 开放清单，未见过的原因码走兜底 */
+const UNAVAIL = {
+  ARCHIVE_DIR_MISSING:     '归档目录没建起来。',
+  ITEM_WRITE_FAILED:       '这一项写盘失败。',
+  NO_SOURCE_TO_COPY:       '源头就没有可拷的东西。',
+  DIGEST_FAILED:           '拷下来了，但算不出指纹。',
+  SOURCE_RUN_NOT_ARCHIVED: '当初那次运行没有开可视化，只保留了指纹。这是当时的选择，不是故障。',
+};
+
+/* 三档改动结论 —— 文案按 §4A 定死，不得改写 */
+const OUTCOME = {
+  delivered: '已交付',
+  no_change: '无改动',
+  unknown:   '交付状态不明',
+};
+
+const REJECT = {
+  dup_id: {
+    t:'这个名字被占着',
+    d:'另一个环节已经用了同一个 id，本地当场挡下，没有联系任何 AI。',
+    todo:['先分辨占着它的是谁：可能是<b>另一个正在跑的进程</b>，也可能是上次异常退出留下的。',
+          '如果是前者，等它跑完；如果是后者，清掉残留再重跑。<b>两种处置完全相反，别猜。</b>'],
+  },
+  dirty_repo: {
+    t:'你的代码目录有没提交的改动',
+    d:'开跑前的仓库体检没过，本地当场挡下，没有联系任何 AI。',
+    todo:['这是你自己工作区的状态，没有任何东西被创建或残留。','提交或暂存后重跑即可。'],
+  },
+  reuse_mismatch: {
+    t:'上次的结果和这次对不上，不能拿来用',
+    d:'复用校验没过，本地当场挡下，没有联系任何 AI。',
+    todo:['没有任何东西被创建或残留。','要么关掉复用，要么核对上次那份结果是不是你想要的。'],
+  },
+  worktree_failed: {
+    t:'独立工作副本没建起来',
+    d:'准备隔离目录时失败，本地当场挡下，没有联系任何 AI。',
+    todo:['<b>可能有东西要管</b>：最常见的原因就是上次残留的工作副本或分支清不掉，那东西<b>可能还在</b>。',
+          '也可能是这次建到一半失败、自动清理也没成功。<b>去下面这个预定位置看一眼。</b>'],
+  },
+};
+
+/* ============================================================
+   2. 场景数据
+   一个 scene = 一次运行的全部内容。nodeSeq 是唯一键;id 可以重复。
+   ============================================================ */
+const MD_SURVEY = `## 仓库概览
+
+扫描了 \`src/\` 下 214 个文件，按职责聚成四块：
+
+- **传输层** \`src/transport/\` — SSE 广播、背压、重连回放
+- **编排层** \`src/graph/\` — 名额调度、依赖推断、节点生命周期
+- **执行层** \`src/engines/\` — 五个引擎适配器
+- **归档层** \`src/archive/\` — 事件落盘与资产拷贝
+
+### 值得注意的地方
+
+1. \`transport/sse.ts\` 的积压上限写死在常量里，超限会主动断开客户端。
+2. \`graph/infer.ts\` 用输入文本里出现的产出文件名做依赖推断，**没有做路径归一化**。
+3. \`archive/assets.ts\` 的失败路径只记 code，不记 message。
+
+### 建议后续环节关注
+
+- 依赖推断的误判面（见 \`nodes/survey-repo.md\` 第 3 节）
+- 归档失败时前端拿到的信息够不够解释给用户`;
+
+const MD_AUDIT_A1 = `## 鉴权路径审查（第 1 次）
+
+看了 \`src/auth/\` 全部 11 个文件。
+
+结论：会话续期存在一个窗口，刷新令牌在旧令牌失效之后才写入，
+中间约 40ms 内并发请求会拿到 401。
+
+（此处原本应输出结构化结论块，但本次回答直接以散文收尾。）`;
+
+const MD_AUDIT_A2 = `## 鉴权路径审查（第 2 次 · 已按要求补上结构化结论）
+
+### 结论
+会话续期存在竞态窗口。
+
+### 证据
+- \`src/auth/session.ts:88\` 先 \`revoke(old)\` 后 \`issue(new)\`
+- 两步之间无事务，实测窗口 38～45ms
+
+### 影响面
+并发刷新时前端偶发 401，用户表现为"随机掉登录"。
+
+### 建议
+调换顺序并保留双令牌 5 秒重叠期：
+
+\`\`\`ts
+const next = await issue(user);
+await Promise.all([persist(next), scheduleRevoke(old, 5_000)]);
+return next;
+\`\`\`
+
+### 置信度
+高 —— 已在本地复现 3/3。`;
+
+const MD_PATCH_REPORT = `## 工作报告 · 会话续期竞态
+
+按上一环节的结论改了 \`src/auth/session.ts\` 与它的两处调用点，
+并补了一个并发刷新的回归用例。
+
+- 调换 revoke / issue 顺序
+- 旧令牌保留 5 秒重叠期
+- 新增 \`session.concurrent-refresh.test.ts\`
+
+本地跑过 \`npm test -- auth\`，17 项全绿。
+
+> 注意：重叠期的常量放在 \`src/auth/const.ts\`，如果部署环境的时钟漂移大于 5 秒需要调大。`;
+
+const TAIL_TEXT = '…继续检查 `src/graph/infer.ts`。该文件用输入文本里出现的产出文件名做依赖推断，匹配逻辑是朴素子串包含，没有做路径归一化，也没有排除代码块内的引用。这意味着当某个环节的输入里恰好粘贴了一段包含 nodes/ 路径的示例时，会被误判成一条依赖边。下一步去看调用方是否对推断结果做了二次校验';
+
+const BOUNDED_ERR = {
+  head:'[engine:kimi] request accepted, stream opened\n[engine:kimi] chunk 1/… ok\n[engine:kimi] chunk 2/… ok\n[engine:kimi] warn: upstream latency 8.2s',
+  tail:'[engine:kimi] stream aborted by upstream\n[engine:kimi] ERR upstream_closed: connection reset by peer (after 214 chunks)\n[bridge] backend reported failure, no usable answer',
+  omitted:18432, total:19004, digest:'sha256:9f2c…a41d',
+};
+const BOUNDED_REJECT = {
+  head:'第 1 次输出缺少结构化结论块。合同要求依次给出「结论 / 证据 / 影响面 / 建议 / 置信度」五节，',
+  tail:'请以完全相同的小节标题重写，证据必须带文件与行号，置信度只能取 高/中/低 三者之一。',
+  omitted:1180, total:1512, digest:'sha256:41ab…7d02',
+};
+
+const SCENES = [];
+const have = t => ({s:'have', text:t});
+const asset = (s, o) => Object.assign({s}, o||{});
+
+/* ---- 场景 1 · 运行中(并行 + 运行中 + 排队 + 声明边/推断边) ---- */
+SCENES.push({
+  key:'running', label:'运行中',
+  run:{ id:'gr-20260727-1418-4f2a', dir:'D:\\cc\\agent-bridge', state:'running', elapsed:260, slots:4, now:260 },
+  conn:{s:'live', text:'实时'},
+  select:2,
+  edges:[
+    {a:1,b:2,kind:'declared'},{a:1,b:3,kind:'declared'},{a:1,b:4,kind:'declared'},
+    {a:2,b:6,kind:'inferred',why:'<code>audit-auth</code> 的产出文件 <code>nodes/audit-auth.md</code> 出现在 <code>cross-check</code> 的输入原文里。'},
+    {a:3,b:6,kind:'inferred',why:'<code>audit-data-flow</code> 的产出文件 <code>nodes/audit-data-flow.md</code> 出现在 <code>cross-check</code> 的输入原文里。'},
+    {a:6,b:7,kind:'declared'},
+  ],
+  nodes:[
+    {seq:1,id:'survey-repo',engine:'codex',mode:'read',model:'gpt-5-codex',effort:'medium',status:'ok',
+     t:{q:[0,12],r:[12,204]},words:4820,ctx:38,
+     attempts:[{n:1,verdict:'accepted',input:have('通读 D:\\cc\\agent-bridge 的 src/ 目录，按职责分块，指出后续审查值得优先看的地方。不要改任何文件。'),output:have(MD_SURVEY)}],
+     scene:{session:asset('na',{why:'正常收场，没有需要抢救的现场'}),answer:asset('have'),snapshot:asset('na',{why:'正常收场'})}},
+
+    {seq:2,id:'audit-auth',engine:'claude',mode:'read',model:'claude-opus-5',effort:'high',status:'running',
+     t:{q:[204,212],r:[212,null]},phase:'streaming',
+     live:{words:1240,tail:TAIL_TEXT,event:'engine.chunk · 第 214 段 · 2 秒前'},
+     attempts:[{n:1,verdict:'running',input:have('基于 nodes/survey-repo.md 的结论，审查 src/auth/ 的会话续期路径。输出必须包含：结论 / 证据 / 影响面 / 建议 / 置信度 五节。'),output:asset('pending')}],
+     scene:{session:asset('pending'),answer:asset('pending'),snapshot:asset('pending')}},
+
+    {seq:3,id:'audit-data-flow',engine:'omp',mode:'read',model:'deepseek-v3.2',effort:'medium',status:'running',
+     t:{q:[204,210],r:[210,null]},phase:'streaming',
+     live:{words:2010,tail:'…SSE 广播路径上，事件先入内存环形缓冲，再按客户端游标推送。环形缓冲的容量是 4096，超出时最老的事件被覆盖',event:'engine.chunk · 第 331 段 · 1 秒前'},
+     attempts:[{n:1,verdict:'running',input:have('基于 nodes/survey-repo.md，追踪 src/transport/ 的事件流：从产生到落盘到推送，指出可能丢事件的位置。'),output:asset('pending')}],
+     scene:{session:asset('pending'),answer:asset('pending'),snapshot:asset('pending')}},
+
+    {seq:4,id:'patch-session-guard',engine:'cursor',mode:'write',model:'composer-2',effort:'high',status:'running',
+     t:{q:[204,218],r:[218,null]},phase:'preparing_worktree',
+     live:{words:0,tail:'',event:'worktree.creating · 正在复制代码并建分支 · 6 秒前'},
+     attempts:[{n:1,verdict:'running',input:have('修复 nodes/audit-auth.md 指出的会话续期竞态。允许改文件。改完给一份工作报告。'),output:asset('pending')}],
+     write:{outcome:null,branch:'agent/patch-session-guard-4f2a',base:'a91c04e',files:null,worktree:{state:'pending',path:'D:\\cc\\agent-bridge\\.worktrees\\patch-session-guard-4f2a'}},
+     scene:{session:asset('pending'),answer:asset('pending'),snapshot:asset('pending')}},
+
+    {seq:5,id:'audit-auth',engine:'claude',mode:'read',model:'claude-opus-5',effort:'high',status:'queued',
+     t:{q:[214,null],r:[null,null]},note:'与 seq 2 同名：同一次运行里把这个环节又跑了一遍，两次各自成卡。',
+     attempts:[{n:1,verdict:'queued',input:have('（同 audit-auth，换一组更严格的判定门槛重跑）基于 nodes/survey-repo.md 审查 src/auth/ 的会话续期路径。'),output:asset('pending')}],
+     scene:{session:asset('pending'),answer:asset('pending'),snapshot:asset('pending')}},
+
+    {seq:6,id:'cross-check',engine:'kimi',mode:'read',model:'kimi-k2.5',effort:'medium',status:'queued',
+     t:{q:[219,null],r:[null,null]},
+     attempts:[{n:1,verdict:'queued',input:have('对照 nodes/audit-auth.md 与 nodes/audit-data-flow.md，找出两份结论互相矛盾的地方。'),output:asset('pending')}],
+     scene:{session:asset('pending'),answer:asset('pending'),snapshot:asset('pending')}},
+
+    {seq:7,id:'summarize',engine:'codex',mode:'read',model:'gpt-5-codex',effort:'low',status:'discovered',
+     t:{q:[null,null],r:[null,null]},
+     attempts:[{n:1,verdict:'discovered',input:asset('pending'),output:asset('pending')}],
+     scene:{session:asset('pending'),answer:asset('pending'),snapshot:asset('pending')}},
+
+    {seq:8,id:'patch-retry-logic',engine:'omp',mode:'write',model:'deepseek-v3.2',effort:'high',status:'queued',
+     t:{q:[221,null],r:[null,null]},
+     attempts:[{n:1,verdict:'queued',input:have('修复 nodes/audit-data-flow.md 指出的重试退避问题。允许改文件。'),output:asset('pending')}],
+     write:{outcome:null,branch:null,base:null,files:null,worktree:{state:'not_started',path:null}},
+     scene:{session:asset('pending'),answer:asset('pending'),snapshot:asset('pending')}},
+  ],
+});
+
+/* ---- 场景 2 · 已结束(含全部判别态:write 三档 / 失败+已交付 / unknown+已交付 / 复用 / 被拒绝 ×2 / 净改动为零) ---- */
+SCENES.push({
+  key:'ended', label:'已结束 · 判别态全集',
+  run:{ id:'gr-20260727-0902-8b1c', dir:'D:\\cc\\agent-bridge', state:'ended', elapsed:2946, slots:4, now:2946 },
+  conn:{s:'live', text:'实时 · 运行已结束'},
+  select:4,
+  edges:[
+    {a:1,b:2,kind:'declared'},{a:1,b:3,kind:'declared'},
+    {a:2,b:4,kind:'inferred',why:'<code>audit-auth</code> 的产出文件 <code>nodes/audit-auth.md</code> 出现在 <code>patch-session-guard</code> 的输入原文里。'},
+    {a:3,b:5,kind:'inferred',why:'<code>audit-data-flow</code> 的产出文件出现在 <code>patch-retry-logic</code> 的输入原文里。'},
+    {a:1,b:6,kind:'declared'},{a:1,b:7,kind:'declared'},{a:1,b:8,kind:'declared'},{a:1,b:9,kind:'declared'},{a:1,b:10,kind:'declared'},
+    {a:4,b:13,kind:'declared'},
+    {a:13,b:14,kind:'declared',warn:'声明的先后与实际执行不符：<code>report</code> 比 <code>long-scan</code> 更早结束。这条边只是一句声明，系统既不校验也不据此调度。'},
+  ],
+  nodes:[
+    {seq:1,id:'survey-repo',engine:'codex',mode:'read',model:'gpt-5-codex',effort:'medium',status:'ok',
+     t:{q:[0,9],r:[9,196]},words:4820,ctx:38,
+     attempts:[{n:1,verdict:'accepted',input:have('通读 D:\\cc\\agent-bridge 的 src/ 目录，按职责分块，指出后续审查值得优先看的地方。不要改任何文件。'),output:have(MD_SURVEY)}],
+     scene:{session:asset('na',{why:'正常收场'}),answer:asset('have'),snapshot:asset('na',{why:'正常收场'})}},
+
+    {seq:2,id:'audit-auth',engine:'claude',mode:'read',model:'claude-opus-5',effort:'high',status:'contract_error',
+     t:{q:[196,204],r:[204,712]},words:6180,ctx:52,
+     error:{title:'输出格式不合格', desc:'第 2 次仍然缺少「置信度」小节的取值约束（给了"比较高"，合同只接受 高/中/低）。',
+            bounded:BOUNDED_REJECT, diagnostics:['contract.section_missing = confidence','contract.checked_at = attempt 2','contract.schema = audit-v3']},
+     attempts:[
+       {n:1,verdict:'rejected',input:have('基于 nodes/survey-repo.md 的结论，审查 src/auth/ 的会话续期路径。输出必须包含：结论 / 证据 / 影响面 / 建议 / 置信度 五节。'),
+        output:have(MD_AUDIT_A1),reject:BOUNDED_REJECT},
+       {n:2,verdict:'rejected',input:have('上一次的输出被打回，原因如下：\n\n> 第 1 次输出缺少结构化结论块。合同要求依次给出「结论 / 证据 / 影响面 / 建议 / 置信度」五节，你只给了散文。\n\n纠正要求：以完全相同的小节标题重写，证据必须带文件与行号，置信度只能取 高/中/低 三者之一。原任务原文附后：\n\n基于 nodes/survey-repo.md 的结论，审查 src/auth/ 的会话续期路径。'),
+        output:have(MD_AUDIT_A2)},
+     ],
+     scene:{session:asset('have'),answer:asset('have'),snapshot:asset('unavailable',{code:'ITEM_WRITE_FAILED'})}},
+
+    {seq:3,id:'audit-data-flow',engine:'omp',mode:'read',model:'deepseek-v3.2',effort:'medium',status:'ok',reused:true,
+     t:{q:[196,197],r:[197,197.4]},words:7310,ctx:44,origRun:2547,reuseFrom:'gr-20260726-1130-2a77',
+     attempts:[
+       {n:1,verdict:'rejected',input:asset('unavailable',{code:'SOURCE_RUN_NOT_ARCHIVED',digest:'sha256:c704…19be'}),
+        output:asset('unavailable',{code:'SOURCE_RUN_NOT_ARCHIVED',digest:'sha256:2ad1…8f30'}),
+        rejectAsset:asset('unavailable',{code:'SOURCE_RUN_NOT_ARCHIVED',digest:'sha256:6b8e…c015'})},
+       {n:2,verdict:'accepted',input:asset('unavailable',{code:'SOURCE_RUN_NOT_ARCHIVED',digest:'sha256:df41…a7c9'}),
+        output:have('## 事件流追踪\n\n（这份产出是复用来的，原件已随本次运行归档，可以照常阅读。）\n\n事件从 `graph/emit.ts` 产生后先入内存环形缓冲（容量 4096），再按客户端游标推送。\n\n### 可能丢事件的位置\n\n1. **环形缓冲覆盖**：慢客户端游标落后超过 4096 条时，最老的事件被覆盖。当前实现改为主动断开该客户端并期待重连，重连后从文件完整回放。\n2. **落盘与推送不同源**：`archive/write.ts` 失败时只记 code，推送侧不知情。\n\n### 置信度\n中 —— 第 2 点未在真实磁盘故障下验证过。')},
+     ],
+     scene:{session:asset('unavailable',{code:'SOURCE_RUN_NOT_ARCHIVED'}),answer:asset('have'),snapshot:asset('unavailable',{code:'SOURCE_RUN_NOT_ARCHIVED'})}},
+
+    {seq:4,id:'patch-session-guard',engine:'cursor',mode:'write',model:'composer-2',effort:'high',status:'ok',
+     t:{q:[712,726],r:[726,1604]},words:1980,ctx:null,
+     attempts:[{n:1,verdict:'accepted',input:have('修复 nodes/audit-auth.md 指出的会话续期竞态。允许改文件。改完给一份工作报告。'),output:have(MD_PATCH_REPORT)}],
+     write:{outcome:'delivered',branch:'agent/patch-session-guard-8b1c',base:'a91c04e',
+       files:[['M','src/auth/session.ts'],['M','src/auth/const.ts'],['M','src/auth/index.ts'],['A','src/auth/__tests__/session.concurrent-refresh.test.ts'],['M','src/api/middleware/auth.ts'],['M','src/api/routes/refresh.ts'],['D','src/auth/legacy-revoke.ts'],['R','src/auth/token.ts → src/auth/token/issue.ts']],
+       worktree:{state:'cleaned',path:'D:\\cc\\agent-bridge\\.worktrees\\patch-session-guard-8b1c'},
+       diff:asset('have')},
+     scene:{session:asset('na',{why:'正常收场'}),answer:asset('have'),snapshot:asset('na',{why:'正常收场'})}},
+
+    {seq:5,id:'patch-retry-logic',engine:'omp',mode:'write',model:'deepseek-v3.2',effort:'high',status:'ok',
+     t:{q:[712,730],r:[730,1388]},words:1120,ctx:29,
+     attempts:[{n:1,verdict:'accepted',input:have('修复 nodes/audit-data-flow.md 指出的重试退避问题。允许改文件。'),output:have('## 工作报告 · 重试退避\n\n读了 `src/transport/retry.ts` 与它的三处调用点。\n\n现有实现已经是带抖动的指数退避，上限 30s，与上游结论描述的"固定 1s 重试"不符——上游看的是 2 个月前的版本。\n\n**因此本次没有落下任何修改。** 建议把这条结论回退给 audit 环节复核。')}],
+     write:{outcome:'no_change',branch:'agent/patch-retry-logic-8b1c',base:'a91c04e',files:[],
+       worktree:{state:'cleaned',path:'D:\\cc\\agent-bridge\\.worktrees\\patch-retry-logic-8b1c'},diff:asset('na',{why:'没有可交付的改动'})},
+     scene:{session:asset('na',{why:'正常收场'}),answer:asset('have'),snapshot:asset('na',{why:'正常收场'})}},
+
+    {seq:6,id:'patch-config-schema',engine:'claude',mode:'write',model:'claude-opus-5',effort:'medium',status:'ok',
+     t:{q:[712,741],r:[741,1219]},words:860,ctx:31,
+     attempts:[{n:1,verdict:'accepted',input:have('给 config schema 补上 slots 上限的校验。允许改文件。'),output:have('## 工作报告 · config schema\n\n先加了 `slots` 的 min/max 校验，随后发现 `src/config/schema.ts` 已经在上游合并里加过等价校验，于是把自己的改动撤了回去，只留下提交本身作为记录。')}],
+     write:{outcome:'delivered',branch:'agent/patch-config-schema-8b1c',base:'a91c04e',files:[],netEmpty:true,
+       worktree:{state:'cleaned',path:'D:\\cc\\agent-bridge\\.worktrees\\patch-config-schema-8b1c'},diff:asset('have',{empty:true})},
+     scene:{session:asset('na',{why:'正常收场'}),answer:asset('have'),snapshot:asset('na',{why:'正常收场'})}},
+
+    {seq:7,id:'patch-telemetry',engine:'codex',mode:'write',model:'gpt-5-codex',effort:'medium',status:'ok',
+     t:{q:[712,758],r:[758,1502]},words:1440,ctx:47,
+     attempts:[{n:1,verdict:'accepted',input:have('把节点生命周期事件补进 telemetry。允许改文件。'),output:have('## 工作报告 · telemetry\n\n补了 `node.queued` / `node.slot_acquired` / `node.worktree_ready` 三个事件，并在前端消费侧加了对应的分支。')}],
+     write:{outcome:'delivered',branch:'agent/patch-telemetry-8b1c',base:'a91c04e',
+       files:[['M','src/telemetry/events.ts'],['M','src/graph/node.ts'],['A','src/telemetry/__tests__/lifecycle.test.ts']],
+       worktree:{state:'unconfirmed',path:'D:\\cc\\agent-bridge\\.worktrees\\patch-telemetry-8b1c',
+                 why:'收尾时没能确认后端已经停下，此时删掉副本可能丢代码，于是没有删。'},
+       diff:asset('have')},
+     scene:{session:asset('na',{why:'正常收场'}),answer:asset('have'),snapshot:asset('na',{why:'正常收场'})}},
+
+    {seq:8,id:'patch-cli-flags',engine:'kimi',mode:'write',model:'kimi-k2.5',effort:'medium',status:'backend_failed',
+     t:{q:[712,769],r:[769,1955]},words:640,ctx:null,
+     error:{title:'引擎明确报错', desc:'上游在第 214 段之后断开了流，本次没有拿到可用的答案。可以安全换一个引擎重跑。',
+            bounded:BOUNDED_ERR, diagnostics:['engine.code = upstream_closed','engine.http_status = 200 (stream aborted)','engine.retryable = true']},
+     attempts:[{n:1,verdict:'failed',input:have('给 CLI 补上 --slots 与 --no-viz 两个开关。允许改文件。'),output:have('## 工作报告（未写完）\n\n已经改了 `src/cli/args.ts`，正在补文档时流断了。')}],
+     write:{outcome:'delivered',branch:'agent/patch-cli-flags-8b1c',base:'a91c04e',
+       files:[['M','src/cli/args.ts'],['M','src/cli/index.ts'],['M','docs/cli.md']],
+       worktree:{state:'cleaned',path:'D:\\cc\\agent-bridge\\.worktrees\\patch-cli-flags-8b1c'},diff:asset('have')},
+     scene:{session:asset('have'),answer:asset('gone'),snapshot:asset('have')}},
+
+    {seq:9,id:'patch-sse-buffer',engine:'cursor',mode:'write',model:'composer-2',effort:'high',status:'unknown',
+     t:{q:[712,780],r:[780,2210]},words:1710,ctx:null,
+     error:{title:'这个环节干没干完，说不清', desc:'写结果记录那一步自己失败了，所以没有一份权威的结束回执。三种可能的成因：联系 AI 时返回的东西看不懂、确认任务是否已开始时返回的东西看不懂、或者最后写结果记录时写不下去。',
+            diagnostics:['result.write = failed (ENOSPC)','engine.ack = received','engine.final_chunk = received']},
+     attempts:[{n:1,verdict:'unknown',input:have('调大 SSE 环形缓冲并在超限时主动断开慢客户端。允许改文件。'),output:have('## 工作报告 · SSE 缓冲\n\n把环形缓冲从 4096 提到 16384，并在游标落后超过一半容量时主动断开该客户端，让它重连后走完整回放。\n\n改动集中在 `src/transport/sse.ts` 与 `src/transport/const.ts`。')}],
+     write:{outcome:'delivered',branch:'agent/patch-sse-buffer-8b1c',base:'a91c04e',
+       files:[['M','src/transport/sse.ts'],['M','src/transport/const.ts'],['M','src/transport/__tests__/sse.test.ts']],
+       worktree:{state:'cleaned',path:'D:\\cc\\agent-bridge\\.worktrees\\patch-sse-buffer-8b1c'},diff:asset('have')},
+     scene:{session:asset('have'),answer:asset('have'),snapshot:asset('unavailable',{code:'ITEM_WRITE_FAILED'})}},
+
+    {seq:10,id:'patch-worktree-gc',engine:'omp',mode:'write',model:'deepseek-v3.2',effort:'high',status:'unknown',
+     t:{q:[712,801],r:[801,2402]},words:1290,ctx:36,
+     error:{title:'这个环节干没干完，说不清', desc:'提交步骤自己失败了，收尾检查也没跑完，所以既没有结束回执，也没法判断代码去向。',
+            diagnostics:['commit.exit_code = 128','finalize.snapshot = not_taken','result.write = ok']},
+     attempts:[{n:1,verdict:'unknown',input:have('给残留工作副本加一个启动时的清理步骤。允许改文件。'),output:have('## 工作报告 · worktree 清理\n\n加了启动时扫描 `.worktrees/` 并清理超过 24 小时的残留目录的逻辑。')}],
+     write:{outcome:'unknown',branch:'agent/patch-worktree-gc-8b1c',base:'a91c04e',files:null,
+       reason:'提交步骤退出码 128（分支引用被占用），随后的收尾检查也没跑完。改动有没有落到分支上，说不清。',
+       worktree:{state:'kept',path:'D:\\cc\\agent-bridge\\.worktrees\\patch-worktree-gc-8b1c'},diff:asset('unavailable',{code:'NO_SOURCE_TO_COPY'})},
+     scene:{session:asset('have'),answer:asset('have'),snapshot:asset('unavailable',{code:'ARCHIVE_DIR_MISSING'})}},
+
+    {seq:11,id:'audit-auth',engine:'claude',mode:'read',model:'claude-opus-5',effort:'high',status:'rejected',
+     t:{q:[196,196.2],r:[null,null]},rejected:{kind:'dup_id'},
+     attempts:[{n:1,verdict:'rejected_local',input:have('（同名重跑）基于 nodes/survey-repo.md 审查 src/auth/ 的会话续期路径。'),output:asset('na',{why:'还没开跑就被本地挡下了，AI 那边一无所知'})}],
+     scene:{session:asset('na',{why:'没有联系过 AI'}),answer:asset('na',{why:'没有联系过 AI'}),snapshot:asset('na',{why:'没有联系过 AI'})}},
+
+    {seq:12,id:'patch-docs',engine:'codex',mode:'write',model:'gpt-5-codex',effort:'low',status:'rejected',
+     t:{q:[712,713.4],r:[null,null]},
+     rejected:{kind:'worktree_failed',plannedPath:'D:\\cc\\agent-bridge\\.worktrees\\patch-docs-8b1c',
+               detail:'git worktree add 退出码 128：目标目录已存在且非空。'},
+     attempts:[{n:1,verdict:'rejected_local',input:have('把新的 CLI 开关补进 docs/。允许改文件。'),output:asset('na',{why:'还没开跑就被本地挡下了'})}],
+     write:{outcome:null,branch:null,base:null,files:null,worktree:{state:'failed',path:'D:\\cc\\agent-bridge\\.worktrees\\patch-docs-8b1c'}},
+     scene:{session:asset('na',{why:'没有联系过 AI'}),answer:asset('na',{why:'没有联系过 AI'}),snapshot:asset('na',{why:'没有联系过 AI'})}},
+
+    {seq:13,id:'long-scan',engine:'omp',mode:'read',model:'deepseek-v3.2',effort:'high',status:'timeout',
+     t:{q:[1604,1611],r:[1611,2811]},words:12400,ctx:88,
+     error:{title:'超时被打断', desc:'到达 20 分钟的执行上限，被主动打断。它当时还在输出。考虑加时间或者把任务拆小。',
+            diagnostics:['timeout.budget_ms = 1200000','timeout.elapsed_ms = 1200004','timeout.counted_from = slot_acquired']},
+     attempts:[{n:1,verdict:'timeout',input:have('逐文件扫描 src/ 全部 214 个文件，为每个文件写一句职责说明。'),output:have('## 逐文件说明（未写完）\n\n### src/transport/\n\n- `sse.ts` — SSE 广播与背压\n- `retry.ts` — 带抖动的指数退避\n…（输出在第 137 个文件处被打断）')}],
+     scene:{session:asset('have'),answer:asset('have'),snapshot:asset('have')}},
+
+    {seq:14,id:'report',engine:'codex',mode:'read',model:'gpt-5-codex',effort:'medium',status:'ok',
+     t:{q:[1604,1609],r:[1609,2046]},words:3260,ctx:41,
+     attempts:[{n:1,verdict:'accepted',input:have('汇总本次全部环节的结论，给一份给人看的总结。'),output:have('## 本次运行总结\n\n八处审查、六处改动，其中两处代码去向需要人工确认。\n\n### 可以直接用的\n- `agent/patch-session-guard-8b1c` — 会话续期竞态，已交付并有回归用例\n- `agent/patch-cli-flags-8b1c` — CLI 开关，引擎中途报错但代码已提交\n\n### 需要人工看一眼的\n- `patch-sse-buffer` 与 `patch-worktree-gc` 的执行结局说不清，别自动重跑')}],
+     scene:{session:asset('na',{why:'正常收场'}),answer:asset('have'),snapshot:asset('na',{why:'正常收场'})}},
+  ],
+});
+
+/* ---- 场景 3 · 未观测到正常收尾(六种停留位置,语气各不相同) ---- */
+const CUT_WHY = '被中断时，把现场文件抢救出来那一步没有机会执行。';
+const noScene = () => ({session:asset('unavailable',{code:'SCENE_NOT_CAPTURED',why:CUT_WHY}),
+                        answer:asset('unavailable',{code:'SCENE_NOT_CAPTURED',why:CUT_WHY}),
+                        snapshot:asset('unavailable',{code:'SCENE_NOT_CAPTURED',why:CUT_WHY})});
+SCENES.push({
+  key:'nofinish', label:'未观测到正常收尾',
+  run:{ id:'gr-20260727-1602-c3d9', dir:'D:\\cc\\agent-bridge', state:'no_finish', elapsed:498, slots:4, now:498 },
+  conn:{s:'live', text:'实时'},
+  select:3,
+  edges:[{a:1,b:2,kind:'declared'},{a:1,b:3,kind:'declared'},{a:1,b:4,kind:'declared'},{a:1,b:5,kind:'declared'},{a:2,b:6,kind:'declared'},{a:6,b:7,kind:'declared'}],
+  nodes:[
+    {seq:1,id:'survey-repo',engine:'codex',mode:'read',model:'gpt-5-codex',effort:'medium',status:'ok',
+     t:{q:[0,10],r:[10,188]},words:4820,ctx:38,
+     attempts:[{n:1,verdict:'accepted',input:have('通读 src/ 目录并分块。'),output:have(MD_SURVEY)}],
+     scene:{session:asset('na',{why:'正常收场'}),answer:asset('have'),snapshot:asset('na',{why:'正常收场'})}},
+
+    {seq:2,id:'audit-auth',engine:'claude',mode:'read',model:'claude-opus-5',effort:'high',status:'abandoned',
+     t:{q:[188,196],r:[196,498]},words:1980,ctx:33,
+     abandonedAt:{stage:'running'}, sceneNone:true,
+     attempts:[{n:1,verdict:'abandoned',input:have('基于 nodes/survey-repo.md 审查 src/auth/ 的会话续期路径。'),output:asset('gone')}],
+     scene:noScene()},
+
+    {seq:3,id:'patch-session-guard',engine:'cursor',mode:'write',model:'composer-2',effort:'high',status:'abandoned',
+     t:{q:[188,202],r:[202,498]},words:740,ctx:null,
+     abandonedAt:{stage:'running',writePhase:'created'},
+     attempts:[{n:1,verdict:'abandoned',input:have('修复 nodes/audit-auth.md 指出的会话续期竞态。允许改文件。'),output:asset('gone')}],
+     write:{outcome:'unknown',branch:'agent/patch-session-guard-c3d9',base:'a91c04e',files:null,
+       reason:'中断时它已经拿到名额、工作副本也已确认建成，但没有看到它的结局，改动有没有落到分支上同样说不清。',
+       worktree:{state:'kept',path:'D:\\cc\\agent-bridge\\.worktrees\\patch-session-guard-c3d9'},diff:asset('unavailable',{code:'NO_SOURCE_TO_COPY'})},
+     scene:noScene()},
+
+    {seq:4,id:'patch-retry-logic',engine:'omp',mode:'write',model:'deepseek-v3.2',effort:'high',status:'abandoned',
+     t:{q:[188,210],r:[210,498]},
+     abandonedAt:{stage:'running',writePhase:'creating'},
+     attempts:[{n:1,verdict:'abandoned',input:have('修复重试退避问题。允许改文件。'),output:asset('unavailable',{code:'ASSET_QUOTA_EXCEEDED'})}],
+     write:{outcome:null,branch:null,base:null,files:null,
+       worktree:{state:'unconfirmed_create',path:'D:\\cc\\agent-bridge\\.worktrees\\patch-retry-logic-c3d9'}},
+     scene:noScene()},
+
+    {seq:5,id:'patch-telemetry',engine:'codex',mode:'write',model:'gpt-5-codex',effort:'medium',status:'abandoned',
+     t:{q:[188,216],r:[216,498]},
+     abandonedAt:{stage:'running',writePhase:'pre'},
+     attempts:[{n:1,verdict:'abandoned',input:have('把节点生命周期事件补进 telemetry。允许改文件。'),output:asset('gone')}],
+     write:{outcome:null,branch:null,base:null,files:null,worktree:{state:'not_started',path:null}},
+     scene:noScene()},
+
+    {seq:6,id:'cross-check',engine:'kimi',mode:'read',model:'kimi-k2.5',effort:'medium',status:'abandoned',
+     t:{q:[196,498],r:[null,null]},
+     abandonedAt:{stage:'queued'},
+     attempts:[{n:1,verdict:'abandoned',input:have('对照两份审查结论，找出互相矛盾的地方。'),output:asset('na',{why:'一个字都还没发给 AI'})}],
+     scene:{session:asset('na',{why:'没有联系过 AI'}),answer:asset('na',{why:'没有联系过 AI'}),snapshot:asset('na',{why:'没有联系过 AI'})}},
+
+    {seq:7,id:'summarize',engine:'codex',mode:'read',model:'gpt-5-codex',effort:'low',status:'abandoned',
+     t:{q:[null,null],r:[null,null]},
+     abandonedAt:{stage:'discovered'},
+     attempts:[{n:1,verdict:'abandoned',input:asset('na',{why:'还在做本地准备，输入还没拼出来'}),output:asset('na',{why:'还没派出去'})}],
+     scene:{session:asset('na',{why:'没有联系过 AI'}),answer:asset('na',{why:'没有联系过 AI'}),snapshot:asset('na',{why:'没有联系过 AI'})}},
+  ],
+});
+
+/* ---- 场景 4 · 规模压力:50 环节 / 4 名额 / 46 同时排队 ---- */
+(function(){
+  const KIND = ['audit','probe','scan','trace','lint','spec','bench','risk','dep','api'];
+  const ENG = ['codex','omp','claude','cursor','kimi'];
+  const MODEL = {codex:'gpt-5-codex',omp:'deepseek-v3.2',claude:'claude-opus-5',cursor:'composer-2',kimi:'kimi-k2.5'};
+  const nodes = [], edges = [];
+  for (let i=1;i<=50;i++){
+    const eng = ENG[i%5], running = i<=4;
+    nodes.push({
+      seq:i, id:KIND[i%10]+'-'+String(i).padStart(2,'0'), engine:eng, mode:(i%7===0)?'write':'read',
+      model:MODEL[eng], effort:'medium', status: running?'running':'queued',
+      t: running ? {q:[0,3+i],r:[3+i,null]} : {q:[3+i,null],r:[null,null]},
+      phase: running?'streaming':undefined,
+      live: running?{words:400+i*137, tail:'…正在读第 '+(i*7)+' 个文件，逐条记录职责与调用方', event:'engine.chunk · '+(i*3)+' 秒前'}:undefined,
+      attempts:[{n:1,verdict:running?'running':'queued',
+        input:have('扇出批次 '+i+'：审查 src/ 的第 '+i+' 个切片，只读，不改任何文件。'), output:asset('pending')}],
+      scene:{session:asset('pending'),answer:asset('pending'),snapshot:asset('pending')},
+    });
+  }
+  for (let i=2;i<=50;i++) edges.push({a:1,b:i,kind:'declared'});
+  SCENES.push({
+    key:'scale', label:'规模压力 · 50 / 46 排队',
+    run:{id:'gr-20260727-1735-e77b', dir:'D:\\cc\\agent-bridge', state:'running', elapsed:212, slots:4, now:212},
+    conn:{s:'live', text:'实时'}, select:1, edges, nodes,
+  });
+})();
+
+/* ---- 场景 5 · 空态 ---- */
+SCENES.push({
+  key:'empty', label:'空态',
+  run:{id:null, dir:null, state:'waiting', elapsed:0, slots:4, now:0},
+  conn:{s:'live', text:'实时 · 已连上'}, select:null, edges:[], nodes:[],
+});
+
+/* ---- 场景 6 · 加载 / 回放:刚连上,正在从记录文件完整回放 ---- */
+SCENES.push({
+  key:'replaying', label:'加载 · 回放中',
+  run:{id:'gr-20260727-1418-4f2a', dir:'D:\\cc\\agent-bridge', state:'replaying', elapsed:null, slots:4, now:0, replayDone:118, replayTotal:412},
+  conn:{s:'replay', text:'已连上 · 正在回放'}, select:null, edges:[], nodes:[],
+});
+
+/* ---- 场景 7 · 断线 / 正在重连 ---- */
+SCENES.push({
+  key:'offline', label:'断线',
+  run:{id:'gr-20260727-1418-4f2a', dir:'D:\\cc\\agent-bridge', state:'running', elapsed:260, slots:4, now:260, stale:true},
+  conn:{s:'reconnect', text:'连接已断开 · 正在重连'},
+  select:null,
+  edges:[{a:1,b:2,kind:'declared'},{a:1,b:3,kind:'declared'}],
+  nodes:[
+    {seq:1,id:'survey-repo',engine:'codex',mode:'read',model:'gpt-5-codex',effort:'medium',status:'ok',
+     t:{q:[0,12],r:[12,204]},words:4820,ctx:38,
+     attempts:[{n:1,verdict:'accepted',input:have('通读 src/ 目录并分块。'),output:have(MD_SURVEY)}],
+     scene:{session:asset('na',{why:'正常收场'}),answer:asset('have'),snapshot:asset('na',{why:'正常收场'})}},
+    {seq:2,id:'audit-auth',engine:'claude',mode:'read',model:'claude-opus-5',effort:'high',status:'running',
+     t:{q:[204,212],r:[212,null]},phase:'streaming',
+     live:{words:1240,tail:TAIL_TEXT,event:'engine.chunk · 第 214 段 · 断开前最后一条'},
+     attempts:[{n:1,verdict:'running',input:have('审查 src/auth/ 的会话续期路径。'),output:asset('pending')}],
+     scene:{session:asset('pending'),answer:asset('pending'),snapshot:asset('pending')}},
+    {seq:3,id:'audit-data-flow',engine:'omp',mode:'read',model:'deepseek-v3.2',effort:'medium',status:'running',
+     t:{q:[204,210],r:[210,null]},phase:'streaming',
+     live:{words:2010,tail:'…环形缓冲的容量是 4096，超出时最老的事件被覆盖',event:'engine.chunk · 第 331 段 · 断开前最后一条'},
+     attempts:[{n:1,verdict:'running',input:have('追踪 src/transport/ 的事件流。'),output:asset('pending')}],
+     scene:{session:asset('pending'),answer:asset('pending'),snapshot:asset('pending')}},
+  ],
+});
+
+/* ---- 场景 7 · 已结束,但观测记录从某处起损坏 ---- */
+SCENES.push({
+  key:'logbroken1', label:'记录损坏 · 已结束',
+  run:{id:'gr-20260727-1120-71fe', dir:'D:\\cc\\agent-bridge', state:'log_broken_ended', elapsed:1866, slots:4, now:1866, brokenAt:4128,
+       brokenWhy:'写观测记录时磁盘写满（ENOSPC）。运行本身照常收了场，只是从第 4128 条起没人记下来。'},
+  conn:{s:'live', text:'实时'}, select:3,
+  edges:[{a:1,b:2,kind:'declared'},{a:1,b:3,kind:'declared'},{a:1,b:4,kind:'declared'},{a:2,b:5,kind:'declared'}],
+  nodes:[
+    {seq:1,id:'survey-repo',engine:'codex',mode:'read',model:'gpt-5-codex',effort:'medium',status:'ok',
+     t:{q:[0,9],r:[9,196]},words:4820,ctx:38,
+     attempts:[{n:1,verdict:'accepted',input:have('通读 src/ 目录并分块。'),output:have(MD_SURVEY)}],
+     scene:{session:asset('na',{why:'正常收场'}),answer:asset('have'),snapshot:asset('na',{why:'正常收场'})}},
+    {seq:2,id:'audit-auth',engine:'claude',mode:'read',model:'claude-opus-5',effort:'high',status:'ok',
+     t:{q:[196,204],r:[204,712]},words:6180,ctx:52,
+     attempts:[{n:1,verdict:'accepted',input:have('审查 src/auth/ 的会话续期路径。'),output:have(MD_AUDIT_A2)}],
+     scene:{session:asset('na',{why:'正常收场'}),answer:asset('have'),snapshot:asset('na',{why:'正常收场'})}},
+    {seq:3,id:'patch-session-guard',engine:'cursor',mode:'write',model:'composer-2',effort:'high',status:'unlogged',
+     t:{q:[712,726],r:[726,null]},unloggedFrom:4128,
+     attempts:[{n:1,verdict:'unlogged',input:have('修复会话续期竞态。允许改文件。'),output:asset('unlogged')}],
+     write:{outcome:'unlogged',branch:null,base:null,files:null,worktree:{state:'unlogged',path:null}},
+     scene:{session:asset('unlogged'),answer:asset('unlogged'),snapshot:asset('unlogged')}},
+    {seq:4,id:'patch-retry-logic',engine:'omp',mode:'write',model:'deepseek-v3.2',effort:'high',status:'unlogged',
+     t:{q:[712,730],r:[730,null]},unloggedFrom:4128,
+     attempts:[{n:1,verdict:'unlogged',input:have('修复重试退避问题。允许改文件。'),output:asset('unlogged')}],
+     write:{outcome:'unlogged',branch:null,base:null,files:null,worktree:{state:'unlogged',path:null}},
+     scene:{session:asset('unlogged'),answer:asset('unlogged'),snapshot:asset('unlogged')}},
+    {seq:5,id:'report',engine:'codex',mode:'read',model:'gpt-5-codex',effort:'medium',status:'unlogged',
+     t:{q:[712,740],r:[740,null]},unloggedFrom:4128,
+     attempts:[{n:1,verdict:'unlogged',input:asset('unlogged'),output:asset('unlogged')}],
+     scene:{session:asset('unlogged'),answer:asset('unlogged'),snapshot:asset('unlogged')}},
+  ],
+});
+
+/* ---- 场景 8 · 记录损坏,且不知道后来怎么样了 ---- */
+SCENES.push({
+  key:'logbroken2', label:'记录损坏 · 后续未知',
+  run:{id:'gr-20260727-1348-05ac', dir:'D:\\cc\\agent-bridge', state:'log_broken_unknown', elapsed:null, slots:4, now:980, brokenAt:3160,
+       brokenWhy:'写观测记录时 IO 错误。记录断在第 3160 条，之后运行有没有收场、怎么收的场，我们都没有看到。'},
+  conn:{s:'live', text:'实时'}, select:2,
+  edges:[{a:1,b:2,kind:'declared'},{a:1,b:3,kind:'declared'}],
+  nodes:[
+    {seq:1,id:'survey-repo',engine:'codex',mode:'read',model:'gpt-5-codex',effort:'medium',status:'ok',
+     t:{q:[0,9],r:[9,196]},words:4820,ctx:38,
+     attempts:[{n:1,verdict:'accepted',input:have('通读 src/ 目录并分块。'),output:have(MD_SURVEY)}],
+     scene:{session:asset('na',{why:'正常收场'}),answer:asset('have'),snapshot:asset('na',{why:'正常收场'})}},
+    {seq:2,id:'audit-auth',engine:'claude',mode:'read',model:'claude-opus-5',effort:'high',status:'unlogged',
+     t:{q:[196,204],r:[204,null]},unloggedFrom:3160,
+     attempts:[{n:1,verdict:'unlogged',input:have('审查 src/auth/ 的会话续期路径。'),output:asset('unlogged')}],
+     scene:{session:asset('unlogged'),answer:asset('unlogged'),snapshot:asset('unlogged')}},
+    {seq:3,id:'patch-session-guard',engine:'cursor',mode:'write',model:'composer-2',effort:'high',status:'unlogged',
+     t:{q:[196,210],r:[210,null]},unloggedFrom:3160,
+     attempts:[{n:1,verdict:'unlogged',input:have('修复会话续期竞态。允许改文件。'),output:asset('unlogged')}],
+     write:{outcome:'unlogged',branch:null,base:null,files:null,worktree:{state:'unlogged',path:null}},
+     scene:{session:asset('unlogged'),answer:asset('unlogged'),snapshot:asset('unlogged')}},
+  ],
+});
+
+/* ---- 场景 9 · 零依赖信息(自动落时间轴) ---- */
+SCENES.push({
+  key:'nodeps', label:'零依赖信息',
+  run:{id:'gr-20260727-1802-9ad4', dir:'D:\\cc\\agent-bridge', state:'ended', elapsed:1320, slots:2, now:1320},
+  conn:{s:'live', text:'实时 · 运行已结束'}, select:null, edges:[],
+  nodes:[
+    {seq:1,id:'review-a',engine:'codex',mode:'read',model:'gpt-5-codex',effort:'medium',status:'ok',
+     t:{q:[0,8],r:[8,520]},words:3900,ctx:36,
+     attempts:[{n:1,verdict:'accepted',input:have('用 codex 评审这份方案。'),output:have('## 评审 A\n\n方案可行，两处需要收紧边界条件。')}],
+     scene:{session:asset('na',{why:'正常收场'}),answer:asset('have'),snapshot:asset('na',{why:'正常收场'})}},
+    {seq:2,id:'review-b',engine:'claude',mode:'read',model:'claude-opus-5',effort:'high',status:'ok',
+     t:{q:[0,11],r:[11,610]},words:4400,ctx:42,
+     attempts:[{n:1,verdict:'accepted',input:have('用 claude 评审这份方案。'),output:have('## 评审 B\n\n同意可行性，但反对其中的重试策略。')}],
+     scene:{session:asset('na',{why:'正常收场'}),answer:asset('have'),snapshot:asset('na',{why:'正常收场'})}},
+    {seq:3,id:'review-c',engine:'kimi',mode:'read',model:'kimi-k2.5',effort:'medium',status:'ok',
+     t:{q:[8,520],r:[520,1090]},words:3120,ctx:null,
+     attempts:[{n:1,verdict:'accepted',input:have('用 kimi 评审这份方案。'),output:have('## 评审 C\n\n主要风险在可观测性，不在正确性。')}],
+     scene:{session:asset('na',{why:'正常收场'}),answer:asset('have'),snapshot:asset('na',{why:'正常收场'})}},
+    {seq:4,id:'review-d',engine:'omp',mode:'read',model:'deepseek-v3.2',effort:'medium',status:'ok',
+     t:{q:[11,610],r:[610,1320]},words:2860,ctx:33,
+     attempts:[{n:1,verdict:'accepted',input:have('用 deepseek 评审这份方案。'),output:have('## 评审 D\n\n补充一处并发下的边界情况。')}],
+     scene:{session:asset('na',{why:'正常收场'}),answer:asset('have'),snapshot:asset('na',{why:'正常收场'})}},
+  ],
+});
+
+/* ---- 场景 10 · 长跑:44 环节跨时段铺开
+   用途是验证滚动本身:纵向 44 行必然溢出容器,横向在 1× 恰好铺满、放大后可左右拖。
+   起止时间不是编的 —— 用固定种子的伪随机时长 + 真实的 4 名额调度算出来,
+   所以每次打开完全一样,且排队段与执行段的错落是调度的真实结果。 ---- */
+(function(){
+  const ENG = ['codex','omp','claude','cursor','kimi'];
+  const MODEL = {codex:'gpt-5-codex',omp:'deepseek-v3.2',claude:'claude-opus-5',cursor:'composer-2',kimi:'kimi-k2.5'};
+  const KIND = ['auth','transport','graph','engines','archive','cli','config','telemetry','retry','schema','worktree','sse'];
+  let seed = 20260727;
+  const rnd = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+
+  const N = 44, SLOTS = 4, ROOT_END = 420;
+  const nodes = [], edges = [], free = new Array(SLOTS).fill(ROOT_END);
+
+  nodes.push({seq:1,id:'survey-repo',engine:'codex',mode:'read',model:MODEL.codex,effort:'medium',status:'ok',
+    t:{q:[0,6],r:[6,ROOT_END]},words:4820,ctx:38,
+    attempts:[{n:1,verdict:'accepted',input:have('通读 src/，切成 43 个审查切片逐个派下去。同时能跑的上限是 4 个。'),output:have(MD_SURVEY)}],
+    scene:{session:asset('na',{why:'正常收场'}),answer:asset('have'),snapshot:asset('na',{why:'正常收场'})}});
+
+  for (let i = 2; i <= N; i++){
+    const eng = ENG[i%5], kind = KIND[i%12];
+    const reused = (i === 11), write = (i % 7 === 0);
+    const dur = reused ? 0.4 : 90 + Math.floor(rnd() * 1100);
+    let k = 0; for (let j = 1; j < SLOTS; j++) if (free[j] < free[k]) k = j;
+    const start = free[k]; free[k] = start + dur;
+
+    let status = 'ok';
+    if (i === 23) status = 'backend_failed';
+    else if (i === 31) status = 'unknown';
+    else if (i % 13 === 0) status = 'contract_error';
+    else if (i % 17 === 0) status = 'timeout';
+    const ok = status === 'ok';
+
+    const n = {
+      seq:i, id:kind+'-'+String(i).padStart(2,'0'), engine:eng, mode: write?'write':'read',
+      model:MODEL[eng], effort: i%3===0 ? 'high' : 'medium', status,
+      t:{q:[ROOT_END, start], r:[start, start+dur]},
+      words: 900 + Math.floor(rnd()*7000),
+      ctx: (eng==='cursor'||eng==='kimi') ? null : (22 + i%60),
+      attempts:[{n:1, verdict: ok ? 'accepted' : (status==='contract_error' ? 'rejected' : status),
+        input: have('审查切片 '+i+'：`src/'+kind+'/`。'+(write?'允许改文件，改完给一份工作报告。':'只读，不改任何文件。')+'发现要带文件与行号。'),
+        output: have('## '+kind+' · 切片 '+i+'\n\n检查了 `src/'+kind+'/` 下 '+(9+i%17)+' 个文件。\n\n### 结论\n'+
+          (write ? '已按上游结论落下修改，并补了一个回归用例。' : '未发现阻断性问题，'+(1+i%4)+' 处建议收紧边界条件。')+
+          '\n\n### 置信度\n'+['高','中','低'][i%3])}],
+      scene:{session: asset(ok?'na':'have', ok?{why:'正常收场'}:undefined),
+             answer:  asset('have'),
+             snapshot:asset(ok?'na':'have', ok?{why:'正常收场'}:undefined)},
+    };
+    if (reused){ n.reused = true; n.origRun = 2547; n.reuseFrom = 'gr-20260726-1130-2a77'; }
+    if (write){
+      n.write = {outcome:'delivered', branch:'agent/'+kind+'-'+String(i).padStart(2,'0')+'-9f1d', base:'a91c04e',
+        files:[['M','src/'+kind+'/index.ts'],['M','src/'+kind+'/const.ts'],['A','src/'+kind+'/__tests__/'+kind+'.test.ts']],
+        worktree:{state:'cleaned', path:'D:\\cc\\agent-bridge\\.worktrees\\'+kind+'-'+i+'-9f1d'}, diff:asset('have')};
+    }
+    if (!ok){
+      n.error = {title: STATUS[status].short, desc:'切片 '+i+' 没有正常收束，诊断见下。',
+        diagnostics:['slice = '+i, 'engine = '+eng, 'slot = '+(k+1)]};
+    }
+    nodes.push(n);
+    edges.push(i <= 9 ? {a:1, b:i, kind:'declared'} : {a:i-8, b:i, kind:'declared'});
+  }
+
+  const now = Math.max.apply(null, free);
+  SCENES.push({
+    key:'longrun', label:'长跑 · 44 环节',
+    run:{id:'gr-20260726-2140-9f1d', dir:'D:\\cc\\agent-bridge', state:'ended', elapsed:now, slots:SLOTS, now},
+    conn:{s:'live', text:'实时 · 运行已结束'}, select:null, edges, nodes,
+    /* 两小时压进一屏没法读,这一张默认就放大到 4× —— 打开即超出画面,可以直接左右拖 */
+    tlz:4,
+  });
+})();
+
+/* ============================================================
+   3. 工具
+   ============================================================ */
+const $ = s => document.querySelector(s);
+const esc = s => String(s==null?'':s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const ICO = {
+  warn:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 4.5 2.6 20h18.8L12 4.5Z"/><path d="M12 10v4"/><path d="M12 17.2v.2"/></svg>',
+  cut:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M4 12h4"/><path d="M16 12h4"/><path d="M10.5 12h.1M13.4 12h.1"/></svg>',
+  plug:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 3v6"/><path d="M8 9h8v3a4 4 0 0 1-8 0V9Z"/><path d="M12 16v5"/></svg>',
+  info:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 11v5"/><path d="M12 8v.2"/></svg>',
+  copy:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>',
+  caret:'<svg class="caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M9 5l7 7-7 7"/></svg>',
+  wait:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></svg>',
+  ban:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="12" cy="12" r="8.5"/><path d="M6.2 6.2l11.6 11.6"/></svg>',
+};
+
+function fmtDur(sec){
+  if (sec==null || !isFinite(sec)) return '—';
+  if (sec < 1) return Math.round(sec*1000)+'ms';
+  const s = Math.round(sec), h = Math.floor(s/3600), m = Math.floor(s%3600/60), r = s%60;
+  if (h) return h+'h'+String(m).padStart(2,'0')+'m';
+  if (m) return m+'m'+String(r).padStart(2,'0')+'s';
+  return r+'s';
+}
+const fmtN = n => n==null ? '—' : String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+const engColor = e => 'var('+(ENGINES[e]?ENGINES[e].v:'--faint')+')';
+const engBadge = (e,sm) => '<span class="badge'+(sm?' sm':'')+'" style="--ec:'+engColor(e)+'" title="引擎 '+esc(e)+'">'+esc(ENGINES[e]?ENGINES[e].short:'??')+'</span><span class="sr-only">引擎 '+esc(e)+'</span>';
+
+/* ---- 极简 Markdown 渲染:只渲染,绝不改写原文 ---- */
+function inlineMd(s){
+  return esc(s)
+    .replace(/`([^`]+)`/g, (m,c)=>'<code>'+c+'</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+}
+function mdBlocks(src){
+  const lines = String(src).split('\n');
+  let out = '', list = null;
+  const closeList = () => { if (list){ out += '</'+list+'>'; list = null; } };
+  for (const raw of lines){
+    const line = raw.replace(/\s+$/,'');
+    let m;
+    if (!line.trim()){ closeList(); continue; }
+    if ((m = line.match(/^(#{1,3})\s+(.*)$/))){ closeList(); out += '<h'+m[1].length+'>'+inlineMd(m[2])+'</h'+m[1].length+'>'; continue; }
+    if (/^---+$/.test(line.trim())){ closeList(); out += '<hr/>'; continue; }
+    if ((m = line.match(/^>\s?(.*)$/))){ closeList(); out += '<blockquote>'+inlineMd(m[1])+'</blockquote>'; continue; }
+    if ((m = line.match(/^\s*[-*]\s+(.*)$/))){ if (list!=='ul'){ closeList(); out += '<ul>'; list='ul'; } out += '<li>'+inlineMd(m[1])+'</li>'; continue; }
+    if ((m = line.match(/^\s*\d+\.\s+(.*)$/))){ if (list!=='ol'){ closeList(); out += '<ol>'; list='ol'; } out += '<li>'+inlineMd(m[1])+'</li>'; continue; }
+    closeList(); out += '<p>'+inlineMd(line)+'</p>';
+  }
+  closeList();
+  return out;
+}
+function md(src){
+  const parts = String(src==null?'':src).split('```');
+  let out = '';
+  parts.forEach((chunk,i)=>{
+    if (i % 2 === 1){
+      const body = chunk.replace(/^[a-zA-Z0-9]*\n/,'').replace(/\n$/,'');
+      const n = body.split('\n').length;
+      out += '<details class="codefold"'+(n<=10?' open':'')+'><summary>'+ICO.caret+'展开代码块（约 '+n+' 行）</summary><pre>'+esc(body)+'</pre></details>';
+    } else out += mdBlocks(chunk);
+  });
+  return out;
+}
+
+/* ---- 复制(零依赖,带降级) ---- */
+function copyText(text, btn){
+  const done = ok => { if (!btn) return;
+    const old = btn.getAttribute('data-label') || btn.textContent;
+    btn.classList.toggle('done', ok); btn.innerHTML = ICO.copy + (ok ? '已复制' : '复制失败');
+    setTimeout(()=>{ btn.classList.remove('done'); btn.innerHTML = ICO.copy + old; }, 1400);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(text).then(()=>done(true), ()=>done(false)); return;
+  }
+  const ta = document.createElement('textarea');
+  ta.value = text; ta.style.cssText = 'position:fixed;opacity:0;top:0;left:0';
+  document.body.appendChild(ta); ta.select();
+  let ok = false; try { ok = document.execCommand('copy'); } catch(e){ ok = false; }
+  document.body.removeChild(ta); done(ok);
+}
+const COPYBUF = [];
+function copyBtn(label, text){
+  const i = COPYBUF.push(text) - 1;
+  return '<button type="button" class="copy" data-copy="'+i+'" data-label="'+esc(label)+'">'+ICO.copy+esc(label)+'</button>';
+}
+
+/* ---- §6.6 六态资产渲染器(全页通用) ---- */
+function assetRow(name, a, openLabel){
+  const b = [];
+  if (!a) a = {s:'unlogged'};
+  switch (a.s){
+    case 'have':
+      b.push('<span class="a-open">'+esc(openLabel||('打开'+name))+'</span>');
+      if (a.empty) b.push('<div class="a-why">这份 diff 是空文件——这次提交没有净改动。</div>');
+      break;
+    case 'na':
+      b.push('<span class="a-flag" data-s="na">不适用</span>');
+      b.push('<div class="a-why">'+esc(a.why||'本来就不该有这一项。')+'</div>');
+      break;
+    case 'unavailable': {
+      const known = UNAVAIL[a.code];
+      b.push('<span class="a-flag" data-s="unavailable">拿不到</span>');
+      b.push('<div class="a-why">这一项现在打不开：'+
+        (a.why ? esc(a.why) : known ? esc(known) : '原因码不在已知清单里，无法进一步解释——请拿这个原因码去查。')+
+        ' <code>'+esc(a.code||'UNSPECIFIED')+'</code>'+
+        (a.digest ? ' · 指纹 <code>'+esc(a.digest)+'</code>' : '')+'</div>');
+      break;
+    }
+    case 'pending':
+      b.push('<span class="a-flag" data-s="pending">等待中</span>');
+      b.push('<div class="a-why">环节还在跑，这一项还没产生。</div>');
+      break;
+    case 'gone':
+      b.push('<span class="a-flag" data-s="gone">记录时它在，现在取不到了</span>');
+      b.push('<div class="a-why">记录的时候确实有这个文件，现在按记下来的位置取不回来——可能被后来的清理删掉了。这与「本来就没有」是两件事。</div>');
+      break;
+    default:
+      b.push('<span class="a-flag" data-s="unlogged">状态未知</span>');
+      b.push('<div class="a-why">记录从某处起不完整，这一项的状态未知——既不能说它不适用，也不能说它没记下来。</div>');
+  }
+  return '<div class="asset"><span class="a-n">'+esc(name)+'</span><span class="a-b">'+b.join('')+'</span></div>';
+}
+
+/* ---- §6.4 有界摘要:头 + 尾 + 省略量 + 总量 + 指纹,结尾必须显示 ---- */
+function bounded(b, label){
+  if (!b) return '';
+  return '<div class="bounded">'+
+    (label?'<div class="bd-lab">'+esc(label)+'</div>':'')+
+    '<pre>'+esc(b.head)+'</pre>'+
+    '<div class="bd-gap">'+ICO.warn.replace('<svg','<svg style="width:12px;height:12px;flex:0 0 auto"')+'中间省略了 '+fmtN(b.omitted)+' 字节</div>'+
+    '<pre>'+esc(b.tail)+'</pre>'+
+    '<div class="bd-foot"><span>总计 '+fmtN(b.total)+' 字节</span><span>指纹 '+esc(b.digest)+'</span></div>'+
+  '</div>';
+}
+
+/* ============================================================
+   4. 顶栏 / 横幅
+   ============================================================ */
+const RUNSTATE = {
+  waiting:          {r:'waiting',           t:'等待运行开始'},
+  replaying:        {r:'replaying',         t:'正在回放历史记录'},
+  running:          {r:'running',           t:'运行中'},
+  ended:            {r:'ended',             t:'已结束'},
+  ended_failed:     {r:'ended_failed',      t:'已结束（失败）'},
+  no_finish:        {r:'no_finish',         t:'未观测到正常收尾'},
+  log_broken_ended: {r:'log_broken_ended',  t:'已结束，但观测记录从某处起损坏'},
+  log_broken_unknown:{r:'log_broken_unknown',t:'观测记录损坏，且不知道后来怎么样了'},
+};
+
+function countsOf(nodes){
+  const c = {total:nodes.length, running:0, queued:0, ok:0, fail:0, rejected:0, unknown:0, abandoned:0, unlogged:0};
+  for (const n of nodes){
+    if (n.status==='running') c.running++;
+    else if (n.status==='queued'||n.status==='discovered') c.queued++;
+    else if (n.status==='ok') c.ok++;
+    else if (n.status==='rejected') c.rejected++;
+    else if (n.status==='unknown') c.unknown++;
+    else if (n.status==='abandoned') c.abandoned++;
+    else if (n.status==='unlogged') c.unlogged++;
+    else c.fail++;
+  }
+  return c;
+}
+
+function renderTop(sc){
+  const rs = RUNSTATE[sc.run.state] || RUNSTATE.waiting;
+  $('#runId').textContent = sc.run.id ? sc.run.id + ' · ' + sc.run.dir : '尚未收到任何运行';
+  $('#runPill').setAttribute('data-r', rs.r);
+  $('#runPillText').textContent = rs.t + (sc.run.state==='running' && sc.run.elapsed!=null ? ' · 已跑 '+fmtDur(sc.run.elapsed) : '')
+    + (sc.run.state==='ended' && sc.run.elapsed!=null ? ' · 用时 '+fmtDur(sc.run.elapsed) : '');
+
+  const c = countsOf(sc.nodes), box = $('#counts');
+  if (sc.run.state === 'replaying'){
+    /* 回放没读完就给一个看起来完整的汇总,和「记录损坏」那一档犯的是同一个错 */
+    box.innerHTML = '<span class="counts-note" style="border-style:solid;border-color:color-mix(in oklab,var(--accent) 38%,var(--line));'+
+      'background:color-mix(in oklab,var(--accent) 7%,var(--surface));color:var(--accent)">回放中 · 已读 '+
+      fmtN(sc.run.replayDone)+' / '+fmtN(sc.run.replayTotal)+' 条，计数尚未就绪</span>';
+    return;
+  }
+  if (sc.run.state === 'log_broken_unknown'){
+    box.innerHTML = '<span class="counts-note">汇总计数不可用 —— 记录断在第 '+fmtN(sc.run.brokenAt)+' 条，无法给出可信的总数</span>';
+    return;
+  }
+  const rows = [
+    ['total','环节',c.total],['running','运行中',c.running],['queued','排队/准备',c.queued],
+    ['ok','完成',c.ok],['fail','失败',c.fail],['rejected','被拒绝',c.rejected],
+    ['unknown','说不清',c.unknown],['abandoned','未见结局',c.abandoned],['unlogged','状态未记录',c.unlogged],
+  ].filter(r => r[0]==='total' || r[2] > 0);
+  box.innerHTML = (sc.run.state==='log_broken_ended'
+      ? '<span class="counts-note">以下为截至第 '+fmtN(sc.run.brokenAt)+' 条记录的部分计数</span>' : '')
+    + rows.map(r => '<span class="count" data-k="'+r[0]+'">'+esc(r[1])+' <b>'+r[2]+'</b></span>').join('');
+}
+
+function banner(v, ic, title, desc){
+  return '<div class="banner" data-v="'+v+'"><span class="b-ic">'+ic+'</span><div><div class="b-t">'+title+'</div><div class="b-d">'+desc+'</div></div></div>';
+}
+function renderBanners(sc){
+  const out = [];
+  if (sc.run.state === 'replaying'){
+    out.push(banner('info', ICO.wait, '正在回放历史记录 · 已读 '+fmtN(sc.run.replayDone)+' / '+fmtN(sc.run.replayTotal)+' 条',
+      '刚连上，正在从记录文件<b>完整回放</b>这次运行到此刻为止的全部事件 —— <b>不会丢事件</b>，你也不需要做任何事。'+
+      '读完之前下面是占位骨架，环节卡与汇总计数会在读完后一次就位。'));
+  }
+  if (sc.conn.s === 'reconnect'){
+    out.push(banner('conn', ICO.plug, '连接已断开 · 正在重连',
+      '页面已经停止接收新事件，下面看到的是断开前的最后一帧，<b>不是当前状态</b>。'+
+      '两种可能：服务已经停了；或者这个页面消费得太慢、积压超过上限，服务端主动把它断开让它重连。'+
+      '<b>后者不是故障</b> —— 重连后会从记录文件完整回放，不会丢事件。'));
+  }
+  if (sc.run.replayIncomplete){
+    out.push(banner('unlog', ICO.warn, '历史回放不完整 —— 出问题的是我们读历史这一侧',
+      '重连后回放记录文件时读到了坏行，第 '+fmtN(sc.run.replayFrom)+' 条之后没能读回来。'+
+      '<b>这不是「未观测到正常收尾」</b>：任务很可能好好地在跑，只是这个页面没把历史读全。没回放到的部分<b>不等于本来就没有</b>。'));
+  }
+  if (sc.run.state === 'no_finish'){
+    out.push(banner('lost', ICO.cut, '未观测到正常收尾',
+      '我们没有看到这次运行正常收尾。<b>最常见的成因是进程被强行终止</b>（Ctrl-C / 被杀），来不及写下"我结束了"；'+
+      '但报信的两条通道同时坏掉时，它其实也可能有序地收了场。<b>成因只是推测，定义只有一句：我们没看到它收尾。</b><br>'+
+      '还停在「已发现 / 排队中 / 运行中」的环节已统一标成 <code>abandoned</code> —— 意思是<b>没看到它的结局</b>，'+
+      '不是"结果永远拿不到了"：工作副本、分支、锁文件往往都还在。'));
+  }
+  if (sc.run.state === 'log_broken_ended'){
+    out.push(banner('unlog', ICO.warn, '已结束，但观测记录从第 '+fmtN(sc.run.brokenAt)+' 条起损坏',
+      esc(sc.run.brokenWhy)+'<br><b>此后记录不完整。</b>下面标成「状态未记录」的环节<b>很可能好好地跑完了，只是没人记下来</b> —— '+
+      '它们<b>不是</b> <code>abandoned</code>，别逐个去排查。'));
+  }
+  if (sc.run.state === 'log_broken_unknown'){
+    out.push(banner('unlog', ICO.warn, '观测记录从第 '+fmtN(sc.run.brokenAt)+' 条起损坏，且不知道后来怎么样了',
+      esc(sc.run.brokenWhy)+'<br>与「未观测到正常收尾」<b>不是一回事</b>：那一档说的是任务，这一档说的是记录。'+
+      '汇总计数已标为不可用 —— 记录都断了，给一个看起来完整的汇总是错的。'));
+  }
+  if (sc.nodes.length && !sc.edges.length){
+    out.push(banner('info', ICO.info, '这次运行没有任何依赖信息',
+      '用户没有声明依赖，系统也没有推断出任何一条。图视图会退化成一堆孤立方块，因此<b>自动落到时间轴</b>。'+
+      '时间轴上的先后<b>不代表因果</b> —— 名额只有 '+sc.run.slots+' 个，B 排在 A 之后很可能只是在等名额。'));
+  }
+  $('#banners').innerHTML = out.join('');
+}
+
+/* ============================================================
+   5. B 主视图 · 图视图
+   50 节点的应对:分层布局 + 排队区折叠成一行摘要 + 缩放/适应画布
+   ============================================================ */
+const COLW = 216, GAPX = 78, GAPY = 14, PAD = 22;
+/* 预留高度必须与实际渲染出来的行数一致 —— 对不上就会把文字挤出卡片外框。
+   两个 phase 都会渲染尾巴行,所以都要按带尾巴的高度预留。 */
+const hasTail = n => n.status==='running' && (n.phase==='streaming' || n.phase==='preparing_worktree');
+const nodeH = n => hasTail(n) ? 112 : 72;
+
+function statusChip(n){
+  const st = STATUS[n.status] || {short:n.status};
+  const dot = n.status==='running' ? '<span class="dt"></span>' : '';
+  return '<span class="nb-st st-'+n.status+'">'+dot+esc(st.short)+'</span>';
+}
+
+function nodeHTML(n, selected){
+  const st = STATUS[n.status] || {};
+  let t = '';
+  if (n.status==='queued') t = '排队 '+fmtDur(cur(n.t.q[0], SC.run.now) );
+  else if (n.status==='discovered') t = '准备中';
+  else if (n.status==='running') t = '已跑 '+fmtDur(SC.run.now - n.t.r[0]);
+  else if (n.status==='unlogged') t = '无结束记录';
+  else if (n.reused) t = '复用 '+fmtDur(n.t.r[1]-n.t.r[0]);
+  else if (n.t.r[0]!=null && n.t.r[1]!=null) t = fmtDur(n.t.r[1]-n.t.r[0]);
+  return '<button type="button" class="nodebox" data-seq="'+n.seq+'" data-st="'+n.status+'" aria-pressed="'+(selected?'true':'false')+'"'+
+    ' style="left:'+n._x+'px;top:'+n._y+'px;min-height:'+nodeH(n)+'px">'+
+    '<span class="nb-top">'+engBadge(n.engine,false)+
+      '<span class="nb-id" title="'+esc(n.id)+'">'+esc(n.id)+'</span>'+
+      '<span class="nb-seq">#'+n.seq+'</span>'+
+      (n.mode==='write' ? '<span class="chip w" title="write 模式 · 有独立工作副本">W</span>' : '')+
+    '</span>'+
+    '<span class="nb-bot">'+statusChip(n)+
+      (n.reused ? '<span class="chip reuse" title="没真跑，直接用了上次的结果">↺ 复用</span>' : '')+
+      '<span class="nb-t">'+esc(t)+'</span>'+
+    '</span>'+
+    (n.status==='running' && n.phase==='streaming'
+      ? '<span class="nb-tail">'+esc((n.live&&n.live.tail||'').slice(-40))+'</span>' : '')+
+    (n.status==='running' && n.phase==='preparing_worktree'
+      ? '<span class="nb-tail">正在准备独立工作副本 · 还没联系 AI</span>' : '')+
+  '</button>';
+}
+const cur = (start, now) => (start==null ? null : now - start);
+
+function layout(sc){
+  const byq = {}; sc.nodes.forEach(n => byq[n.seq] = n);
+  const depth = {}; sc.nodes.forEach(n => depth[n.seq] = 0);
+  for (let pass=0; pass<sc.nodes.length; pass++){
+    let moved = false;
+    for (const e of sc.edges){
+      if (!byq[e.a] || !byq[e.b]) continue;
+      if (depth[e.b] < depth[e.a] + 1){ depth[e.b] = depth[e.a] + 1; moved = true; }
+    }
+    if (!moved) break;
+  }
+  const waiting = sc.nodes.filter(n => n.status==='queued' || n.status==='discovered');
+  const collapse = waiting.length >= 6;
+  const shown = collapse ? sc.nodes.filter(n => !(n.status==='queued'||n.status==='discovered')) : sc.nodes.slice();
+
+  const cols = {};
+  shown.forEach(n => { (cols[depth[n.seq]] = cols[depth[n.seq]] || []).push(n); });
+  const keys = Object.keys(cols).map(Number).sort((a,b)=>a-b);
+  let maxY = 0;
+  keys.forEach((d,ci) => {
+    let y = PAD;
+    cols[d].forEach(n => { n._x = PAD + ci*(COLW+GAPX); n._y = y; y += nodeH(n) + GAPY; });
+    maxY = Math.max(maxY, y);
+  });
+  const W = PAD*2 + (keys.length ? (keys.length-1)*(COLW+GAPX) + COLW : COLW);
+  return {shown, waiting, collapse, W:Math.max(W, 420), H:maxY, depth, byq};
+}
+
+/* 回放骨架:只占位、不假装有数据。aria-hidden —— 播报交给顶栏的 role="status" */
+function skeletonGraph(){
+  const col = (n, tall) => '<div class="sk-col">'+Array.from({length:n},(_,i)=>
+    '<div class="sk sk-card'+(tall && i===0 ? ' tall' : '')+'"></div>').join('')+'</div>';
+  return '<div class="sk-wrap" aria-hidden="true"><div class="sk-cols">'+col(2,false)+col(3,true)+col(1,false)+'</div></div>';
+}
+
+let QOPEN = false;
+function renderGraph(sc, sel){
+  const L = layout(sc);
+  const cv = $('#gcanvas');
+  if (sc.run.state === 'replaying'){ cv.innerHTML = skeletonGraph(); return; }
+  if (!sc.nodes.length){
+    cv.style.width = ''; cv.style.height = '';
+    cv.innerHTML = '<div class="empty"><div class="e-ic">'+ICO.wait+'</div>'+
+      '<h2>等待运行开始</h2>'+
+      '<p>已经连上观测服务，还没有收到任何环节。脚本一开跑，这里就会出现第一张卡片。</p>'+
+      '<p style="font-size:12.5px;color:var(--faint)">观测台地址以启动器输出的 localhost 地址为准；端口被占用时会自动换一个。<br>关掉最后一个页面后，服务将在 60 秒后退出。</p>'+
+      '<p class="dots">等待事件<span>·</span><span>·</span><span>·</span></p></div>';
+    return;
+  }
+  let qh = 0;
+  if (L.collapse) qh = QOPEN ? 320 : 62;
+  cv.style.width = L.W + 'px';
+  cv.style.height = (L.H + qh + PAD) + 'px';
+
+  const edges = sc.edges.filter(e => L.shown.some(n=>n.seq===e.a) && L.shown.some(n=>n.seq===e.b));
+  const paths = edges.map((e,i) => {
+    const a = L.shown.find(n=>n.seq===e.a), b = L.shown.find(n=>n.seq===e.b);
+    const x1 = a._x + COLW, y1 = a._y + nodeH(a)/2, x2 = b._x, y2 = b._y + nodeH(b)/2;
+    const dx = Math.max(34, (x2-x1)/2);
+    const d = 'M'+x1+' '+y1+' C'+(x1+dx)+' '+y1+' '+(x2-dx)+' '+y2+' '+x2+' '+y2;
+    const inf = e.kind==='inferred';
+    return '<path d="'+d+'" data-edge="'+i+'" stroke="'+(inf?'var(--faint)':'var(--ink-soft)')+'"'+
+      ' stroke-width="'+(inf?1.4:1.8)+'"'+(inf?' stroke-dasharray="5 5"':'')+
+      ' marker-end="url(#'+(inf?'mi':'md')+')" opacity="'+(inf?.8:.72)+'"></path>'+
+      (e.warn ? '<circle cx="'+((x1+x2)/2)+'" cy="'+((y1+y2)/2)+'" r="7" fill="var(--c-timeout)" data-edge="'+i+'"></circle>'+
+                '<text x="'+((x1+x2)/2)+'" y="'+((y1+y2)/2+3.6)+'" text-anchor="middle" font-size="10" font-weight="700" fill="var(--on-solid)" data-edge="'+i+'" style="pointer-events:none">!</text>' : '');
+  }).join('');
+
+  const defs = '<defs>'+
+    '<marker id="md" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">'+
+      '<path d="M0 1 L9 5 L0 9 z" fill="var(--ink-soft)"/></marker>'+
+    '<marker id="mi" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">'+
+      '<path d="M0 1.5 L8.4 5 L0 8.5" fill="none" stroke="var(--faint)" stroke-width="1.6"/></marker>'+
+  '</defs>';
+
+  let qband = '';
+  if (L.collapse){
+    const q = L.waiting;
+    qband = '<div class="qband" style="left:'+PAD+'px;top:'+(L.H+4)+'px;width:'+(L.W-PAD*2)+'px">'+
+      '<div class="qband-h">'+ICO.wait.replace('<svg','<svg style="width:15px;height:15px;color:var(--faint)"')+
+        '<span>另有 <b>'+q.length+'</b> 个排队中 —— 已进入本地队列，<b>一个字都还没发给 AI</b>。同时能跑的上限是 '+sc.run.slots+' 个。</span>'+
+        '<button type="button" class="qband-toggle" id="qtoggle">'+(QOPEN?'收起':'展开全部')+'</button></div>'+
+      (QOPEN ? '<div class="qgrid scroll">'+q.map(n =>
+        '<button type="button" class="qitem" data-seq="'+n.seq+'" aria-pressed="'+(sel===n.seq?'true':'false')+'">'+
+          engBadge(n.engine,true)+'<span class="qi-id" title="'+esc(n.id)+'">'+esc(n.id)+'</span>'+
+          '<span class="qi-t">'+(n.status==='discovered'?'准备中':'排队 '+fmtDur(cur(n.t.q[0], sc.run.now)))+'</span>'+
+        '</button>').join('')+'</div>' : '')+
+    '</div>';
+  }
+
+  cv.innerHTML = '<svg class="gedges" width="'+L.W+'" height="'+(L.H+qh+PAD)+'">'+defs+paths+'</svg>'+
+    L.shown.map(n => nodeHTML(n, sel===n.seq)).join('') + qband;
+  cv._edges = edges;
+}
+
+/* ============================================================
+   6. B 主视图 · 时间轴
+   排队等待与真正在跑必须是两段;纯时间先后绝不画成箭头
+   ============================================================ */
+/* 时间刻度缩放:1× = 整程铺满容器(不可再缩小,那是「适应」本身);
+   放大后横向可滚,用于把长运行里几十秒的环节看清楚 */
+let TLZ = 1;
+function applyTlZoom(){
+  const w = $('#tlwrap'), has = SC.nodes.length > 0 && SC.run.state !== 'replaying';
+  w.style.setProperty('--tlz', TLZ);
+  w.setAttribute('data-scrollx', (has && TLZ > 1) ? '1' : '0');
+  $('#zoomBox').style.visibility = has ? 'visible' : 'hidden';
+  $('#zoomVal').textContent = (Number.isInteger(TLZ) ? TLZ : TLZ.toFixed(1)) + '×';
+  $('#zoomOut').disabled = TLZ <= 1;
+  $('#zoomIn').disabled = TLZ >= 8;
+  $('#zoomIn').setAttribute('aria-label','放大时间刻度');
+  $('#zoomOut').setAttribute('aria-label','缩小时间刻度');
+  $('#zoomFit').setAttribute('aria-label','时间刻度复位到整程铺满');
+}
+
+function renderTimeline(sc, sel){
+  const w = $('#tlwrap'), key = $('#tlKey');
+  key.hidden = !(sc.nodes.length && sc.run.state !== 'replaying');
+  if (sc.run.state === 'replaying'){
+    w.innerHTML = '<div class="sk-tl" aria-hidden="true">'+Array.from({length:7},(_,i)=>
+      '<div class="sk-tlrow"><div class="sk" style="width:clamp(150px,20vw,236px);flex:0 0 auto"></div>'+
+      '<div style="flex:1 1 auto;display:flex;padding-right:14px"><div class="sk" style="margin-left:'+((i*11)%34)+'%;width:'+(26+((i*13)%40))+'%"></div></div></div>').join('')+'</div>';
+    return;
+  }
+  if (!sc.nodes.length){ w.innerHTML = '<div class="empty"><div class="e-ic">'+ICO.wait+'</div><h2>等待运行开始</h2><p>还没有收到任何环节。</p></div>'; return; }
+  const T = Math.max(1, sc.run.now);
+  const pc = v => Math.max(0, Math.min(100, v / T * 100));
+  /* 放大后刻度要跟着变密,否则 4 倍宽的轨道上还是只有 5 个刻度 */
+  const nTick = Math.min(25, Math.round(4 * TLZ) + 1);
+  const ticks = Array.from({length:nTick}, (_,i) => {
+    const f = i/(nTick-1);
+    return '<span class="tl-tick" style="left:'+(f*100)+'%">'+(i===0?'0s':fmtDur(T*f))+'</span>';
+  }).join('');
+
+  const rows = sc.nodes.map(n => {
+    const segs = [];
+    const q0 = n.t.q[0], q1 = n.t.q[1], r0 = n.t.r[0], r1 = n.t.r[1];
+    if (q0 != null){
+      const end = (q1==null ? sc.run.now : q1);
+      segs.push('<span class="tl-seg q" style="left:'+pc(q0)+'%;width:'+Math.max(.6,pc(end)-pc(q0))+'%" title="排队等待 '+fmtDur(end-q0)+' —— 还没派给 AI，也还没开始消耗超时预算"></span>');
+    }
+    if (r0 != null){
+      const end = (r1==null ? sc.run.now : r1);
+      const open = r1==null;
+      segs.push('<span class="tl-seg run'+(open?' open':'')+(n.reused?' dim':'')+'" style="left:'+pc(r0)+'%;width:'+Math.max(.6,pc(end)-pc(r0))+'%;--sc:'+engColor(n.engine)+'" title="'+
+        (n.reused?'复用校验（原执行耗时 '+fmtDur(n.origRun)+' 不在本次时间轴上）':'执行 '+fmtDur(end-r0))+'"></span>');
+    }
+    if (q0 == null && r0 == null) segs.push('<span class="tl-note" style="left:0">已发现 · 还没进队列</span>');
+    else if (n.status==='unlogged') segs.push('<span class="tl-note" style="left:'+pc(r0==null?q0:r0)+'%;padding-left:'+0+'px;transform:translateX(6px)">…记录从此处起不完整，没有结束时间</span>');
+    return '<button type="button" class="tl-row" data-seq="'+n.seq+'" aria-pressed="'+(sel===n.seq?'true':'false')+'">'+
+      '<span class="tl-lab">'+engBadge(n.engine,true)+
+        '<span class="tl-id" title="'+esc(n.id)+'">'+esc(n.id)+'</span>'+
+        '<span class="nb-seq">#'+n.seq+'</span>'+
+        (n.mode==='write'?'<span class="chip w">W</span>':'')+
+        (n.reused?'<span class="chip reuse">↺</span>':'')+
+      '</span><span class="tl-track">'+segs.join('')+'</span></button>';
+  }).join('');
+
+  w.innerHTML = '<div class="tl-inner">'+
+    '<div class="tl-axis"><span class="tl-lab" style="padding-left:14px;font:10px/1 var(--mono);color:var(--faint);letter-spacing:.08em">环节（按进入顺序）</span><span class="tl-ticks">'+ticks+'</span></div>'+
+    rows +
+    '</div>';
+
+  key.innerHTML =
+    '<i><span class="sw" style="background:repeating-linear-gradient(90deg,color-mix(in oklab,var(--faint) 24%,var(--surface)) 0 5px,color-mix(in oklab,var(--faint) 12%,var(--surface)) 5px 10px);border:1px solid var(--line-2)"></span>排队等待（还没派给 AI）</i>'+
+    '<i><span class="sw" style="background:var(--accent);opacity:.9"></span>真正在跑（颜色 = 引擎）</i>'+
+    '<span>先后顺序不代表因果 —— 名额只有 '+sc.run.slots+' 个，排在后面很可能只是在等名额。</span>'+
+    '<span style="margin-left:auto">'+(TLZ > 1 ? '按住拖动 或 Shift+滚轮 可左右平移　·　' : '')+
+      '全长 '+fmtDur(T)+'　·　'+sc.nodes.length+' 个环节</span>';
+}
+
+/* ============================================================
+   7. C 详情面板
+   ============================================================ */
+let ATT = {seq:null, idx:0, raw:false};
+
+function factsHTML(n){
+  const f = [];
+  f.push(['型号', esc(n.model)]);
+  f.push(['强度', esc(n.effort)]);
+  const qd = (n.t.q[0]==null) ? '—' : fmtDur((n.t.q[1]==null ? SC.run.now : n.t.q[1]) - n.t.q[0]);
+  f.push(['排队时长', qd + (n.t.q[1]==null && n.t.q[0]!=null ? ' <span class="u">仍在排队</span>' : '')]);
+  if (n.reused){
+    f.push(['原执行耗时', fmtDur(n.origRun) + ' <span class="u">来自 '+esc(n.reuseFrom)+'</span>']);
+    f.push(['本次复用校验', fmtDur(n.t.r[1]-n.t.r[0])]);
+  } else if (n.status==='running'){
+    f.push(['已执行', fmtDur(SC.run.now - n.t.r[0])]);
+  } else if (n.status==='unlogged'){
+    f.push(['执行耗时', '<span class="unknownv">没有结束记录</span>']);
+  } else {
+    f.push(['执行耗时', (n.t.r[0]!=null && n.t.r[1]!=null) ? fmtDur(n.t.r[1]-n.t.r[0]) : '<span class="unknownv">—</span>']);
+  }
+  const w = n.status==='running' ? (n.live?n.live.words:0) : n.words;
+  f.push(['产出字数', w==null ? '<span class="unknownv">—</span>' : fmtN(w)+' <span class="u">字</span>']);
+  f.push(['上下文占用', n.ctx==null
+    ? '<span class="unknownv">未知</span> <span class="u">'+(n.engine==='cursor'||n.engine==='kimi'?'该引擎不提供':'本次没拿到')+'</span>'
+    : n.ctx+'% <span class="u">of window</span>']);
+  const modeTxt = n.mode==='write'
+    ? '<b>write 模式 · 独立工作副本</b><div class="u" style="margin-top:3px;line-height:1.5">明确授权改文件，且改动有隔离。</div>'
+    : '<b>read 模式 · 无独立工作副本</b><div class="u" style="margin-top:3px;line-height:1.5">不打算改文件；<b>改了也没有隔离，会落在主目录</b>。Codex 为系统级只读，其余引擎为约定只读。</div>';
+  return '<div class="facts">'+
+    f.map(x => '<div class="fact"><span class="k">'+x[0]+'</span><span class="v">'+x[1]+'</span></div>').join('')+
+    '<div class="fact wide"><span class="k">模式</span><span class="v">'+modeTxt+'</span></div>'+
+  '</div>';
+}
+
+function box(v, ic, title, body){
+  return '<div class="alertbox" data-v="'+v+'"><div class="ab-t">'+ic+esc(title)+'</div>'+body+'</div>';
+}
+const diagList = d => !d||!d.length ? '' :
+  '<div style="margin-top:8px"><div class="bd-lab" style="padding:0 0 4px">诊断信息</div>'+
+  d.map(x=>'<div style="font:11px/1.7 var(--mono);color:var(--faint);overflow-wrap:anywhere">'+esc(x)+'</div>').join('')+'</div>';
+
+function statusBlock(n){
+  const o = [];
+  if (n.status==='running'){
+    if (n.phase==='preparing_worktree'){
+      o.push(box('quiet', ICO.info, '运行中 · 正在准备独立工作副本',
+        '<p style="margin:0">已经拿到执行名额，正在复制代码、建分支。<b>这一段还没有联系 AI</b>，所以现在一个字都没有是正常的。</p>'+
+        '<div style="margin-top:7px;font:11px/1.6 var(--mono);color:var(--faint)">最近一条事件：'+esc(n.live.event)+'</div>'));
+    } else {
+      o.push('<div class="livewrap"><div class="livehead"><span class="dt"></span>正在输出</div>'+
+        '<div class="livetail">'+esc(n.live.tail)+'<span class="cursor"></span></div>'+
+        '<div class="livemeta"><span>已产出 '+fmtN(n.live.words)+' 字</span><span>'+esc(n.live.event)+'</span></div></div>');
+    }
+  }
+  if (n.status==='queued'){
+    o.push(box('quiet', ICO.wait, '排队中 · 尚未派给 AI',
+      '<p style="margin:0">已经进入本地队列，但<b>一个字都还没发出去</b> —— 对面什么都不知道。同时能跑的上限是 '+SC.run.slots+' 个。</p>'+
+      '<p style="margin:7px 0 0">已排队 <b>'+fmtDur(cur(n.t.q[0], SC.run.now))+'</b>。'+
+      '<span style="color:var(--faint)">超时预算从拿到名额那一刻才开始算，所以这里没有倒计时，也不该有。</span></p>'));
+  }
+  if (n.status==='discovered'){
+    o.push(box('quiet', ICO.wait, '已发现 · 正在做本地准备',
+      '<p style="margin:0">系统认下了这个环节，还没有进入队列。</p>'));
+  }
+  if (n.status==='rejected'){
+    const r = REJECT[n.rejected.kind];
+    o.push(box('reject', ICO.ban, '被拒绝 · '+r.t,
+      '<p style="margin:0">'+esc(r.d)+'</p>'+
+      '<p style="margin:7px 0 0;color:var(--faint)"><b>没有花钱，也没有一个"结局不明"的任务在后台跑。</b></p>'+
+      '<ul class="todo">'+r.todo.map(x=>'<li>'+x+'</li>').join('')+'</ul>'+
+      (n.rejected.detail ? '<div style="margin-top:8px;font:11px/1.7 var(--mono);color:var(--faint)">'+esc(n.rejected.detail)+'</div>' : '')+
+      (n.rejected.plannedPath ? '<div style="margin-top:8px"><div class="bd-lab" style="padding:0 0 4px">预定位置（去核对有没有残留）</div>'+
+        '<code class="path">'+esc(n.rejected.plannedPath)+'</code>'+copyBtn('复制路径', n.rejected.plannedPath)+'</div>' : '')));
+  }
+  if (n.status==='unknown'){
+    o.push(box('hazard', ICO.warn, '这个环节干没干完，说不清',
+      '<p style="margin:0">'+esc(n.error.desc)+'</p>'+
+      '<ul class="todo"><li><b>停下来人工看一眼。</b></li>'+
+      '<li><b>绝不能自动重跑</b> —— 盲目重跑可能让同一件事做两遍。</li></ul>'+
+      diagList(n.error.diagnostics)));
+  }
+  if (n.status==='abandoned'){
+    const a = n.abandonedAt, W = {
+      discovered:['中断时停在「已发现」','本地准备中，还没派出去。<b>大概率什么都没发生</b>，没有需要你去管的东西。'],
+      queued:['中断时停在「排队中」','在等名额，<b>一个字都还没发给 AI</b>。没有需要你去管的东西。'],
+      run_read:['中断时正在跑（read）','执行结果不明。'],
+      pre:['中断时正在跑（write · 还没开始建工作副本）','当时还在做准备检查，<b>创建动作压根还没开始，不会有工作副本</b>。<b>不用去找。</b>'],
+      creating:['中断时正在跑（write · 正在建、未确认建成）','<b>可能已经开始建工作副本，位置未确认。</b>下面这个是预定位置 —— <b>未确认，可能不存在</b>，去看看有没有。'],
+      created:['中断时正在跑（write · 工作副本已确认建成）','<b>执行与代码去向都不明；工作副本已建成。</b>'],
+    };
+    const key = a.stage==='running' ? (a.writePhase || 'run_read') : a.stage;
+    const w = W[key] || W.run_read;
+    const soft = (a.stage==='discovered' || a.stage==='queued');
+    o.push(box(soft ? 'quiet' : 'lost', soft ? ICO.info : ICO.cut, '没有看到这个环节的结局 · '+w[0],
+      '<p style="margin:0">'+w[1]+'</p>'+
+      (soft ? '' : '<p style="margin:7px 0 0;color:var(--faint)">这不是"结果永远拿不到了" —— 缺的只是一份权威的结束回执。</p>')+
+      (key==='created' ? '<ul class="todo"><li><b>禁止自动重跑</b> —— 可能把还没保住的代码覆盖掉。</li></ul>' : '')));
+  }
+  if (n.status==='unlogged'){
+    o.push(box('unlog', ICO.warn, '记录从第 '+fmtN(n.unloggedFrom)+' 条起不完整，这个环节的状态未知',
+      '<p style="margin:0">既不能说它跑完了，也不能说它没跑完 —— <b>我们只是没看到</b>。'+
+      '它<b>很可能好好地跑完了</b>，只是从那一条起没人记下来。</p>'+
+      '<p style="margin:7px 0 0;color:var(--faint)">这个环节<b>不会</b>因此被标成「未见结局」—— 把一次记录故障摊派成一堆环节事故，会让你去排查根本没出问题的环节。</p>'));
+  }
+  if (n.error && (n.status==='contract_error' || n.status==='timeout' || n.status==='backend_failed')){
+    const v = n.status==='backend_failed' ? 'alert' : 'quiet';
+    o.push(box(v, ICO.warn, n.error.title,
+      '<p style="margin:0 0 8px">'+esc(n.error.desc)+'</p>'+
+      (n.error.bounded ? bounded(n.error.bounded, '错误详情（有界摘要）') : '')+
+      diagList(n.error.diagnostics)));
+  }
+  return o.length ? '<div class="sec">'+o.join('')+'</div>' : '';
+}
+
+const WT = {
+  cleaned:          ['已清理', '收尾时确认删除成功。'],
+  unconfirmed:      ['收尾时未确认清理', '这是收尾那一刻的快照，不是现在的事实 —— 那个目录现在可能已经被别的东西清掉了，可去核对。'],
+  kept:             ['系统已为你保留', '结论是「交付状态不明」时，系统刻意没删这份副本，因为里面可能有还没进分支的代码。路径在此，去核对。'],
+  not_started:      ['不会有', '创建动作还没开始，不用去找。'],
+  unconfirmed_create:['未确认建成', '可能已经开始建，位置未确认 —— 可能不存在。'],
+  failed:           ['建不起来', '创建失败；常见原因是上次残留清不掉，那东西可能还在。'],
+  pending:          ['正在建', '这个环节还在跑。'],
+  unlogged:         ['状态未记录', '记录从某处起不完整，这一栏的状态未知。'],
+};
+
+function writeBlock(n){
+  if (n.mode !== 'write') return '';
+  const w = n.write || {}, o = [];
+  o.push('<h3 class="sec-h">改动区块<span class="hint">write 环节专有</span></h3>');
+
+  if (w.outcome === 'delivered'){
+    const zero = w.netEmpty || (w.files && !w.files.length);
+    o.push(box('ok', ICO.info, zero ? '已交付，但这次提交没有净改动' : '已交付',
+      zero ? '<p style="margin:0">分支往前走了，但净改动是空的 —— 改动清单是零项、diff 是空文件。'+
+             '<b>这不是「无改动」</b>：分支上确实有这次提交。</p>'
+           : '<p style="margin:0">改动已提交，进了下面这个分支。</p>'+
+             (n.status!=='ok' ? '<p style="margin:7px 0 0"><b>这次执行不合格，但改动是可用的</b> —— 分支与清单照常给出。</p>' : '')));
+    o.push('<div class="kv"><span class="k">分支</span><span class="v"><code style="font-family:var(--mono);font-size:12.5px">'+esc(w.branch)+'</code> '+copyBtn('复制', w.branch)+'</span></div>');
+    o.push('<div class="kv"><span class="k">基线</span><span class="v"><code style="font-family:var(--mono);font-size:12.5px">'+esc(w.base)+'</code></span></div>');
+    o.push('<div style="margin:9px 0 6px;font-size:12.5px;color:var(--ink-soft);display:flex;align-items:center;gap:8px">改动清单'+
+      '<span style="font:10.5px/1 var(--mono);color:var(--faint)">'+(w.files? w.files.length : 0)+' 项</span></div>');
+    o.push('<div class="difflist scroll">'+ (w.files && w.files.length
+      ? w.files.map(f => '<div class="diffrow"><span class="df-t" data-t="'+f[0]+'" title="'+({A:'新增',M:'修改',D:'删除',R:'重命名'}[f[0]])+'">'+f[0]+'</span><span class="df-p">'+esc(f[1])+'</span></div>').join('')
+      : '<div class="zero">零项 —— 这次提交没有净改动</div>')+'</div>');
+    o.push('<div style="margin-top:9px">'+assetRow('改动详情', w.diff, '打开完整 diff（超长时按有界摘要折叠）')+'</div>');
+  }
+  else if (w.outcome === 'no_change'){
+    o.push(box('quiet', ICO.info, '无改动',
+      '<p style="margin:0"><b>收尾检查未发现可交付的改动。</b></p>'+
+      '<p style="margin:7px 0 0;color:var(--faint)">这里只陈述系统看到的事实：收尾快照里没有检测到可交付的改动。'+
+      '系统并不知道这个 AI 的意图 —— 也可能它改错了地方，或者改的是被忽略的文件。</p>'));
+    o.push('<div class="kv"><span class="k">分支</span><span class="v"><code style="font-family:var(--mono);font-size:12.5px">'+esc(w.branch)+'</code> '+copyBtn('复制', w.branch)+'</span></div>');
+    o.push('<div style="margin-top:4px;font-size:12.5px;color:var(--faint)">没有改动清单可看，因此这里不给入口。</div>');
+  }
+  else if (w.outcome === 'unknown'){
+    o.push(box('hazard', ICO.warn, '交付状态不明 —— 现场已为你保留',
+      '<p style="margin:0"><b>改动有没有落到分支上，说不清。</b></p>'+
+      '<p style="margin:7px 0 0">'+esc(w.reason || '收尾流程没有走完。')+'</p>'+
+      '<ul class="todo"><li><b>不要自动重跑。</b>重跑可能让同一件事做两遍，或把那份还没保住的代码覆盖掉。</li>'+
+      '<li>先打开下面这个目录核对里面有什么。</li></ul>'+
+      '<div style="margin-top:9px"><div class="bd-lab" style="padding:0 0 4px">工作副本路径（系统当时选择了保留）</div>'+
+      '<code class="path">'+esc(w.worktree.path)+'</code>'+copyBtn('复制路径', w.worktree.path)+'</div>'));
+    if (w.branch) o.push('<div class="kv"><span class="k">分支</span><span class="v"><code style="font-family:var(--mono);font-size:12.5px">'+esc(w.branch)+'</code> '+copyBtn('复制', w.branch)+'</span></div>');
+    o.push('<div style="margin-top:9px">'+assetRow('改动详情', w.diff)+'</div>');
+  }
+  else if (w.outcome === 'unlogged'){
+    o.push(box('unlog', ICO.warn, '交付结论：状态未记录',
+      '<p style="margin:0">记录从第 '+fmtN(n.unloggedFrom)+' 条起不完整，这个环节的交付结论我们没有看到。<b>不代表它没交付。</b></p>'));
+  }
+  else {
+    o.push(box('quiet', ICO.info, '还没有交付结论',
+      '<p style="margin:0">'+(n.status==='rejected'
+        ? '这个环节还没开跑就被本地挡下了，不存在交付结论。'
+        : '这个环节还没跑到收尾那一步。')+'</p>'));
+  }
+
+  const ws = (w.worktree && WT[w.worktree.state]) || WT.unlogged;
+  o.push('<div style="margin-top:11px;border-top:1px dashed var(--line);padding-top:9px">'+
+    '<div class="kv"><span class="k">工作副本</span><span class="v"><b>'+esc(ws[0])+'</b>'+
+      '<div style="color:var(--faint);font-size:11.5px;line-height:1.55;margin-top:3px">'+esc(ws[1])+'</div>'+
+      (w.worktree && w.worktree.why ? '<div style="color:var(--faint);font-size:11.5px;line-height:1.55;margin-top:3px">'+esc(w.worktree.why)+'</div>' : '')+
+      (w.worktree && w.worktree.path && w.worktree.state!=='kept'
+        ? '<div style="margin-top:6px"><code class="path">'+esc(w.worktree.path)+'</code>'+copyBtn('复制路径', w.worktree.path)+'</div>' : '')+
+    '</span></div></div>');
+  return '<div class="sec">'+o.join('')+'</div>';
+}
+
+function attemptBody(n, a){
+  const o = [];
+  const inTxt = a.input && a.input.s==='have' ? a.input.text : null;
+  o.push('<details class="fold"><summary>'+ICO.caret+'输入原文'+
+    '<span class="sm">'+(inTxt ? fmtN(inTxt.length)+' 字' : '不可读')+'</span></summary>'+
+    '<div class="fold-body">'+
+      (inTxt ? '<pre class="raw scroll">'+esc(inTxt)+'</pre><div style="margin-top:7px">'+copyBtn('复制输入原文', inTxt)+'</div>'
+             : assetRow('输入原文', a.input))+
+      (a.input && a.input.s==='unavailable' && a.input.code==='SOURCE_RUN_NOT_ARCHIVED'
+        ? '<div style="margin-top:6px;font-size:12.5px;color:var(--faint);line-height:1.6">'+
+          '原运行未归档输入原文，仅保留指纹。<b>这里不会"还原"一份看起来对的输入</b> —— 没有逐字节验证过的还原就是伪造历史。</div>' : '')+
+    '</div></details>');
+
+  const outTxt = a.output && a.output.s==='have' ? a.output.text : null;
+  if (outTxt){
+    const raw = ATT.raw;
+    o.push('<div class="fold" style="background:var(--surface)"><div style="padding:9px 11px;display:flex;align-items:center;gap:8px;font-size:12.5px;font-weight:650">产出'+
+      '<span class="sm" style="font:10.5px/1 var(--mono);color:var(--faint);font-weight:400">'+fmtN(outTxt.length)+' 字</span>'+
+      '<span class="viewswitch"><button type="button" data-raw="0" aria-pressed="'+(!raw)+'">渲染</button>'+
+      '<button type="button" data-raw="1" aria-pressed="'+raw+'">看原文</button></span></div>'+
+      '<div class="fold-body" id="outBody">'+ (raw ? '<pre class="raw scroll">'+esc(outTxt)+'</pre>' : '<div class="md">'+md(outTxt)+'</div>')+
+      '<div style="margin-top:8px;display:flex;align-items:center;gap:8px">'+copyBtn('复制产出原文', outTxt)+
+      '<button type="button" class="totop" id="toTop">回到顶部</button></div>'+
+      '<div style="clear:both"></div></div></div>');
+  } else {
+    o.push('<div class="fold" style="background:var(--surface)"><div class="fold-body" style="border-top:0;padding-top:11px">'+assetRow('产出', a.output)+'</div></div>');
+  }
+
+  if (a.reject) o.push('<div style="margin-top:2px">'+bounded(a.reject, '被打回的原因（有界摘要）')+'</div>');
+  else if (a.rejectAsset) o.push('<div style="margin-top:2px">'+assetRow('打回原因', a.rejectAsset)+'</div>');
+  return o.join('');
+}
+
+function attemptsBlock(n){
+  const as = n.attempts || [];
+  if (!as.length) return '';
+  if (ATT.seq !== n.seq){ ATT = {seq:n.seq, idx:as.length-1, raw:false}; }
+  const idx = Math.min(ATT.idx, as.length-1);
+  const V = {accepted:'通过', rejected:'被打回', running:'进行中', queued:'排队中', discovered:'准备中',
+             failed:'引擎报错', timeout:'超时', unknown:'说不清', abandoned:'未见结局',
+             rejected_local:'本地挡下', unlogged:'状态未记录'};
+  /* 只有 1 次尝试时不显示任何分段控件。分段由数组生成，段数没有上限——
+     将来在「环节 → 轮 → 尝试」里，轮这一层用同一个规则再套一层即可。 */
+  const bar = as.length > 1
+    ? '<div class="segbar">'+as.map((a,i)=>'<button type="button" class="seg" data-att="'+i+'" data-r="'+
+        (a.verdict==='rejected'?'rejected':a.verdict==='accepted'?'accepted':'')+'" aria-pressed="'+(i===idx)+'">'+
+        '<span class="sdot"></span>第 '+a.n+' 次 · '+(V[a.verdict]||a.verdict)+'</button>').join('')+
+      '<span style="font:10.5px/1.5 var(--mono);color:var(--faint);flex:1 1 100%">两次的输入是不同的：第 2 次由「上次被打回的原因 + 纠正要求 + 原任务原文」拼出。</span></div>'
+    : '';
+  return '<div class="sec"><h3 class="sec-h">输入与产出'+
+    (as.length>1 ? '<span class="hint">'+as.length+' 次尝试</span>' : '<span class="hint">单次尝试</span>')+'</h3>'+
+    bar + attemptBody(n, as[idx]) + '</div>';
+}
+
+function sceneBlock(n){
+  const s = n.scene || {};
+  const none = n.sceneNone;
+  return '<div class="sec"><h3 class="sec-h">现场文件<span class="hint">目录，三样各自独立</span></h3>'+
+    (none ? box('lost', ICO.cut, '本次未捕获现场',
+      '<p style="margin:0">系统只有在<b>有序收场</b>时才会把会话日志等现场文件抢救出来；这次没有机会跑那一步，所以<b>一样都没留下</b>。'+
+      '这里不给一个点了 404 的入口。</p>') : '')+
+    assetRow('会话日志', s.session, '打开会话日志')+
+    assetRow('回答原文', s.answer, '打开回答原文')+
+    assetRow('状态快照', s.snapshot, '打开状态快照')+
+  '</div>';
+}
+
+function renderDetail(sc, sel){
+  const el = $('#detail'), ws = $('#workspace');
+  const n = sc.nodes.find(x => x.seq === sel);
+  if (!n){ el.hidden = true; ws.setAttribute('data-detail','closed'); return; }
+  el.hidden = false; ws.setAttribute('data-detail','open');
+  COPYBUF.length = 0;
+  const st = STATUS[n.status] || {};
+  el.innerHTML =
+    '<div class="d-head"><div class="d-title">'+engBadge(n.engine,false)+
+      '<h2 class="d-id" title="'+esc(n.id)+'">'+esc(n.id)+'</h2>'+
+      '<span class="nb-seq">#'+n.seq+'</span>'+
+      '<button type="button" class="d-close" id="dClose" title="关闭详情" aria-label="关闭详情面板"><span aria-hidden="true">✕</span></button></div>'+
+      '<div class="d-sub">'+statusChip(n)+
+        (n.reused ? '<span class="chip reuse">↺ 复用 · 没真跑，直接用了上次的结果</span>' : '')+
+        '<span class="chip">'+esc(st.long||'')+'</span>'+
+      '</div>'+
+      (n.note ? '<div style="margin-top:7px;font:11px/1.6 var(--mono);color:var(--faint)">'+esc(n.note)+'</div>' : '')+
+    '</div>'+
+    '<div class="d-scroll scroll" id="dScroll">'+
+      factsHTML(n)+
+      (n.reused ? '<div class="sec">'+box('quiet', ICO.info, '这是一次复用，不是一次验证',
+        '<p style="margin:0">这个环节<b>没真跑</b>，直接用了 <code>'+esc(n.reuseFrom)+'</code> 的结果。'+
+        '上面的「原执行耗时」是<b>当初那次</b>跑出来的；这次只做了一次 '+fmtDur(n.t.r[1]-n.t.r[0])+' 的复用校验。</p>')+'</div>' : '')+
+      statusBlock(n)+
+      writeBlock(n)+
+      attemptsBlock(n)+
+      sceneBlock(n)+
+    '</div>';
+}
+
+/* ============================================================
+   8. 状态与装配
+   ============================================================ */
+(function(){ const s = SCENES.find(x=>x.key==='offline'); s.run.replayIncomplete = true; s.run.replayFrom = 1907; })();
+
+let SC = SCENES[0], SEL = SC.select, VIEW = 'graph', ZOOM = 1;
+
+function hasDeps(sc){ return sc.edges && sc.edges.length > 0; }
+
+function renderLegend(sc){
+  if (VIEW !== 'graph' || !sc.nodes.length){ $('#legend').innerHTML = ''; return; }
+  if (!hasDeps(sc)){ $('#legend').innerHTML = '<span style="color:var(--faint)">没有任何依赖信息</span>'; return; }
+  const inf = sc.edges.some(e => e.kind==='inferred');
+  $('#legend').innerHTML =
+    '<i title="用户自己写的一句声明"><span class="lg-line"></span>声明（未经验证）</i>'+
+    (inf ? '<i title="系统从输入原文里猜出来的"><span class="lg-dash"></span>推断（可点开看依据）</i>' : '')+
+    '<span style="color:var(--faint)">纯时间先后不画箭头</span>';
+}
+
+function applyZoom(){
+  const cv = $('#gcanvas'), wrap = $('#gwrap');
+  let sp = document.getElementById('gspacer');
+  if (!SC.nodes.length){
+    cv.style.cssText = 'padding:22px'; if (sp) sp.remove();
+    $('#zoomBox').style.visibility = 'hidden'; return;
+  }
+  $('#zoomBox').style.visibility = VIEW==='graph' ? 'visible' : 'hidden';
+  /* 缩放条是两个视图共用的,切回图视图要把时间轴那边设的禁用/命名还原 */
+  $('#zoomIn').disabled = false; $('#zoomOut').disabled = false;
+  $('#zoomIn').setAttribute('aria-label','放大图视图');
+  $('#zoomOut').setAttribute('aria-label','缩小图视图');
+  $('#zoomFit').setAttribute('aria-label','缩放至适应画布');
+  const GW = parseFloat(cv.style.width) || 400, GH = parseFloat(cv.style.height) || 300;
+  cv.style.transformOrigin = '0 0';
+  cv.style.transform = 'scale('+ZOOM+')';
+  cv.style.position = 'absolute'; cv.style.top = '0'; cv.style.left = '0'; cv.style.padding = '0';
+  if (!sp){ sp = document.createElement('div'); sp.id = 'gspacer';
+    sp.style.cssText = 'position:absolute;top:0;left:0;pointer-events:none'; wrap.appendChild(sp); }
+  sp.style.width = (GW*ZOOM)+'px'; sp.style.height = (GH*ZOOM)+'px';
+  wrap.setAttribute('data-scrollx', (GW*ZOOM > wrap.clientWidth + 2) ? '1' : '0');
+  $('#zoomVal').textContent = Math.round(ZOOM*100)+'%';
+}
+function fitZoom(){
+  const cv = $('#gcanvas'), wrap = $('#gwrap');
+  const GW = parseFloat(cv.style.width) || 1, GH = parseFloat(cv.style.height) || 1;
+  const z = Math.min(1, (wrap.clientWidth - 26)/GW, (wrap.clientHeight - 26)/GH);
+  ZOOM = Math.max(.3, Math.round(z*20)/20); applyZoom();
+}
+
+function render(){
+  if (!hasDeps(SC) && SC.nodes.length) VIEW = 'timeline';
+  $('#tabGraph').setAttribute('aria-pressed', VIEW==='graph');
+  $('#tabTimeline').setAttribute('aria-pressed', VIEW==='timeline');
+  $('#tabGraph').disabled = (!hasDeps(SC) && SC.nodes.length > 0);
+  $('#tabGraph').title = $('#tabGraph').disabled ? '这次运行没有任何依赖信息，图视图会退化成一堆孤立方块' : '';
+  $('#gwrap').hidden = VIEW !== 'graph';
+  $('#tlwrap').hidden = VIEW !== 'timeline';
+
+  renderTop(SC); renderBanners(SC); renderLegend(SC);
+  if (VIEW === 'graph'){ renderGraph(SC, SEL); applyZoom(); $('#tlKey').hidden = true; }
+  else { renderTimeline(SC, SEL); applyTlZoom(); }
+  renderDetail(SC, SEL);
+}
+
+function setScene(key){
+  const sc = SCENES.find(s => s.key === key); if (!sc) return;
+  SC = sc; SEL = sc.select; VIEW = 'graph'; ZOOM = 1; TLZ = sc.tlz || 1; QOPEN = false;
+  ATT = {seq:null, idx:0, raw:false};
+  const pop = document.getElementById('edgePop'); if (pop) pop.remove();
+  document.querySelectorAll('.scene-btn').forEach(b => b.setAttribute('aria-pressed', b.dataset.scene===key));
+  $('#conn').setAttribute('data-s', sc.conn.s); $('#connText').textContent = sc.conn.text;
+  render();
+  if (sc.key === 'scale') requestAnimationFrame(fitZoom);
+}
+
+$('#scenes').innerHTML = SCENES.map(s =>
+  '<button type="button" class="scene-btn" data-scene="'+s.key+'" aria-pressed="'+(s.key===SC.key)+'">'+esc(s.label)+'</button>').join('');
+
+/* ---- 主题 ---- */
+function setTheme(t){
+  if (t) document.documentElement.setAttribute('data-theme', t);
+  else document.documentElement.removeAttribute('data-theme');
+  try { t ? localStorage.setItem('gvz-theme', t) : localStorage.removeItem('gvz-theme'); } catch(e){}
+  const dark = t ? t==='dark' : matchMedia('(prefers-color-scheme: dark)').matches;
+  $('#themeLabel').textContent = dark ? '浅色' : '深色';
+}
+try { const saved = localStorage.getItem('gvz-theme'); if (saved) setTheme(saved); else setTheme(null); } catch(e){ setTheme(null); }
+
+/* ---- 边解释气泡 ---- */
+function showEdgePop(i, ev){
+  const e = ($('#gcanvas')._edges || [])[i]; if (!e) return;
+  const wrap = $('#gwrap'), r = wrap.getBoundingClientRect();
+  let pop = document.getElementById('edgePop');
+  if (!pop){ pop = document.createElement('div'); pop.id = 'edgePop'; pop.className = 'edgepop'; wrap.appendChild(pop); }
+  const body = e.kind === 'inferred'
+    ? '<b>推断的依赖 · 可能猜错，也可能漏掉</b>'+e.why+'<div style="margin-top:6px;color:var(--faint)">系统发现后一个环节的输入里提到了前一个环节的产出文件，据此猜了一条边。</div>'
+    : '<b>显式声明（未经验证）</b>用户自己写了这条依赖。<div style="margin-top:6px;color:var(--faint)"><b>仅展示，不影响执行顺序</b> —— 系统既不校验也不据此调度。</div>';
+  const warn = e.warn ? '<div style="margin-top:8px;padding:7px 9px;border-radius:6px;background:color-mix(in oklab,var(--c-timeout) 13%,var(--surface));border:1px solid color-mix(in oklab,var(--c-timeout) 42%,var(--line));color:var(--ink)"><b>一致性提示</b> · '+e.warn+'</div>' : '';
+  pop.innerHTML = '<button type="button" class="x" id="popX" aria-label="关闭说明"><span aria-hidden="true">✕</span></button>'+body+warn;
+  const x = Math.min(Math.max(8, ev.clientX - r.left + wrap.scrollLeft + 12), wrap.scrollLeft + wrap.clientWidth - 320);
+  const y = Math.max(8, ev.clientY - r.top + wrap.scrollTop + 10);
+  pop.style.left = x+'px'; pop.style.top = y+'px';
+}
+
+/* ---- 拖拽平移:鼠标用户没有触控板的双指手势,给一个抓手。
+       阈值 5px —— 小于它仍然算一次点击,不会把「选中环节」这件事弄丢。 ---- */
+let SUPPRESS_CLICK = false;
+function enablePan(el){
+  let sx = 0, sy = 0, sl = 0, st = 0, down = false, panned = false;
+  const move = e => {
+    if (!down) return;
+    const dx = e.clientX - sx, dy = e.clientY - sy;
+    if (!panned && Math.abs(dx) + Math.abs(dy) < 5) return;
+    panned = true; el.classList.add('panning');
+    el.scrollLeft = sl - dx; el.scrollTop = st - dy;
+  };
+  const up = () => {
+    if (!down) return;
+    down = false; el.classList.remove('panning');
+    if (panned) SUPPRESS_CLICK = true;
+    panned = false;
+    removeEventListener('pointermove', move); removeEventListener('pointerup', up);
+  };
+  el.addEventListener('pointerdown', e => {
+    if (e.button !== 0) return;
+    SUPPRESS_CLICK = false;
+    down = true; panned = false;
+    sx = e.clientX; sy = e.clientY; sl = el.scrollLeft; st = el.scrollTop;
+    addEventListener('pointermove', move); addEventListener('pointerup', up);
+  });
+  el.addEventListener('wheel', e => {
+    if (e.shiftKey && e.deltaY && !e.deltaX){ el.scrollLeft += e.deltaY; e.preventDefault(); }
+  }, {passive:false});
+}
+enablePan($('#gwrap')); enablePan($('#tlwrap'));
+
+/* ---- 事件(全部委托,只读:不改变任何运行状态) ---- */
+document.addEventListener('click', ev => {
+  if (SUPPRESS_CLICK){ SUPPRESS_CLICK = false; return; }   /* 刚拖过,这一下不是点击 */
+  const t = ev.target;
+  const hit = s => t.closest ? t.closest(s) : null;
+
+  const sb = hit('.scene-btn'); if (sb){ setScene(sb.dataset.scene); return; }
+  if (hit('#themeBtn')){
+    const now = document.documentElement.getAttribute('data-theme');
+    const dark = now ? now==='dark' : matchMedia('(prefers-color-scheme: dark)').matches;
+    setTheme(dark ? 'light' : 'dark'); return;
+  }
+  if (hit('#tabGraph') && !$('#tabGraph').disabled){ VIEW='graph'; render(); return; }
+  if (hit('#tabTimeline')){ VIEW='timeline'; render(); return; }
+  const tlStep = d => { const s = TLZ < 2 ? .5 : 1; TLZ = Math.min(8, Math.max(1, +(TLZ + d*s).toFixed(1)));
+                        renderTimeline(SC, SEL); applyTlZoom(); };
+  if (hit('#zoomIn')){ if (VIEW === 'graph'){ ZOOM = Math.min(1.8, ZOOM+.1); applyZoom(); } else tlStep(+1); return; }
+  if (hit('#zoomOut')){ if (VIEW === 'graph'){ ZOOM = Math.max(.3, ZOOM-.1); applyZoom(); } else tlStep(-1); return; }
+  if (hit('#zoomFit')){ if (VIEW === 'graph') fitZoom(); else { TLZ = 1; renderTimeline(SC, SEL); applyTlZoom(); } return; }
+  if (hit('#qtoggle')){ QOPEN = !QOPEN; renderGraph(SC, SEL); applyZoom(); return; }
+  if (hit('#popX')){ const p = document.getElementById('edgePop'); if (p) p.remove(); return; }
+
+  const edge = t.getAttribute && t.getAttribute('data-edge');
+  if (edge != null){ showEdgePop(+edge, ev); return; }
+
+  const cp = hit('.copy'); if (cp){ copyText(COPYBUF[+cp.dataset.copy] || '', cp); return; }
+  if (hit('#dClose')){ SEL = null; render(); return; }
+
+  const seg = hit('.seg'); if (seg){ ATT.idx = +seg.dataset.att; ATT.raw = false; renderDetail(SC, SEL); return; }
+  const rw = t.closest && t.closest('[data-raw]');
+  if (rw){ ATT.raw = rw.dataset.raw === '1'; renderDetail(SC, SEL); return; }
+  if (hit('#toTop')){ const s = $('#dScroll'); if (s) s.scrollTo({top:0, behavior:'smooth'}); return; }
+
+  const nb = hit('.nodebox') || hit('.qitem') || hit('.tl-row');
+  if (nb){ SEL = +nb.dataset.seq; ATT = {seq:null, idx:0, raw:false};
+    const p = document.getElementById('edgePop'); if (p) p.remove();
+    if (VIEW === 'graph'){ renderGraph(SC, SEL); applyZoom(); } else { renderTimeline(SC, SEL); applyTlZoom(); }
+    renderDetail(SC, SEL); return; }
+});
+
+document.addEventListener('keydown', ev => {
+  if (ev.key === 'Escape'){
+    const p = document.getElementById('edgePop');
+    if (p) p.remove(); else if (SEL != null){ SEL = null; render(); }
+  }
+});
+addEventListener('resize', () => { if (VIEW==='graph' && SC.key==='scale') fitZoom(); });
+
+setScene(SC.key);
+</script>
+</body>
+</html>
