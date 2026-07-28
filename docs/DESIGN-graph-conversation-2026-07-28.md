@@ -1,13 +1,13 @@
 # agent-bridge-graph:多轮对话（可选的记忆）—— 方案设计
 
-**日期** 2026-07-28 · **修订 v3** · **状态** 提案，待评审
+**日期** 2026-07-28 · **修订 v4** · **状态** ✅ **可施工**（复审第 3 轮为止，用户 2026-07-28 裁定截止；本轮 4 BLOCKER + 3 MAJOR 已逐条落地，见 §9）
 **关联** `skills/agent-bridge-graph/tools/node-core.mjs`、`docs/DESIGN-graph-viz-2026-07-26.md`（viz 的「轮」事件依赖本文档）
 
-> **v3**：codex 复审 v2 判 CHANGES-REQUIRED（4 BLOCKER + 2 MAJOR）。四条 BLOCKER 全部成立，逐条落点见 §9。
-> 其中两条打穿了 v2 的隐藏假设：
-> ① **"拿闸时起钟"在对话里根本无法实现**——顶层 spec 没有 `timeoutMs`，那个数字要到第一次 `turn()` 才出现。
-> ② **"整段持有一个并发名额"会自锁**——回调里再跑一个 `runNode` 就是等自己手里那把闸。而"回调里跑别的节点"恰恰是这功能的头号用法（复审在两轮之间）。
-> MAJOR 里 `rejectedReason` 那条**结论认、理由驳**（§9）。
+> **v4** 修的是 v3 自己造出来的回归。三轮下来最该记住的一条：
+> **每一轮"修好"的动作本身都在制造下一轮的 BLOCKER。** v3 的 4 条 BLOCKER 里有 2 条（执行闸的持有区间、回放反写回执）是 v2→v3 那次修订新引入的，
+> 与 viz 那 13 轮里的形状一模一样——**"改一处 ≠ 改干净一处"**。
+> 因此 v4 的每一处判据都尽量**直接引用源码里已经存在的那条**（`STATUS_EXIT` 的序、`closeConfirmed` 的三条授权、`if (workspace)` 的外层守卫），
+> 而不是重新发明一条读起来更顺的。
 
 ---
 
@@ -58,10 +58,10 @@ await bridge.conversation(
 | 代价 | 说明 |
 |---|---|
 | **一段对话 = 一条分支** | N 轮共享一棵 worktree，收尾时提交**一次**。这对"反复修同一份东西"更干净，但它不能再当 N 个独立可合并的产出用 |
-| **对话名额被整段持有** | 见 §1.1。执行名额只在轮期间占，但**对话名额**（会话活着这件事）整段占 |
+| **对话名额被整段持有** | 见 §1.1。执行名额只在轮期间占，但**对话名额**（会话活着这件事）从首轮一直占到收尾 |
 | **复用是整段的，且要重放** | 见 §4 |
 
-### 1.1 名额要拆成两把闸（v3 定，BLOCKER）
+### 1.1 名额要拆成两把闸（v4 修正取得时机与持有区间）
 
 v2 写的是"对话活着就占一个 slot"，而 §4 又写"回调里的 `runNode` 各自撞自己的闸"。**这两句放一起就是死锁**：
 
@@ -76,15 +76,29 @@ conversation 持有 slot → 回调 await runNode → runNode 等 slot → 回�
 
 **定死：两把独立的闸，语义不同、不许合并。**
 
-| 闸 | 界什么 | 谁持有、持有多久 |
-|---|---|---|
-| **执行闸** `_gate`（今天这把，默认 4） | 同时有几轮**正在烧后端** | 每一轮从 admit 到该轮结束。`runNode` = N=1 ⇒ **与今天逐字节相同** |
-| **对话闸** `_scopeGate`（新，默认同值） | 同时有几个**会话活着** | 一段对话从 prepare 到收尾 |
+| 闸 | 界什么 | 谁取、什么时候取 | 什么时候放 |
+|---|---|---|---|
+| **执行闸** `_gate`（今天这把，默认 4） | 同时有几轮**正在烧后端** | 每一轮 admit 时 | 见下面的**两种 lease** |
+| **对话闸** `_scopeGate`（新，默认同值） | 同时有几段对话**持着活会话** | **第一个 live turn**（不是 prepare），顺序 **`scope → exec`** | 整段收尾时 |
 
-- 回调运行期间（轮与轮之间）对话**不持执行闸** ⇒ 嵌套 `runNode` 拿得到，不自锁。
-- 嵌套 `runNode` 只要执行闸，不要对话闸 ⇒ 依赖图无环。
-- ⚠️ **嵌套 `conversation()` 一律 `UsageError`**：它要对话闸，那才会成环。这条**在 live 与 replay 两条路上判据完全一致**，不许一边禁一边放。
-- 为什么必须是两把而不是一把开大：它们界的是两种不同的资源——执行闸界 CPU/后端并发，对话闸界**同时活着的后端会话数**。合成一把，要么嵌套死锁，要么活会话数无上限（开 20 段对话 = 20 个常驻后端）。
+**执行闸有两种 lease，不许统一（v4 修，BLOCKER）：**
+
+| 调用方 | 持有到 |
+|---|---|
+| **`runNode`（N=1）** | **close_session + finalizeWorktree + 写回执全部结束之后**——就是今天 `finally` 里那一句（`node-core.mjs:1715`），**一个字不改** |
+| **`conversation` 的每一轮** | **该轮自己的收尾做完**（产出复制 + 算 SHA +（非 ok 时）冻结现场）之后即释放；回调期间不持有 |
+
+⚠️ **共享 `runTurn` 不等于两个调用方必须在同一时刻放闸。** v3 把执行闸统一写成"持有到该轮结束"，而 §2.3 又规定 turn 结束不关会话、不收工作区——**于是 `runNode` 会在 close/finalize 还在跑的时候就放闸**。反例：`maxConcurrent = 2`、同时起 5 个慢 `runNode`，前两个一结束轮就放闸，后面立刻开新会话，桥里同时能有 3~4 个 session——**当场打红 W8**（`repro-graph-worktree.mjs:337` 实测活会话数不超上限）。
+
+**对话闸必须懒取（v4 修，MAJOR）：**
+
+- 放在 `prepare` 里取是错的：那时**还没有任何会话**。反例：`scopeGate = 1`，对话 A 的回调在第一次 `turn()` 之前先去等一个长外部任务——它一个 session 都没有，却占着唯一的名额，对话 B 永远进不来。
+- **回放路径与零轮一律不取**（它们不开会话，没有要界的资源）。
+- 顺序恒为 `scope → exec`，且 scope 一旦拿到就持有到收尾 ⇒ 不存在"持 exec 等 scope"，依赖图无环。
+
+⚠️ **`_scopeGate` 不是"全局活会话上限"，别这么写进 SKILL。** 4 段对话停在轮间 + 4 个独立 `runNode` 在跑 = 桥里 **8** 个会话。真实上限是 **`scope + exec`**。这不成环也不饿死执行闸（信号量是 FIFO 直接交接），但**上限的口径必须如实说**。
+
+**为什么必须是两把而不是一把开大**：它们界的是两种不同的资源——执行闸界同时烧后端的并发，对话闸界**跨轮活着的会话**。合成一把，要么嵌套死锁，要么活会话数无上限（开 20 段对话 = 20 个常驻后端）。
 
 ---
 
@@ -112,7 +126,7 @@ finalizeRun(run, extra)                                              → receipt
 
 ⚠️ **绝不允许把 ③ 复制一份给 conversation 用。** "同一件事两处各写一遍，迟早漂成两种行为"——这个仓库在 `artifactSha256` / `diffPath` / `committed` 上已经栽过**三次**，都是同一个形状。
 
-### 2.1 时钟：**每一轮在自己被 admit 时起钟；②挂在第一轮上**（v3 重写，BLOCKER）
+### 2.1 时钟：**每一轮在自己被 admit 时起钟；②挂在第一轮上**
 
 v2 定的是"`startClock()` 在拿到并发闸那一刻起算，第一轮继承这口钟"。**这在对话里无法实现**：顶层 spec 没有 `timeoutMs`，那个数字要到第一次 `turn({timeoutMs})` 才出现；而 v2 又把拿闸/建 worktree/开会话放在 `prepare`——**拿闸的那一刻，实现根本不知道预算是多少**。
 
@@ -121,15 +135,17 @@ v2 定的是"`startClock()` 在拿到并发闸那一刻起算，第一轮继承�
 **定死一条规矩，两条路共用：**
 
 > **入场（②）延到第一次 `turn()` 被调用时才发生。** 每一轮的顺序是：
-> **拿执行闸（排队不计入预算）→ 用本轮 `timeoutMs` 起钟 → （仅首轮）脏树复查 → worktree → open_session → send**。
+> **（首轮）拿对话闸 → 拿执行闸（排队不计入预算）→ 用本轮 `timeoutMs` 起钟 →（首轮）脏树复查 → worktree → open_session → send**。
 
 - `runNode` = 只有第一轮，且那一轮的 `timeoutMs` 就是 `spec.timeoutMs` ⇒ **与今天逐字节相同的因果顺序**（源码 `1296-1313`：拿闸 → `startClock()` → 脏树复查 → `createWorktree` → 开会话）。不需要任何兼容分支。
-- setup 花在第一轮的预算里 ⇒ **与 `runNode` 今天的口径完全一致**：setup 花光预算，第一轮就超时。这是现在的行为，不是新规则。T9 原样成立（预算耗尽时还没走到 `open_session`）。
-- `prepare` 里只剩**不需要预算的本地动作**：`normalizeSpec` / 建目录 / 进程内防撞键 / 锁文件 / 仓库体检 + 第一次脏树查 / 幂等闸或回放闸 / 拿**对话闸**。这些今天也全在并发闸之前（源码 `1149-1294`）。
-- **零轮 ⇒ 从没拿过执行闸、没建 worktree、没开会话**。收尾因此是平凡的（§7）。
-- ⚠️ **顶层 spec 传 `timeoutMs` 一律 `UsageError`**。多一个顶层预算就多一处"两个预算谁管谁"的解释，而上面这条规矩已经够用。**同理不引入 `setupTimeoutMs`。**
+- setup 花在第一轮的预算里 ⇒ **与 `runNode` 今天的口径完全一致**：setup 花光预算，第一轮就超时。这是现在的行为，不是新规则。
+- `prepare` 里只剩**不需要预算的本地动作**：`normalizeSpec` / 建目录 / 进程内防撞键 / 锁文件 / 仓库体检 + 第一次脏树查 / 幂等闸或回放闸 / 嵌套检查。这些今天也全在并发闸之前（源码 `1149-1294`）。**对话闸不在这里取**（§1.1）。
+- **零轮 ⇒ 从没拿过任何闸、没建 worktree、没开会话**。收尾因此是平凡的（§7）。
+- ⚠️ **顶层 spec 传 `timeoutMs` 一律 `UsageError`**。多一个顶层预算就多一处"两个预算谁管谁"的解释。**同理不引入 `setupTimeoutMs`。**
 
-### 2.2 `main` 轮到旧回执顶层字段的兼容投影（v3 收窄，BLOCKER）
+**T9 为什么仍然成立（完整链条，v4 补）**：拿执行闸 → 起钟 → 脏树复查与 `createWorktree` 消耗预算 → 走到 `open_session` **之前**还有一道 `remaining() <= 0` 检查（源码 `1500`），它在 `openOutcome` 被改成 `"unknown"`（`1504`）**之前**就 `return finish("timeout")`。于是预算耗尽时：`sessionId === null`、`openOutcome === "not-attempted"`，**而且那棵 worktree 因此可以安全删除**（§7 的三条授权之一）。懒入场不动这条链上的任何一环。
+
+### 2.2 `main` 轮到旧回执顶层字段的兼容投影
 
 抽取之后 `runNode` 的那一轮内部叫 `key: "main"`。**投影只覆盖内容字段，不覆盖生命周期字段**——v2 那句"顶层字段投影自 `main` 轮"写过头了，它会把 `finalizeWorktree` 的**降级权**一起投影掉（§2.4）。
 
@@ -148,14 +164,15 @@ v2 定的是"`startClock()` 在拿到并发闸那一刻起算，第一轮继承�
 |---|---|
 | `finish()` 同时干"结束这一轮"和"结束这个节点" | 拆开。**turn 结束不关会话、不收工作区**；节点结束才收 |
 | `finishTimeout()` abort 之后直接 `finish("timeout")` | abort 之后**只结束这一轮**，并据 `abortConfirmed` 决定会话还能不能用（§3） |
-| `saveScene()` 是会话级、且延后取 | **改成 turn-scoped，且立刻取**（§3.2） |
+| `saveScene()` 是会话级、且延后取 | **改成 turn-scoped，且立刻取**（§3.3） |
 | 拿闸 / 起钟 / worktree / open 在 `runNode` 函数体里线性排开 | 搬进 `runTurn` 的**首轮入场**分支（§2.1） |
+| `finally` 里 `bridge._gate.release()` 一处管所有 | **两种 lease**（§1.1）：`runNode` 保持在最外层 `finally`，对话按轮放 |
 
-### 2.4 顶层状态的优先级：轮不是唯一的输入（v3 新增，BLOCKER）
+### 2.4 顶层状态的优先级：轮不是唯一的输入
 
 v2 的 §5 把顶层状态定成"全轮 ok / 否则第一个非 ok 轮"，**漏了三类结局**，而其中一类今天就是关键语义：
 
-- 源码 `1458-1469`：`workspace.outcome` 不是 `delivered`/`no-changes` 时，**无条件**把 `status` 降成 `unknown`——理由写在那儿：`backend_failed`/`timeout` 在本工具的契约里是"可以安全换个人重跑"，而重跑常带 `force`，`force` 会删掉那棵**正因为说不清才被保留**的工作树。
+- 源码 `1458-1469`：`workspace.outcome` 不是 `delivered`/`no-changes` 时把 `status` 降成 `unknown`——理由写在那儿：`backend_failed`/`timeout` 在本工具的契约里是"可以安全换个人重跑"，而重跑常带 `force`，`force` 会删掉那棵**正因为说不清才被保留**的工作树。
 - 源码 `1478`：回执落盘失败也降 `unknown`。
 - **全轮 ok 但回调自己抛异常**：按 v2 会落一张 `status:"ok"` 的回执，还能过复用闸——等于把一次崩掉的编排当成功缓存起来。
 
@@ -164,12 +181,28 @@ v2 的 §5 把顶层状态定成"全轮 ok / 否则第一个非 ok 轮"，**漏�
 | # | 判据 | 结果 |
 |---|---|---|
 | 1 | 全部轮 `ok` | `ok` |
-| 2 | 有非 ok 的轮 | **第一个**非 ok 轮的 status（不取最后一轮：那会让"第 2 轮挂了、第 3 轮碰巧成了"报成功） |
+| 2 | 有非 ok 的轮 | **各轮里最严重的那一个**（严重度序见下） |
 | 3 | 回调抛了异常，**且**此刻 status 仍是 `ok` | `callback_error`（对话独有；`runNode` 不可能产生它） |
-| 4 | `workspace.outcome` 不是 `delivered`/`no-changes` | `unknown`（沿用源码 `1458` 那段，一字不改） |
+| 4 | **`access === "write"` 且 worktree 确实建起来了**，而 `workspace.outcome` 不是 `delivered`/`no-changes` | `unknown` |
 | 5 | 回执写入失败 | `unknown`（沿用源码 `1478`） |
 
+**第 2 级用「最严重」而不是「第一个非 ok」（v4 修，MAJOR）。** 严重度序**直接取仓里已有的 `STATUS_EXIT`**（`node-core.mjs:1723-1729`），不另发明：
+
+```
+ok(0) < contract_error(2) < backend_failed(3) < timeout(4) < unknown(6)
+```
+
+- "第一个非 ok"会被**后面更坏的轮**遮住。反例：第 1 轮 `contract_error`（`sessionReusable:true`）、第 2 轮 timeout 且 `abortConfirmed:false`（毒化）、回调正常返回 ⇒ 顶层报 `contract_error`，而 `contract_error` 按现有语义是"后端好好的，改改 prompt 就能重跑"——**实际上第 2 轮可能还在后台跑**。
+- "最后一轮"会被**前面更坏的轮**遮住（"第 2 轮挂了、第 3 轮碰巧成了"报成功）。
+- **取最严重的一次把两个方向一起修掉**，且 **N=1 时与今天恒等**（只有一轮，最严重的就是它）⇒ `runNode` 零变化。
+- 哪一轮出的事不靠顶层 status 讲：`turns[]` 每轮都带自己的 status，毒化那轮另有 `poisonedAfter`。
+
+**第 4 级必须带 `write` + `workspace` 两个前提（v4 修，BLOCKER）。** v3 只写"`workspace.outcome` 不是 delivered/no-changes"，**read 档的 `workspace` 恒为 `null`**，于是 `null.outcome` 也不属于那两个合法值——**每一个成功的 read 对话都会被降成 `unknown`**。源码那段本来就在 `if (workspace && !workspaceFinalized)` 里面（`1429` / `1705`），前提不能丢。
+
+**其余两条：**
+
 - 第 3 条**只在 status 还是 `ok` 时**生效：轮先挂了、回调因此抛（`r1.text.trim()` 之类）时，轮的 status 更接近根因，不许被 `callback_error` 盖掉。
+  ⚠️ **但回调异常这件事不许因此消失**：第 2 级生效时，回调异常的 `name + message` **必须进 `diagnostics`**。否则进程一退，canonical 回执里就再也没有"回调也炸了"这个事实。
 - `callback_error` ≠ `ok` ⇒ **复用闸自然拒绝它**，不需要额外规则。
 - ⚠️ **顶层 status 怎么变，都不改变"原始异常原样重抛"**（§7）。回执是记录，异常是控制流，两回事。
 
@@ -177,7 +210,7 @@ v2 的 §5 把顶层状态定成"全轮 ok / 否则第一个非 ok 轮"，**漏�
 
 ## 3. 会话还能不能接着用：串行闸、`sessionReusable` 与「毒化」
 
-### 3.1 同一时刻只许有一轮（v3 新增，BLOCKER）
+### 3.1 同一时刻只许有一轮
 
 `Promise.all([turn(a), turn(b)])` 会让两轮在第一轮还没产出任何结论之前**同时通过毒化 guard**，随后两边向同一个 session `send`——正是要消灭的东西。§8 只写"不做并发"是**调用纪律，不是判据**。
 
@@ -185,7 +218,12 @@ v2 的 §5 把顶层状态定成"全轮 ok / 否则第一个非 ok 轮"，**漏�
 
 > 该段对话已有一轮在途 ⇒ 立刻 `UsageError`，**且这一步排在任何 `await` 之前**——占 key、建产出文件、发事件、拿闸、起钟、发消息，一件都还没发生。
 
-JS 单线程，函数入口处的"查+置位"之间没有让出点，所以这道闸是原子的。**判据放在工具里，不是写在 SKILL 里请人自觉。**
+JS 单线程，async 函数体在第一个 `await` 之前是同步执行的，所以这道闸是原子的。**两条实现约束跟着写死**（不写死就会在某次重构里悄悄失效）：
+
+- "查 + 置位"必须**字面上**排在任何可能返回 Promise 的 helper 之前——包括参数校验。**一旦哪天把校验改成 `await validate(...)` 放到前面，这条保证当场作废。**
+- 置位在 `finally` 里清，不能只在成功路径清。
+
+**判据放在工具里，不是写在 SKILL 里请人自觉。**
 
 ### 3.2 `sessionReusable` 与毒化
 
@@ -206,13 +244,13 @@ v1 写的是"abort 之后只结束这一轮，是否继续由回调决定"。**�
 
 - 后续任何 `turn()` 返回 **rejected Promise**（`UsageError`），拒的位置**与 §3.1 的串行闸同一处**——同样在任何副作用之前
 - 毒化之后 `fn` 继续跑完（它可能还要做别的），作用域退出时照常收尾
-- 回执里 `poisonedAfter` = 毒化那一轮的 `key`
+- 回执里 `poisonedAfter` = 毒化那一轮的 `key`。⚠️ 它**不是**顶层 status 的替代品——status 已经按 §2.4 第 2 级取到了那一轮（毒化的三种结局 `timeout`/`backend_failed`/`unknown` 严重度都不低），`poisonedAfter` 只回答"是哪一轮"
 
 ### 3.3 现场必须**当轮**冻结，不能延到整段收尾
 
 v1 说"最后保存第一个非 ok 轮的现场"。**那会保存错轮的现场**：桥的 `answerFile` / `textRef` 是**会话级的单一路径**，每轮结果覆盖同一个文件。第 1 轮超时、第 2 轮继续跑完之后再去取，拿到的 `answer.txt` / `status.json` **属于第 2 轮**，却被标成"第 1 轮失败的现场"。
 
-**定死：某一轮非 `ok` 时，在下一次 `send` 之前立刻冻结它自己的现场。**
+**定死：某一轮非 `ok` 时，在下一次 `send` 之前立刻冻结它自己的现场**（也就是在该轮释放执行闸之前，§1.1）。
 
 - 对话：`nodes/<id>.t-<key>.scene/`（turn-scoped）
 - `runNode`（N=1）：**仍投影到 `nodes/<id>.scene`**，保证 T2/T3 逐字节不变
@@ -226,7 +264,7 @@ v1 的 `lineageHash` 在 callback 式 API 下**没有可执行判据**：调 `fn
 
 **定死：走 replay validation。**
 
-> `reuseIfSame` 且已有一张合格的旧回执时：**不拿执行闸、不建会话、不建 worktree**。回调照常执行，每个 `turn()` **不发任何消息**，而是拿本轮参数与旧回执里对应的那一轮**逐项比对**，一致就直接返回旧的 `turnResult`。`fn` 返回时要求**恰好消费完全部轮次**——多一轮、少一轮、顺序不同，全部拒绝整段。
+> `reuseIfSame` 且已有一张合格的旧回执时：**不拿任何闸、不建会话、不建 worktree**。回调照常执行，每个 `turn()` **不发任何消息**，而是拿本轮参数与旧回执里对应的那一轮**逐项比对**，一致就直接返回旧的 `turnResult`。`fn` 返回时要求**恰好消费完全部轮次**——多一轮、少一轮、顺序不同，全部拒绝整段。
 
 **每轮的指纹必须覆盖**：
 
@@ -236,19 +274,27 @@ turnSpecHash = H(key, prompt 正文, timeoutMs, schema, outputShape, reask)
 
 **复用闸（逐项，缺一即 `UsageError`）：**
 
-回执存在且 `receiptVersion` 对得上 → `kind === "conversation"` → `specHash` 一致 → 顶层 `status === "ok"` →（write 再加：主树干净、`baseCommit` 未变、按 `workspace.outcome` **字面量**分派，沿用 `runNode` 那套一字不改）→ 进回放：每轮 `turnSpecHash` 一致、该轮产出文件存在且 SHA 与回执一致 → `fn` 返回后恰好消费完全部轮次。
+回执存在且 `receiptVersion` 对得上 → `kind === "conversation"` → `specHash` 一致 → 顶层 `status === "ok"` →（write 再加：主树干净、`baseCommit` 未变、按 `workspace.outcome` **字面量**分派，沿用 `runNode` 那套一字不改）→ 进回放：每轮 `turnSpecHash` 一致、该轮产出文件存在且 SHA 与回执一致、**该轮每一条非空 attempt 产出的路径与 SHA 也逐项一致**（§6）→ `fn` 返回后恰好消费完全部轮次。
 
 - ⚠️ **`kind` 这道闸只属于 `conversation()`。** `runNode()` 的复用闸**不许开始查 `kind`**——历史回执没有这个键，加上去等于把所有旧回执一次判死。**按调用的是哪个 API 分派，不按回执里有没有某个字段分派。**
 - ⚠️ **少一项就拒绝，不是跳过。** 按 `kind` 的字面量分派，结构上就没有"跳过"这条路——**"字段缺失＝静默跳过校验"这个坑本仓踩过三次**。
-- ⚠️ **删掉 v2 的 `conversationHash`**：它完全由 `specHash` + 逐轮 `turnSpecHash` + 逐轮 `artifactSha256` + 轮序列派生，而这四样上面每一样都已经逐项强制校验过。留着它只是让被验的一方多出示一张自己算的成绩单。**没有独立消费者的字段，本仓已经栽过好几次**（`pid` / `archiveRef` / `halt` / `BoundedSummary.name`）。同理 v1 那个逐轮累计的 `lineageHash(k)` 也早已删掉。
+- ⚠️ **删掉 v2 的 `conversationHash`**：它完全由 `specHash` + 逐轮 `turnSpecHash` + 逐轮 SHA + 轮序列派生，而这几样上面每一样都已经逐项强制校验过。留着它只是让被验的一方多出示一张自己算的成绩单。**没有独立消费者的字段，本仓已经栽过好几次**（`pid` / `archiveRef` / `halt` / `BoundedSummary.name`）。
 
 **不匹配之后怎么办：响亮失败，不静默转 live。**
 
-任一闸不过 → `UsageError`。**不会"那就重新跑一遍"**——这不是新规矩，**这就是 `runNode` 今天的口径**（源码 `1162-1293`：版本不对、`specHash` 变了、上次不是 ok、产出被换过、基线漂了、分支没了……每一条都是 `throw new UsageError`，从来没有一条是回退去重跑）。要重跑请加 `force`，或换个 `id`。
+任一闸不过 → `UsageError`。**不会"那就重新跑一遍"**——这不是新规矩，**这就是 `runNode` 今天的口径**（源码 `1162-1293`：版本不对、`specHash` 变了、上次不是 ok、产出被换过、基线漂了、分支没了……每一条都是 `throw new UsageError`，从来没有一条回退去重跑）。
 
-**回放的副作用边界（v3 补，MAJOR）：**
+在分波（`templates/wave.mjs`）里怎么用，写进 SKILL：
 
-- 工具在回放期间**承诺**的只有：不拿执行闸、不建 worktree、不开会话、不发任何消息。
+| 情况 | 怎么写 |
+|---|---|
+| 语义没变的旧对话 | 稳定 `id` + `reuseIfSame` |
+| prompt / 轮序列改了 | **换新 `id`** |
+| 明确要覆盖上次那一次执行 | 用 `force`，**且不要同时传 `reuseIfSame`** |
+
+**回放的副作用边界：**
+
+- 工具在回放期间**承诺**的只有：不拿任何闸、不建 worktree、不开会话、不发任何消息、**不动 canonical 回执**（§7）。
 - 回调里**其它**东西的副作用（嵌套 `runNode`、直接写文件、发网络请求）**工具管不了**，而"恰好消费完全部轮次"只能在末尾才判得出来——那时嵌套节点早跑完了。
 - ⚠️ **"拒绝整段"的意思只有一个：这一段对话不接受复用。它不是回滚，也不是事务。**
 - 因此定死一条使用纪律并写进 SKILL：**回放模式下的回调必须是可重放的**——嵌套节点一律带 `reuseIfSame`（它自己会命中自己的复用闸），**绝不用 `force:true`**（那会真删真跑）。
@@ -275,7 +321,11 @@ turnSpecHash = H(key, prompt 正文, timeoutMs, schema, outputShape, reask)
       "artifactSha256": "…", "charCount": 1234, "byteCount": 1400,
       "reaskCount": 0, "durationMs": 84000,
       "startedAt": "…", "endedAt": "…", "contextUsage": { "tokens": 51234 },
-      "abortConfirmed": null, "scene": null, "error": null },
+      "abortConfirmed": null, "scene": null, "error": null,
+      \ 每次尝试各一条,形状与 viz 施工第 5 项在节点级加的那份完全相同:
+      "attempts": [ { "n": 1, "inputSha256": "…", "inputRef": null,
+                      "artifactPath": "…", "artifactSha256": "…",
+                      "status": "accepted", "rejectedReason": null } ] },
     { "key": "fix", "…": "…" }
   ],
   "workspace": { "outcome": "delivered", "branch": "graph/<runKey>/events-md", "…": "…" },
@@ -287,7 +337,9 @@ turnSpecHash = H(key, prompt 正文, timeoutMs, schema, outputShape, reask)
 - **每轮一个产出文件** `nodes/<id>.t-<key>.md`；`key` 只许 `[A-Za-z0-9._-]`、≤200 字节、段内唯一
 - **`turn()` 不抛异常**（同 `runNode`）：失败进 `turnResult.status`。只有**用法错**（串行闸、毒化后仍调、`key` 非法/重复、超 `maxTurns`、`fn` 返回后迟到调用）才抛
 - 顶层 `status` 见 §2.4；`error` 在 `callback_error` 时装回调异常的 `name + message`（**不新开字段**）
-- **轮级不设 `rejectedReason`**：契约打回的原因就是那一轮的 `error`，再放一份是第二个副本（§9）
+- **轮级不设 `rejectedReason`**：契约打回的原因就在 `attempts[].rejectedReason` 里，轮级再放一份是第二个副本（§9）
+- **`turns[].attempts[]` 必须持久化**（v4 补，MAJOR）：viz 的回放兜底**唯一**能拿到 attempt 证据的地方就是终态里的这份摘要——复用命中时**不发任何 attempt 事件**（viz 设计 §1120）。不落盘，"attempt 1 被打回、attempt 2 成功"这段历史在下一次回放时就彻底没了。
+  ⚠️ **`runNode` 的节点级 `attempts[]` 不由本方案添加**——它是 viz 施工清单第 5 项（viz 设计 §1078，`RECEIPT_VERSION` 也是因它升到 2）。这里加的是 `turns[]` 里面的那份，而 `turns[]` 只存在于 `kind:"conversation"` 的回执上，**碰不到旧形状**。
 - **`maxTurns = 20`**，超过当场 `UsageError`。理由：`node:settled` 要内联一份有界的轮摘要（§6），而 N 无上限就顶穿事件的行上限。20 对"复审→修订"这类用法足够宽（实测 2~6 轮），**而且超了是响亮报错、不是静默截断**
 - v1 **不给 CLI 暴露对话**（`node-turn.mjs` 只跑单节点），所以不新增退出码
 
@@ -314,7 +366,7 @@ EVENTS.md v1 必须直接包含：
 - 归档多一层：`<seq>-<id>/turns/<key>/`
 - ⚠️ **`node:settled` 里内联的是有界的 `TurnSummary`，不是回执同形对象**：viz 的既有原则是"事件只装发生了什么 + 去哪儿找，不复制 canonical 回执"。
   `TurnSummary` = `{ key, status, sessionReusable, output: AssetState, turnSpecHash, charCount|null, durationMs, attempts[] }`。
-  其中 `attempts[]` 就是 viz 现有的那份兜底摘要（含 attempt 级的 `rejectedReason?`）**搬到轮下面**，每轮 ≤2 项 ⇒ 全节点 ≤40 项，仍然有界。
+  `attempts[]` 就是 viz 现有的那份兜底摘要（含 attempt 级的 `rejectedReason?`）**搬到轮下面**，每轮 ≤2 项 ⇒ 全节点 ≤40 项，仍然有界。它的持久来源是 §5 的 `turns[].attempts[]`。
   ⚠️ **轮级不再另设 `rejectedReason`**——它就是本轮最后一次 attempt 的那个值，第二个副本（§9）
 - ⚠️ **复用命中只发 `node:settled{execution:"reused"}` 的历史摘要**，**不伪造**本次并未发生的 `node:turn` 开始事件——页面上"这一轮什么时候开始的"必须是真的发生过
 
@@ -322,33 +374,62 @@ EVENTS.md v1 必须直接包含：
 
 ---
 
-## 7. 作用域的所有权与收尾协议（v3 重写，BLOCKER）
+## 7. 作用域的所有权与收尾协议
 
-`conversation()` 拥有：对话闸名额、会话、worktree、锁文件、进程内防撞键、产出目录。（执行闸名额**不由它持有**，见 §1.1。）
+`conversation()` 拥有：对话闸名额、会话、worktree、锁文件、进程内防撞键、产出目录。（执行闸名额按轮持有，见 §1.1。）
 
-**收尾是一条固定的八步，每一步各自 try/catch，前一步失败绝不跳过后面的步骤：**
+### 7.1 live 路径：八步，每步各自 try/catch，前一步失败绝不跳过后面的步骤
 
 | # | 动作 | 它自己失败了怎么办 |
 |---|---|---|
 | ① | **封 admission**（同步置位；之后任何 `turn()` 立刻 rejected） | 不会失败 |
-| ② | **排空在途轮**：等那一轮自然结束（它有自己的钟，必然终止） | 记 diagnostics，继续 |
-| ③ | **关会话** | `closeConfirmed=false` + diagnostics，继续。⚠️ 关不掉可能意味着后端还活着，于是④必须保留 worktree |
-| ④ | **按 `outcome` 收工作区** | 记 diagnostics + 按 §2.4 第 4 条降 `unknown`，继续。收不掉 ⇒ 树与分支留在盘上（这是**故意**的，路径进 diagnostics） |
+| ② | **排空在途轮**：等那一轮自然结束 | 记 diagnostics，继续 |
+| ③ | **关会话** | `closeConfirmed=false` + diagnostics，继续 |
+| ④ | **按 `outcome` 收工作区**（只有 write 且树建起来了才有这一步） | 记 diagnostics + 按 §2.4 第 4 条降 `unknown`，继续 |
 | ⑤ | **定顶层 status**（§2.4）+ `endedAt` / `durationMs` | 不会失败 |
-| ⑥ | **原子写回执** | 按 §2.4 第 5 条降 `unknown`，继续。⚠️ 写不下去 = 这次没有 canonical 回执，下次无法据它做幂等判断 |
-| ⑦ | **无条件释放**：执行闸（若仍持有）→ 对话闸 → 进程内防撞键 → 锁文件 | 各自 try/catch。**这一步一件都不许漏**——漏了下一段对话永远起不来 |
+| ⑥ | **原子写回执** | 按 §2.4 第 5 条降 `unknown`，继续 |
+| ⑦ | **无条件释放**：执行闸（若仍持有）→ 对话闸（若取过）→ 进程内防撞键 → 锁文件 | 各自 try/catch。**一件都不许漏**——漏了下一段对话永远起不来 |
 | ⑧ | **若回调抛过异常：原样重抛那个异常对象** | ③④⑥ 的抱怨一律只进 `diagnostics`，**绝不替换它** |
 
-**四条路都走这八步：**
+**第④步删不删树，判据是源码那三条，不是"关没关成"（v4 修，BLOCKER）：**
 
-- **① 回调正常返回** —— 八步走完，返回回执。
-- **② 回调抛异常** —— 八步走完，第⑧步重抛**原始异常**。
+```
+可以删 ⟺ closeConfirmed === true
+        || openOutcome === "not-attempted"
+        || openOutcome === "refused"
+```
+
+（源码 `1431-1439`。）v3 写成"关不掉可能意味着后端还活着 ⇒ 保留"是**错的**，它会改掉现有 `runNode` 行为并留下残骸：
+
+- write 节点建好 worktree 后预算耗尽、**还没发出 `open_session`**（`openOutcome === "not-attempted"`，正是 T9 那条路）：没有任何后端可能写这棵树，**必须删**。
+- `open_session` 被桥**明确回报**起不来（`openOutcome === "refused"`）：同样是空树空分支，**必须删**——否则每次后端没装好都攒一棵。
+
+第②步那一轮**会终止**：桥的每次 RPC 都有客户端计时器、`wait` 用有限切片，超时后进 abort/finalize（前提只是 event loop 与 OS 还能调度）。**不需要为它新增机制。**
+
+### 7.2 replay 路径：只读收尾，**绝不碰 canonical 回执**（v4 补，BLOCKER）
+
+v3 让两条路共用同一套八步，于是回放会去写回执——**那是在毁掉自己刚刚验证过的那份缓存**：
+
+- 反例一：回放正常命中，⑤⑥ 把 `endedAt`/`durationMs` 改成**本次验证**的时间，历史执行的耗时就此丢失。
+- 反例二：旧回执是 `ok`、每一轮都对得上，但回调最后抛了个新异常 ⇒ 八步会把这张成功回执改写成 `callback_error`。**一次回放期的编排 bug，永久毁掉一份有效缓存。**
+- 现有 `runNode` 命中复用是 `return { ...prev, reused: true }`（源码 `1293`），**一个字节都不写**。
+
+**定死 replay 的四步：**
+
+> ① 封 admission → ② 排空在途轮 → ③ 验证「恰好消费完全部轮次」→ ④ 释放**本次**取得的东西（进程内防撞键、锁文件；**闸没取过，会话不存在，工作区没建过，一律不动**）
+> ⇒ 返回 `{ ...prev, reused: true }`，或（回调抛过异常时）重抛原始异常。
+> **不关会话、不 finalize 工作区、不写回执、不改 `endedAt`。**
+
+### 7.3 四条路 + 两个边界
+
+- **① 回调正常返回** —— 走 7.1 或 7.2，返回回执。
+- **② 回调抛异常** —— 同上走完，最后重抛**原始异常**。
 - **③ `fn` 返回之后迟到的 `turn()`**（回调里 `setTimeout` 了一下之类）—— 第①步已经封了，返回 rejected Promise，**不产生任何事件、文件、消息**。
 - **④ 进程被强杀** —— **不承诺统一收尾**：JS 的 `finally` 不运行。会话与后端只能靠桥的 EOF / OS 兜底，**worktree 与 `.lock` 可能残留、终态回执不会产生**。这条**如实写进 SKILL**，并给出人工恢复办法（`git worktree remove --force` + 删锁文件）。**不为它做持久 lease / crash recovery**——那是另一个量级的机制，而这条边界 viz 设计里已经接受过一次。
 
 **零轮**（`fn` 一次 `turn()` 都没调）：
 
-- 因为入场是懒的（§2.1），此时**从没拿过执行闸、没建 worktree、没开过会话**，③④ 是空操作。
+- 因为入场是懒的（§2.1），此时**从没拿过任何闸、没建 worktree、没开过会话**，③④ 是空操作。
 - **回调正常返回** ⇒ 收完资源后报 `UsageError`。**不写空回执**（一张 `turns: []` 的回执会让复用闸面对一个没有任何判据的对象）。
 - **回调抛了异常** ⇒ **抛回调那个异常，不是零轮的 `UsageError`**。⚠️ v2 这两条规则直接打架；根因说清楚就不再冲突：**零轮检查是"你什么都没干"的兜底诊断，而回调已经抛出的异常才是根因，兜底不许盖根因。**
 
@@ -360,36 +441,41 @@ EVENTS.md v1 必须直接包含：
 
 - **不做部分复用**（§4）
 - **回放拒绝之后不自动转 live 重跑**（§4：与 `runNode` 复用闸同一口径，响亮失败）
+- **回放不写回执**（§7.2）
 - **不做跨 `withBridge` 的对话**：会话活在桥进程里，桥没了对话就没了。分波要延续 → 复用整段（§4）
 - **不做 `runNode` 的 `keepSession` 标志**（§1：谁收尾说不清）
 - **不做一段对话内换 agent / model / access / cwd**：全是 `open_session` 的参数，钉死在开会话那一刻。要换 → 另起一段对话
 - **不做轮与轮之间的并发**：由 §3.1 的串行闸**强制**，不是纪律
 - **不做嵌套 `conversation()`**（§1.1：会在对话闸上成环）。嵌套 `runNode` **支持**，那是头号用法
-- **不做强杀后的自动恢复**（§7④）
+- **不做强杀后的自动恢复**（§7.3④）
 - **顶层不接受 `timeoutMs`，也不引入 `setupTimeoutMs`**（§2.1）
+- **不由本方案给 `runNode` 的回执加 `attempts[]`**（那是 viz 施工第 5 项，§5）
 
 ---
 
-## 9. codex 复审 v2 的落点（4 BLOCKER + 2 MAJOR）
+## 9. codex 复审第 3 轮的落点（4 BLOCKER + 3 MAJOR）
+
+**用户 2026-07-28 裁定：复审到本轮为止。** 下面是逐条裁定，成立的已全部落地。
 
 | 级别 | 发现 | 裁定 | 修在 |
 |---|---|---|---|
-| **BLOCKER** | "拿闸时起钟"在对话里无法实现：顶层 spec 没有 `timeoutMs`，而拿闸/worktree/open 都在 `prepare` 里 | **认** | §2.1 改成**懒入场**：拿闸/起钟/worktree/open 全延到第一次 `turn()`。`runNode` 因 N=1 而因果顺序逐字节不变（源码 `1296-1313`） |
-| **BLOCKER** | 状态模型只定义了轮的结局，漏了 prepare / callback / finalize；`finalizeWorktree` 的降级权被"顶层投影自 main 轮"抹掉 | **认**（源码 `1458` / `1478` 确认降级是无条件的） | §2.4 五级优先级 + §2.2 把投影收窄到内容字段 + §7 逐步隔离的八步收尾 |
-| **BLOCKER** | 对话整段持名额 + 回调里嵌套 `runNode` = 自锁；且 replay 不持真名额 ⇒ live/replay 不一致 | **认问题；驳 remedy** —— codex 给的两个选项是"禁止嵌套"或"重设名额所有权"，**禁止嵌套会杀掉头号用法**（复审必须发生在两轮之间） | §1.1 拆成**执行闸 + 对话闸**两把：轮期间才占执行闸 ⇒ 嵌套 `runNode` 拿得到；嵌套 `conversation` 禁掉（它才成环），live/replay 判据一致 |
-| **BLOCKER** | 毒化 guard 挡不住 `Promise.all([turn(a), turn(b)])` 的并发 admission | **认** | §3.1 在 `turn()` 入口加**同步**串行闸，排在任何 `await` 与任何副作用之前 |
-| MAJOR | replay rejection 不是事务：回调副作用可在判失败前发生，无法回滚 | **认，并收窄** | §4 写死"拒绝＝不接受复用，不是回滚"+ 回放回调必须可重放（嵌套用 `reuseIfSame`、禁 `force`）+ 恰好消费检查排在封 admission、排空之后 + 原始异常优先 |
-| MAJOR | 删 `conversationHash` 与 `rejectedReason` | `conversationHash` **认**（确实完全派生、无独立消费者）；`rejectedReason` **结论认、理由驳** | §4 删 `conversationHash`；§5/§6 删**轮级**的 `rejectedReason` |
+| **BLOCKER** | v3 把执行闸统一成"持有到该轮结束"，而 `runNode` 的 close/finalize/写回执在轮之后 ⇒ 活会话数会超上限，**打红 W8** | **认**（`node-core.mjs:1715` 今天在最外层 `finally` 放闸；`repro-graph-worktree.mjs:337` 实测断言）。**这是 v3 新造的回归** | §1.1 **两种 lease**：`runNode` 保持最外层，对话按轮放 |
+| **BLOCKER** | §2.4 第 4 级没有 `write` / `workspace` 前提 ⇒ **每个成功的 read 对话都被降成 `unknown`** | **认**（源码那段本来就在 `if (workspace)` 里，`1429`/`1705`） | §2.4 第 4 级补两个前提 |
+| **BLOCKER** | §7"关不掉就保留 worktree"不精确 ⇒ `not-attempted` / `refused` 两条路会留残骸，改变 `runNode` 行为 | **认**（授权是 `closeConfirmed \|\| not-attempted \|\| refused`，`1431-1439`） | §7.1 直接引用源码那三条；§2.1 把 T9 的完整链条写全（含 `1500` 那道 pre-open 检查） |
+| **BLOCKER** | 八步收尾没分出 replay 路径 ⇒ 回放会反写、甚至把 `ok` 毁成 `callback_error` | **认**（`runNode` 命中复用是 `return {...prev, reused:true}`，`1293`，一个字节不写）。**也是 v3 新造的回归** | §7.2 replay 专用四步只读收尾 |
+| MAJOR | `poisonedAfter` 会被"第一个非 ok"遮住，顶层 status 不再表达重跑安全性 | **认问题，改 remedy**——codex 的两个选项（毒化结局不可被遮 / 消费者先查 `poisonedAfter`）前者会把 `runNode` 的 `timeout` 改成 `unknown`、后者要求所有下游改代码 | §2.4 第 2 级改成**取最严重的一轮**，严重度序**直接用仓里的 `STATUS_EXIT`**（`1723-1729`）。N=1 恒等 ⇒ `runNode` 零变化，且"前遮后""后遮前"一起修掉。另补：第 2 级生效时回调异常仍须进 `diagnostics` |
+| MAJOR | `_scopeGate` 在 prepare 取（那时还没会话）；且它不是全局活会话上限 | **认** | §1.1 改成**首个 live turn 才取**、顺序 `scope → exec`、回放/零轮不取；并如实写明总上限 = `scope + exec` |
+| MAJOR | `TurnSummary.attempts[]` 有消费者但回执里没有持久生产源 | **认** | §5 给 `turns[]` 加 `attempts[]` + §4 复用闸逐项校验 attempt 产出；并写明 `runNode` 的节点级那份属 viz 施工第 5 项，不由本方案加 |
 
-**驳回的那半条，理由写清楚：** codex 说 `rejectedReason` "没有生产路径，因为用法错/毒化/超 `maxTurns` 都在 admission 前抛异常，不会进 `turns[]`"。**这是把它读成了"这一轮被拒绝的原因"。** 它实际是 **attempt 级的「产出被契约打回的原因」**（viz 设计 §3.3 `node:attempt-settled` 的 `rejectedReason?`，对应源码里那个 `bad` 字符串），生产路径就是 `contract_error`，一直都在。
-——但**删的结论仍然成立，换一条理由**：在**轮**这一级它与 `turns[].error` 是同一个字符串的第二份副本。所以删轮级的、**保留 attempt 级的**（后者搬到 `TurnSummary.attempts[]` 下面）。
+**第 2 轮里我驳回的三处，本轮 codex 的复核结果：**
 
-**codex 另外两条附注，都采纳：**
+- **拆两把闸（驳"禁止嵌套 runNode"）** → 确认方向正确、依赖图无环、FIFO 交接不会饿死；问题只在取得时机与持有区间（已修）。
+- **`rejectedReason` 的理由** → **codex 承认上一轮理由错了**，我读对了：它是 attempt 级"产出为何被契约拒绝"，生产者就是 reask 分支那个 `bad`（`1658`）。只补一条表述：它与 `turn.error` 语义重复但**不保证字节相同**（预算耗尽时 `error` 还会追加"没能打回重说"后缀）——不影响删轮级副本。
+- **回放拒绝不转 live** → 确认与既有 `runNode` 完全一致，代价应当接受，并给出了分波三条写法（已写进 §4）。
 
-- 收尾顺序必须保持 `abort（若需要）→ 当轮 scene → close_session → finalizeWorktree → 顶层 duration/status → 回执` —— 与源码 `1418-1482` 一致，§7 的八步就是它。
-- **legacy `runNode` 的复用仍按 API 模式分派，不能因为回执缺 `kind` 就被对话的闸误拒** —— 已写进 §4 的加粗警告。
+**三样"能不能删"的结论：`callback_error` / `_scopeGate` / `attempts[]` 都不能删**，各自有独立消费者（区分已知编排缺陷 vs 未知后端状态 / 界长寿命会话 / 回放兜底的唯一来源）。
 
-**关于"本轮没能独立复跑 74/74 + 149/149"**：codex 的只读沙箱禁掉了测试用的 `mkdtemp`，在任何断言执行前就 `EPERM` 终止。**这两套回归是我在本机跑过的**（基线冻在 `cb28aec` + `bc94972`）；复审侧只静态核到三份 `.mjs` 过 `node --check`、工作树干净。这条差异如实记在这里，不当成"已被第三方验证"。
+**关于"复审侧没能独立复跑回归"**：codex 的只读沙箱禁掉了测试用的 `mkdtemp`，在任何断言执行前就 `EPERM` 终止。**两套回归是我在本机实跑确认的**：`repro-graph-node.mjs` **74/74**、`repro-graph-worktree.mjs` **149/149**，基线冻在 `cb28aec` + `bc94972`。复审侧只静态核到 HEAD `e512615`、工作树干净、三份 `.mjs` 过 `node --check`。这条差异如实记在这里，不当成"已被第三方验证"。
 
 ---
 
@@ -402,24 +488,29 @@ EVENTS.md v1 必须直接包含：
 **`runNode` 零变化**
 
 - `repro-graph-node.mjs`（74）与 `repro-graph-worktree.mjs`（149）**全绿**，且**不许改断言来将就**（基线已冻在 `bc94972`）
-- **时钟语义没变**：T9 原样通过（`timeoutMs` 极小的节点，预算耗尽时**不该**已经有 sessionId）
-- **旧回执仍能复用**：一张**没有 `kind` 键**的历史回执 + `reuseIfSame` → `runNode` 照常命中复用（防止 `kind` 闸渗进旧路径）
+- **W8 不许松动**：抽取之后重跑，活会话数仍不超 `maxConcurrent`（这条正是 v3 那次回归会打红的）
+- **时钟语义没变**：T9 原样通过，且**断言那棵 worktree 被删掉了**（`openOutcome === "not-attempted"` ⇒ 可以删）
+- **open 被明确拒绝时不留残骸**：造 `refused` → 断言空 worktree 与空分支都被清掉
+- **旧回执仍能复用**：一张**没有 `kind` 键**的历史回执 + `reuseIfSame` → `runNode` 照常命中复用
 
 **名额与并发**
 
-- **嵌套不自锁**：`maxConcurrent = 1`，对话回调里跑一个 `runNode` → **必须能跑完**（这条一旦回归就是死锁，测试要带自己的超时，不能靠跑挂）
+- **嵌套不自锁**：`maxConcurrent = 1`，对话回调里跑一个 `runNode` → **必须能跑完**（测试要带自己的超时，不能靠跑挂）
 - **嵌套 `conversation` 当场拒**：live 与 replay 两条路**都**抛 `UsageError`
-- **对话闸真的在界会话数**：对话闸设 1 时，第二段对话在第一段收尾前拿不到名额
+- **对话闸懒取**：`scopeGate = 1`，对话 A 在第一次 `turn()` 之前先 await 一个可控的 promise → 断言对话 B **能够开始**（v3 那种在 prepare 取的写法这里会挂）
+- **回放不占闸**：回放命中期间断言 `scopeGate` 与 `_gate` 的占用数都是 0
 - **并发 turn 当场拒**：`Promise.all([turn(a), turn(b)])` → 第二个 rejected，**且没有发出任何消息、没有建任何文件**（要真查盘和真查调用，不能只看返回值）
 
 **状态与收尾**
 
-- **一轮失败不吞后续**：第 1 轮 `contract_error`（`sessionReusable:true`），回调选择继续 → 第 2 轮照常跑；断言节点级 status 是**第一个**非 ok 的那个
-- **全轮 ok + 回调抛异常** → 顶层 status 是 `callback_error`（**不是 ok**），且随后用 `reuseIfSame` **拒绝复用它**
-- **轮先挂 + 回调再抛** → 顶层 status 是那一轮的 status，**不是** `callback_error`
-- **零轮 + 回调正常返回** → `UsageError`，且**没有开过会话、没建过 worktree**（懒入场的直接证据）
+- **read 档成功就是 `ok`**：`access:"read"` 的单轮成功对话 → 顶层 `ok`（**不是 `unknown`**；这条正是 BLOCKER 2）
+- **取最严重的那一轮**：第 1 轮 `contract_error`、第 2 轮 timeout 且 `abortConfirmed:false` → 顶层 **`timeout`**，`poisonedAfter` 指第 2 轮
+- **后面的成功不遮前面的失败**：第 2 轮 `backend_failed`、第 3 轮 `ok` → 顶层 `backend_failed`
+- **全轮 ok + 回调抛异常** → 顶层 `callback_error`，且随后 `reuseIfSame` **拒绝复用它**
+- **轮先挂 + 回调再抛** → 顶层是那一轮的 status，**且回调异常出现在 `diagnostics` 里**
+- **零轮 + 回调正常返回** → `UsageError`，且**没有开过会话、没建过 worktree、没取过任何闸**
 - **零轮 + 回调抛异常** → 抛的是**回调那个异常对象**，不是零轮的 `UsageError`
-- **收尾失败不吞名额**：造一个关会话失败 + 收工作区失败 → 断言**执行闸、对话闸、锁文件、防撞键全部已释放**（下一段对话起得来），且原始异常没被诊断盖掉
+- **收尾失败不吞名额**：造关会话失败 + 收工作区失败 → 断言**两把闸、锁文件、防撞键全部已释放**，且原始异常没被诊断盖掉
 - **`workspace.outcome` 不明 → 顶层降 `unknown`**：即便全轮 ok
 - **毒化**：造 `abortConfirmed:false` 的超时 → 断言 `sessionReusable === false`，随后 `turn()` rejected，**且没有产生任何文件、没有发出任何消息**
 - **现场归属**：第 1 轮超时、第 2 轮继续并成功 → 断言存下来的 `answer.txt` 内容属于**第 1 轮**
@@ -429,7 +520,9 @@ EVENTS.md v1 必须直接包含：
 **write 与复用**
 
 - **write 一段一条分支**：三轮各改一个文件，断言**只有一条分支**、三处改动都在里面、`outcome === "delivered"`
-- **replay 复用**：同 key/prompt 序列 → 复用且**不开会话、不拿执行闸、不建 worktree**（真查这三样）；改第 1 轮 prompt → 拒**整段**；改第 2 轮 prompt → 同样拒整段；少一轮/多一轮 → 拒；某一轮产出文件被换过 → 当场拒
+- **回放不写回执**（BLOCKER 4）：先跑一段成功对话记下回执的 `endedAt` / `durationMs` 与文件 mtime → 回放命中 → 断言**三者一字未变**
+- **回放期回调抛异常不毁缓存**：回放全部匹配但回调最后抛异常 → 断言异常被重抛，**且盘上那张回执仍是 `ok`、内容与回放前逐字节相同**
+- **replay 复用**：同 key/prompt 序列 → 复用且**不开会话、不拿任何闸、不建 worktree**；改第 1 轮 prompt → 拒**整段**；改第 2 轮 prompt → 同样拒整段；少一轮/多一轮 → 拒；某一轮**最终产出**被换过 → 拒；某一轮**某次 attempt 的产出**被换过 → 也要拒（§4 逐项校验）
 - **回放拒绝不自动重跑**：上一条每种拒绝之后，断言**没有开过会话**（证明没有偷偷转 live）
 
 **零残留**
