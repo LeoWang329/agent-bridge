@@ -184,6 +184,11 @@ diff 里——跑测试产生的 `coverage/`、临时文件、它自己写的 `.
 
 **`runNode` 只为用法错抛异常**(`UsageError`);环节失败一律进 `status`,因为"挂了怎么办"是策略、归调用方。
 
+⚠️ **一个环节 = 一个会话,跑完就关**(`open_session` → `send_message` → `close_session`)。
+**环节之间不复用会话、没有记忆**;环节内唯一的多轮是 `reask`(≤1 次,只为格式不合格打回)。
+这是 `specHash` 成立的前提 —— 结果一旦取决于看不见的会话状态,指纹与复用闸就都是谎言。
+多轮任务怎么把记忆喂回去,见 `../templates/review-fix-loop.mjs`。
+
 ## node-turn.mjs(命令行)
 
 ```sh
