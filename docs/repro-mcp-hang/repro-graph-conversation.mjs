@@ -636,6 +636,21 @@ async function c19() {
   ok("★ turns[] 里只有真跑过的那一轮", re.turns.length === 1 && re.turns[0].key === "good",
     JSON.stringify(re.turns?.map(t => t.key)));
   ok("★ 顶层结局没被幽灵轮污染成 unknown", re.status === "ok", re.status);
+
+  console.log("\n[C19f] 校验就没过的那一轮:什么都没发生过,**同一个 key 可以再来**");
+  // ⚠️ 这里要和「已经开过头才失败」分清楚(那条在 W28):
+  //    normalizeTurn 抛 = 参数就不合法,key 还没登记、事件流里一个字都没有 ⇒ 重用 key 完全正当。
+  //    runTurn 抛   = 这一轮已经开过头(node:turn 发出去了)⇒ key 必须烧掉,不然事件流里
+  //                    会有两条同 key 的开始事件、第一条永远等不到终态。
+  const outF = out("c19f");
+  const rf = await withBridge(async (b) => b.conversation(spec({ id: "cv", outDir: outF }), async (turn) => {
+    try { await turn({ key: "draft", promptFile: path.join(RUN_ROOT, "nope.txt"), timeoutMs: 30000 }); }
+    catch { /* 参数写错了,改对再来 */ }
+    await turn({ key: "draft", prompt: "fixed", timeoutMs: 30000 });
+  }), { env: env("echoturn") });
+  ok("★ 校验没过之后,同一个 key 能接着用", rf.turns.length === 1 && rf.turns[0].key === "draft",
+    JSON.stringify(rf.turns?.map(t => t.key)));
+  ok("跑的是改对之后那份提问", (readText(path.join(outF, "nodes", "cv.t-draft.md")) || "").includes("fixed"));
 }
 
 // ── 零残留 ─────────────────────────────────────────────────────────────────────

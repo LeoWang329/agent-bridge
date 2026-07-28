@@ -842,6 +842,36 @@ async function main() {
     String(gone27?.message).slice(0, 160));
   ok("W27 首跑那条分支名是对的", typeof br27 === "string" && br27.startsWith("graph/"), String(br27));
 
+  // ── W28 已经开过头才失败的那一轮:key 烧掉,不还回来 ─────────────────────────
+  // ⚠️ 这条是 EVENTS.md 复审顺着文档指回实现的:key 要是还回去,回调 catch 之后能用**同一个 key**
+  //    再来一轮 —— 事件流里就有两条 `node:turn{turnKey}`,而第一条永远等不到自己的终态,
+  //    页面按 key 建 map 会把前一条直接盖掉。(参数校验就没过的那种在 C19f,那种可以重用。)
+  console.log("\n[W28] runTurn 里失败的轮:key 烧掉,必须换一个");
+  const r28 = makeRepo("conv-burnkey");
+  const out28 = path.join(r28, ".graph", "run-1");
+  let first28 = null, retry28 = null;
+  const rec28 = await withBridge((b) => b.conversation(
+    { agent: "omp", id: "cv", cwd: r28, outDir: out28, access: "write" },
+    async (turn) => {
+      // prepare 那次脏树检查已经过了;现在把主树弄脏,让**首轮入场**的第二次检查抛
+      fs.writeFileSync(path.join(r28, "dirty.txt"), "x\n", "utf8");
+      try { await turn({ key: "draft", prompt: "one", timeoutMs: 60000 }); }
+      catch (e) { first28 = e; }
+      fs.rmSync(path.join(r28, "dirty.txt"), { force: true });   // 清理干净,想重试
+      try { await turn({ key: "draft", prompt: "two", timeoutMs: 60000 }); }
+      catch (e) { retry28 = e; }
+      await turn({ key: "draft-2", prompt: "three", timeoutMs: 60000 });  // 换 key 才行
+    },
+  ), { env: { ...BASE_ENV, FAKE_OMP_MODE: "writeturn-perprompt" } });
+
+  ok("W28 首轮因脏树被拒", first28 instanceof UsageError, String(first28?.message).slice(0, 100));
+  ok("★ W28 同一个 key 重试被拒", retry28 instanceof UsageError, String(retry28?.message).slice(0, 100));
+  ok("★ W28 说清了「入场失败也不还 key」", /不还回来/.test(String(retry28?.message)),
+    String(retry28?.message).slice(0, 160));
+  ok("★ W28 换个 key 就能继续", rec28.turns?.length === 1 && rec28.turns[0].key === "draft-2",
+    JSON.stringify(rec28.turns?.map((t) => t.key)));
+  ok("W28 顶层没被没跑成的那轮污染", rec28.status === "ok", `${rec28.status} ${rec28.error ?? ""}`);
+
   // ── W9 零残留 ─────────────────────────────────────────────────────────────
   console.log("\n[W9] 零残留总检");
   for (const [tag, repo] of [["W1", r1], ["W2", r2], ["W6", r6], ["W26", r26]]) {

@@ -2091,7 +2091,12 @@ function normalizeTurn(run, raw) {
   if (!/^[A-Za-z0-9._-]+$/.test(t.key)) throw new UsageError(`key 只能用字母数字和 . _ -(拿来做文件名):${t.key}`);
   if (Buffer.byteLength(t.key, "utf8") > 200) throw new UsageError(`key 太长(超过 200 字节,拿来做文件名):${t.key}`);
   if (run.turnKeys.has(t.key)) {
-    throw new UsageError(`同一段对话里 key 重复了:"${t.key}" —— 每一轮的 key 必须唯一(它就是那一轮的产出文件名)`);
+    throw new UsageError(
+      `同一段对话里 key 重复了:"${t.key}" —— 每一轮的 key 必须唯一(它是这一轮的身份,也是产出文件名)。\n` +
+      `⚠️ **一轮入场失败(脏树 / 建工作树失败之类)之后,它的 key 也不还回来**:` +
+      `事件流里那一轮已经开过头了,同一个 key 再来一次会让页面把前一条直接盖掉。\n` +
+      `确实要重试,请换一个 key(例如 "${t.key}-retry")。`,
+    );
   }
 
   const hasPrompt = typeof t.prompt === "string" && t.prompt.length > 0;
@@ -2160,7 +2165,11 @@ async function liveTurn(run, t) {
     // 没发过消息,多半连会话都没开。把它从 turns[] 里撤掉,别留一条 status:"unknown" 的幽灵轮
     // 去污染顶层结局(顶层取最严重的一轮,unknown 正好是最严重的那个)。
     run.turns.pop();
-    run.turnKeys.delete(t.key);
+    // ⚠️ **但 key 不还回去。** 早先这里 `turnKeys.delete(t.key)`,于是回调 catch 之后可以拿
+    // **同一个 key** 再来一轮 —— 事件流里就出现两条 `node:turn{turnKey:"draft"}`,而第一条
+    // 永远等不到自己的终态;页面按 key 建 map 会把前一条直接盖掉。
+    // key 是这一轮的**身份**(也是产出文件名),用过就不能再用,哪怕那一轮没跑成。
+    // (EVENTS.md 复审 BLOCKER 1 顺着文档指回来的实现问题。)
     // 会话根本没开起来时,对话名额界的那个东西不存在 —— 还给别人,别让一段跑不起来的对话
     // 把 maxConversations 一直占着。下一轮真跑起来时 liveTurn 会重新取。
     if (!run.opened && run.scopeHeld) { run.bridge._scopeGate.release(); run.scopeHeld = false; }
