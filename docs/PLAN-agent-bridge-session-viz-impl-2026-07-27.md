@@ -1,6 +1,11 @@
-# 委托会话史可视化 —— 实施计划 v4
+# 委托会话史可视化 —— 实施计划 v5
 
-**日期** 2026-07-27 · **状态** 待施工 · **修订** v4（codex 四轮复审，见 §10）
+**日期** 2026-07-27（v5 修订 2026-07-29）· **状态** 待施工 · **修订** v5（codex 七轮复审，见 §10）
+
+> **v5 的触发不是又想到了什么，是仓库变了。** 07-28~29 合入了 `skills/agent-bridge-graph/` 的
+> graph 观测台——一套**已经跑通、过了七轮复审和真后端 e2e** 的同类系统。
+> 本文有若干条"要做什么"，现在有了现成且更好的答案，还有几条被它的实测结果直接推翻。
+> v5 就是拿那份真实代码回头校对这份计划的结果。
 **上游** `docs/DESIGN-agent-bridge-session-viz-2026-07-26.md`（v4）、`docs/UIREQ-agent-bridge-session-viz-2026-07-26.md`
 
 **本文相对 DESIGN 的结构性改动**：数据面换双槽快照（§3）、turn 语义改「桥已派发」（§2.1）、结算改 ledger 状态机（§4）、**默认关**（§8）。DESIGN 其余部分仍作数。
@@ -76,7 +81,7 @@ Claude 的 `#write` 是**无 callback 的裸 `stdin.write`**，只证明进了 N
 
 ```
 <VIZ_DIR>/
-  meta.json                     ← runId / pid / 桥版本 / degraded
+  meta.json                     ← runId / pid / 桥版本 —— **只有不可变身份字段**
   owner                         ← pid + 进程起始时间
   state.0.json  state.1.json    ← 双槽,各带 schemaVersion + runId + generation
   turns/<sessionId>/
@@ -99,7 +104,12 @@ DESIGN §5.3 已论证：Windows 上 temp+rename 会因 Defender 让 `MoveFileEx
 
 - 每次 MCP run 重新 `mkdtemp` → 新 runId、新目录 → **`generation` 从 1 开始**
 - 上一进程 SIGKILL 留下的两槽只供 viewer 回看，随后由 owner/gone 与 `cleanup` 处理
-- **若因配置错误让新 writer 指向已存在的旧目录 → 拒绝初始化 + degraded**，绝不重置 generation 覆盖旧 run
+- ⚠️ **v5 改**：原来这里写「若因配置错误让新 writer 指向已存在的旧目录 → 拒绝初始化 + degraded」。
+  **那个分支不可达**——`createVizRun()` 不接收目录参数，唯一入口内部自己 `mkdtemp`（§7），
+  公开面上没有任何办法让 writer 指向别的目录。为一个到不了的状态写实现、写原因码、写机器验收，
+  等于**给测试造了一个只有测试能构造出来的绿灯**。
+  **根治不是加检查，是让它结构上不可能**：`createVizRun()` 签名里**不许有目录参数**；
+  初始化失败一律返回 disabled recorder + 记一次诊断。原因码 `dir_conflict` 与对应验收一并删除。
 
 **「合法槽」四条校验**：`runId` 与同目录 `meta.json` 一致 · `generation` 是安全正整数 · `schemaVersion` 受支持 · 必填结构完整。**高 generation 但 runId 不符者不得胜出。**
 
@@ -275,8 +285,13 @@ r.session.lastTurn.id
   "updatedAt": "2026-07-27T…",
   "run": {
     "pid": 1234, "bridgeVersion": "0.10.0", "startedAt": "…",
-    "status": "running" | "terminated",
-    "terminatedAt": null, "reason": null, "exitCode": null,   // status=terminated 时必填
+    // ⚠️ **v5 删掉了 `terminated` 这一档。** 它**不可达**:§4.2 明令 run 退出时只做 O(1) 的
+    //    ledger seal、**不写快照**,`process.on("exit")` **零 snapshot I/O**;而正常退出还会
+    //    **立刻把整个 VIZ_DIR 删掉**——就算写了也没有消费者。留着它的唯一后果是:
+    //    机器测试能直接构造出这个状态并全绿,而生产路径**永远发不出来**。
+    //    **run 终态不是快照里的一个字段,是传输层的一帧**(§6.4 的 `control{kind:"run-gone"}`):
+    //    viewer 靠 owner 检查确认死亡后广播,页面据此把仍为 dispatched 的轮次合成 abandoned。
+    "status": "running",
     "degraded": false,              // 记录不完整 → UI 显示"观测数据可能过期/不完整"
     "recordingErrors": ["queue_full"]   // 去重原因码,**最多 16 条**;枚举见 §6.1
   },
@@ -315,14 +330,21 @@ r.session.lastTurn.id
           "settledAt": null,
           "firstBackendEventAt": "…" | null, // 诊断用,不作门槛;**允许早于 dispatchedAt**(OMP ACK 前可先来 lifecycle)
           "source": "initial_prompt" | "send_message", "blocking": false, "hasSchema": false,
+          // ⚠️ **v5 加 `sha256`**:页面上「这就是记录里那一份」这句话,原来**没有任何东西**能支撑。
+          //    graph 观测台是拿**响应体实时算出的 SHA-256**(`X-Graph-Sha256`)与状态里记的指纹
+          //    当场对证的,并有篡改负对照(`repro-graph-viz.mjs` V8)。少了它,文件被改过页面一点红都没有。
           "input":  { "state": "pending" | "ready" | "missing",
                       "ref": "turns/<sid>/t3.in.md" | null,
+                      "sha256": "…64位hex…" | null,      // state==="ready" 时必有
                       "chars": 1240, "bytes": 3720,      // 实际保存的
                       "truncated": false, "originalBytes": 4820,
                       "error": null | "queue_full" | "write_failed" },
           "output": { "state": "pending" | "ready" | "missing",
                       "ref": "turns/<sid>/t3.out.md" | null,
+                      "sha256": "…64位hex…" | null,      // 同上
                       "chars": null, "bytes": null,      // **dispatched 阶段恒 null**,settled 后才是数字
+                      // 超过 VIZ_FILE_MAX_MB 时另记预览段的长度与指纹,服务端只返回该 UTF-8 完整边界前缀
+                      "previewBytes": null, "previewSha256": null,
                       "error": null | "queue_full" | "queue_item_too_large" | "write_failed" },
           "outcome": null | "completed" | "failed" | "aborted" | "abandoned",
           "bodyKind": null | "final" | "partial" | "none",
@@ -344,9 +366,35 @@ r.session.lastTurn.id
 
 ### 6.1 `recordingErrors` 原因码（封闭枚举，最多 16 条去重）
 
-`queue_full` · `queue_item_too_large` · `write_failed` · `snapshot_write_failed` · `dir_conflict`（新 writer 指向已存在旧目录）。
+`queue_full` · `queue_item_too_large` · `write_failed` · `snapshot_write_failed`。
+（**v5 删掉 `dir_conflict`** —— 那个状态结构上不可达，见 §3.2。）
 
 **观测失败只描述"我们没记下来"，绝不改变后端的 `outcome`。**
+
+### 6.1.1 `degraded` 只有一个真理源（v5 新增）
+
+**「本次记录不完整」这件事只写在最新合法快照的 `run.degraded` / `run.recordingErrors` 上。**
+`meta.json` 里**不许再有 `degraded`**（原 §3 的目录树与 `DESIGN §8.6` 都写过一份，那是第二副本）。
+
+⚠️ 理由不是"少写一个字段"，是**同一个事实有两份可写的副本，就一定会漂**——
+这个仓库刚在 graph 观测台上按这个形状栽过（见 `docs/DRIFT-events-contract-vs-producer-2026-07-28.md`）：
+一处更新了另一处没有，页面显示的是哪一份取决于它先读了谁。
+`meta.json` 从此**只放不可变身份字段**（runId / pid / 进程起始时间 / 桥版本），写一次就再也不动。
+
+### 6.1.2 计量口径（v5 新增，不定死就一定会各写各的）
+
+| 字段 | 单位 |
+|---|---|
+| `chars` / `returnedChars` / `progress.charCount` | **JS 字符串长度（UTF-16 code unit）** |
+| `bytes` / `originalBytes` / `previewBytes` | **UTF-8 字节** |
+
+⚠️ **400 字尾巴取末 400 个 code unit 之后，若首字符是落单的低代理就丢掉它**——
+直接 `.slice(-400)` 会从代理对中间切开，页面上就是一个 `U+FFFD`。
+（graph 那边踩过并已修，见 `skills/agent-bridge-graph/tools/viz-node.mjs` 的 `trimLoneSurrogate()`。）
+
+所有计数、`generation`、`generationCount`、`pid`、`durationMs` 一律是**有限的非负安全整数**。
+⚠️ **`NaN` / `Infinity` 经 `JSON.stringify` 会静默变成 `null`** —— 而 `null` 在本 schema 里到处都是合法值，
+于是一个算错的数字会伪装成"这项没有"。校验必须显式拒绝非有限值，负例里要有 emoji 边界、`NaN`、`Infinity`。
 
 ### 6.2 合法组合矩阵（**必须实现成语义校验函数**）
 
@@ -389,6 +437,48 @@ r.session.lastTurn.id
 
 ---
 
+### 6.4 传输层合同（v5 新增 —— 原来这一整块是空的）
+
+原文只有 `§9 S5` 一句「SSE 重连**只发当前态**」。**那句话下面躺着好几种互不兼容的实现，全都符合字面。**
+端点叫什么、帧怎么分、重连怎么办、两槽都读不出来时说什么——一个都没定。
+graph 那边把这些钉到了逐字节（`skills/agent-bridge-graph/EVENTS.md` 传输章 + `viz/serve.mjs`），**照那个粒度写进 `STATE.md`**：
+
+| 要定死的 | 内容 |
+|---|---|
+| 端点 | `GET /events`（SSE）· `GET /file?ref=`（资产）· `GET /`（页面）。**没有第四个** |
+| 响应头 | `text/event-stream` · `no-cache` · `keep-alive` · `X-Accel-Buffering: no` |
+| 帧 | `hello`（协议版本 + runId）· `state`（一份完整快照）· `control`（`kind: "run-gone"`）· `viz:overflow` |
+| 边界 | `\n\n`；每帧 `event:` + `data:` 两行 |
+| 心跳 | 定期注释行，防中间件掐死空闲连接 |
+| 背压 | **每客户端只保留一份可合并的最新 `state`**（新的覆盖旧的，不排队），并遵守 `write()` 的 `drain` |
+| 重连 | 连上先发 `hello` + **当前** `state`，**不回放历史**（快照本来就是全量当前态） |
+
+⚠️ **两槽都读不出来、而 owner 还活着**——必须发一个**自己的**帧（`history-read-failure`）。
+**不许冒充成 `run.degraded`**（那是"桥没记下来"，这是"viewer 读不到"，处置完全不同），
+也不许假装断连或 owner gone（那会让页面进入"已清除"终态，而记录其实还在）。
+
+### 6.5 `STATE.md` 是唯一真理源，校验器必须是**第二实现**（v5 新增）
+
+原来 `§6` 把 schema 内嵌在 PLAN 里、又要求实现者"再生成一份 `STATE.md`"，`S2` 只要求交出
+JSON Schema + `validateState()`——**没有一个字禁止它们与 writer 同源**。
+
+⚠️ **同一个人写规格、写生产者、再写校验器，校验器只能证明"生产者和它自己一致"。**
+这不是理论风险：graph 观测台最狠的几个 bug 全是被 `viz/contract-invariants.mjs` 抓到的，
+而它之所以抓得到，正因为它是**照着合同散文另写一遍、刻意不 import 生产端**的第二实现
+（见 `docs/DRIFT-events-contract-vs-producer-2026-07-28.md`）。
+
+**四条硬规则：**
+
+1. **`skills/agent-bridge/viz/STATE.md` 是唯一 wire 真理源。** PLAN §6 的 JSONC 只是它的草稿，
+   S1 落地后**以 `STATE.md` 为准**，两处不一致时改 PLAN，不改 `STATE.md`。
+2. 生产侧的 schema/有界化器 与 `skills/agent-bridge/viz/contract-invariants.mjs`
+   **必须独立实现、互不 import**（包括不共用常量表与枚举字面量）。
+3. **冻结样例按 `STATE.md` 手工构造**，不是把 writer 的输出录下来当样例——
+   录出来的样例只会把 writer 当时的 bug 一起冻住。
+4. 独立不变量**同时**跑在冻结样例与**真实桥运行**产出的快照上。只跑前者证明不了生产路径。
+
+---
+
 ## 7. 模块结构：独立 `scripts/viz-writer.mjs`
 
 三轮都选 B。+900 行塞进 6004 行 core 会让 writer/ledger/队列/cleanup **无法直接单测**，而 §9 明确要求零消耗回归。
@@ -427,7 +517,11 @@ r.session.lastTurn.id
 - **队列满 → `state="settled"` + `bodyKind="none"` + `output.error="queue_full"` + `run.degraded=true` + `run.recordingErrors` 含 `queue_full`，且最终能进入下一代快照**
   > ⚠️ 字段名是 **`output.error`**，schema 里**没有** turn 级的 `recordingError` 字段（v3 写过、v4 已删）。断言写错字段名 = 断言了一个永远不存在的东西 = 假绿。
 - 快照写失败 → 保留上一代 + `dirty=true` 重试
-- 新 run `generation===1`；指向已存在旧目录 → **拒绝初始化 + degraded**
+- 新 run `generation===1`
+- **v5 删掉**「指向已存在旧目录 → 拒绝初始化 + degraded」这条验收：那个状态结构上到不了（§3.2），
+  留着它就是**一条只有测试构造得出来的绿灯**。改为断言 `createVizRun()` 的签名里**没有目录参数**
+- **v5 新增**：`STATE.md` 与 `contract-invariants.mjs` 落地（§6.5），断言 `contract-invariants.mjs`
+  **没有 import 生产侧任何模块**（源码级检查，不是口头约定）
 - ownerless 60s 宽限**用可注入的 fake clock / 可配置测试宽限**，不真 sleep 60 秒
 - 三条退出路径各造一次，断言目录被删；SIGKILL 后 `cleanup` 能回收
 - `AGENT_BRIDGE_VIZ` 未设时 tmpdir 零产出（**这是默认路径**）
@@ -501,13 +595,33 @@ r.session.lastTurn.id
 - OMP 造「`agent_end` 先于末条 `message_update`」→ 宽限救回尾部
 - OMP 造「宽限内进了新子轮」→ 标 `partial`，**不冒充 final**
 - **专项断言 viz 开启后 OMP 的 `unresponsiveSince`/`dead`/`status` 与关闭时逐字段一致**（X9 守门）
+- ⚠️ **v5 改：约束 3「绝不干扰桥的运行」的机器门禁不能只查 OMP 那三个字段，也不能靠 p95/p99。**
+  `DESIGN §12` 原来写的是"对比 `VIZ=on/off` 的 MCP p95/p99 延迟"——**没有通过阈值的对比不是门禁**（永远绿），
+  而**加了阈值又会被 Defender 与机器负载支配**（随机红）。两头都不成立。
+  **改成故障注入 + 逐字段等值**：对五个后端**逐一**注入 input / progress / output / snapshot 四类写入的
+  `throw`、`reject`、queue-full、**永不 resolve**，断言 MCP 返回值、turn `outcome`、session `status`、
+  后端健康字段、进程退出码与 `VIZ=off` **完全一致**，且**核心调用路径没有 await 过 recorder**。
+  p95/p99 降级为**信息输出**，不作判红依据。
+  （graph 那边的守卫就是这个形状：recorder 全部 non-throwing + 直接断言归档失败不改变业务结局。）
 - **五种**失败形态都无悬空 ref：body enqueue 被拒 · body write callback 报错 · snapshot write 失败 · **input enqueue 失败** · **input write callback 报错**（v3 漏了最后一条）
 - 单个正文大于 queue byte cap → **精确断言结果**：`state="settled"` + `bodyKind="none"` + `output.ref=null` + `output.error="queue_item_too_large"`（不许写"明确降级"这种话）
 - run exit 恰好发生在 `settling` 中间 → **子进程在 10 秒内以预期退出码退出**（不许写"不挂死"）
 
 ### S5 —— collected + viewer
 
-`turn:collected`（§5）· `viz/serve.mjs`（拷圆桌 + 双槽读 + owner 检查 + sidecar 轮询）· `viz/index.html` · `viz/sample/` · `test-viz.mjs`
+`turn:collected`（§5）· `viz/serve.mjs`（双槽读 + owner 检查 + sidecar 轮询）· `viz/index.html` · `viz/sample/` · `test-viz.mjs`
+
+⚠️ **v5 改：基线不再是圆桌那份。** `DESIGN §9` 写"拷圆桌 + 改五处"时，仓库里还没有别的选择。
+现在有了——`skills/agent-bridge-graph/viz/serve.mjs` 是**已经改好并过了真后端 e2e** 的那一份：
+`/file` 短开短关、ref 词法校验 → 400、越界 → 403、目录与 symlink 逃逸拒绝、`nosniff`、
+响应体实时 SHA-256 头、异步流式回放、**owner 存活期间绝不退出**。
+而圆桌那份**正是 PLAN 自己点名要修的病人**（`createReadStream` 整个传输期握着句柄，挡住临时目录删除），
+且没有任何内容对证。**照抄一份已知有病的、再把病重新治一遍，是纯返工。**
+
+**做法**：把 graph 那份里的**纯函数**（ref 词法校验、越界判定、响应原语）抽出来复用，
+不复制粘贴第四份。⚠️ 仓库里 `viz/` 目录马上是第 4 个（roundtable / loop / graph / session）——
+**S5 的交付说明里必须写明：哪些是共用的、哪些是有意分叉的、分叉的理由是什么。**
+不写清楚，第 4 份就会像前 3 份一样各自漂。
 
 **机器验收：**
 - collected **四种工具返回形状逐一测试**（open/send/result/wait）
@@ -515,6 +629,13 @@ r.session.lastTurn.id
 - backendTurnId → vizTurnId **映射正确**
 - 同一轮重复 result/wait **只记第一次**
 - viewer：最新槽损坏→回退旧槽 · SSE 重连**只发当前态** · 迟到 progress · owner gone · **路径穿越与 symlink 拒绝**
+- **v5 新增（传输层，照 §6.4 逐条断言）**：`/events` 的响应头与帧格式 · `hello` 先于首个 `state` ·
+  背压下**每客户端只留最新一份 state**（连发 N 代只收到最后一代，不排队堆积） ·
+  **两槽都读不出来且 owner 仍活着 → 发 `history-read-failure`**，断言它**不是** `run.degraded`、
+  **不是**断连、**不是** owner gone（三者处置完全不同，混成一句话页面就会做错事）
+- **v5 新增（内容对证）**：`/file` 响应体实时算出的 SHA-256 与状态里 `input.sha256`/`output.sha256` 一致；
+  **篡改负对照**——把落盘的 `t<N>.out.md` 改一个字节，断言页面标出"文件被改动"而不是照常展示
+- **v5 新增**：owner 存活期间**无客户端也绝不退出**（断言进程在无连接 N 分钟后仍在跑）
 - 长历史**固定两个用例：20 会话×15 轮、1 会话×1000 轮**。判据：不丢 session/turn · JSON 可解析 · **`validateState()` 全过（断言不存在 §6.2 矩阵外的组合）** · **ref 非空数量等于预期值，且逐字节核对其中内容**
   > ⚠️ 只写"所有 ref 可读"是**假绿口子**——实现把 ref 全设成 `null` 也能过。必须同时钉住"该有多少个非空 ref"。
 - **1×1000 的确定性体积断言**：compact 快照 < 2 MiB（实测基线 815,252 字节）
@@ -535,23 +656,31 @@ r.session.lastTurn.id
      | **A1** | 选中项 id 不变 |
      | **A2** | 已展开轮次仍 `open` |
      | **A3** | `scrollTop` 不被重置 |
-     | **A4** | 未变化的 turn 节点**对象身份未变**（复用而非重建） |
 
   4. ⚠️ **自动化负对照**（不是"我改坏看过它红了"的文字记录——那本身可以假绿）：
      `test-viz.mjs` **在同一次运行里跑两遍同一套断言**：
 
-     | 注入的实现 | A1 | A2 | A3 | A4 |
-     |---|---|---|---|---|
-     | 真实 `reconcile` | 过 | 过 | 过 | 过 |
-     | 朴素全量替换（`replaceAllChildren` 语义） | **必须过** | 不限定 | 不限定 | **必须失败** |
+     | 注入的实现 | A1 | A2 | A3 |
+     |---|---|---|---|
+     | 真实 `reconcile` | 过 | 过 | 过 |
+     | **朴素全量替换、且不从 `uiState` 恢复**（`replaceAllChildren` 语义） | **必须过** | **必须失败** | **必须失败** |
 
      **⚠️ 这张表必须写死在测试里，不许实施者跑完看结果再反向定义预期**——那是把假绿换个地方藏。
 
-     **为什么只有 A4 是判别项**（过度指定会走向另一个极端——**制造假红**）：
+     ⚠️ **v5 改：删掉 A4（"未变化的 turn 节点对象身份未变"），并把负对照的定义收紧。**
 
-     - **A1 仍应过**：选中态通常存在 JS 变量里、重建后可重新套 class。把它列为"应失败"会诱导实施者把选中态搬进 DOM ——**为迎合测试而改坏设计**。
-     - **A2 / A3 不限定**：`open` 同样可以从 `uiState` 重新套回；而滚动容器本身没被替换时，换掉子节点也**不必然**把 `scrollTop` 归零。把它们钉成"必失败"，等于逼实施者写一个**故意比必要更差**的朴素实现去凑预期——那是伪造判别力。
-     - **A4 必然失败**：全量替换就是重建节点，对象身份不可能保住。**这是唯一能真正区分"复用"与"重建"的断言。**
+     v4 的理由是"A4 是唯一必然失败的断言，所以是唯一的判别项"。**这个推理有个洞：
+     A4 验的是实现策略，不是用户看得见的结果。** 一个"重建节点但从 `uiState` 恢复选中/展开/滚动"的实现，
+     用户完全看不出差别，却会被 A4 判错——**那是用测试规定架构**。
+
+     但删掉 A4 之后，v4 那张表就一条判别项都不剩了（A2/A3 当时被标成"不限定"，
+     恰恰因为它们**可以**从 `uiState` 套回来）——**负对照变成零判别力**，shim 测试重新退化成摆设。
+
+     **根治是换掉负对照的定义，不是换掉断言**：把它从"朴素全量替换"改成
+     "**朴素全量替换、且不恢复 `uiState`**"。这样 A2/A3 就**必然**失败，
+     判别力落在**用户真正看得见的属性**（展开态没了、滚动位置回到顶）上，
+     而不再规定实现必须复用节点。**A1 仍必须过**——选中态本来就常存在 JS 变量里，
+     把它列成"应失败"会诱导实施者把选中态搬进 DOM，为迎合测试而改坏设计。
 
      **任一遍不符合上表 ⇒ 测试判红**（不是"两遍都不符才判红"）。**没有这个自动负对照，shim 测试不算数。**
 
@@ -615,5 +744,29 @@ r.session.lastTurn.id
 | 负对照表**过度指定 = 制造假红**：全量替换下只有 **A4 必然失败**，A2 可从 `uiState` 套回、A3 的滚动容器没被换不必然归零；逼实施者写"故意更差的朴素实现"去凑预期就是伪造判别力 | §9 S5 表 |
 
 **第六轮结论：APPROVE。**
+
+### 第七轮（2026-07-29，v4 → v5）：**审的不是文档，是「仓库变了之后文档还对不对」**
+
+前六轮都在文档内部找矛盾。这一轮换了个输入：**07-28~29 合入的 graph 观测台是真实代码**，
+拿它回头对这份计划。产出 4 阻塞 + 5 高 + 3 中，**没有一条是"再想深一层"，全是"现在有更好的答案"或"已经被实测推翻"**。
+
+| 级别 | 发现 | 修在 |
+|---|---|---|
+| **阻塞** | **`run.status:"terminated"` 不可达**——§4.2 明令退出不写快照、`exit` 零 I/O，正常退出还立刻删目录；测试能构造它而全绿，生产路径永远发不出来 | §6 删档 + §6.4 改成传输层 `control{run-gone}` |
+| **阻塞** | **仍允许生产者自证合同**——schema 内嵌在 PLAN、S2 只要 `validateState()`，没禁止它与 writer 同源 | §6.5 四条硬规则 |
+| **阻塞** | **SSE 合同整块是空的**——只有"重连只发当前态"一句，端点/帧/背压/双槽全坏时的语义都没定 | §6.4 新增传输章 |
+| **阻塞** | 默认开关与"事后复盘"的承诺不同步 | 实为 DESIGN §4.3/§10 未跟上 v4 的翻转，PLAN §8 本来就写对了 |
+| 高 | 仍以圆桌 `/file` 为基线——而圆桌那份正是本文点名要修的病人，且**没有内容对证** | §9 S5 改基线 + §6 加 `sha256` |
+| 高 | "无客户端满十分钟自灭"会让**提前起、晚点看**的链接失效 | DESIGN §9 删掉；graph 已明令禁止 |
+| 高 | **`degraded` 两个真理源**（`meta.json` 一份、快照一份） | §6.1.1 单一真理源 |
+| 高 | 不干扰验收**既能假绿也能假红**——无阈值的 p95/p99 对比永远绿，加阈值又被 Defender 支配 | §9 S4 改故障注入 + 逐字段等值 |
+| 高 | `dir_conflict` 是**为不可达配置造实现** | §3.2 改成结构上不可能 |
+| 中 | **A4 用 DOM 对象身份规定架构**；删了它 v4 那张负对照表又零判别力 | §9 S5 改负对照定义，判别力落到 A2/A3 |
+| 中 | `chars`/`bytes`/400 字尾巴的**计量单位从未定义**，`.slice(-400)` 会切开代理对 | §6.1.2 |
+| 中 | 建议砍 `generationCount` | **未采纳**（用户 2026-07-29 拍板保留）——它是「第 N 稿」徽章的唯一数据源，砍了页面上只剩一个会莫名缩水的字数 |
+
+**这一轮的形状值得记一句**：六轮 APPROVE 之后，第七轮又出 4 个阻塞——**不是前六轮没做好，
+是前六轮问不到这些问题**。文档内部的自洽性已经被榨干了，而"外面的世界变了没有"是另一个维度。
+**一份 APPROVE 的有效期，取决于它当时能看见的东西。**
 
 **六轮的产量曲线**：结构性 BLOCKER（3）→ 自我修正（撤回 1Hz 全量覆盖）→ 文档内部矛盾（8）→ schema 与假绿（10）→ 合同不唯一（6）→ 假红（1）→ APPROVE。**没有一轮是"上轮全绿"**——每轮只是问到了不同的问题。

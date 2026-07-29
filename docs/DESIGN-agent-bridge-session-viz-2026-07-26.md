@@ -1,6 +1,11 @@
 # 基础桥「委托会话史」可视化 —— 方案设计
 
-**日期** 2026-07-26 · **状态** 提案 · **修订** v4（codex 两轮 + claude 交叉复审后定范围，见 §13）
+**日期** 2026-07-26（v5 修订 2026-07-29）· **状态** 提案 · **修订** v5（codex 两轮 + claude 交叉 + 第四轮"对着已建成系统"复审，见 §13）
+
+> **v5 的六处改动全部来自同一个新事实**：07-28~29 合入了 `skills/agent-bridge-graph/` 的 graph 观测台——
+> 一套**已经跑通、过了七轮复审和真后端 e2e** 的同类系统。本文若干条结论在它面前要么有了更好的现成答案，
+> 要么被直接推翻。**改动清单**：§4.3 复盘口径（默认已翻转成关）· §8.1 静默观测缺失 · §8.6 `degraded` 单一真理源 ·
+> §9 服务端基线换成 graph 那份 + 删掉"无客户端十分钟自灭" · §10 默认关 · §12 不干扰验收改故障注入。
 **范围** `skills/agent-bridge/`（基础桥本体），**不是** graph / roundtable / loop 的可视化
 **关联** `scripts/agent-bridge.mjs`、`docs/DESIGN-agent-bridge-roundtable-viz-2026-07-04.md`（形态先例）
 
@@ -179,6 +184,12 @@ VIZ_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bridge-viz-"));
 
 **客户端一退，这批记录就没了，无法隔天复盘。** 缓解在于场景本身：复盘几乎总在同一个主 agent 会话内发生（「它说改完了但结果不对」→ 回头看），这时目录还在。要留档就在页面上复制原文。
 
+⚠️ **v5 更正：上面这段缓解论证是在「默认开」的前提下写的，而默认已经翻转成关（`PLAN §8`，用户 2026-07-27 拍板）。**
+翻转之后「这时目录还在」**就不够了**——还得**这个 run 开跑之前就已经启用**。
+准确口径只有一句：**只承诺「启用之后、同一个 run 之内」回看原文；那次没开就没有记录。**
+所以 SKILL.md 要提示用户在**准备重度委托 / 多 agent 编排之前**主动打开，而不是出事之后才想起来。
+（`PLAN §8` 本来就是这么写的，是本文这两处没跟上。）
+
 ⚠️ **一条容易说反的：viz 不是比 `answerFile` 活得更短。** 一个 session 被 `close_session` 时 `answerFile` **立即删除**，而 viz 把该 session 的全部正文**留到整个 run 结束**。对已关闭的会话，viz 留存明显更久。这与"随主 agent 生灭"的边界不冲突，但**是一处真实的新增暴露面，不该被"临时目录"四个字粉饰**。默认仍为开；`AGENT_BRIDGE_VIZ=off` 一键关。
 
 ---
@@ -192,6 +203,11 @@ VIZ_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bridge-viz-"));
 **半行容错：** 进程可能写到一半被 SIGKILL，末行可能没有 `\n`。回放与 tail 都必须缓冲到下一个换行再解析。
 
 ### 5.2 事件表
+
+> ⚠️ **这张表已被 `PLAN §3`/`§6` 的双槽快照取代**（`PLAN §0` 明写"数据面换双槽快照"）。
+> 留在这里只作**字段来源的说明**（每一项数据从桥的哪个位置取），
+> **不要拿它当 wire 合同** —— 合同是 `STATE.md`。尤其：`run:terminated` **不再是一条记录里的事件**，
+> run 终态走传输层的 `control{kind:"run-gone"}`（`PLAN §6.4`）。
 
 | `event` | 关键 `payload` | 表达什么 |
 |---|---|---|
@@ -363,6 +379,16 @@ request() 超时(OMP_RPC_TIMEOUT_MS 默认 10s)
 
 ⚠️ **但这只防异常，不防状态副作用**（§6.2 那条 BLOCKER 就是活教训）。任何 viz 调用只要**可能改到会话字段、健康判定、进程生命周期**，就不是"包个 try/catch"能救的——那种设计本身就不能要。
 
+⚠️ **v5 补一条推论：吞异常的另一面是「静默观测缺失」。**
+
+"观测永不改变业务结局"这条纪律是对的，但它意味着——**凡是要走到 schema / 形状校验那一层才失败的东西，
+都会变成一次悄无声息的记录丢失**：业务照常返回成功，页面却永远等不到那条记录，而**没有任何人会知道**。
+graph 观测台就是在这个形状上栽的（见 `docs/DRIFT-events-contract-vs-producer-2026-07-28.md`）。
+
+**所以校验必须前移到入口**：一条记录能不能成立，要在**它被构造出来的那一刻**判掉，
+而不是拖到写盘或序列化时才失败。任何被吞掉的失败**必须**同时置 `run.degraded` 并把原因码
+并进 `run.recordingErrors`（`PLAN §6.1.1`）——**吞掉异常可以，吞掉"我丢了一条"不行。**
+
 ### 8.2 零新增 RPC、零额外后端交互（**无例外**）
 
 所有数据来自**已经在手**的流与状态迁移。不多问后端一次、不多起进程、不多开 RPC。
@@ -394,7 +420,12 @@ viz 事件**允许晚于**桥自己的 turn promise，不必阻塞桥。
 
 ### 8.6 降级要可见
 
-写失败时向 `bridge.log` 记**一行**（同一 run 只记一次），并在 `meta.json` 标 `degraded:true`，页面显示"本次记录不完整"。**一份看起来完整实则缺页的历史比没有更危险。**
+写失败时向 `bridge.log` 记**一行**（同一 run 只记一次），页面显示"本次记录不完整"。**一份看起来完整实则缺页的历史比没有更危险。**
+
+⚠️ **v5 更正：不要在 `meta.json` 里标 `degraded`。** 原文让 `meta.json` 与快照 `run.degraded` 各存一份同一个事实——
+**同一个事实有两份可写的副本就一定会漂**，而页面显示哪一份取决于它先读了谁。
+唯一真理源是**最新合法快照的 `run.degraded` / `run.recordingErrors`**（`PLAN §6.1.1`）；
+`meta.json` 只放**写一次就再也不动**的身份字段。
 
 ### 8.7 一键关停
 
@@ -404,7 +435,16 @@ viz 事件**允许晚于**桥自己的 turn promise，不必阻塞桥。
 
 ## 9. 服务面与页面
 
-`skills/agent-bridge/viz/serve.mjs` —— **拷圆桌那份**（零依赖、仅 Node 内建、SSE 先回放后 tail），五处改动：
+`skills/agent-bridge/viz/serve.mjs` —— ⚠️ **v5 改基线：不要拷圆桌那份。**
+
+写这一节的时候仓库里没有别的选择。现在有了：`skills/agent-bridge-graph/viz/serve.mjs` 是**已经改好、
+过了七轮复审与真后端 e2e** 的那一份，下面要求的五处改动它**已经做完**，还多做了几样
+（ref 词法校验 → 400、越界 → 403、目录与 symlink 逃逸拒绝、`nosniff`、**响应体实时 SHA-256 头**）。
+而**圆桌那份正是下面第 3 条点名要修的病人**（`createReadStream` 整个传输期握着句柄）。
+**照抄一个已知有病的、再把病重新治一遍，是纯返工。**
+做法见 `PLAN §9 S5`：抽出 graph 那份里的纯函数复用，不复制粘贴第四份。
+
+（以下五条保留，作为**验收清单**——用来核对新基线是否都覆盖到了，而不是照着从头实现一遍。）
 
 1. **单 run**：`node serve.mjs <viz-dir>`。**不扫 tmpdir、没有 `/runs`、没有列表页**（§11）。
 2. **进度 sidecar 轮询转 SSE**：每秒读活跃轮次的 `t<N>.progress.json`（半截 JSON 就 catch 跳过）；收到 `turn:settled` 后**立刻停止轮询该 sidecar 并广播 `progress:end`**（§5.3 第 4 条）。
@@ -412,7 +452,12 @@ viz 事件**允许晚于**桥自己的 turn promise，不必阻塞桥。
 4. **删掉 `viz.pid` 那套行为**（圆桌版会在 run 目录里写/删这个文件，`serve.mjs:133`/`:204`）——与"不往活着的 run 目录里写东西"冲突。
 5. **周期 owner 存活检查**：viewer 开着时 MCP 被 SIGKILL 的话，既没有 `run:terminated`（进程没机会发）、目录也还在（所以没有 `run:gone`），页面会**永远停在"运行中"**。所以要周期查 `owner`，确认死亡 → 标 terminated、广播、删除该目录。
 
-**自灭**：`run:gone`/`run:terminated` 后末个客户端断开 + 60 s，或始终无客户端满 10 分钟。
+**自灭**：**只有** owner 已结束（`run:gone`）**且**最后一个客户端断开之后，再等 60 s 退出。
+
+⚠️ **v5 删掉了「或始终无客户端满 10 分钟」这条兜底。** 它**不要求 run 已经结束**——
+于是一次两小时的运行，只要前十分钟没人打开页面，viewer 就在半途自己消失了；
+而"先起 viewer、过一会儿再看"恰恰是最自然的用法。
+（graph 观测台已经明令禁止这条，`skills/agent-bridge-graph/viz/serve.mjs` 的 `armGrace()` 里有同样的注释。）
 
 ⚠️ **准确的读写边界**（不能笼统说"服务端绝不写 `VIZ_DIR`"）：
 - **绝不写 transcript / 正文 / 进度**（真理源单 writer = 桥进程）；
@@ -441,7 +486,8 @@ node skills/agent-bridge/viz/serve.mjs <viz-dir> [--port 7346]
 
 **`vizDir` 怎么到 viewer 手上**：桥把绝对路径放进 `agent_bridge_status`（列全部那个形态）与 `agent_bridge_open_session` 的返回值。主 agent 本来就是拿着 shell 起 viewer 的那个人。**不靠扫描。**
 
-**记录开关：默认开**，`AGENT_BRIDGE_VIZ=off` 显式关。
+**记录开关：~~默认开~~ → v5 更正为「默认关，`AGENT_BRIDGE_VIZ=on` 显式开」**，见 `PLAN §8`（用户 2026-07-27 拍板，覆盖本节）。
+理由是隐私：桥今天的诊断日志**刻意不落 prompt 全文**，viz 会把它落盘——这让"本机磁盘上存在全部委托原文"从**不发生**变成**发生**。
 
 **体量上界**（不设 pruner，所以要能估）：
 - ⚠️ 输入侧**没有统一上限**——1 MiB 只约束 `message_file`（`:5141`），inline `message` / `initial_prompt` 不受它管。所以 viz 自设 `AGENT_BRIDGE_VIZ_INPUT_MAX_MB`（默认 4），超限截断并在文件尾标注。
@@ -498,7 +544,7 @@ node skills/agent-bridge/viz/serve.mjs <viz-dir> [--port 7346]
 | 6 | 正文落盘：各后端 canonical 源（§6.2；Codex 三级 fallback；**OMP 宽限 + 无 RPC + `partial` 降级**）+ `bodyKind` 判定 + 同步抓串 → 队列写 → 才发事件 | 五后端 | 5 |
 | 7 | 进度 sidecar（400 字尾巴 + `generation` + `seq`，**覆盖写不用 rename**，结算后删除） | 五后端流式回调 | 4 |
 | 8 | `turn:collected`（§5.4 口径）+ `vizDir` 进 `status`/`open_session` 返回值 | `buildSessionResult` 调用方 + 两个工具 | 4 |
-| 9 | `EVENTS.md` + `viz/serve.mjs`（拷圆桌 + §9 五处改动）+ `viz/index.html` + `viz/sample/` + `test-viz.mjs` + SKILL.md 一节 | `skills/agent-bridge/` | 1-8 |
+| 9 | **`STATE.md`**（v5：唯一 wire 真理源，取代原来的 `EVENTS.md`，含传输章）+ **`contract-invariants.mjs`**（第二实现，不 import 生产端）+ `viz/serve.mjs`（**v5：基线换成 graph 那份**，§9）+ `viz/index.html` + `viz/sample/` + `test-viz.mjs` + SKILL.md 一节 | `skills/agent-bridge/` | 1-8 |
 
 **验收：**
 
@@ -506,6 +552,10 @@ node skills/agent-bridge/viz/serve.mjs <viz-dir> [--port 7346]
 - **终结兜底**：故意**不挂**某个后端的精确 hook，断言 poller 仍在 ~1 s 内补出 `turn:settled`（`bodyKind:none`）——**这是 §3.1 双层架构的直接证明**。
 - **正文保真**：五后端各跑一轮含工具调用的任务，断言 `t<N>.out.md` 与 canonical 源逐字节相等。**OMP 专门造"`agent_end` 先于末条 `message_update` 到达"**，断言宽限救回尾部；再造一次宽限内进了新子轮，断言标 `partial` 而不是冒充 `final`。
 - **不干扰（约束 3 的直接回归）**：`repro-*` 全套全绿（尤其 `repro-log-bounds`）；**专项断言 viz 开启后 OMP 的 `unresponsiveSince` / `dead` / `status` 与关闭时逐字段一致**（X9 那条 BLOCKER 的守门测试）；20 个并发流式会话 + Defender 开启，对比 `VIZ=on/off` 的 MCP p95/p99 延迟。
+  ⚠️ **v5 更正：p95/p99 那条只能当信息输出，不能当门禁。** 不设阈值的"对比"永远绿（等于没验），
+  设了阈值又会被 Defender 与机器负载支配（随机红）——**两头都不成立**。
+  真正的机器门禁见 `PLAN §9 S4`：对五个后端**逐一**注入四类写入的 `throw`/`reject`/queue-full/**永不 resolve**，
+  断言 MCP 返回值、`outcome`、`status`、后端健康字段、退出码与 `VIZ=off` **逐字段一致**。
 - **进度不骗人**：造一次"`turn:settled` 先到、迟到的 progress 后到"，断言页面**不会**把已完成轮次打回"正在生成"；造一次 sidecar 写失败，断言页面标 degraded 而不是显示"卡住"。
 - **零消耗回归** `test-viz.mjs`：喂样例 transcript → 断言多轮分离、四档存活、`outcome`×`bodyKind` 各组合、未收口标注、空态、`run:gone` 态。
 - `AGENT_BRIDGE_VIZ=off` 后 `tmpdir` 里一个 `agent-bridge-viz-*` 都不产生。
@@ -538,3 +588,15 @@ node skills/agent-bridge/viz/serve.mjs <viz-dir> [--port 7346]
 | — | **质疑范围本身**：指出"没有更简单且同样完整的路线"是同义反复（"完整"把结论塞进了前提） | §11 砍到 v0 |
 
 三轮都确认成立的：随机临时目录、单 writer、正文不回灌诊断日志、viewer 绑回环、prompt 只有两个入口、`setSessionStatus` 是状态唯一漏斗、`ownerStillRunning` 不会误删活目录、Cursor/Kimi 轮间无进程但健康可复用、`contextUsage` 在两者恒 `null`、`turn:collected` 新口径可实施、正文不设 40 万字上限符合约束 2。
+
+**第四轮 codex（2026-07-29，v4 → v5）—— 换了输入：不再在文档内部找矛盾，而是拿 07-28~29 建成的 graph 观测台回头对。**
+本文被改的六处见文首。其中三条不是"想深了一层"，是**被已建成系统的实测结果直接推翻**：
+
+| 发现 | 证据 | 修在 |
+|---|---|---|
+| "无客户端满十分钟自灭"会让**提前起、晚点看**的 viewer 半途消失 | graph 的 `armGrace()` 明令禁止这条兜底，注释写的就是这个失效场景 | §9 |
+| 服务端基线选了**本文自己点名要修的那个病人**（圆桌版持长句柄） | graph 那份已经改好并过真后端 e2e，还多了内容对证 | §9 |
+| "全程 try/catch 吞错"会把**形状非法**变成**静默的记录丢失** | graph 上的同款事故，见 `docs/DRIFT-events-contract-vs-producer-2026-07-28.md` | §8.1 |
+
+另三条是内部口径不同步（§4.3/§10 没跟上默认开关的翻转、§8.6 的 `degraded` 第二副本）
+与验收方法错误（§12 的 p95/p99 既能假绿也能假红）。**详细清单与 PLAN 侧的 9 条见 `PLAN §10` 第七轮。**
