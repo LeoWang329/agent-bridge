@@ -19,6 +19,16 @@ import crypto from "node:crypto";
 const REF_ALLOWED = /^[A-Za-z0-9._/-]+$/;
 
 /**
+ * 单份正文最多发多少字节；超出只发 UTF-8 完整边界前缀。
+ *
+ * ⚠️ **writer 与 serve 必须共用这一个数。** 两边各写各的会出现这种事：
+ *    writer 按自己的上限判「没超，是完整的 ready」，serve 按自己的上限只发了前缀，
+ *    于是页面拿到一个**前缀**，手里却只有**全文**的指纹——当场对证必然失败，
+ *    而它其实什么都没坏。指纹对不上是很重的信号，不能让它被口径不一触发。
+ */
+export const VIZ_FILE_MAX_BYTES = Number(process.env.VIZ_FILE_MAX_MB || 8) * 1024 * 1024;
+
+/**
  * ref 的**词法**校验。通过返回 `{ ok, ref }`，否则返回 `{ code, msg }`。
  *
  * ⚠️ 词法这一关只能拒明显非法的，**拦不住 symlink**——所以它后面必须再跟一次

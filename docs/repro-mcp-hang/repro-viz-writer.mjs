@@ -753,6 +753,242 @@ sect("S1-H 独立第二实现（STATE.md §11）");
     && /唯一 *wire *真理源|唯一真理源/.test(fs.readFileSync(STATE_MD, "utf8")));
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+sect("S1-R 复审第 1 轮的收口（每条都写死预期，不接受「产生预期结果」）");
+
+{
+  // ── H1：重试预算只用来**降频**，绝不用来放弃 ──
+  //
+  // 危险恰恰在磁盘恢复之后：最新那一代里带着 `degraded`，把它丢掉就等于
+  // **在记录已经不完整的时候，页面显示一切正常**。
+  await withTmp(async () => {
+    const io = makeIo();
+    const rec = createVizRun({ bridgeVersion: "t", env: on(), io });
+    rec.sessionOpened({ sessionId: "s1", agent: "codex" });
+    await settleIo(rec);
+    const g0 = latest(rec.dir).generation;
+
+    // 让接下来两个槽各连续失败 4 次——**刚好越过** SNAPSHOT_RETRY_MAX(3)，
+    // 于是第 5 次落在慢速档(5s)上。次数不能随手写大：每多失败一次就多等 5 秒，
+    // 而"等得不够久"会伪装成"实现放弃了重试"——正是这条用例要区分的两件事。
+    io.st.failNext.set("state.0.json", 4);
+    io.st.failNext.set("state.1.json", 4);
+    const a = rec.attempt({ sessionId: "s1", input: "x" });
+    rec.dispatch(a, { boundary: "turn_start_ack" });
+    await sleep(1200);
+    ok("R-H1 快速重试烧完后仍停在旧代（没把失败当已发布）", latest(rec.dir).generation === g0);
+    // 此刻磁盘“恢复”：failNext 已耗尽。慢速重试必须把最新一代补上去。
+    await sleep(6000);
+    const now = latest(rec.dir);
+    ok("R-H1 ★ 超预算后改慢速重试而非放弃，磁盘恢复即补发最新一代",
+      now.generation > g0 && turnsOf(now, "s1").length === 1,
+      `g0=${g0} now=${now.generation} turns=${turnsOf(now, "s1").length}`);
+    rec.cleanup();
+  });
+
+  // ── H2 / §4.7：`truncated === false ⟹ bytes === originalBytes`（含同为 null） ──
+  await withTmp(async () => {
+    const rec = createVizRun({ bridgeVersion: "t", env: on() });
+    rec.sessionOpened({ sessionId: "s1", agent: "codex" });
+    const a = rec.attempt({ sessionId: "s1", input: "问题原文" });
+    rec.dispatch(a, { boundary: "rpc_ack" });
+    await settleIo(rec);
+    const t = turnsOf(latest(rec.dir), "s1")[0];
+    ok("R-H2 未截断输入的 originalBytes 恒等于 bytes（不再留 null）",
+      t.input.truncated === false && t.input.bytes > 0 && t.input.originalBytes === t.input.bytes,
+      JSON.stringify(t.input));
+
+    const b = rec.attempt({ sessionId: "s1", input: { text: "保存下来的一段", truncated: true, originalBytes: 999999 } });
+    rec.dispatch(b, { boundary: "rpc_ack" });
+    await settleIo(rec);
+    const t2 = turnsOf(latest(rec.dir), "s1")[1];
+    ok("R-H2 截断输入如实记原始尺寸（页面据此说「原始 X / 保存 Y」）",
+      t2.input.truncated === true && t2.input.originalBytes === 999999 && t2.input.bytes < 999999,
+      JSON.stringify(t2.input));
+    rec.cleanup();
+  });
+
+  // ── H3：`outcome × bodyKind` 归一，矩阵外组合一个都别想上 wire ──
+  await withTmp(async () => {
+    const rec = createVizRun({ bridgeVersion: "t", env: on() });
+    rec.sessionOpened({ sessionId: "s1", agent: "codex" });
+
+    const a = rec.attempt({ sessionId: "s1", input: "x" });
+    rec.dispatch(a, { boundary: "rpc_ack" });
+    // 调用方**明说** final —— 桥那边写出这种组合毫无阻力，而 §4.9 里 failed×final 是 ❌。
+    rec.settleOnce(a, { outcome: "failed", body: "写到一半的东西", bodyKind: "final" });
+    await settleIo(rec);
+    const t = turnsOf(latest(rec.dir), "s1")[0];
+    ok("R-H3 ★ failed + final 被归一成 failed + partial（矩阵外组合进不了 wire）",
+      t.outcome === "failed" && t.bodyKind === "partial" && t.output.state === "ready",
+      JSON.stringify({ outcome: t.outcome, bodyKind: t.bodyKind, out: t.output.state }));
+
+    const b = rec.attempt({ sessionId: "s1", input: "y" });
+    rec.dispatch(b, { boundary: "rpc_ack" });
+    rec.settleOnce(b, { outcome: "谁知道是什么", body: "正文", bodyKind: "彻底乱写" });
+    await settleIo(rec);
+    const t2 = turnsOf(latest(rec.dir), "s1")[1];
+    ok("R-H3 枚举外的值被收进封闭枚举，不原样穿透",
+      ["completed", "failed", "aborted", "abandoned"].includes(t2.outcome)
+      && ["final", "partial", "none"].includes(t2.bodyKind),
+      JSON.stringify({ outcome: t2.outcome, bodyKind: t2.bodyKind }));
+
+    const c = rec.attempt({ sessionId: "s1", input: "z" });
+    rec.dispatch(c, { boundary: "rpc_ack" });
+    rec.settleOnce(c, { outcome: "completed", body: "最终答复", bodyKind: "final" });
+    await settleIo(rec);
+    const t3 = turnsOf(latest(rec.dir), "s1")[2];
+    ok("R-H3 归一化**没有**把合法的 completed + final 也一起降级",
+      t3.outcome === "completed" && t3.bodyKind === "final");
+    rec.cleanup();
+  });
+
+  // ── H4：超过传输上限的正文必须带前缀指纹 ──
+  //
+  // 队列单项上限(32 MiB)比传输上限(8 MiB)宽，中间这一段会被判成完好的 ready，
+  // 而 `/file` 只发得出前 8 MiB。页面手上只有全文指纹 → 拿前缀对全文 → **当场误报篡改**。
+  await withTmp(async () => {
+    const { VIZ_FILE_MAX_BYTES, utf8BoundaryPrefix } =
+      await import(`file://${path.join(ROOT, "scripts/viz-http.mjs")}`);
+    const crypto = await import("node:crypto");
+    const rec = createVizRun({ bridgeVersion: "t", env: on() });
+    rec.sessionOpened({ sessionId: "s1", agent: "codex" });
+
+    const small = rec.attempt({ sessionId: "s1", input: "x" });
+    rec.dispatch(small, { boundary: "rpc_ack" });
+    rec.settleOnce(small, { outcome: "completed", body: "短正文", bodyKind: "final" });
+    await settleIo(rec);
+    ok("R-H4 未超限的正文**不**写预览字段（免得页面以为自己拿到的是前缀）",
+      turnsOf(latest(rec.dir), "s1")[0].output.previewSha256 === null);
+
+    // 刚好越过上限一点点。用多字节字符收尾，顺带考 UTF-8 边界。
+    const body = "字".repeat(Math.ceil(VIZ_FILE_MAX_BYTES / 3) + 64);
+    const big = rec.attempt({ sessionId: "s1", input: "y" });
+    rec.dispatch(big, { boundary: "rpc_ack" });
+    rec.settleOnce(big, { outcome: "completed", body, bodyKind: "final" });
+    await settleIo(rec);
+    const t = turnsOf(latest(rec.dir), "s1")[1];
+    const buf = Buffer.from(body, "utf8");
+    const prefix = utf8BoundaryPrefix(buf, VIZ_FILE_MAX_BYTES);
+    const expect = crypto.createHash("sha256").update(prefix).digest("hex");
+    ok("R-H4 ★ 超限正文写出 previewBytes/previewSha256，且与传输层同一算法逐字节对上",
+      t.output.previewBytes === prefix.length && t.output.previewSha256 === expect,
+      JSON.stringify({ got: t.output.previewBytes, want: prefix.length, sha: t.output.previewSha256 === expect }));
+    ok("R-H4 预览截在 UTF-8 完整边界上（不多不少，且不等于全文长度）",
+      prefix.length <= VIZ_FILE_MAX_BYTES && prefix.length < buf.length);
+    rec.cleanup();
+  });
+
+  // ── M13：sessionId 直接当目录名，`.` 和 `-` 在 SAFE_ID 白名单里，于是 `..` 能整个混过去 ──
+  //
+  // ⚠️ 判据是「这一段等不等于 `.` / `..`」，**不是「含不含 `..` 这两个字符」**。
+  //    复审给的修法是 `id.includes("..")`，那会连 `a..b` 一起拒掉——而 `a..b` 是个
+  //    普普通通的文件名，`path.join` 不会拿它去上跳一层。SAFE_ID 本来就排除了 `/` 和 `\`，
+  //    所以能造成穿越的取值**有且只有** `.` 与 `..` 这两个整段。
+  //    多拒的那部分不是"更安全"，是**把合法输入判成攻击**：真撞上就变成一个会话凭空消失，
+  //    而页面上没有任何东西解释它去哪了。
+  await withTmp(async () => {
+    const rec = createVizRun({ bridgeVersion: "t", env: on() });
+    for (const id of ["..", ".", "a/b", "a\\b", "a..b", "good-1"]) {
+      rec.sessionOpened({ sessionId: id, agent: "codex" });
+    }
+    await settleIo(rec);
+    const ids = latest(rec.dir).sessions.map(s => s.sessionId);
+    ok("R-M13 ★ `..` / `.` 整段被拒（否则输入文件写到 VIZ_DIR 根部、ref 永久 400）",
+      !ids.includes("..") && !ids.includes("."), JSON.stringify(ids));
+    ok("R-M13 带路径分隔符的 id 也拒（SAFE_ID 已挡，这里坐实它没被绕开）",
+      !ids.includes("a/b") && !ids.includes("a\\b"), JSON.stringify(ids));
+    ok("R-M13 而 `a..b` 这种普通名字**必须放行**——收紧不等于宁可错杀",
+      ids.includes("a..b") && ids.includes("good-1"), JSON.stringify(ids));
+
+    // 被拒的会话不该在磁盘上留下任何痕迹。
+    // ⚠️ 不能用 `path.join(dir,"turns","..")` 去 existsSync —— join 会把 `..` 折叠掉，
+    //    那句话实际问的是「dir 在不在」，恒为真，是一条永远不会红的假断言。
+    const turnsDir = path.join(rec.dir, "turns");
+    const entries = fs.existsSync(turnsDir) ? fs.readdirSync(turnsDir) : [];
+    ok("R-M13 被拒的会话不产生目录", !entries.includes("..") && !entries.includes("."),
+      JSON.stringify(entries));
+    rec.cleanup();
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+sect("S1-X 交叉核对：writer 的真实产出必须过独立校验器");
+
+// ⚠️ **这一条是这套双实现真正的收口，别的都只是它的特例。**
+//
+// 在它之前，两侧各有一批很漂亮的绿灯，却谁都没做过这件最朴素的事：
+// **把 writer 真跑出来的目录，交给独立校验器判一次。**
+// 校验器一直在验人手写的冻结样例，writer 一直在被自家 repro 验字段 ——
+// 中间那条缝里当场躺着一个真漂移（`logFile`：writer 发 null，校验器要字符串），
+// 两侧 190 多条断言一条都没红。
+//
+// 所以判据必须是**整目录、全形态**：settled + 仍在跑的 dispatched + 启动就失败的会话。
+// 只喂一种形态，下一次漂移照样从没被喂过的那种里钻出来。
+{
+  const { checkVizDir } = await import(`file://${INVARIANTS}`);
+
+  await withTmp(async () => {
+    const rec = createVizRun({ bridgeVersion: "t", env: on() });
+
+    rec.sessionOpened({ sessionId: "s-done", agent: "codex", access: "read", cwd: "D:\\repo" });
+    const a = rec.attempt({ sessionId: "s-done", input: "问题原文" });
+    rec.dispatch(a, { boundary: "rpc_ack" });
+    rec.settleOnce(a, { outcome: "completed", body: "答复正文", bodyKind: "final" });
+    rec.collected(rec._ledger.attempts.get(a)?.backendTurnId ?? "n/a", { via: "wait", returnedChars: 4 });
+
+    rec.sessionOpened({ sessionId: "s-live", agent: "omp", access: "write", cwd: "D:\\repo" });
+    const b = rec.attempt({ sessionId: "s-live", input: "还在跑的一轮" });
+    rec.dispatch(b, { boundary: "rpc_ack" });          // 故意不结算：留一个公开的 dispatched
+    rec.progress(b, { tail: "写到一半…", charCount: 6, generationCount: 1 });
+
+    rec.sessionOpened({ sessionId: "s-dead", agent: "kimi", access: "read", cwd: "D:\\repo" });
+    rec.sessionOpenFailed("s-dead", { phase: "start", error: "起不来" });
+
+    await settleIo(rec);
+
+    const v = checkVizDir(rec.dir);
+    ok("X1 ★ writer 真实产出通过独立校验器（settled + dispatched + openFailed 三种形态同在）",
+      v.violations.length === 0 && v.chosen !== null,
+      JSON.stringify({ chosen: v.chosen, violations: v.violations }));
+
+    // 顺带坐实：选出来的确实是最新一代，而不是"碰巧有一个槽能过"。
+    // ⚠️ 判据要读**被选中那个槽自己的 generation**，别去猜槽位怎么轮换 ——
+    //    猜错了就只好补一句 `|| chosen !== null` 兜底，而那句会把整条断言变成永远绿。
+    const snap = latest(rec.dir);
+    const chosenGen = v.chosen
+      ? JSON.parse(fs.readFileSync(path.join(rec.dir, v.chosen), "utf8")).generation : null;
+    ok("X1 校验器选中的槽就是最新一代", chosenGen === snap.generation,
+      JSON.stringify({ chosen: v.chosen, chosenGen, latest: snap.generation }));
+    ok("X1 三个会话都在快照里（启动失败的也要占一张卡片）",
+      snap.sessions.length === 3, JSON.stringify(snap.sessions.map(s => s.sessionId)));
+    rec.cleanup();
+  });
+
+  // 降级路径也要过：`degraded` / `recordingErrors` 与 output.error 的三处连带同步，
+  // 恰恰是最容易只在一侧实现的部分。
+  await withTmp(async () => {
+    const io = makeIo();
+    const rec = createVizRun({ bridgeVersion: "t", env: on(), io });
+    rec.sessionOpened({ sessionId: "s1", agent: "claude", access: "read", cwd: "D:\\repo" });
+    const a = rec.attempt({ sessionId: "s1", input: "x" });
+    rec.dispatch(a, { boundary: "pipe_enqueued" });
+    io.st.failNext.set("t1.out.md", 1);                 // 正文写失败 → 必须点亮 degraded
+    rec.settleOnce(a, { outcome: "completed", body: "本该留下的正文", bodyKind: "final" });
+    await settleIo(rec);
+
+    const snap = latest(rec.dir);
+    const t = turnsOf(snap, "s1")[0];
+    ok("X2 正文写失败被如实记成 completed + none + output.error",
+      t.outcome === "completed" && t.bodyKind === "none" && t.output.error === "write_failed",
+      JSON.stringify({ o: t.outcome, k: t.bodyKind, e: t.output.error }));
+    const v = checkVizDir(rec.dir);
+    ok("X2 ★ 降级快照同样通过独立校验器（三处连带同步没漏）",
+      v.violations.length === 0, JSON.stringify(v.violations));
+    rec.cleanup();
+  });
+}
+
 console.log(`\n========================================================`);
 console.log(`  repro-viz-writer: ${pass} passed, ${fail} failed`);
 console.log(`========================================================\n`);

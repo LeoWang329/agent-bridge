@@ -21,6 +21,9 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
+// ⚠️ 只取那两个**纯函数与常量**。上限必须与传输层同源——两边各写各的，
+//    会让 writer 判"完整"而 serve 只发前缀，页面拿前缀去对全文的指纹，当场误报篡改。
+import { VIZ_FILE_MAX_BYTES, utf8BoundaryPrefix } from "./viz-http.mjs";
 
 // ── 常量 ────────────────────────────────────────────────────────────────────
 
@@ -53,10 +56,17 @@ const PROGRESS_MIN_MS = 400;
 /** 正文供体的硬顶。再等下去就是让观测拖住桥。 */
 const BODY_PROVIDER_MAX_MS = 2000;
 
-/** 快照写失败后的自动重试：间隔与连续次数上限。
- *  ⚠️ 有上限是因为磁盘真坏掉时不该一直烧 IO；再有新里程碑会重新开始计数。 */
+/**
+ * 快照写失败后的自动重试。
+ *
+ * ⚠️ **次数上限只用来降频，绝不用来放弃。** 磁盘坏掉时不该一直高频烧 IO，
+ *    但"不再重试"意味着最新一代被彻底丢掉——而那一代里可能正带着 `degraded`。
+ *    结果就是**磁盘恢复之后页面显示一切正常，恰恰是在记录已经不完整的时候**。
+ *    所以超过预算之后改用慢速重试，直到发布成功或 writer 停止。
+ */
 const SNAPSHOT_RETRY_MS = 250;
 const SNAPSHOT_RETRY_MAX = 3;
+const SNAPSHOT_RETRY_SLOW_MS = 5000;
 
 /** sessionId 直接做目录名，字符集必须先卡死。 */
 const SAFE_ID = /^[A-Za-z0-9._-]+$/;
@@ -98,6 +108,31 @@ function safeCount(n) {
 
 function sha256Hex(buf) {
   return crypto.createHash("sha256").update(buf).digest("hex");
+}
+
+/** §4.9 的两个枚举。**不在表里的值一个字节都不许进 wire。** */
+const OUTCOMES = new Set(["completed", "failed", "aborted", "abandoned"]);
+const BODY_KINDS = new Set(["final", "partial", "none"]);
+
+/**
+ * 把 `outcome` × `bodyKind` 归一到 §4.9 矩阵之内。
+ *
+ * ⚠️ **不能直接信任调用方交上来的这两个字段。** 桥那边五个后端各有各的收场路径，
+ *    写出 `failed + final`（"这轮失败了，不过这是最终答复"）毫无阻力，而它在矩阵里是 ❌。
+ *    真正的代价不是页面显示得难看：**独立校验器会把一份真实发生的记录判成非法**，
+ *    于是下一个人开始怀疑校验器而不是怀疑 writer——那正是这套双实现最不该出现的结果。
+ *
+ * 归一化放在**发布前唯一的出口**，而不是指望五处调用点各自自律
+ * （"每处都记得传对"这种纪律，本仓已经被证伪过不止一次）。
+ *
+ * 规则只有一条：**非 `completed` 的收场最多只能有 `partial`。**
+ * "失败/中止/被放弃"这件事本身就说明手上那份正文不是最终答复。
+ */
+function normalizeOutcomeKind(outcome, bodyKind) {
+  const o = OUTCOMES.has(outcome) ? outcome : "failed";
+  let k = BODY_KINDS.has(bodyKind) ? bodyKind : "none";
+  if (k === "final" && o !== "completed") k = "partial";
+  return { outcome: o, bodyKind: k };
 }
 
 function nowIso(clock) {
@@ -325,21 +360,26 @@ class SerialWriter {
       //    交给定时器放回去,才是真的退避。
       this.#onError?.("snapshot_write_failed", err);
       built?.onFailed?.();
+      // ⚠️ **dirty 永远保留，只放慢重试频率。**
+      //    早先这里是"超过 3 次就不再重挂 dirty"——那等于把最新一代**彻底丢掉**：
+      //    磁盘随后恢复、又没有新里程碑时，viewer 就永远停在旧代，
+      //    而那一代里可能正带着 `queue_full` / `degraded`——
+      //    **页面于是显示一切正常，恰恰是在记录已经不完整的时候。**
       this.#snapshotFails++;
-      if (this.#snapshotFails <= SNAPSHOT_RETRY_MAX) this.#armRetry(slot);
+      this.#armRetry(slot, this.#snapshotFails > SNAPSHOT_RETRY_MAX);
     } finally {
       this.#inflight--;
     }
   }
 
-  #armRetry(slot) {
+  #armRetry(slot, slow = false) {
     if (this.#retryTimer || this.#stopped) return;
     this.#retryTimer = setTimeout(() => {
       this.#retryTimer = null;
       // 期间要是来了更新的里程碑,用更新的那份——重试的目的是"发出去",不是"发那一代"。
       if (!this.#snapshotDirty) this.#snapshotDirty = slot;
       this.#drain();
-    }, SNAPSHOT_RETRY_MS);
+    }, slow ? SNAPSHOT_RETRY_SLOW_MS : SNAPSHOT_RETRY_MS);
     this.#retryTimer.unref?.();
   }
 
@@ -567,7 +607,14 @@ class VizRecorder {
   sessionOpened(info) {
     return this.#safe(() => {
       const id = String(info?.sessionId ?? "");
-      if (!SAFE_ID.test(id)) { this.#diag("bad_session_id", new Error(id)); return; }
+      // ⚠️ **`..` 能通过白名单正则**（`.` 和 `-` 都在允许集里），必须单独拒。
+      //    否则 `sessionId = ".."` 会把输入文件写到 VIZ_DIR 根部，而快照公布的是
+      //    `turns/../t1.in.md`——`/file` 的词法闸随后判 400，于是那份正文**永久不可读**，
+      //    页面上看起来像"文件丢了"，实际是我们自己写歪的。
+      if (!SAFE_ID.test(id) || id.split(/[/\\]/).includes("..") || id === "." || id === "..") {
+        this.#diag("bad_session_id", new Error(id));
+        return;
+      }
       if (this.#ledger.sessions.has(id)) { this.sessionStatus(id, info); return; }
       const at = this.#now();
       // ⚠️ **逐字段白名单映射,不许 spread `session.summary()`**——
@@ -811,13 +858,13 @@ class VizRecorder {
   //    这三个方法在 disabled 时是安全 no-op。
 
   rpcRegister(sessionId, requestId, attemptId) {
-    return this.#safe(() => { this.#ledger.pendingRpc.set(`${sessionId} ${requestId}`, attemptId); });
+    return this.#safe(() => { this.#ledger.pendingRpc.set(`${sessionId}|${requestId}`, attemptId); });
   }
 
   /** 取出并**删除**——五类出口都调它，重复调用是安全的。 */
   rpcTake(sessionId, requestId) {
     return this.#safe(() => {
-      const k = `${sessionId} ${requestId}`;
+      const k = `${sessionId}|${requestId}`;
       const v = this.#ledger.pendingRpc.get(k) ?? null;
       this.#ledger.pendingRpc.delete(k);
       return v;
@@ -830,7 +877,7 @@ class VizRecorder {
    */
   rpcDrainSession(sessionId, reason) {
     return this.#safe(() => {
-      const prefix = `${sessionId} `;
+      const prefix = `${sessionId}|`;
       const drained = [];
       for (const k of [...this.#ledger.pendingRpc.keys()]) {
         if (!k.startsWith(prefix)) continue;
@@ -915,13 +962,22 @@ class VizRecorder {
   #progressPath(a) { return path.join(this.#turnDir(a), `t${a.turnNo}.progress.json`); }
   #refOf(a, suffix) { return `turns/${a.sessionId}/t${a.turnNo}.${suffix}`; }
 
-  #writeInput(a, text) {
-    const buf = Buffer.from(String(text ?? ""), "utf8");
+  #writeInput(a, raw) {
+    // 入参可以是字符串，也可以是 `{ text, truncated, originalBytes }`——
+    // 桥那边超长输入会先截断再交过来，那时才有"原始比保存大"这回事。
+    const text = typeof raw === "string" ? raw : String(raw?.text ?? "");
+    const truncated = typeof raw === "object" && raw !== null ? !!raw.truncated : false;
+    const buf = Buffer.from(text, "utf8");
+    a.input.truncated = truncated;
     const r = this.#writer.enqueue({
       path: path.join(this.#turnDir(a), `t${a.turnNo}.in.md`), dir: this.#turnDir(a), data: buf,
       onDone: (err) => {
         if (err) {
           a.input.state = "missing"; a.input.ref = null; a.input.sha256 = null; a.input.error = "write_failed";
+          // ⚠️ 写失败 ⇒ **什么都没保存**，三个数一起清零。
+          //    `chars`/`bytes` 是"实际保存的量"，留着入队时算的那份就是在说
+          //    "我们存了 N 字节"——而磁盘上一个字节都没有。
+          a.input.chars = null; a.input.bytes = null; a.input.originalBytes = null;
           this.#noteRecordingError("write_failed");
         } else {
           // **写成功之后才公布 ref**——任何情况下都不出现悬空引用。
@@ -935,10 +991,19 @@ class VizRecorder {
     });
     if (!r.ok) {
       a.input.state = "missing"; a.input.ref = null; a.input.sha256 = null; a.input.error = r.code;
+      a.input.chars = null; a.input.bytes = null; a.input.originalBytes = null;
       this.#noteRecordingError(r.code);
     } else {
       a.input.chars = safeCount(String(text ?? "").length);
       a.input.bytes = safeCount(buf.length);
+      // ⚠️ **不截断时 `originalBytes` 必须恒等于 `bytes`**（STATE.md §4.7），
+      //    包括两者同为 `null` 的情形——所以它必须和 `bytes` 在**同一处**赋值。
+      //    早先它写在入队之前、无条件赋 `buf.length`，于是入队被拒时
+      //    `bytes=null` 而 `originalBytes=N`，快照当场自相矛盾：
+      //    页面据此算出「已截断 · 原始 N / 保存 0」，而真相是这份输入根本没落盘。
+      a.input.originalBytes = truncated
+        ? (safeCount(raw?.originalBytes) ?? safeCount(buf.length))
+        : safeCount(buf.length);
     }
   }
 
@@ -997,7 +1062,12 @@ class VizRecorder {
       try {
         const at = this.#now();
         a.settledAt = at;
-        a.outcome = result.outcome ?? "failed";
+        // ⚠️ 归一化必须在**任何**分支之前：下面每一条路径都会读 `a.outcome` / `kind`，
+        //    放到某一条分支里就等于只归一了那一条。
+        const norm = normalizeOutcomeKind(
+          result.outcome ?? "failed",
+          result.bodyKind ?? (result.body ? "final" : "none"));
+        a.outcome = norm.outcome;
         a.error = boundError(result.error ?? null);
         if (result.backendTurnCount !== undefined) a.backendTurnCount = safeCount(result.backendTurnCount);
 
@@ -1013,11 +1083,12 @@ class VizRecorder {
         this.#io.unlink(this.#progressPath(a)).catch(() => {});
 
         let body = result.body;
-        const kind = result.bodyKind ?? (body ? "final" : "none");
+        const kind = norm.bodyKind;
         if (body == null || kind === "none") {
           a.bodyKind = "none";
           a.output.state = "missing"; a.output.ref = null; a.output.sha256 = null;
           a.output.chars = null; a.output.bytes = null;
+          a.output.previewBytes = null; a.output.previewSha256 = null;
           // ⚠️ `completed + none` **只在 `output.error` 非空时合法**（STATE.md §4.9）——
           //    「后端正常完成，但观测侧没记下来」。所以这一格必须带上原因码，
           //    否则 writer 会自己造出一个连独立校验器都判非法的快照。
@@ -1039,6 +1110,7 @@ class VizRecorder {
               a.bodyKind = "none";
               a.output.state = "missing"; a.output.ref = null; a.output.sha256 = null;
               a.output.chars = null; a.output.bytes = null; a.output.error = "write_failed";
+              a.output.previewBytes = null; a.output.previewSha256 = null;
               this.#noteRecordingError("write_failed");
             } else {
               a.bodyKind = kind;
@@ -1048,6 +1120,19 @@ class VizRecorder {
               a.output.chars = safeCount(chars);
               a.output.bytes = safeCount(buf.length);
               a.output.error = null;
+              // ⚠️ **正文超过传输上限时，必须现在就把前缀指纹算出来。**
+              //    队列的单项上限（32 MiB）比传输上限（8 MiB）宽，中间这一段正文
+              //    会被 writer 判成完好的 `ready`，而 `/file` 只发得出前 8 MiB。
+              //    页面手上只有全文指纹 → 拿前缀去对全文 → **当场误报「文件被改动」**，
+              //    而它其实什么都没坏。前缀必须按 `utf8BoundaryPrefix` 算，
+              //    与传输层同一个函数、同一个上限——各算各的就是把误报换个地方触发。
+              if (buf.length > VIZ_FILE_MAX_BYTES) {
+                const prefix = utf8BoundaryPrefix(buf, VIZ_FILE_MAX_BYTES);
+                a.output.previewBytes = safeCount(prefix.length);
+                a.output.previewSha256 = sha256Hex(prefix);
+              } else {
+                a.output.previewBytes = null; a.output.previewSha256 = null;
+              }
             }
             a.state = "settled";
             this.#markDirty();
@@ -1062,6 +1147,7 @@ class VizRecorder {
           a.bodyKind = "none";
           a.output.state = "missing"; a.output.ref = null; a.output.sha256 = null;
           a.output.chars = null; a.output.bytes = null; a.output.error = r.code;
+          a.output.previewBytes = null; a.output.previewSha256 = null;
           this.#noteRecordingError(r.code);
           a.state = "settled";
           body = null;                                       // **立即释放正文**,不再占字节预算

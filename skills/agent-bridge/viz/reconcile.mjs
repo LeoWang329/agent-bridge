@@ -159,10 +159,34 @@ export function bodyText(entry) {
   if (entry.pending) return BODY_PLACEHOLDER;
   // ⚠️ 指纹对不上时**绝不照常展示**——那等于替一份被篡改的内容背书。
   if (entry.tamper) return "⚠️ 这份文件在落盘之后被改动过（指纹对不上），已拒绝展示。";
+  // 「对不上」和「压根没得对」是两件事，说法必须分开：前者指认篡改，后者只承认自己验不了。
+  if (entry.unverified) return "⚠️ 这份内容无法对证（缺少对应的指纹），已拒绝展示。";
   if (entry.error) return `⚠️ 读取失败：${entry.error}`;
   return entry.text || "";
 }
-export function bodyUsable(entry) { return !!(entry && !entry.pending && !entry.tamper && !entry.error); }
+export function bodyUsable(entry) {
+  return !!(entry && !entry.pending && !entry.tamper && !entry.unverified && !entry.error);
+}
+
+/**
+ * 这一份正文能不能交给「复制」按钮。**输入与输出各判各的。**
+ *
+ * ⚠️ 早先这里是一个**轮次级**的 `pending`，两个方向共用，于是同时错两次：
+ *    ① 输入写失败（`state:"missing"`、`ref:null`）时压根没有正文要取，
+ *       轮次级判据看不到任何"待取"，按钮照常可点——**复制出一个空串**，
+ *       而用户以为自己留档了当时发出去的 prompt；
+ *    ② 输出还在路上时，已经验过、就在眼前的输入也一并被禁用。
+ *    一个共用的布尔量回答不了两个不同的问题。
+ *
+ * 四个条件缺一不可：声明是 `ready`、`ref`/`sha256` 都在、取回来**验过**、
+ * 且**不是传输截断件**（截断件不是原文，"复制原文"就不该把它交出去）。
+ */
+export function copyable(payload, entry) {
+  if (!payload || payload.state !== "ready") return false;
+  if (!payload.ref || !payload.sha256) return false;
+  if (!bodyUsable(entry)) return false;
+  return !entry.truncated;
+}
 
 /**
  * 快照 → 页面展示模型。**纯函数**：同样的输入必得同样的输出。
@@ -210,7 +234,7 @@ function adaptTurn(t, c) {
   const result = running ? "running" : (synthesized ? "abandoned" : t.outcome);
   const body = running || synthesized ? "none" : t.bodyKind;
 
-  const inEntry = t.input.ref ? c.bodyCache.get(t.input.ref) : { text: "" };
+  const inEntry = t.input.ref ? c.bodyCache.get(t.input.ref) : null;
   const o = {
     n: t.turnNo,
     result, body,
@@ -221,10 +245,11 @@ function adaptTurn(t, c) {
     unfetched: isUncollected(t) && !synthesized,
     error: t.error || null,
     vizTurnId: t.vizTurnId,
-    pending: t.input.ref ? !bodyUsable(inEntry) : false,
     input: {
       chars: t.input.chars || 0,
-      text: t.input.ref ? bodyText(inEntry) : "",
+      // 输入根本没落盘（写失败）时说的是「没有这份记录」，不是「正在读取」。
+      text: t.input.ref ? bodyText(inEntry) : (t.input.error ? "⚠️ 这一轮的输入没有留存下来。" : ""),
+      copyable: copyable(t.input, inEntry),
       truncated: t.input.truncated
         ? { orig: mb(t.input.originalBytes), saved: mb(t.input.bytes) } : null,
     },
@@ -242,7 +267,11 @@ function adaptTurn(t, c) {
     };
   } else if (body !== "none") {
     const outEntry = c.bodyCache.get(t.output.ref);
-    o.output = { chars: t.output.chars || 0, md: bodyText(outEntry) };
+    o.output = {
+      chars: t.output.chars || 0,
+      md: bodyText(outEntry),
+      copyable: copyable(t.output, outEntry),
+    };
     if (outEntry && outEntry.truncated) {
       o.output.capped = {
         shown: mb((o.output.md || "").length),
@@ -250,20 +279,27 @@ function adaptTurn(t, c) {
         path: (c.vizDir ? `${c.vizDir}\\` : "") + String(t.output.ref).replace(/\//g, "\\"),
       };
     }
-    if (!bodyUsable(outEntry)) o.pending = true;
   } else {
-    o.output = { chars: 0, md: "" };
+    o.output = { chars: 0, md: "", copyable: false };
   }
   return o;
 }
 
-/** 这份快照要取哪些正文（页面据此发 `/file` 请求）。 */
+/**
+ * 这份快照要取哪些正文（页面据此发 `/file` 请求）。
+ *
+ * ⚠️ `previewSha256` **必须一起带上**：正文超过传输上限时服务端只发前缀，
+ *    那时唯一能对证的就是这个前缀指纹。不带出来，页面就只能在
+ *    「拿前缀去对全文（必然误报篡改）」和「干脆不验（等于没有对证）」之间二选一。
+ */
 export function refsOf(snapshot) {
   const out = [];
   for (const s of snapshot?.sessions || []) {
     for (const t of s.turns || []) {
-      if (t.input?.ref) out.push({ ref: t.input.ref, sha256: t.input.sha256 });
-      if (t.output?.ref) out.push({ ref: t.output.ref, sha256: t.output.sha256 });
+      if (t.input?.ref) out.push({ ref: t.input.ref, sha256: t.input.sha256, previewSha256: null });
+      if (t.output?.ref) {
+        out.push({ ref: t.output.ref, sha256: t.output.sha256, previewSha256: t.output.previewSha256 ?? null });
+      }
     }
   }
   return out;

@@ -18,7 +18,7 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  resolveWithin, sendArchivedFile, sendPlain, sendMethodNotAllowed,
+  VIZ_FILE_MAX_BYTES, resolveWithin, sendArchivedFile, sendPlain, sendMethodNotAllowed,
 } from "../../../scripts/viz-http.mjs";
 
 /**
@@ -70,8 +70,6 @@ const POLL_MS = 400;
 const PROGRESS_MS = 900;
 /** owner 没了且没有客户端之后的宽限期。 */
 const GRACE_MS = 60000;
-/** 单份正文最多发多少字节（超出只发 UTF-8 完整边界前缀 + 截断头）。 */
-const FILE_MAX_BYTES = Number(process.env.VIZ_FILE_MAX_MB || 8) * 1024 * 1024;
 
 // ── 身份与存活 ──────────────────────────────────────────────────────────────
 
@@ -95,6 +93,45 @@ function ownerAlive() {
 
 // ── 双槽读 ──────────────────────────────────────────────────────────────────
 
+const isStr = (v) => typeof v === "string" && v.length > 0;
+const isBool = (v) => typeof v === "boolean";
+
+/**
+ * §2.1 第 ④ 条：**必填字段全在、类型对**。
+ *
+ * ⚠️ 这不是把独立校验器搬进 viewer——语义矩阵（§4.9）仍然只归 `contract-invariants.mjs`。
+ *    viewer 这一层要回答的是另一个问题：**手上这坨字节，是不是一份快照。**
+ *    早先只判 `run` 真值 + `sessions` 是数组，于是一个 `{run:{},sessions:[]}` 的空壳
+ *    只要 generation 更大就能顶掉旁边那份完好的快照，页面当场清空——
+ *    **而这正是双槽协议存在的理由**：另一个槽好端端的，却因为判据太浅没被选上。
+ *
+ * 深度就到「结构完整性」为止：每层的必填键在不在、基本类型对不对。
+ * 再往里走会变成第二份语义校验器，两份实现迟早漂成两个答案（§11）。
+ */
+function looksLikeSnapshot(p) {
+  const r = p.run;
+  if (!r || typeof r !== "object" || Array.isArray(r)) return false;
+  if (!Number.isSafeInteger(r.pid)) return false;
+  if (!isStr(r.bridgeVersion) || !isStr(r.startedAt)) return false;
+  if (r.status !== "running") return false;                          // §4 只有这一档
+  if (!isBool(r.degraded) || !Array.isArray(r.recordingErrors)) return false;
+  if (!isStr(p.updatedAt)) return false;
+  if (!Array.isArray(p.sessions)) return false;
+  for (const s of p.sessions) {
+    if (!s || typeof s !== "object" || Array.isArray(s)) return false;
+    if (!isStr(s.sessionId) || !isStr(s.agent) || !isStr(s.status)) return false;
+    if (!Array.isArray(s.turns)) return false;
+    for (const t of s.turns) {
+      if (!t || typeof t !== "object" || Array.isArray(t)) return false;
+      if (!Number.isSafeInteger(t.turnNo) || !isStr(t.vizTurnId)) return false;
+      if (t.state !== "dispatched" && t.state !== "settled") return false;
+      if (!t.input || typeof t.input !== "object") return false;
+      if (!t.output || typeof t.output !== "object") return false;
+    }
+  }
+  return true;
+}
+
 /**
  * 读一个槽。返回 `{ raw, parsed }` 或 `null`。
  *
@@ -112,16 +149,25 @@ async function readSlot(i) {
   if (parsed.runId !== META.runId) return null;                     // ①
   if (!Number.isSafeInteger(parsed.generation) || parsed.generation < 1) return null;  // ②
   if (!SUPPORTED_SCHEMA.has(parsed.schemaVersion)) return null;     // ③
-  if (!parsed.run || !Array.isArray(parsed.sessions)) return null;  // ④ 必填结构
+  if (!looksLikeSnapshot(parsed)) return null;                      // ④ 必填结构
   return { raw, parsed };
 }
 
+/**
+ * ⚠️ **两槽 generation 相等 ⇒ 双方都不可信**（STATE.md §2.1）。
+ *
+ * 健康的 run 里到不了这个状态：写成功才推进代次并换槽，两槽必然差 1 以上。
+ * 真出现就说明有东西在这个目录里乱写。静默择一（原来的 `>=` 就是静默择一）
+ * 等于**在最该报警的时刻挑一份看着像的展示出来**——而这时候两份都可能是伪造的。
+ * 返回 `null` 会走 `history-read-failure`：「我暂时读不到」，正是此刻唯一诚实的说法。
+ */
 async function readLatestState() {
   const [a, b] = await Promise.all([readSlot(0), readSlot(1)]);
   if (!a && !b) return null;
   if (!a) return b;
   if (!b) return a;
-  return a.parsed.generation >= b.parsed.generation ? a : b;
+  if (a.parsed.generation === b.parsed.generation) return null;
+  return a.parsed.generation > b.parsed.generation ? a : b;
 }
 
 // ── SSE 客户端 ──────────────────────────────────────────────────────────────
@@ -230,10 +276,21 @@ function broadcastControl(kind) {
   for (const c of clients) pushControl(c, data);
 }
 
+/**
+ * 返回**是否发生了 true → false 的恢复沿**。调用方必须据此重发一次 state。
+ *
+ * ⚠️ 只清内部标志是不够的。页面收到 `history-read-failure` 之后会挂出「暂时读不到」，
+ *    而清除这句话的**唯一**信号是下一帧 `state`——但 `pollState` 有一道
+ *    `generation <= lastGeneration 就不发` 的去重闸。于是：短暂读不到、随后
+ *    在**同一代**上恢复（快照根本没变过，这恰恰是最常见的情形——瞬时 IO 抖动），
+ *    页面就永久停在那句话上，**而记录一直好端端地在那儿**。
+ *    去重闸本身没错，错在拿它当"要不要发"的唯一判据；恢复沿是第二个判据。
+ */
 function setHistoryReadFailure(on) {
-  if (control.historyReadFailure === on) return;
+  if (control.historyReadFailure === on) return false;
   control.historyReadFailure = on;
-  if (on) broadcastControl("history-read-failure");
+  if (on) { broadcastControl("history-read-failure"); return false; }
+  return true;
 }
 
 function setRunGone() {
@@ -282,8 +339,12 @@ async function pollState() {
     setHistoryReadFailure(true);
     return;
   }
-  setHistoryReadFailure(false);
-  if (slot.parsed.generation <= lastGeneration) return;
+  const recovered = setHistoryReadFailure(false);
+  if (slot.parsed.generation <= lastGeneration) {
+    // 代次没推进，但刚从「读不到」里恢复 —— 必须重发一次当前 state 把那句话冲掉。
+    if (recovered && lastStateRaw) for (const c of clients) pushState(c, lastStateRaw);
+    return;
+  }
   lastGeneration = slot.parsed.generation;
   lastStateRaw = slot.raw;
 
@@ -303,10 +364,29 @@ async function pollState() {
   for (const c of clients) pushState(c, lastStateRaw);
 }
 
-async function pollProgress() {
+/**
+ * 「同一 sidecar 路径的读不并发」这句话，**光靠一个 `for await` 是保证不了的**。
+ *
+ * 定时器每 900ms 叫一次，而新客户端连进来时 `handleEvents` 也会叫一次——
+ * 两条路径各自跑一遍循环，同一个文件就有两个 read 同时在飞。
+ * 先发的那次晚返回时，`lastProgress` 被**旧内容**盖回去并广播出去，
+ * 页面上的实时预览当场时间倒流。
+ *
+ * 修法是共用同一次在途读取（in-flight promise），而不是各跑各的：
+ * 后来者拿到的是**同一个** Promise，读只发生一次，顺序也就只有一种。
+ *
+ * （`pollState` 不需要这道闸：它有 `generation <= lastGeneration 就返回` 的单调闸，
+ *   晚到的旧代次过不去——判据本身就带序。这里没有这样的序，才必须靠互斥补上。）
+ */
+let progressInflight = null;
+function pollProgress() {
+  if (progressInflight) return progressInflight;
+  progressInflight = doPollProgress().finally(() => { progressInflight = null; });
+  return progressInflight;
+}
+
+async function doPollProgress() {
   if (control.runGone || activeSidecars.size === 0) return;
-  // ⚠️ 同一 sidecar 路径的读**不并发**（STATE.md §5 前提 4）：
-  //    两个 read 同时在飞时，旧的可能晚于新的返回，页面就会看到时间倒流。
   for (const [vizTurnId, loc] of activeSidecars) {
     let raw;
     try {
@@ -398,7 +478,7 @@ function handleFile(req, res, url) {
   // 但**不额外加前缀闸**：VIZ_DIR 是 mkdtemp 出来的专属目录，里面除了本 run 的东西什么都没有。
   const r = resolveWithin(VIZ_DIR, url.searchParams.get("ref"));
   if (r.code) return sendPlain(res, r.code, r.msg);
-  sendArchivedFile(req, res, r.abs, { shaHeader: "X-Viz-Sha256", maxBytes: FILE_MAX_BYTES });
+  sendArchivedFile(req, res, r.abs, { shaHeader: "X-Viz-Sha256", maxBytes: VIZ_FILE_MAX_BYTES });
 }
 
 function sendLocal(res, file, type) {

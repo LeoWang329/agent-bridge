@@ -143,6 +143,29 @@ function checkEnum(value, allowed, label, violations, { nullable = false } = {})
   return true;
 }
 
+// §3：时间戳一律是 `new Date().toISOString()` 的输出 —— UTC、带毫秒、Z 结尾。
+//
+// 只判“能不能 Date.parse”远远不够：`"2026-07-29 10:00:00"` 照样解析得动，
+// 但它按**本地时区**解释，同一份快照在两台机器上读出来就是两个时刻，
+// 而这份记录存在的全部意义就是事后对时间线。正则先卡住形状，
+// 再用 toISOString() 往回比一次 —— 那一步顺带排掉 13 月、32 日这类正则拦不住的值。
+const ISO_MS_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+function checkIsoTimestamp(value, label, violations, { nullable = false } = {}) {
+  if (value === undefined) return false;
+  if (value === null) {
+    if (nullable) return true;
+    violations.push(label + ' 不能是 null');
+    return false;
+  }
+  if (typeof value !== 'string'
+      || !ISO_MS_UTC.test(value)
+      || new Date(value).toISOString() !== value) {
+    violations.push(label + ' 必须是 toISOString() 形式的 UTC 毫秒时间戳');
+    return false;
+  }
+  return true;
+}
+
 // 错误文本的上限避免异常对象把快照体积无限放大。
 function checkBoundedText(value, label, violations) {
   if (value !== null && typeof value === 'string' && value.length > 300) {
@@ -202,7 +225,9 @@ function collectRequiredStructure(snapshot) {
     checkShapeField(session, 'access', (v) => typeof v === 'string', '字符串', sessionLabel, violations);
     checkShapeField(session, 'cwd', (v) => typeof v === 'string', '字符串', sessionLabel, violations);
     checkShapeField(session, 'returnMode', (v) => typeof v === 'string', '字符串', sessionLabel, violations);
-    checkShapeField(session, 'logFile', (v) => typeof v === 'string', '字符串', sessionLabel, violations);
+    // logFile 可空（§4.2）：调用方没给时，writer 只剩"编一个路径"或"丢掉整张卡片"
+    // 两条路，都比承认没有更坏。页面据此只是不显示逃生门链接。
+    checkShapeField(session, 'logFile', nullableString, '字符串或 null', sessionLabel, violations);
     checkShapeField(session, 'appendSystemPrompt', (v) => v === null || isRecord(v), '对象或 null', sessionLabel, violations);
     checkShapeField(session, 'backendPid', nullableNumber, '数字或 null', sessionLabel, violations);
     checkShapeField(session, 'status', (v) => typeof v === 'string', '字符串', sessionLabel, violations);
@@ -434,6 +459,8 @@ function validateCollected(collected, label, violations) {
 
   // returnedChars 是真实内联返回量，必须保持 UTF-16 计数且不能用非有限数冒充 null。
   checkSafeCount(collected.returnedChars, label + '.returnedChars', violations);
+
+  checkIsoTimestamp(collected.at, label + '.at', violations);
 }
 
 function validatePayload(payload, kind, turn, session, label, vizContext, observedErrors, violations) {
@@ -449,6 +476,26 @@ function validatePayload(payload, kind, turn, session, label, vizContext, observ
   checkSafeCount(payload.bytes, label + '.bytes', violations, { nullable: true });
   if (isInput) {
     checkSafeCount(payload.originalBytes, label + '.originalBytes', violations, { nullable: true });
+
+    // §4.7：`truncated === false ⟹ bytes === originalBytes`。
+    //
+    // 不截断就没有“原始比保存大”这回事，两个数必须是同一个。页面正是拿它们说出
+    // 「已截断 · 原始 12.3 MB / 保存 4 MB」这句话 —— 放任它们对不上，等于凭空告诉
+    // 用户手里那份是残件（或者反过来，把残件说成完整原文）。
+    //
+    // 判据就是**恒等**，包括两者同为 null（尚未落盘 / 写失败，两个数都还不存在）。
+    // 不要额外加一条“originalBytes 不能是 null”：那会把 pending 这个完全正常的
+    // 中间态判成违规 —— 合同要的是两个数一致，不是要求它们随时都有值。
+    if (payload.truncated === false && payload.originalBytes !== payload.bytes) {
+      violations.push(label + '.truncated 为 false 时 originalBytes 必须等于 bytes');
+    }
+    // 反过来，声称截断却没比保存的更大，说明那面“已截断”的旗子是假的。
+    if (payload.truncated === true
+        && typeof payload.originalBytes === 'number'
+        && typeof payload.bytes === 'number'
+        && payload.originalBytes <= payload.bytes) {
+      violations.push(label + '.truncated 为 true 时 originalBytes 必须大于 bytes');
+    }
   } else {
     checkSafeCount(payload.previewBytes, label + '.previewBytes', violations, { nullable: true });
   }
@@ -573,7 +620,19 @@ function validateTurn(turn, session, label, vizContext, seenVizTurnIds, observed
   // 单轮错误同样有体积上限，避免后端异常栈无限进入快照。
   checkBoundedText(turn.error, label + '.error', violations);
 
-  // terminal_adopted 代表终结事件晚到认领，两个时间相等或倒序就不符合这段因果关系。
+  // 时间线是这份记录的主轴，四个时刻的格式一个都不能松。
+  checkIsoTimestamp(turn.attemptedAt, label + '.attemptedAt', violations);
+  checkIsoTimestamp(turn.dispatchedAt, label + '.dispatchedAt', violations);
+  checkIsoTimestamp(turn.settledAt, label + '.settledAt', violations, { nullable: true });
+  checkIsoTimestamp(turn.firstBackendEventAt, label + '.firstBackendEventAt', violations, { nullable: true });
+
+  // terminal_adopted 代表终结事件晚到认领，时间倒序就不符合这段因果关系。
+  //
+  // ⚠️ 判据是 `>=` 而不是 `>`（STATE.md §4.6）。要挡的是「实现把 dispatchedAt 直接抄成
+  //    attemptedAt、抹平中间那段歧义期」，但**严格大于要求的是毫秒时钟分辨率**——
+  //    本地极快的后端、hermetic 假后端都可能在同一毫秒里走完「尝试 → 终结事件 → 认领」。
+  //    合同不该要求实现保证不了的事，否则这里就是一颗随机红的雷。
+  //    牙齿在 writer 回归里：那边造一个真实时间间隔再断言严格 `>`，抄时间戳的实现照样过不去。
   if (turn.boundary === 'terminal_adopted'
       && typeof turn.attemptedAt === 'string'
       && typeof turn.dispatchedAt === 'string') {
@@ -581,8 +640,8 @@ function validateTurn(turn, session, label, vizContext, seenVizTurnIds, observed
     const dispatchedMs = Date.parse(turn.dispatchedAt);
     if (!Number.isFinite(attemptedMs) || !Number.isFinite(dispatchedMs)) {
       violations.push(label + ' 的 terminal_adopted 时间必须可解析后才能证明先后关系');
-    } else if (dispatchedMs <= attemptedMs) {
-      violations.push(label + ' 使用 terminal_adopted 时 dispatchedAt 必须晚于 attemptedAt');
+    } else if (dispatchedMs < attemptedMs) {
+      violations.push(label + ' 使用 terminal_adopted 时 dispatchedAt 不得早于 attemptedAt');
     }
   }
 
@@ -690,7 +749,11 @@ function validateSession(session, index, context, violations) {
   if (isRecord(session.closed)) {
     // close 对象也必须封闭，避免后端 summary 的新字段绕过 session 白名单。
     rejectUnknownKeys(session.closed, CLOSED_KEYS, label + '.closed', violations);
+    checkIsoTimestamp(session.closed.at, label + '.closed.at', violations);
   }
+
+  checkIsoTimestamp(session.createdAt, label + '.createdAt', violations);
+  checkIsoTimestamp(session.updatedAt, label + '.updatedAt', violations);
 
   if (!Array.isArray(session.turns)) return;
   let previousTurnNo = null;
@@ -739,6 +802,8 @@ export function checkSnapshot(snapshot, { vizDir = null } = {}) {
     violations.push('snapshot.runId 不能为空');
   }
 
+  checkIsoTimestamp(snapshot.updatedAt, 'snapshot.updatedAt', violations);
+
   const vizContext = createVizContext(vizDir, violations);
   const observedErrors = new Set();
   const context = {
@@ -754,6 +819,8 @@ export function checkSnapshot(snapshot, { vizDir = null } = {}) {
 
     // run.pid 也属于统一计数口径，不能让进程身份被小数或 Infinity 污染。
     checkSafeCount(run.pid, 'snapshot.run.pid', violations);
+
+    checkIsoTimestamp(run.startedAt, 'snapshot.run.startedAt', violations);
 
     // terminated 在生产路径不可达，保留它只会让测试认可 writer 永远发不出的状态。
     if (run.status !== 'running') {
@@ -825,6 +892,8 @@ function checkMeta(meta) {
   checkShapeField(object, 'bridgeVersion', (v) => typeof v === 'string', '字符串', 'meta.json', violations);
   checkShapeField(object, 'createdAt', (v) => typeof v === 'string', '字符串', 'meta.json', violations);
   checkSafeCount(object.pid, 'meta.json.pid', violations);
+  checkIsoTimestamp(object.processStartedAt, 'meta.json.processStartedAt', violations);
+  checkIsoTimestamp(object.createdAt, 'meta.json.createdAt', violations);
   if (typeof object.runId === 'string' && object.runId.length === 0) {
     violations.push('meta.json.runId 不能为空');
   }

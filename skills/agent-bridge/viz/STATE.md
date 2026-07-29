@@ -218,7 +218,7 @@ viewer 靠 owner 探测确认死亡后广播，页面据此把仍为 `dispatched
   "access": "read",                 // read | write
   "cwd": "D:\\cc\\agent-bridge",
   "returnMode": "full",             // full | ref
-  "logFile": "C:\\…\\codex-….log",  // 逃生门:页面要给出这个路径让人自己去开
+  "logFile": "C:\\…\\codex-….log",  // **可空**;逃生门:页面要给出这个路径让人自己去开
   "appendSystemPrompt": null,       // 或 §4.3 的对象
   "backendPid": 16116,              // **可空**:形状 B(cursor/kimi)轮间本来就没有进程
   "status": "running",              // starting | running | idle | failed | closed
@@ -239,6 +239,13 @@ viewer 靠 owner 探测确认死亡后广播，页面据此把仍为 `dispatched
 ⚠️ **未知字段一律不允许。** 实现者**不许直接 spread `session.summary()`**，
 必须逐字段白名单映射——否则后端将来新增字段会静默流进快照，绕过白名单纪律。
 校验器要显式拒绝 schema 之外的键。
+
+⚠️ **`logFile` 可空。** 桥那边这个路径在 session 对象构造时就定下来了（早于 spawn），
+所以生产路径上它**应当**总是有值——但合同不能因此写成"必须非空"：
+recorder 是一个公开 API，调用方没给的时候，writer 只剩两条路——
+**编一个路径**（撒谎），或者**丢掉这张卡片**（把一次真实发生的会话从记录里抹掉）。
+两条都比"承认这次没有日志可指"更坏。页面据此只是不显示那个逃生门链接。
+（同 `backendPid`：可空是因为**确实存在没有值的时刻**，不是因为懒得填。）
 
 ### 4.3 `appendSystemPrompt`
 

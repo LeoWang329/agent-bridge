@@ -78,7 +78,7 @@ var BODY = new Map();              /* ref -> {text}|{pending}|{tamper}|{error} *
    服务端用**实际发出去的字节**实时算一遍 SHA-256 放在 X-Viz-Sha256 里；
    这里拿它和快照里 writer 记下的指纹比。不一致 = 文件在落盘之后被改过 ——
    这时**绝不能照常展示**，否则页面等于替一份被篡改的内容背书。 */
-function fetchBody(ref, expectSha){
+function fetchBody(ref, expectSha, expectPreviewSha){
   if(!ref || BODY.has(ref)) return;
   BODY.set(ref, { pending:true });
   fetch("/file?ref="+encodeURIComponent(ref)).then(function(r){
@@ -87,8 +87,16 @@ function fetchBody(ref, expectSha){
     var truncated = r.headers.get("X-Viz-Truncated") === "1";
     var fullBytes = Number(r.headers.get("X-Viz-Full-Bytes") || 0);
     return r.text().then(function(text){
-      if(expectSha && got && !truncated && got !== expectSha) BODY.set(ref, { tamper:true });
-      else BODY.set(ref, { text:text, truncated:truncated, fullBytes:fullBytes });
+      /* ⚠️ **截断响应不是"没法验"，是"换一份指纹验"。**
+            原来的判据是 \`!truncated\`，等于说"只要服务端说它截断了，就跳过对证"——
+            那条路上任何被篡改的前缀都能原样显示出来，而页面还照常给出复制按钮。
+            超限正文的 previewSha256 是 writer 用**同一个上限、同一个边界函数**算出来的，
+            就是为这一刻准备的。缺了它则老实说自己验不了，而不是默认放行。 */
+      var expect = truncated ? expectPreviewSha : expectSha;
+      if(truncated && !expect){ BODY.set(ref, { unverified:true }); return; }
+      if(expect && got && got !== expect){ BODY.set(ref, { tamper:true }); return; }
+      if(expect && !got){ BODY.set(ref, { unverified:true }); return; }
+      BODY.set(ref, { text:text, truncated:truncated, fullBytes:fullBytes });
     });
   }).catch(function(e){
     BODY.set(ref, { error:String((e && e.message) || e) });
@@ -123,7 +131,7 @@ function applyState(snap){
   RUN.degraded = !!(snap.run && snap.run.degraded);
   RUN.recordingErrors = (snap.run && snap.run.recordingErrors) || [];
   RUN.startedAt = snap.run && snap.run.startedAt;
-  refsOf(snap).forEach(function(x){ fetchBody(x.ref, x.sha256); });
+  refsOf(snap).forEach(function(x){ fetchBody(x.ref, x.sha256, x.previewSha256); });
   /* 已结算的轮次立刻忘掉 sidecar——留着它只会让迟到的内容有机会回来。 */
   var alive = new Set();
   (snap.sessions || []).forEach(function(s){
@@ -276,16 +284,24 @@ out = out.replace(/\(UI\.proto==='nosessions'\n/, "(SESSIONS.length===0\n");
 out = out.replace(/&&\s*UI\.proto!=='ended'/g, "&& !RUN.gone");
 out = out.replace(/\n\s*proto:'live',/, "");
 
-// 复制按钮：正文还没读回来（或指纹对不上）时**不许复制**——
-// 否则「复制原文」会把占位符或一份被篡改的内容当原文交出去。
+// 复制按钮：正文还没读回来 / 指纹对不上 / 只拿到截断前缀时**不许复制**——
+// 否则「复制原文」会把占位符、一份被篡改的内容、或一个残件当原文交出去。
 out = out.replace(
   "function bindDetail(s){",
   `function bindDetail(s){
-  /* ⚠️ 正文未就绪时禁用复制。这是用户唯一的留档手段，交出去的必须是真东西。 */
+  /* ⚠️ **按方向各判各的。** data-copy 的键是 \`会话|轮次|in|out\`，
+        第三段就是方向——原来只取第二段（轮次号）拿一个轮次级布尔量一起禁，
+        于是"输出还在路上"会连累已经验过的输入，而"输入压根没落盘"反倒放行。
+        资格判定本身在 reconcile.mjs 的 copyable() 里，可单测；这里只负责照着关。 */
   Array.prototype.forEach.call(elDetail.querySelectorAll("[data-copy]"), function(el){
-    var n = el.getAttribute("data-copy").split("|")[1];
-    var t = s.turns.filter(function(x){ return String(x.n) === n; })[0];
-    if(t && t.pending){ el.disabled = true; el.title = "原文尚未读取完成"; }
+    var parts = el.getAttribute("data-copy").split("|");
+    var t = s.turns.filter(function(x){ return String(x.n) === parts[1]; })[0];
+    if(!t) return;
+    var side = parts[2] === "in" ? t.input : t.output;
+    if(!side || !side.copyable){
+      el.disabled = true;
+      el.title = "这份内容还不能当原文交出去（尚未读回、指纹对不上、或只拿到截断前缀）";
+    }
   });`);
 
 if (/UI\.proto/.test(out)) throw new Error("仍残留 UI.proto 引用：" + (out.match(/.*UI\.proto.*/g) || []).join(" | "));

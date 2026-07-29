@@ -140,10 +140,10 @@
       "violates": "§4.9 outcome × bodyKind 矩阵：failed × final 是 ❌ 格"
     },
     {
-      "name": "bad-terminal-adopted-equal-timestamps",
-      "why": "钉 §4.6 末行硬蕴含：terminal_adopted ⟹ dispatchedAt > attemptedAt。此处两刻完全相等，说明实现把派发时刻直接复制成了认领时刻 —— 这一档的全部意义就是「没有任何 ACK，只能靠后到的终结事件反推」，抹掉时间差后页面再也分不清它与有 ACK 的轮次。",
-      "expectValid": false,
-      "violates": "§4.6：terminal_adopted 要求 dispatchedAt 严格大于 attemptedAt，此处二者相等"
+      "name": "terminal-adopted-same-millisecond",
+      "why": "钉 §4.6 末行判据是 `>=` 而不是 `>`：同毫秒内走完「尝试 → 后到终结事件 → 认领」是合法的，本地极快的后端与 hermetic 假后端都会撞上。**这份样例原本被冻成 `bad-…`、expectValid:false** —— 它把一条实现保证不了的要求（毫秒时钟分辨率）固化成了绿色测试，于是一份真实发生的记录会被判红，而下一个人只会去怀疑校验器。要挡的「把 dispatchedAt 直接抄成 attemptedAt」由 writer 回归造真实时间间隔来考（见 terminal-adopted-strictly-later-dispatch 与 repro-viz-writer 的 S3a），不由这条判据考。",
+      "expectValid": true,
+      "violates": null
     },
     {
       "name": "bad-recording-error-code-outside-enum",

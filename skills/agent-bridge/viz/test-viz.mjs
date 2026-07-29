@@ -941,6 +941,26 @@ async function runTransportTests() {
         !controls.some((frame) => frame.data?.kind === 'run-gone'),
       );
 
+      // ── 从「暂时读不到」恢复，**且 generation 没有推进** ──
+      //
+      // 这是最常见的形态：瞬时 IO 抖动，快照本身根本没变过。
+      // 页面上那句「暂时读不到」的唯一清除信号是下一帧 state，而 pollState 有一道
+      // `generation <= lastGeneration 就不发` 的去重闸。只清内部标志、不重发的实现，
+      // 会让页面**永久**停在那句话上 —— 而记录一直好端端地在那儿。
+      // 判别式必须在**同一条连接**上做：新连接本来就会收到当前态，测不出这件事。
+      const recovering = collectSse(service.baseUrl, 2600);
+      await delay(700);
+      await writeFile(path.join(vizDir, 'state.1.json'), generation2Raw, 'utf8');
+      await writeFile(path.join(vizDir, 'state.0.json'), fixture.stateRaw, 'utf8');
+      const recovered = await recovering;
+      const recoveredStates = recovered.frames.filter((f) => f.event === 'state');
+      assertCase(
+        '★ 同代恢复后向已连接的客户端重发 state（否则「暂时读不到」永远清不掉）',
+        recoveredStates.length >= 2
+          && recoveredStates[recoveredStates.length - 1]?.data?.generation === 2,
+        recovered.frames.map((f) => `${f.event}:${f.data?.generation ?? f.data?.kind ?? ''}`).join(','),
+      );
+
       const lexical = await fetchFile(service.baseUrl, 'turns/bad name.md');
       // 非白名单字符应在任何路径解析前拒绝，避免错误输入触碰文件系统。
       assertCase('/file 词法非法 ref → 400', lexical.response.status === 400, lexical.response.status);
@@ -1002,6 +1022,70 @@ async function runTransportTests() {
   });
 }
 
+// ── 第四组之二：选槽的稳健性（每种都用一个**全新的** serve 进程考） ───────────
+//
+// 必须新起进程：一个跑过的 serve 手上有 `lastStateRaw`，那份陈旧快照会替它兜底，
+// 于是「选不出槽」这件事根本表现不出来 —— 用例会因为兜底而变绿。
+async function runSlotRobustnessTests() {
+  // ① 空壳槽 generation 更高时，**不得**顶掉旁边那份完好的快照。
+  //    这正是双槽协议存在的理由：另一个槽好端端的，不该因为判据太浅而落选。
+  await withTempVizDir(async (vizDir) => {
+    const fixture = await createTransportFixture(vizDir);
+    const good = clone(fixture.snapshot);
+    good.generation = 5;
+    await writeFile(path.join(vizDir, 'state.0.json'), JSON.stringify(good), 'utf8');
+    await writeFile(path.join(vizDir, 'state.1.json'), JSON.stringify({
+      schemaVersion: 1, runId: fixture.runId, generation: 9,
+      updatedAt: new Date().toISOString(), run: {}, sessions: [],
+    }), 'utf8');
+
+    const service = await startServe(vizDir);
+    try {
+      const seen = await collectSse(service.baseUrl, 1200);
+      const states = seen.frames.filter((f) => f.event === 'state');
+      assertCase(
+        '★ 空壳槽（generation 更高但必填结构不全）不得胜出',
+        states.length >= 1 && states.every((f) => f.data?.generation === 5),
+        seen.frames.map((f) => `${f.event}:${f.data?.generation ?? f.data?.kind ?? ''}`).join(','),
+      );
+    } finally {
+      await stopServe(service.child);
+    }
+  });
+
+  // ② 两槽 generation 相等 ⇒ **双方都不可信**，不许静默择一。
+  //    健康 run 到不了这个状态（写成功才推进代次并换槽），真出现就说明有东西在乱写 ——
+  //    而这恰恰是最不该「挑一份看着像的展示出来」的时刻。
+  await withTempVizDir(async (vizDir) => {
+    const fixture = await createTransportFixture(vizDir);
+    const a = clone(fixture.snapshot); a.generation = 7;
+    const b = clone(fixture.snapshot); b.generation = 7;
+    b.updatedAt = new Date(Date.now() + 1000).toISOString();
+    await writeFile(path.join(vizDir, 'state.0.json'), JSON.stringify(a), 'utf8');
+    await writeFile(path.join(vizDir, 'state.1.json'), JSON.stringify(b), 'utf8');
+
+    const service = await startServe(vizDir);
+    try {
+      const seen = await collectSse(service.baseUrl, 1600);
+      const states = seen.frames.filter((f) => f.event === 'state');
+      const controls = seen.frames.filter((f) => f.event === 'control');
+      assertCase(
+        '★ 两槽同代时判双方不可信：不发 state',
+        states.length === 0,
+        seen.frames.map((f) => `${f.event}:${f.data?.generation ?? f.data?.kind ?? ''}`).join(','),
+      );
+      assertCase(
+        '两槽同代时如实说「暂时读不到」，而不是冒充 run-gone',
+        controls.some((f) => f.data?.kind === 'history-read-failure')
+          && !controls.some((f) => f.data?.kind === 'run-gone'),
+        controls.map((f) => JSON.stringify(f.data)).join(','),
+      );
+    } finally {
+      await stopServe(service.child);
+    }
+  });
+}
+
 // ── 第五组：适配层的正文缓存（这一组是被一个真 bug 逼出来的） ─────────────────
 //
 // 正文是异步从 /file 取的。**取回来必须重建模型，不能只重画 DOM**——
@@ -1042,13 +1126,18 @@ async function runAdapterBodyTests() {
   const refs = refsOf(snap);
   assertCase('refsOf 找出输入与输出两个 ref', refs.length === 2, JSON.stringify(refs.map(r => r.ref)));
   assertCase('refsOf 带上了用于对证的 sha256', refs.every(r => /^[0-9a-f]{64}$/.test(r.sha256)));
+  // 超限正文只发得出前缀，那时唯一能对证的就是前缀指纹——不带出来，页面只能在
+  // 「拿前缀对全文（必然误报篡改）」和「干脆不验」之间二选一。
+  assertCase('refsOf 把 output 的 previewSha256 一并带出（截断响应的唯一对证依据）',
+    refs.some(r => r.ref === OUT_REF && 'previewSha256' in r), JSON.stringify(refs));
 
   // ① 缓存为空 → 占位符
   const t0 = adaptSnapshot(snap, { bodyCache: new Map() })[0].turns[0];
   assertCase('缓存为空时是占位符',
     t0.input.text === BODY_PLACEHOLDER && t0.output.md === BODY_PLACEHOLDER,
     JSON.stringify({ i: t0.input.text, o: t0.output.md }));
-  assertCase('缓存为空时标记 pending（页面据此禁用复制，不许把占位符当原文交出去）', t0.pending === true);
+  assertCase('缓存为空时两个方向都不可复制（不许把占位符当原文交出去）',
+    t0.input.copyable === false && t0.output.copyable === false);
 
   // ② 缓存填上 → **同一份快照必须产出不同的模型**。
   //    这一条就是那个 bug 的判别式：只重画 DOM、不重建模型的实现在这里过不去。
@@ -1057,7 +1146,8 @@ async function runAdapterBodyTests() {
   assertCase('★ 缓存填上后同一份快照产出真正文（不再是占位符）',
     t1.input.text === '问题原文' && t1.output.md === '回答正文',
     JSON.stringify({ i: t1.input.text, o: t1.output.md }));
-  assertCase('缓存填上后不再 pending', t1.pending === false);
+  assertCase('缓存填上后两个方向都可复制',
+    t1.input.copyable === true && t1.output.copyable === true);
 
   // ③ 指纹对不上 → **绝不照常展示**（否则页面等于替一份被篡改的内容背书）
   const tampered = new Map([[IN_REF, { text: '问题原文' }], [OUT_REF, { tamper: true }]]);
@@ -1069,7 +1159,49 @@ async function runAdapterBodyTests() {
   const t3 = adaptSnapshot(snap, { bodyCache: new Map([[OUT_REF, { error: 'HTTP 500' }]]) })[0].turns[0];
   assertCase('读失败时如实说读失败（区别于「这轮没有输出」）', /读取失败/.test(t3.output.md), t3.output.md);
 
-  // ⑤ 纯函数：同输入必得同输出（它不该有记忆——瞬态属于页面层）
+  // ⑤ 复制资格**按方向各判各的**。
+  //    共用一个轮次级布尔量会同时错两次，下面两条就是那两次。
+
+  // ⑤-a 输出还在路上，不该连累已经验过的输入。
+  const halfLoaded = new Map([[IN_REF, { text: '问题原文' }]]);
+  const t4 = adaptSnapshot(snap, { bodyCache: halfLoaded })[0].turns[0];
+  assertCase('★ 输出未就绪时，已验过的输入仍可复制（两个方向不共用一个判据）',
+    t4.input.copyable === true && t4.output.copyable === false,
+    JSON.stringify({ i: t4.input.copyable, o: t4.output.copyable }));
+
+  // ⑤-b 输入压根没落盘（写失败 → missing / ref=null）时**必须禁用**。
+  //     这里最危险：没有任何"待取"可言，轮次级判据看不到异常，按钮照常可点，
+  //     复制出一个空串——而用户以为自己留档了当时发出去的 prompt。
+  const noInput = JSON.parse(JSON.stringify(snap));
+  noInput.sessions[0].turns[0].input = {
+    state: 'missing', ref: null, sha256: null, chars: null, bytes: null,
+    truncated: false, originalBytes: null, error: 'write_failed',
+  };
+  noInput.run.degraded = true;
+  noInput.run.recordingErrors = ['write_failed'];
+  const t5 = adaptSnapshot(noInput, { bodyCache: cache })[0].turns[0];
+  assertCase('★ 输入没落盘时禁止复制（否则交出去的是一个空串）',
+    t5.input.copyable === false, JSON.stringify(t5.input));
+  assertCase('输入没落盘时说的是「没留存」，不是「正在读取」',
+    t5.input.text !== BODY_PLACEHOLDER && /没有留存/.test(t5.input.text), t5.input.text);
+
+  // ⑤-c 只拿到传输截断前缀时，"复制原文"就不该把残件交出去。
+  const cappedCache = new Map([
+    [IN_REF, { text: '问题原文' }],
+    [OUT_REF, { text: '前 8 MB…', truncated: true, fullBytes: 9 * 1024 * 1024 }],
+  ]);
+  const t6 = adaptSnapshot(snap, { bodyCache: cappedCache })[0].turns[0];
+  assertCase('★ 截断前缀不算原文，禁止复制', t6.output.copyable === false);
+  assertCase('截断时页面仍要给出「完整件在哪」', !!t6.output.capped, JSON.stringify(t6.output.capped));
+
+  // ⑤-d 无法对证（缺前缀指纹）与「对不上」是两回事，说法必须分开、且都不可复制。
+  const t7 = adaptSnapshot(snap, {
+    bodyCache: new Map([[IN_REF, { text: '问题原文' }], [OUT_REF, { unverified: true }]]),
+  })[0].turns[0];
+  assertCase('无法对证时拒绝展示且禁止复制',
+    /无法对证/.test(t7.output.md) && t7.output.copyable === false, t7.output.md);
+
+  // ⑥ 纯函数：同输入必得同输出（它不该有记忆——瞬态属于页面层）
   const a = adaptSnapshot(snap, { bodyCache: cache, now: 1 });
   const b = adaptSnapshot(snap, { bodyCache: cache, now: 1 });
   assertCase('adaptSnapshot 是纯函数（同输入同输出）', JSON.stringify(a) === JSON.stringify(b));
@@ -1083,6 +1215,7 @@ async function main() {
   await runSection('第二组：reconcile DOM shim 自动负对照', runDomShimTests);
   await runSection('第三组：展示映射', runDisplayMappingTests);
   await runSection('第四组：真实 serve.mjs 传输层', runTransportTests);
+  await runSection('第四组之二：选槽稳健性', runSlotRobustnessTests);
   await runSection('第五组：适配层的正文缓存', runAdapterBodyTests);
 }
 
