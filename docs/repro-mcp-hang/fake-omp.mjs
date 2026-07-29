@@ -118,7 +118,7 @@ process.stdin.on("data", d => {
           ? slowsettleStreaming
           : (MODE === "multiturn" || MODE === "multiturn-fast")
           ? multiturnStreaming
-          : !(MODE === "okturn" || MODE === "errturn" || MODE === "echoturn" || MODE === "reaskturn" || WRITE_MODES.includes(MODE) || MODE === "ctxturn" || MODE === "logstress" || MODE === "badline" || MODE === "toolturns" || MODE === "agentenderr");
+          : !(MODE === "okturn" || MODE === "okturn-exit" || MODE === "errturn" || MODE === "echoturn" || MODE === "reaskturn" || WRITE_MODES.includes(MODE) || MODE === "ctxturn" || MODE === "logstress" || MODE === "badline" || MODE === "toolturns" || MODE === "agentenderr");
         const data = { isStreaming, queuedMessageCount: 0, sessionId: "fake", messageCount: 1 };
         // ctx* modes: real omp reports current-context occupancy in get_state.data (contextUsage sub-object
         // + isCompacting/autoCompactionEnabled siblings — see the probe dump). The bridge normalizes this to
@@ -138,7 +138,18 @@ process.stdin.on("data", d => {
           continue;
         }
         say({ type: "response", id: msg.id, success: true });
-        if (MODE === "okturn" || MODE === "ctxturn") {
+        if (MODE === "okturn-exit") {
+          // 和 okturn 一样干净地跑完一轮,**然后后端自己以 code 0 退出**。
+          // 桥这时把会话标成 `closed`(process_close),但**对象仍留在 sessions 里、正文仍在内存**,
+          // 所以 `agent_bridge_result` 照样取得回来 —— 用来考"closed ≠ 救不回来"。
+          say({ type: "agent_start" });
+          setTimeout(() => {
+            say({ type: "message_update", message: { type: "text_delta", delta: "OKTURN_EXIT_ANSWER" } });
+            say({ type: "turn_end" });
+            say({ type: "agent_end" });
+            setTimeout(() => process.exit(0), 120);
+          }, 60);
+        } else if (MODE === "okturn" || MODE === "ctxturn") {
           // A clean, fully-settling turn with real answer text. Emit a benign STDERR line mid-turn so
           // tests can assert it does NOT become a fatal lastError (T4). Then agent_start -> text -> turn_end.
           process.stderr.write("[fake-omp] progress: thinking...\n");

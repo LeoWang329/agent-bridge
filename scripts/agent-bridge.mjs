@@ -448,7 +448,9 @@ const TOOLS = [
       "Send a message to an existing persistent delegated-agent session. Returns immediately with an ack by " +
       "default (non-blocking) so you stay responsive — the ack is NOT the result and the bridge will never " +
       "push you one, so you must collect it with agent_bridge_wait before ending your turn or closing the " +
-      "session. Pass wait=true to block inline until the turn completes and return its result instead.",
+      "session. It is fine to go do other work first — later agent_bridge_* responses keep carrying an " +
+      "`uncollected` debt list until you collect, and the ack itself says what is lost if you never do. " +
+      "Pass wait=true to block inline until the turn completes and return its result instead.",
     inputSchema: {
       type: "object",
       properties: {
@@ -528,6 +530,12 @@ const TOOLS = [
     description:
       "Collect the results of delegated-agent turns. This is the ONLY way a result reaches you: the bridge " +
       "never pushes anything on its own, so a turn nobody waits on is simply never collected. " +
+      "Every SUCCESSFUL agent_bridge_* response carries `uncollected: [{sessionId, turnId, settledAt}]` " +
+      "whenever some turn has finished and nobody has collected it — a LIVE debt list, not a one-off " +
+      "reminder, so it keeps reappearing on later calls while you do other work (agent_bridge_doctor returns " +
+      "plain text and appends the same warning as a final line instead). On a SUCCESSFUL response, absence of " +
+      "the field means nothing is owed (omitted when empty, never null); a call that ERRORS carries no debt " +
+      "info at all, so do not read an error as 'nothing owed'. Clear it by calling this tool with those session_ids. " +
       "Timing out is NOT a failure and does NOT interrupt the turn — you get " +
       "{timedOut, settled, pending, pendingSnapshots} and the work keeps running, so call again. " +
       "KEEP CALLING while the response has a non-empty pending[] (feed that array straight back in as " +
@@ -1288,6 +1296,15 @@ function decorateUncollectedAck(payload, sessionIds) {
       arguments: { session_ids: sessionIds },
       repeatWhile: "the response still has a non-empty pending[]",
     },
+    /* ⚠️ 这一条补的是**后果**,不是又一条指令。
+       "该调哪个"这件事已经说了三遍(工具描述里连 "before ending your turn" 都写了、
+       `requiredAction` 就在旁边、skill 文档还有一段),再加第四遍是这个仓库栽过两次的那个反模式。
+       而整个 ack 里**从来没有一个字**讲过不收会怎样 —— `accepted:true` + `status:"running"`
+       读起来全是好消息。真实后果是:这一轮的答案只活在会话的内存里,**没人取就永远不会有人送**,
+       而进程一退(客户端一关)全部会话被逐个 close,那条路径上**没有任何闸**。 */
+    ifNotCollected:
+      "nothing will ever deliver this answer on its own; if this process exits (or the session is " +
+      "closed) before you collect it, the answer is gone for good.",
   };
 }
 
@@ -1307,6 +1324,110 @@ function decorateIncompleteCollection(payload, pendingIds, mode) {
       arguments: { session_ids: pendingIds, mode },
       repeatWhile: "the response still has a non-empty pending[]",
     },
+  };
+}
+
+// ── 收口台账:桥知道「谁还欠着」,并在**后续每一次调用上**说出来 ──────────────────────────────
+//
+// ⚠️ **一次性提醒治不了这个问题。** 上面那两个装饰器把提示挂在 ack 上,理由(见 :1269 那段)是对的
+// —— 提示必须落在决策点上。但它漏了一件事:**决策点不止一个**。ack 只覆盖第一个(刚发完消息那一刻),
+// 而实际出错的往往是**第 N 个** —— 中间去干了别的事,等到"该收尾了"那一刻,手里没有任何东西提醒
+// 还有在途没收。**义务持续整个 turn,提醒却只存在于一个 tool result 里** —— 这就是错配所在。
+//
+// ⚠️ **产出被销毁有两条路径,而没有闸的那条才是常态:**
+//   ① 显式 `close_session` —— 有一道闸(还在跑就 blocked),但它**看不见**"已结算却从没人取";
+//   ② **进程退出 → `cleanupSessions()` 逐个 close** —— **一道闸都没有**,而且原理上也加不了
+//      (你没法拒绝退出)。没人会在收工时挨个 close,大家就是把客户端关掉 —— 所以②才是天天发生的那条。
+// 对②,**通知是唯一剩下的手段**。这就是本台账存在的理由,它不是"更好听的提醒"。
+//
+// **只记最近一轮,不是偷懒,是完备的**:`answerFile` 每个会话只有一份、后写覆盖先写,
+// `lastTurnOf()` 也只给最近一轮 —— 所以任何时刻**每个会话最多只有一轮的产出还救得回来**。
+// 记一个 turnId 是 O(1);记一个越来越长的列表反而会造出"前面那些还能救"的假象。
+const DISCHARGED = new Map(); // sessionId → { turnId, how: "collected" | "aborted" }
+
+// 交付溯源。**构造处登记、返回处记账 —— 这两件事必须分开:**
+// `buildSessionResult()` 允许在 turn **还在跑**的时候被调用(`result()` 就是中途取的),
+// 而 `wait` 的稳定性复核还会**丢弃**一些已经构造好的结果。所以"构造出来了" ≠ "交付了"。
+// 在构造处直接记收口,就会**把没交付的记成已交付** —— 那是最坏的方向:台账会说"你不欠了"。
+//
+// ⚠️ **载体是「可枚举的 Symbol 属性」,不是 WeakMap —— 这是被测试逼出来的。**
+// 第一版用 WeakMap 按对象身份记,结果 `wait` 全程不清账:`summarize()` 返回的是
+// `{ ...extra, ...base }` —— 一个**重新拼出来的新对象**,WeakMap 的键在那一步就没了。
+// 而"在每个拷贝点手动把溯源搬过去"正是这个仓库反复栽跟头的形状(维护一张会漏的清单)。
+// 可枚举 Symbol 属性同时满足两件事:**对象展开与 rest 解构会自动带上它**(所以任何基于
+// spread 的重整都白送),而 **`JSON.stringify` 完全忽略 Symbol 键**(所以它绝不会漏到线上)。
+const DELIVERED_TURN = Symbol("agent-bridge.deliveredTurn");
+
+/** 记一笔"这一轮不欠了"。两个来源:真的交付了、或调用方显式 abort 放弃了。 */
+function dischargeTurn(sessionId, turnId, how) {
+  if (!sessionId || !turnId) return;
+  DISCHARGED.set(sessionId, { turnId, how });
+}
+
+/** 在**真正返回给调用方之前**把这次交付记进台账。
+ *
+ *  ⚠️ **走的是通用递归,不是"已知返回形状清单"。** 交付面有五种形状(open_session.initial /
+ *  send_message 顶层 / result 顶层 / wait.completed / wait.results[]、settled[]),而"维护一张
+ *  会漏的清单"正是这个仓库反复栽跟头的形状 —— 新增一个工具或换一个返回形状,清单就静默失效。
+ *  payload 本身是有界的小对象,深度封顶即可。 */
+function collectDeliveries(payload, depth = 0) {
+  if (!payload || typeof payload !== "object" || depth > 5) return;
+  const prov = payload[DELIVERED_TURN];
+  if (prov) dischargeTurn(prov.sessionId, prov.turnId, "collected");
+  if (Array.isArray(payload)) { for (const v of payload) collectDeliveries(v, depth + 1); return; }
+  for (const v of Object.values(payload)) collectDeliveries(v, depth + 1);
+}
+
+// 一次返回里最多列几条。会话数本身就不大,但**"有界"这条纪律没有例外**——超出就只报条数。
+const UNCOLLECTED_MAX = 16;
+
+/** 此刻还欠着谁。**纯内存,零 I/O。**
+ *
+ *  ⚠️ 零 I/O 不是性能洁癖:这个仓库有前科 —— 同步的进程探针会冻住整个事件循环。
+ *  这里只读已经在手的会话状态,不 stat 文件、不探进程。 */
+function uncollectedTurns() {
+  const out = [];
+  let more = 0;
+  for (const session of sessions.values()) {
+    /* ⚠️ **判据是"还在不在 `sessions` 里",不是 `status === "closed"`。**
+       第一版按 status 过滤,漏掉了一整类:**后端自己以 code 0 退出**时(`process_close`),
+       桥只把会话**标成** `closed`,对象仍留在注册表里、正文仍在内存里,
+       `agent_bridge_result` **照样取得回来** —— 也就是说它其实还救得回来,却被台账当成"没了"。
+       真正"没了"只有一种:`closeOne()` 把它从 `sessions` 删掉那一刻 —— 而那一刻它就不在这个循环里了。
+       所以这里**不需要**任何 status 过滤:能被遍历到,就说明还救得回来。 */
+    // 还在跑的**不算欠** —— 它还没产出,报出来就是噪音,而噪音会让整个字段被无视。
+    // ⚠️ 这里刻意**复用共享的 `sessionSettled()`**,不另立一套"到底settle没有"的判据。
+    //    代价是台账会继承它的准确度(OMP 那个已知的陈旧 isStreaming 读数会让会话被当成还在跑,
+    //    于是这一轮暂时不报)。但**分叉出第二个定义会更糟** —— 那是两个真理源,
+    //    会出现"wait 认为没结束、台账认为结束了"这种谁也解释不了的状态。
+    //    真正必须挡住的是**让一个不可靠读数造成永久后果**,见 `abortSession()`。
+    if (!sessionSettled(session)) continue;
+    const lt = lastTurnOf(session);
+    if (!lt || !lt.id) continue; // 从未 prompt 过
+    const d = DISCHARGED.get(session.id);
+    if (d && d.turnId === lt.id) continue; // 已交付,或已被显式 abort 放弃
+    if (out.length >= UNCOLLECTED_MAX) { more++; continue; }
+    out.push({ sessionId: session.id, name: session.name ?? null, turnId: lt.id, settledAt: lt.endedAt ?? null });
+  }
+  return { list: out, more };
+}
+
+/** 把"还欠着什么"挂到**每一个**工具返回上(非空才挂)。
+ *
+ *  ⚠️ **空就不挂**,所以"没有这个字段"= 没有欠的,不是"不知道" —— 这条必须写进工具描述,
+ *  否则调用方会把字段缺席读成信息缺失。 */
+function decorateUncollectedDebt(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return payload;
+  const { list, more } = uncollectedTurns();
+  if (!list.length) return payload;
+  return {
+    ...payload,
+    uncollected: list,
+    ...(more ? { uncollectedMore: more } : {}),
+    uncollectedNote:
+      "These turns have FINISHED but nobody collected them. Nothing will deliver them on its own: " +
+      "call agent_bridge_wait with these session_ids. If this process exits (or the session is closed) " +
+      "first, the answers are gone for good — exiting closes every session and there is no gate on that path.",
   };
 }
 
@@ -1411,6 +1532,16 @@ function buildSessionResult(session, fullText, options = {}) {
         result.schemaError = { error: `model output was not valid JSON: ${e.message}`, rawText: displayText };
       }
     }
+  }
+  /* 登记交付溯源(**只登记,不记账** —— 记账在 `callTool` 真正返回时,见 `collectDeliveries`)。
+     资格两条,缺一不可:
+       ① `turnSettled` 为真 —— 中途取到的半截**不算收口**(那正是 result() 允许的用法);
+       ② 有确切的 `turnId` —— 认不到具体哪一轮,就没有可清的账。
+     ⚠️ 不满足就**不登记**,于是这一轮继续算欠着。方向是刻意的:**宁可多提醒一次,
+        也绝不能说"你不欠了"** —— 后者会让人放心地把还救得回来的产出关掉。 */
+  const deliveredTurnId = result.session?.lastTurn?.id || null;
+  if (settledNow && deliveredTurnId) {
+    result[DELIVERED_TURN] = { sessionId: session.id, turnId: deliveredTurnId };
   }
   return result;
 }
@@ -5370,7 +5501,35 @@ async function waitSessions(params) {
 }
 
 async function abortSession(sessionId) {
-  return await getSession(sessionId).abort();
+  const session = getSession(sessionId);
+  /* ⚠️ **只有当时确实有一轮在跑,这次 abort 才清账。**
+     显式 abort = 调用方主动放弃这一轮的产出,继续把它报成"你还欠着"就是噪音。
+     但**对着一个空闲会话调 abort 绝不能清账** —— 那时 `lastTurnOf()` 指的是**上一轮已经
+     跑完、而且可能真的还没人取**的那一轮,清掉它等于凭空抹掉一笔真实的债。
+     判据只能取自 abort **之前**的状态:之后 turn 已经被结算,`sessionSettled` 必然为真。 */
+  /* ⚠️ **判据必须是两个信号都说"在跑",不能只信 `sessionSettled()`。**
+     OMP 有一个已知且可复现的不一致(`docs/BUG-omp-turn-state-inconsistency-2026-06-10.md`,
+     `FAKE_OMP_MODE=turnstate`):`agent_end` 已到、`turnInFlight` 已清之后,一次会刷新状态的
+     `status(session_id)` 仍可能因为陈旧的 `isStreaming:true` 把 `status` 翻回 `running`。
+     只信 `sessionSettled()` 的话,这时的 abort 会被判成"确有一轮在跑"并**永久清账** ——
+     而那一轮其实早就跑完、正文还在、`result()` 照样取得回来。**一个瞬时的错读数,
+     换来一笔真实债务被永久抹掉**,这正是最坏的方向(台账说"你不欠了")。
+     所以再要一个**不会被那个读数污染**的证据:原始时间戳。`turnEndedAt` 是各后端在结算时
+     直接写的字段(OMP 连进程自己退出那条路也补写,见 `process_close` 分支),不经过 status 派生。
+     两个都说在跑才清账;任一说不在,就宁可多报一次。 */
+  const startedAt = session.turnStartedAt || null;
+  const endedAt = session.turnEndedAt || null;
+  const stampsSayRunning = !!startedAt && (!endedAt || new Date(startedAt) > new Date(endedAt));
+  const hadRunningTurn = !sessionSettled(session) && stampsSayRunning;
+  const abandoned = hadRunningTurn ? lastTurnOf(session)?.id || null : null;
+  const out = await session.abort();
+  // abort 之后 turnId 才是这一轮最终的身份(有的后端在结算时才铸/换 id),所以两个都清:
+  // 事前抓到的那个,和事后落定的那个。多清一个已经不存在的 id 无害,漏清会留下一条假账。
+  if (hadRunningTurn) {
+    const settledId = lastTurnOf(session)?.id || null;
+    dischargeTurn(session.id, settledId || abandoned, "aborted");
+  }
+  return out;
 }
 
 // Close one session and drop it from the maps. Does NOT prune (callers prune once after a batch so a
@@ -5379,6 +5538,9 @@ function closeOne(session) {
   const closed = session.close();
   sessions.delete(session.id);
   logBytesWritten.delete(session.logFile);
+  // 会话没了,它的账也就没有意义了(产出已经随之销毁,不存在"还救得回来"这回事)。
+  // 不删就是一条按 sessionId 无限增长的表 —— 一个 run 开几百个会话就会一直攒着。
+  DISCHARGED.delete(session.id);
   return closed;
 }
 
@@ -5684,33 +5846,73 @@ function mcpText(value, isError = false) {
   return { content: [{ type: "text", text }], isError };
 }
 
+/* 每一个工具返回都要经过的两步。**顺序是承重的:先记账,再挂账。**
+   反过来的话,一次刚刚把所有结果都收干净的 `wait`,返回里仍会带着它自己刚清掉的那笔债
+   —— 页面上/模型眼里就是"我明明刚收完,它还说我欠着",这种字段两次之后就没人信了。 */
 async function callTool(name, args) {
+  let payload;
+  try {
+    payload = await dispatchTool(name, args);
+  } catch (err) {
+    // 只接住"工具名不认识"这一种,**其余异常照旧往上抛** —— 上层对它们另有处置,
+    // 在这里一并吞掉会把各种真实失败压成同一句话。
+    if (err instanceof UnknownToolError) return mcpText(err.message, true);
+    throw err;
+  }
+  if (payload && typeof payload === "object") {
+    collectDeliveries(payload);                       // ① 这一次**真的交付**了什么 → 清账
+    return mcpText(decorateUncollectedDebt(payload)); // ② 清完之后**还剩**什么 → 挂账
+  }
+  /* ⚠️ 字符串返回(`doctor`)加不了字段 —— 但**承诺不能只对一部分返回成立**。
+     工具描述里写的是"没有这个字段 = 不欠",一旦有某条成功返回天然带不了它,
+     那条读法就成了假话:一个欠着账的人调一次 `doctor`,会看到一片干净。
+     同一份事实换一种载体:给它追加一行纯文本。 */
+  return mcpText(appendDebtLine(payload));
+}
+
+/** 给纯文本返回追加一行债务提示(无债则原样返回)。 */
+function appendDebtLine(text) {
+  if (typeof text !== "string") return text;
+  const { list, more } = uncollectedTurns();
+  if (!list.length) return text;
+  const ids = list.slice(0, 4).map(x => x.sessionId).join(", ");
+  const rest = list.length > 4 || more ? ` (+${list.length - Math.min(4, list.length) + more} more)` : "";
+  return `${text}\n\n⚠️ ${list.length + more} finished turn(s) still uncollected: ${ids}${rest}. ` +
+    `Call agent_bridge_wait with those session_ids — nothing will deliver them on its own, and exiting destroys them.`;
+}
+
+async function dispatchTool(name, args) {
   switch (name) {
     case "agent_bridge_open_session":
-      return mcpText(await openSession(args || {}));
+      return await openSession(args || {});
     case "agent_bridge_send_message":
       // Default to non-blocking: an omitted wait means false, returning an ack immediately so
       // the agent stays responsive instead of dead-waiting (up to 30 min) on one turn. Join the
       // result via agent_bridge_wait with a short timeout_ms to poll progress. Pass wait:true
       // here for a simple inline blocking send.
-      return mcpText(await sendMessage({ ...(args || {}), wait: args?.wait ?? false }));
+      return await sendMessage({ ...(args || {}), wait: args?.wait ?? false });
     case "agent_bridge_status":
-      return mcpText(await status(args?.session_id));
+      return await status(args?.session_id);
     case "agent_bridge_result":
-      return mcpText(await result(args?.session_id, { maxChars: args?.max_chars }));
+      return await result(args?.session_id, { maxChars: args?.max_chars });
     case "agent_bridge_wait":
-      return mcpText(await waitSessions(args || {}));
+      return await waitSessions(args || {});
     case "agent_bridge_abort":
-      return mcpText(await abortSession(args?.session_id));
+      return await abortSession(args?.session_id);
     case "agent_bridge_close_session":
       // `force` 必须显式转发:漏了这一步闸门就静默失效(schema 收了参数、闭包里却读不到)。
-      return mcpText(closeSession(args?.session_id, { force: args?.force === true }));
+      return closeSession(args?.session_id, { force: args?.force === true });
     case "agent_bridge_doctor":
-      return mcpText(renderDoctor(await doctor()));
+      // 字符串 —— 走 callTool 里的 non-object 分支,不挂债务字段(doctor 与会话无关)。
+      return renderDoctor(await doctor());
     default:
-      return mcpText(`Unknown tool: ${name}`, true);
+      throw new UnknownToolError(`Unknown tool: ${name}`);
   }
 }
+
+// 未知工具名以前是 `mcpText(msg, true)`(isError)。拆出 dispatchTool 之后它必须仍然是 isError,
+// 否则一个打错的工具名会变成一条**看起来成功**的返回 —— 用一个自有错误类型把这件事显式接住。
+class UnknownToolError extends Error {}
 
 function serveMcp() {
   // This MCP server process is the sole owner of its sessions; give it a private log dir so
@@ -5929,6 +6131,16 @@ function cleanupAndExit(code = 0, reason = "shutdown", error = null) {
     for (const s of sessions.values()) {
       try { sessionStates.push({ id: s.id, status: s.status, access: s.access ?? null, backendPid: s.proc?.pid ?? null }); } catch {}
     }
+    /* 退出这一刻还有几轮**跑完了但从没人取**。
+       ⚠️ 这里**拦不住**任何事 —— 下面 `cleanupSessions()` 马上就会把它们连同产出一起销毁,
+       而这条路径原理上就加不了闸(你没法拒绝退出)。它的价值只有一个:**事后查得出来**。
+       在这之前,产出丢没丢过**连痕迹都没有**;而这份 journal 恰恰是活得比 run 目录久的那一份。
+       ⚠️ **必须有界**:整条记录要塞进 appendLog 的单次写入上限才保持是可解析的 JSON
+       (`fitExitJournalRecord` 只会去修剪 `sessions`,基础字段得自己保证有界),
+       所以这里只放一个计数 + 最多 4 个会话 id。 */
+    let owed = { list: [], more: 0 };
+    try { owed = uncollectedTurns(); } catch {}
+    const uncollectedCount = owed.list.length + owed.more;
     appendLog(EXIT_JOURNAL, `${JSON.stringify(fitExitJournalRecord({
       ts: nowIso(),
       runId: path.basename(RUN_LOG_DIR),
@@ -5938,6 +6150,8 @@ function cleanupAndExit(code = 0, reason = "shutdown", error = null) {
       ppid: process.ppid,
       uptimeSec: Math.round(process.uptime()),
       activeRequests,
+      uncollectedTurns: uncollectedCount,
+      ...(uncollectedCount ? { uncollectedSessions: owed.list.slice(0, 4).map(x => x.sessionId) } : {}),
     }, sessionStates))}\n`);
   } catch {}
   appendLog(path.join(RUN_LOG_DIR, "bridge.log"), `[${nowIso()}] Agent Bridge shutdown code=${code} reason=${reason}\n`);
