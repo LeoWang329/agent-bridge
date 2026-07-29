@@ -733,6 +733,8 @@ class VizRecorder {
         outcome: null, bodyKind: null, generationCount: 0,
         collected: null, error: null, durationMs: null,
         buffered: null, settlePromise: null, pendingInput: input ?? null,
+        // 正文宽限期里到达的收口先停在这儿,`#finishSettled` 兑现(见 `collected()`)。
+        pendingCollected: null,
       };
       this.#ledger.attempts.set(a.id, a);
       s.attempts.push(a);
@@ -1056,6 +1058,20 @@ class VizRecorder {
     return { ...result, body };
   }
 
+  /**
+   * `settling → settled` 的**唯一**落点。
+   *
+   * ⚠️ 单独抽出来不是为了少写一行:`#doSettle` 有四条收场分支(无正文 / 写成功 / 写失败 /
+   *    入队被拒),而"结算完成时要做的事"必须四条都做。以前那四处各写一句 `state = "settled"`,
+   *    于是新增一件收尾动作就要记得改四个地方 —— 这个仓库在"维护一张会漏的清单"上
+   *    已经栽过好几次。现在只有一个地方可漏。
+   */
+  #finishSettled(a) {
+    a.state = "settled";
+    // 宽限期里到达的收口在这里兑现(见 `collected()` 的说明)。
+    if (a.pendingCollected) { a.collected = a.pendingCollected; a.pendingCollected = null; }
+  }
+
   async #doSettle(a, rawResult) {
     const result = await this.#resolveBody(rawResult);
     return new Promise((resolve) => {
@@ -1096,7 +1112,7 @@ class VizRecorder {
           const code = result.output?.error ?? (a.outcome === "completed" ? "write_failed" : null);
           a.output.error = code;
           if (code) this.#noteRecordingError(code);
-          a.state = "settled";
+          this.#finishSettled(a);
           this.#markDirty();
           resolve(); return;
         }
@@ -1134,7 +1150,7 @@ class VizRecorder {
                 a.output.previewBytes = null; a.output.previewSha256 = null;
               }
             }
-            a.state = "settled";
+            this.#finishSettled(a);
             this.#markDirty();
             resolve();
           },
@@ -1149,7 +1165,7 @@ class VizRecorder {
           a.output.chars = null; a.output.bytes = null; a.output.error = r.code;
           a.output.previewBytes = null; a.output.previewSha256 = null;
           this.#noteRecordingError(r.code);
-          a.state = "settled";
+          this.#finishSettled(a);
           body = null;                                       // **立即释放正文**,不再占字节预算
           this.#markDirty();
           resolve(); return;
@@ -1157,7 +1173,7 @@ class VizRecorder {
         body = null;
       } catch (err) {
         this.#diag("settle_error", err);
-        a.state = "settled";
+        this.#finishSettled(a);
         this.#markDirty();
         resolve();
       }
@@ -1170,13 +1186,24 @@ class VizRecorder {
       const attemptId = this.#ledger.byBackendTurnId.get(String(backendTurnId));
       if (!attemptId) return;
       const a = this.#ledger.attempts.get(attemptId);
-      if (!a || a.state !== "settled") return;               // collected ⟹ settled
-      if (a.collected) return;                               // 只记第一次
-      a.collected = {
+      if (!a) return;
+      if (a.collected || a.pendingCollected) return;          // 只记第一次
+      const rec = {
         at: this.#now(), via,
         returnedChars: safeCount(returnedChars),
         truncated: !!truncated,
       };
+      // ⚠️ **`settling` 期到达的收口必须暂存,不能丢。**
+      //    合同要求 `collected !== null ⟹ state === "settled"`,但那说的是**快照里**的样子,
+      //    不是"晚于我们自己写完才算数"。真实时序恰恰相反:结算时正文可能还在宽限期里
+      //    (OMP 要等最后一条 message_update,最多 2s),而调用方的 `wait` 早就返回、
+      //    正文早就交到它手上了。按老写法这一条会被静默丢弃 ——
+      //    于是**一次已经取走的交付被记成「从未被取走」**,页面挂出"未取结果"的假警报,
+      //    而那个标记的全部价值就在于它不说假话。
+      //    收口是**外部事实**;不该因为我们自己的写还在途就当它没发生过。
+      if (a.state === "settling") { a.pendingCollected = rec; return; }
+      if (a.state !== "settled") return;                     // 还没结算就更谈不上取走
+      a.collected = rec;
       this.#markDirty();
     });
   }

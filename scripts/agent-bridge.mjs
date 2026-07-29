@@ -6,6 +6,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
+// ⚠️ **零副作用 import**:viz-writer 模块顶层什么都不做,只有 `createVizRun()` 被调用才建目录。
+//    这是它能被 `doctor` / `cleanup` / 测试 import 的前提(STATE.md §7)。
+import { createVizRun, vizCleanup } from "./viz-writer.mjs";
 
 const IS_WINDOWS = process.platform === "win32";
 
@@ -1163,6 +1166,25 @@ function setSessionStatus(session, status, isStreaming = session.isStreaming, ex
   session.status = status;
   session.isStreaming = nextStreaming;
   session.updatedAt = nowIso();
+  // 观测台的状态钩子。**这是唯一漏斗**:全仓 `.status =` 的写点只有这里,加上五个构造函数里的
+  // `this.status = "starting"`(那时会话还没登记,由 `sessionOpened` 的初值覆盖)。
+  //
+  // ⚠️ **无条件上报**,不看上面那个 `changed`。"变没变"由 writer 的 `sessionStatus()` 逐字段判
+  //    (无变化就不推进 generation)。两边各判一次就分叉出第二个真理源,而这两个判据的口径
+  //    并不相同(这里只比 status/isStreaming,writer 还比 health 与 contextUsage)。
+  // ⚠️ **绝不在这里挂 `sessionClosed()`**:后端进程自己以 code 0 退出时也会走到这里
+  //    (`{source:"process_close"}`),但那时会话仍在 `sessions` 里、`result()` 照样取得回。
+  //    记成 closed 会让 finalizeSession 把一批**还救得回来**的轮次说成 abandoned。
+  //    页面靠「status=closed 但 closed 对象为 null」区分"它自己死的"和"我关的"。
+  // ⚠️ `deriveHealth` 必须**现场重算**,不能从 summary() 里取:形状 B(cursor/kimi)轮间
+  //    `proc === null`,拿进程存活性判会把健康的 idle 判成 dead——`isReusable()` 钩子就是为此存在。
+  vz(v => v.sessionStatus(session.id, {
+    status,
+    isStreaming: nextStreaming,
+    health: deriveHealth(session),
+    backendPid: session.proc?.pid ?? null,
+    contextUsage: (() => { try { return session.contextUsage?.() ?? null; } catch { return null; } })(),
+  }));
   if (changed || extra.force) {
     pushEvent(session, { type: "status", status, isStreaming: nextStreaming, ...extra });
   }
@@ -1358,6 +1380,61 @@ const DISCHARGED = new Map(); // sessionId → { turnId, how: "collected" | "abo
 // spread 的重整都白送),而 **`JSON.stringify` 完全忽略 Symbol 键**(所以它绝不会漏到线上)。
 const DELIVERED_TURN = Symbol("agent-bridge.deliveredTurn");
 
+// ── 委托会话史观测台（session viz）的接线 ─────────────────────────────────────
+//
+// 合同在 `skills/agent-bridge/viz/STATE.md`,实现在 `scripts/viz-writer.mjs`。
+// 这里只有**两样东西**:一个 recorder 单例,和一道护栏。
+//
+// ⚠️ **护栏必须只有一处。** 桥里有 70 多个插桩点,而纪律是死的:
+//    「观测失败绝不能改变桥的运行结局」。把 `try { … } catch {}` 抄 70 遍,
+//    等于维护一张七十行的清单 —— 而这个仓库在"维护一张会漏的清单"上已经栽过好几次。
+//    漏掉一处的代价还特别重:`installProcessHandlers` 把 `unhandledRejection` 当**致命**
+//    (`cleanupAndExit(1)`),所以一个没接住的 recorder Promise 能**杀掉整个桥**;
+//    而一个没接住的同步异常会让 `turn.resolve/reject` 永不执行,调用方的 wait 永久挂住。
+//    所以所有插桩一律走 `vz()`,不许在别处直接碰 `viz`。
+let viz = null;
+
+/**
+ * 唯一的观测调用入口。**同步、不抛、不阻塞核心。**
+ *
+ * - 观测没开 → 直接返回 `undefined`(不是 no-op 对象:writer 不导出 disabled 单例)。
+ * - 回调抛了 → 吞掉。
+ * - 回调返回 Promise → **就地接住**,绝不让它变成 unhandledRejection。
+ *   (`settleOnce` 是 recorder 里唯一返回 Promise 的公开方法,也是唯一没过 `#safe` 的那个。)
+ *
+ * ⚠️ **核心路径上永远不要 await 它的返回值。** `#settleTurn` / `close()` / `#handleLine`
+ *    都是同步函数,插一个 await 进去就改变了时序 —— 那已经是越界,不是观测。
+ */
+function vz(fn) {
+  if (!viz) return undefined;
+  try {
+    const r = fn(viz);
+    if (r && typeof r.then === "function") { r.catch(() => {}); return undefined; }
+    return r;
+  } catch { return undefined; }
+}
+
+/** `appendSystemPrompt` 到底是怎么注进去的(STATE.md §4.3 三档,**照抄源码枚举,不许自创**)。
+ *
+ *  页面靠它说出「这份角色文件是真 system prompt」还是「只是首轮用户消息的前缀」——
+ *  后者遵从与否**看模型**,把两者混成一句话就等于替一个软注入背书。 */
+/** OMP 结算时等最后一条 `message_update` 的宽限。`agent_end` 可能先到,
+ *  立刻取正文会丢掉结尾那一小段。writer 侧另有 2s 硬顶,这里只是"通常够用"的那一档。 */
+const OMP_VIZ_SETTLE_GRACE_MS = 250;
+
+/** 算「后端真的动起来了」的事件类型。**只用于诊断字段 `firstBackendEventAt`**,
+ *  不作轮次出现的门槛(STATE.md §4.5),也不参与任何状态判定。 */
+const VIZ_BACKEND_EVENTS = new Set([
+  "agent_start", "turn_start", "message_update", "agent_end", "turn_end",
+  "tool_execution_start", "tool_execution_end",
+]);
+
+function vizInjectionMode(agent) {
+  if (agent === "codex") return "developer";                       // thread developerInstructions
+  if (agent === "cursor" || agent === "kimi") return "first-turn-user-prefix";  // 软注入
+  return "system";                                                  // omp / claude:真 system prompt
+}
+
 /** 记一笔"这一轮不欠了"。两个来源:真的交付了、或调用方显式 abort 放弃了。 */
 function dischargeTurn(sessionId, turnId, how) {
   if (!sessionId || !turnId) return;
@@ -1370,13 +1447,32 @@ function dischargeTurn(sessionId, turnId, how) {
  *  send_message 顶层 / result 顶层 / wait.completed / wait.results[]、settled[]),而"维护一张
  *  会漏的清单"正是这个仓库反复栽跟头的形状 —— 新增一个工具或换一个返回形状,清单就静默失效。
  *  payload 本身是有界的小对象,深度封顶即可。 */
-function collectDeliveries(payload, depth = 0) {
+function collectDeliveries(payload, depth = 0, via = null) {
   if (!payload || typeof payload !== "object" || depth > 5) return;
   const prov = payload[DELIVERED_TURN];
-  if (prov) dischargeTurn(prov.sessionId, prov.turnId, "collected");
-  if (Array.isArray(payload)) { for (const v of payload) collectDeliveries(v, depth + 1); return; }
-  for (const v of Object.values(payload)) collectDeliveries(v, depth + 1);
+  if (prov) {
+    dischargeTurn(prov.sessionId, prov.turnId, "collected");
+    // 观测台的 `collected`(STATE.md §4.8)。**同一轮重复 result/wait 只记第一次**——
+    // 这条幂等由 writer 保证,这里只管如实上报每一次交付。
+    // 搭已有的溯源通道,不新造第二条:交付面有五种返回形状,而"维护一张会漏的清单"
+    // 正是这个仓库反复栽跟头的形状。
+    vz(v => v.collected(prov.turnId, {
+      via,
+      returnedChars: prov.returnedChars ?? null,
+      truncated: !!prov.truncated,
+    }));
+  }
+  if (Array.isArray(payload)) { for (const v of payload) collectDeliveries(v, depth + 1, via); return; }
+  for (const v of Object.values(payload)) collectDeliveries(v, depth + 1, via);
 }
+
+/** MCP 工具名 → STATE.md §4.8 的 `via` 枚举。不认识的一律 null(未知,不是瞎猜一个)。 */
+const VIA_BY_TOOL = new Map([
+  ["agent_bridge_open_session", "open_session"],
+  ["agent_bridge_send_message", "send_message"],
+  ["agent_bridge_result", "result"],
+  ["agent_bridge_wait", "wait"],
+]);
 
 // 一次返回里最多列几条。会话数本身就不大,但**"有界"这条纪律没有例外**——超出就只报条数。
 const UNCOLLECTED_MAX = 16;
@@ -1541,7 +1637,16 @@ function buildSessionResult(session, fullText, options = {}) {
         也绝不能说"你不欠了"** —— 后者会让人放心地把还救得回来的产出关掉。 */
   const deliveredTurnId = result.session?.lastTurn?.id || null;
   if (settledNow && deliveredTurnId) {
-    result[DELIVERED_TURN] = { sessionId: session.id, turnId: deliveredTurnId };
+    // 观测台的 `collected` 记录也搭这条已有通道走(STATE.md §4.8),**不新造第二条**:
+    // 溯源载荷本身就是"这一轮真的交到调用方手上了"的证据,而它已经解决了最难的部分
+    // (可枚举 Symbol,跟着 spread 自动走完五种返回形状)。
+    // `returnedChars` 是**实际内联返回的字符数**,不是正文长度——`returnMode:"ref"` 时它可以是 0。
+    result[DELIVERED_TURN] = {
+      sessionId: session.id,
+      turnId: deliveredTurnId,
+      returnedChars: typeof displayText === "string" ? displayText.length : 0,
+      truncated: !!truncated,
+    };
   }
   return result;
 }
@@ -2335,6 +2440,10 @@ class OmpRpcSession {
         this.dead = true;
         if (this.turnStartedAt && !this.turnEndedAt) this.turnEndedAt = nowIso();
         setSessionStatus(this, "failed", false, { source: "stdin_error", error: err.message });
+        // 观测台:stdin 断了 ⇒ 在途的这些轮次到底被后端收下没有,**无从得知** ⇒ ambiguous。
+        // 说"确定拒绝"是假话(prompt 可能早就写进去了),说"已派发"也是假话。
+        vz(v => v.rpcDrainSession(this.id, "stdin_error"));
+        vz(v => v.markSessionTerminal(this.id, { outcome: "failed" }));
         this.readyReject?.(err);
         for (const pending of this.pending.values()) pending.reject(err);
         this.pending.clear();
@@ -2365,6 +2474,8 @@ class OmpRpcSession {
       this.lastError = err.message;
       if (this.turnStartedAt && !this.turnEndedAt) this.turnEndedAt = nowIso();
       setSessionStatus(this, "failed", false, { source: "process_error", error: err.message });
+      vz(v => v.rpcDrainSession(this.id, "process_error"));
+      vz(v => v.markSessionTerminal(this.id, { outcome: "failed" }));
       this.readyReject?.(err);
       for (const pending of this.pending.values()) pending.reject(err);
       this.pending.clear();
@@ -2385,6 +2496,12 @@ class OmpRpcSession {
         code,
         signal,
       });
+      // 观测台:进程没了。
+      // ⚠️ **终态要按 source 分,不能只看 status**:`code === 0` 时核心把 status 落成 `closed`,
+      //    但那是"后端自己正常退出",不是"我们关的"——会话仍在 `sessions` 里、result() 还取得回。
+      //    这里只说清在途轮次的归属:后端没了 ⇒ 它们再也不会有结果 ⇒ failed。
+      vz(v => v.rpcDrainSession(this.id, "process_close"));
+      vz(v => v.markSessionTerminal(this.id, { outcome: "failed" }));
       this.readyReject?.(new Error(this.lastError || "OMP RPC exited before ready."));
       for (const pending of this.pending.values()) pending.reject(new Error(this.lastError || "OMP RPC exited."));
       this.pending.clear();
@@ -2456,6 +2573,23 @@ class OmpRpcSession {
       // arriving after request()'s timer already deleted its pending, takes the !has(id) path below and
       // deliberately does NOT clear it — a consistently-late backend stays "wedged".)
       this.unresponsiveSince = null;
+      // 观测台:OMP 的**派发边界就在这里**(STATE.md §4.6 的 `rpc_ack`,协议级证据)。
+      //
+      // ⚠️ **不能挪到 `send()` 里 await 之后**。`pending.resolve(message)` 只排一个微任务,
+      //    而同一个 stdout chunk 里的后续行会被 readline **同步**送进 `#applyEvent` ——
+      //    于是 `agent_start` / `agent_end` 可能先于"这一轮已派发"到达,
+      //    页面上就成了「还没派发就已经有输出了」。
+      // ⚠️ `success:false` 是**结构化的确定拒绝**,与超时/断链是两回事,必须在这里就分开;
+      //    等到 send() 的 catch 再判,三种失败就被压成同一句话了。
+      // ⚠️ 上面那句 `unresponsiveSince = null` 对 `success:false` **同样**要执行(按时回话
+      //    就是响应正常),所以钩子挂在它之后——顺序是承重的,别调换。
+      {
+        const attemptId = vz(v => v.rpcTake(this.id, message.id));
+        if (attemptId) {
+          if (message.success === false) vz(v => v.reject(attemptId, message.error || "OMP RPC command failed."));
+          else vz(v => v.dispatch(attemptId, { boundary: "rpc_ack" }));
+        }
+      }
       if (message.success === false) pending.reject(new Error(message.error || "OMP RPC command failed."));
       else pending.resolve(message);
       return;
@@ -2472,6 +2606,15 @@ class OmpRpcSession {
     // dead backend as cleanly settled. From here status only moves forward to "closed" (close() /
     // proc.on("close")), never back to running/idle.
     if (this.dead) return;
+    // 观测台:第一条真正来自后端的事件。**放在 `if (this.dead) return` 之后**是刻意的——
+    // 濒死进程 stdout 里的缓冲尾行不算"后端还活着"的证据。
+    // 它只是**诊断**,不是轮次出现的门槛(STATE.md §4.5:允许早于 dispatchedAt)。
+    // ⚠️ 这里拿不到 pendingRpc:ACK 一到就删了。所以走会话级的 activeAttempt()——
+    //    「当前这个会话正在跑哪一轮」是 recorder 自己知道的事,不该让桥去扫核心的 this.pending。
+    if (VIZ_BACKEND_EVENTS.has(message.type)) {
+      const a = vz(v => v.activeAttempt(this.id));
+      if (a) vz(v => v.firstBackendEvent(a));
+    }
     if (message.type === "agent_start" || message.type === "turn_start") {
       this.lastAssistantText = "";
       this.turnGeneration += 1; // see the field's comment: this is the "which turn's text is this" stamp
@@ -2585,6 +2728,31 @@ class OmpRpcSession {
       this.turnEndedAt = nowIso();
       this.turnInFlight = false; // request finished — the session is now settle-able
       setSessionStatus(this, "idle", false, { source: message.type });
+      // 观测台:`agent_end` 是 OMP 的**精确结算边界**(不是 `turn_end` —— 那只是内部子轮次)。
+      //
+      // ⚠️ 正文用**函数**交(两阶段)。原因很实在:`agent_end` 可能先于最后一条 `message_update`
+      //    到达,立刻取 `lastAssistantText` 就会丢掉结尾那一小段。宽限一小会儿能救回来。
+      //    这不违反「settleOnce 必须同步转移」——**同步的是状态转移,不是正文**:
+      //    `dispatched → settling` 在 settleOnce() 里已经同步完成,幂等护栏没松。
+      // ⚠️ 宽限期硬顶在 writer 里(2s),这里只等 250ms:再等下去就是让观测拖住桥。
+      // ⚠️ outcome 跟着桥自己的判据走(`lastTurnError`),不另立一套。viz 与桥的口径
+      //    打架一次,这块表就没人信了。
+      {
+        const a = vz(v => v.activeAttempt(this.id));
+        if (a) {
+          const errored = this.lastTurnError;
+          vz(v => v.settleOnce(a, {
+            outcome: errored ? "failed" : "completed",
+            error: errored ? this.lastError : null,
+            bodyKind: errored ? "partial" : "final",
+            backendTurnCount: this.turnGeneration,
+            body: () => new Promise(r => {
+              const t = setTimeout(() => r(this.lastAssistantText || ""), OMP_VIZ_SETTLE_GRACE_MS);
+              t.unref?.();
+            }),
+          }));
+        }
+      }
       return;
       // REMAINING LIMITATION (narrowed, not gone): OMP's events carry no request id, so a late
       // `agent_end` that lands AFTER we observed the new request's start is still indistinguishable
@@ -2606,13 +2774,29 @@ class OmpRpcSession {
       if (typeof update?.text === "string") {
         this.lastAssistantText = clampText(update.text);
       }
+      // 观测台:实时预览(STATE.md §5 的 sidecar)。
+      // ⚠️ 这是**每 token 级**频率。节流不在这里做,在 writer 的合并槽里做——
+      //    五个后端各自自律的话,迟早有一处忘;而它一旦漏进有界队列,
+      //    一个正常跑着的轮次几百毫秒就能把队列打满 → queue_full → 页面挂出
+      //    「本次记录不完整」。**观测把被观测者报成了病人。**
+      {
+        const a = vz(v => v.activeAttempt(this.id));
+        if (a) {
+          const full = this.lastAssistantText || "";
+          // `charCount` 是**全长**,`tail` 是给页面看的末段——两个不同的事实,recorder 只负责裁 tail。
+          vz(v => v.progress(a, { charCount: full.length, tail: full, generationCount: this.turnGeneration }));
+        }
+      }
     }
     if (message.type === "error" || message.type === "extension_error") {
       this.lastError = JSON.stringify(message);
     }
   }
 
-  request(type, extra = {}) {
+  // 第三参数 `vizAttemptId` 只给 prompt RPC 传:观测台要把「哪个 requestId 的 ACK 属于哪一轮」
+  // 记下来。别的 RPC(get_state / get_last_assistant_text / interrupt …)不建映射——
+  // 它们不是轮次,给它们建映射只会让 ACK 认领到一个不存在的 attempt 上。
+  request(type, extra = {}, vizAttemptId = null) {
     // Fail fast instead of writing into a dead pipe: once the close/error handlers have run
     // and cleared `pending`, a request registered here would never be settled by anyone —
     // wait/status/result would hang forever on it.
@@ -2624,6 +2808,10 @@ class OmpRpcSession {
     const promise = new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
     });
+    // 观测台:先建映射,**再** write。反过来会留下一个"已写出但还没登记"的窗口——
+    // 那期间到达的 ACK 找不到 attempt,这一轮就永远停在 attempted、不会公开。
+    // 核心的 this.pending 已在上面注册,所以也不存在"观测有映射、核心没请求"的反向空窗。
+    if (vizAttemptId) vz(v => v.rpcRegister(this.id, id, vizAttemptId));
     this.proc.stdin.write(`${JSON.stringify(payload)}\n`);
     if (OMP_RPC_TIMEOUT_MS > 0) {
       // Also covers the "backend alive but unresponsive / pipe half-broken" shape, where the
@@ -2632,6 +2820,16 @@ class OmpRpcSession {
         const pending = this.pending.get(id);
         if (pending) {
           this.pending.delete(id);
+          // 观测台:这是 ACK 超时的**唯一结构化判据** —— 明确的 error 与 stdin 死都会先 delete,
+          // 只有超时会走到这里。所以它就是 `ambiguous`:**后端可能已经收下了这一轮,我们不知道**。
+          // 说"确定拒绝"是假话,说"已派发"也是假话。
+          // ⚠️ X9 高风险区:下面那段 unresponsiveSince 的打点是核心自己的静默期判据,
+          //    这里**绝不能碰它**——按 RPC 清零、或在迟到 response 上清零,都会让"卡死的后端"
+          //    永远判不出来。观测只旁观,不参与。
+          {
+            const attemptId = vz(v => v.rpcTake(this.id, id));
+            if (attemptId) vz(v => v.ambiguous(attemptId, "ack_timeout"));
+          }
           pending.reject(new Error(`OMP RPC ${type} got no response in ${OMP_RPC_TIMEOUT_MS}ms for ${this.id}.`));
           // A half-dead backend (writes succeed, nothing ever comes back) would otherwise keep timing
           // out one poll at a time until the caller's wait deadline. Track how long we've gone with NO
@@ -2665,6 +2863,14 @@ class OmpRpcSession {
     appendLog(this.logFile, `[agent-bridge] ${this.lastError} — marking failed and reaping.\n`);
     if (this.turnStartedAt && !this.turnEndedAt) this.turnEndedAt = nowIso();
     setSessionStatus(this, "failed", false, { source: "rpc_timeout" });
+    // 观测台:批量清理**同一个会话**剩下的所有映射。这是 pendingRpc 的第八个物理出口,
+    // 也是最容易漏的那个——漏了就会留下一批永远等不到 ACK 的 attempt,页面上什么都不显示
+    // (attempted 不公开),而用户看到的是"这些轮次凭空消失了"。
+    // 后端此刻被判定为卡死,这些轮次到底有没有被收下**无从得知** ⇒ ambiguous,不是 reject。
+    vz(v => v.rpcDrainSession(this.id, "backend_unresponsive"));
+    // 会话终态是「后端崩了」,不是「被关了」——说清楚,否则退出期 finalizeSession
+    // 会把它们一律收成 abandoned,而 abandoned 的意思是"被我们打断的",两回事。
+    vz(v => v.markSessionTerminal(this.id, { outcome: "failed" }));
     for (const pending of this.pending.values()) pending.reject(new Error(this.lastError));
     this.pending.clear();
     const pid = this.proc?.pid;
@@ -2688,7 +2894,21 @@ class OmpRpcSession {
     // otherwise accept a second `prompt` mid-turn and interleave it into the same context — a silent
     // corruption rather than a clear error. turnInFlight is armed for the whole turn (below), so this is
     // the authoritative "busy" signal. To run turns in parallel, open separate sessions.
-    if (this.turnInFlight) throw new Error(`OMP session ${this.id} already has a running turn; wait for it to finish.`);
+    // 观测台:本轮的 attempt 就在这里诞生。
+    // ⚠️ **必须在 busy 闸门之前建、并在闸门命中时当场 reject**。放到闸门之后,
+    //    "并发 send 被拒"这种**确定拒绝**就一条都记不下来了(页面上那次调用凭空消失);
+    //    再往前放,则会给 closed/dead/进程没跑 这些前置失败凭空造出无意义的 attempt。
+    const vizAttempt = vz(v => v.attempt({
+      sessionId: this.id,
+      input: String(message),
+      source: options.source ?? "send_message",
+      blocking: !!options.wait,
+      hasSchema: !!options.schema,
+    }));
+    if (this.turnInFlight) {
+      vz(v => v.reject(vizAttempt, "already has a running turn"));
+      throw new Error(`OMP session ${this.id} already has a running turn; wait for it to finish.`);
+    }
     // Reset before prompting so waitIdle below ignores the pre-streaming idle window
     // (a stale idle reading from before this turn actually starts).
     this.turnStarted = false;
@@ -2699,7 +2919,7 @@ class OmpRpcSession {
     this.turnInFlight = true;
     setSessionStatus(this, "running", true, { source: "send" });
     try {
-      await this.request("prompt", { message: String(message) });
+      await this.request("prompt", { message: String(message) }, vizAttempt);
     } catch (err) {
       // Prompt was rejected; don't leave the session stuck at "running". Return to idle ONLY if the
       // backend is genuinely still usable. `!this.dead` is the key guard: a stdin-error / process-error
@@ -2709,6 +2929,13 @@ class OmpRpcSession {
         // No turn ever started (the prompt was refused), so clear the in-flight flag: the session is
         // genuinely idle and wait() must settle it instead of dead-waiting on a turn that won't come.
         this.turnInFlight = false;
+        // ⚠️ **这是一个负坐标:这里禁止任何 settle。** 这条 catch 是三种失败的汇合处,
+        //    而它们的观测语义完全不同,且**都已经在各自的源头分好了**:
+        //      success:false → #handleLine 里 reject;ACK 超时 → request 的 timer 里 ambiguous;
+        //      stdin/进程断链 → 各自的 handler 里 ambiguous。
+        //    这里的 `turnInFlight=false` + idle 只表示"桥允许你继续用这个会话",
+        //    **不证明后端没收下那条 prompt**。在这里补一刀 settle,就会把 ACK 超时
+        //    当场伪装成"已结算",而后端可能正跑着。
         setSessionStatus(this, "idle", false, { source: "prompt_error" });
       }
       throw err;
@@ -2720,6 +2947,9 @@ class OmpRpcSession {
     this.lastTurnId = this.currentTurnId;
     this.turnStartedAt = nowIso();
     this.turnEndedAt = null;
+    // 观测台:把桥自己铸的 turnId 绑到这一轮上。页面靠它把「委托台账里的那一笔」
+    // 和「历史里的这一轮」对上——`collected` 就是按 backendTurnId 找回来的。
+    vz(v => v.bindBackendTurnId(vizAttempt, this.currentTurnId));
     if (options.wait) {
       try {
         await this.waitIdle(options.timeout_ms || DEFAULT_WAIT_TIMEOUT_MS);
@@ -2798,6 +3028,22 @@ class OmpRpcSession {
     // "degraded" from a PRIOR errored turn after this clean abort (T9 — abort bypasses the turn_end path).
     this.lastTurnError = false;
     setSessionStatus(this, "idle", false, { source: "abort" });
+    // 观测台:abort 与 `agent_end` 一样是**精确边界**——用户主动中断,不是失败。
+    // 已经写出来的那截要留下:`bodyKind:"partial"`(§4.9 允许 aborted × partial),
+    // 而不是一律 none。丢掉它等于把"被打断的半篇"和"什么都没有"混成一句话。
+    // 幂等由 writer 的 settleOnce 保证:abort 与随后可能迟到的 agent_end 只会结算一次。
+    {
+      const a = vz(v => v.activeAttempt(this.id));
+      if (a) {
+        const partial = this.lastAssistantText || "";
+        vz(v => v.settleOnce(a, {
+          outcome: "aborted",
+          body: partial || null,
+          bodyKind: partial ? "partial" : "none",
+          backendTurnCount: this.turnGeneration,
+        }));
+      }
+    }
     return { aborted: true, sessionId: this.id };
   }
 
@@ -2882,6 +3128,12 @@ class OmpRpcSession {
   }
 
   close(options = {}) {
+    // 观测台:会话被**桥主动关掉**。这里是五个类各自的 close();`process_close`(后端进程自己退出)
+    // 走不到这条路——那正是页面区分「我关的」与「它自己死的」的依据:后者只有 status=closed,
+    // `closed` 对象保持 null,而且那时会话仍在 sessions 里、result() 照样取得回。
+    // ⚠️ 必须在 close 的**任何**实际拆除动作之前:writer 的 `sessionClosed()` 会顺带 finalizeSession,
+    //    把仍在途的轮次收成 abandoned;放到后面,那些轮次已经被 reject 掉、连收都收不着了。
+    vz(v => v.sessionClosed(this.id, { reason: options.reason ?? "close", forced: !!options.forced }));
     this.dead = true;
     if (this.turnStartedAt && !this.turnEndedAt) this.turnEndedAt = nowIso();
     setSessionStatus(this, "closed", false, { source: "close" });
@@ -3551,6 +3803,12 @@ class CodexAppServerSession {
   }
 
   close(options = {}) {
+    // 观测台:会话被**桥主动关掉**。这里是五个类各自的 close();`process_close`(后端进程自己退出)
+    // 走不到这条路——那正是页面区分「我关的」与「它自己死的」的依据:后者只有 status=closed,
+    // `closed` 对象保持 null,而且那时会话仍在 sessions 里、result() 照样取得回。
+    // ⚠️ 必须在 close 的**任何**实际拆除动作之前:writer 的 `sessionClosed()` 会顺带 finalizeSession,
+    //    把仍在途的轮次收成 abandoned;放到后面,那些轮次已经被 reject 掉、连收都收不着了。
+    vz(v => v.sessionClosed(this.id, { reason: options.reason ?? "close", forced: !!options.forced }));
     setSessionStatus(this, "closed", false, { source: "close" });
     try {
       this.proc?.stdin?.end();
@@ -3982,6 +4240,12 @@ class ClaudeCodeSession {
   }
 
   close(options = {}) {
+    // 观测台:会话被**桥主动关掉**。这里是五个类各自的 close();`process_close`(后端进程自己退出)
+    // 走不到这条路——那正是页面区分「我关的」与「它自己死的」的依据:后者只有 status=closed,
+    // `closed` 对象保持 null,而且那时会话仍在 sessions 里、result() 照样取得回。
+    // ⚠️ 必须在 close 的**任何**实际拆除动作之前:writer 的 `sessionClosed()` 会顺带 finalizeSession,
+    //    把仍在途的轮次收成 abandoned;放到后面,那些轮次已经被 reject 掉、连收都收不着了。
+    vz(v => v.sessionClosed(this.id, { reason: options.reason ?? "close", forced: !!options.forced }));
     setSessionStatus(this, "closed", false, { source: "close" });
     this.pendingAbortedResults = 0;
     try { this.proc?.stdin?.end(); } catch {}
@@ -4525,6 +4789,12 @@ class CursorAgentSession {
 
   // Synchronous (closeOne does not await; an async close would corrupt the returned shape).
   close(options = {}) {
+    // 观测台:会话被**桥主动关掉**。这里是五个类各自的 close();`process_close`(后端进程自己退出)
+    // 走不到这条路——那正是页面区分「我关的」与「它自己死的」的依据:后者只有 status=closed,
+    // `closed` 对象保持 null,而且那时会话仍在 sessions 里、result() 照样取得回。
+    // ⚠️ 必须在 close 的**任何**实际拆除动作之前:writer 的 `sessionClosed()` 会顺带 finalizeSession,
+    //    把仍在途的轮次收成 abandoned;放到后面,那些轮次已经被 reject 掉、连收都收不着了。
+    vz(v => v.sessionClosed(this.id, { reason: options.reason ?? "close", forced: !!options.forced }));
     setSessionStatus(this, "closed", false, { source: "close" });
     const child = this.proc;
     const pid = child?.pid;
@@ -5037,6 +5307,12 @@ class KimiCodeSession {
 
   // Synchronous (closeOne does not await; an async close would corrupt the returned shape).
   close(options = {}) {
+    // 观测台:会话被**桥主动关掉**。这里是五个类各自的 close();`process_close`(后端进程自己退出)
+    // 走不到这条路——那正是页面区分「我关的」与「它自己死的」的依据:后者只有 status=closed,
+    // `closed` 对象保持 null,而且那时会话仍在 sessions 里、result() 照样取得回。
+    // ⚠️ 必须在 close 的**任何**实际拆除动作之前:writer 的 `sessionClosed()` 会顺带 finalizeSession,
+    //    把仍在途的轮次收成 abandoned;放到后面,那些轮次已经被 reject 掉、连收都收不着了。
+    vz(v => v.sessionClosed(this.id, { reason: options.reason ?? "close", forced: !!options.forced }));
     setSessionStatus(this, "closed", false, { source: "close" });
     const child = this.proc;
     const pid = child?.pid;
@@ -5185,6 +5461,36 @@ async function openSession(params) {
   session.name = name;
   session.returnMode = assertEnum(params.return_mode, "return_mode", ["full", "ref"], "full");
   sessions.set(session.id, session);
+  // 观测台登记。**必须在 `await session.start()` 之前**,不是之后。
+  //
+  // ⚠️ 这一条与 PLAN §2.3 相反,而 PLAN 是错的:writer 的 `sessionOpenFailed()` 第一句就是
+  //    「这个 session 没登记过就直接返回」——会话若不先登记,`phase:"start"` 那条失败分支
+  //    **结构上永远是 no-op**。而 STATE.md §4.2 明写「启动失败的会话也要占一个位置
+  //    (页面要把它渲染成一张『生下来就死了』的卡片)」,数组还要按**创建顺序**排。
+  //    附带收益:start() 期间的 `setSessionStatus` 会被状态钩子实时收到——cursor 的
+  //    `#createChat` 可能耗几十秒,这段时间页面能显示一张 starting 卡片而不是一片空白。
+  //
+  // ⚠️ **逐字段白名单,绝不 spread `session.summary()`**(STATE.md §4.2 明令):
+  //    否则后端将来新增字段会静默流进快照,绕过白名单纪律。
+  vz(v => v.sessionOpened({
+    sessionId: session.id,
+    name: session.name,
+    agent: params.agent,
+    model: session.model ?? null,
+    effort: session.effort ?? null,
+    access: session.access ?? null,
+    cwd: session.cwd ?? null,
+    returnMode: session.returnMode,
+    logFile: session.logFile ?? null,
+    appendSystemPrompt: appendSystemPrompt
+      ? { file: appendSystemPrompt.path, bytes: appendSystemPrompt.bytes, injectionMode: vizInjectionMode(params.agent) }
+      : null,
+    backendPid: session.proc?.pid ?? null,   // 此刻恒 null,合法(形状 B 轮间本来就没有进程)
+    status: session.status ?? "starting",
+    health: "healthy",
+    isStreaming: false,
+    contextUsage: null,
+  }));
   try {
     await session.start();
   } catch (err) {
@@ -5192,6 +5498,12 @@ async function openSession(params) {
     try {
       session.close({ removePidRecord: false });
     } catch {}
+    // ⚠️ **必须在 `session.close()` 之后**。writer 只做单向抑制:openFailed 会抹掉 closed,
+    //    反过来不会。挂在 close 之前,页面上就只剩一句「已关闭」,而「为什么起不来」
+    //    ——真正有用的那句——被盖掉了。
+    // ⚠️ 也必须在这里而不是任一条 throw 之前:下面有两条 throw(带 model 提示的 / 裸 throw),
+    //    这是它们**唯一的公共祖先**,挂在任一条之前都会漏掉另一条。
+    vz(v => v.sessionOpenFailed(session.id, { phase: "start", error: err }));
     // Surface the requested model alongside the raw error so a bad provider/model string is at least
     // diagnosable (the underlying error is often opaque, e.g. "Timed out waiting for OMP RPC ready.").
     // Deliberately does NOT claim the model is the cause — the failure may be unrelated (missing
@@ -5224,6 +5536,11 @@ async function openSession(params) {
       try {
         session.close({ removePidRecord: false });
       } catch {}
+      // ⚠️ 两个 phase 必须分开:对用户意味着**完全不同**的两件事——
+      //    `start` 失败是「这个后端根本没起来」,`initialTurn` 失败是「后端活着,但第一句话没跑通」。
+      //    同样在 close 之后:让 openFailed 抑制 closed。这条路上首轮的 viz 轮次通常已经 dispatched,
+      //    close → finalizeSession 会先把它收成 abandoned,再由 openFailed 把会话标 failed,顺序自洽。
+      vz(v => v.sessionOpenFailed(session.id, { phase: "initialTurn", error: err }));
       throw err;
     }
   }
@@ -5534,8 +5851,11 @@ async function abortSession(sessionId) {
 
 // Close one session and drop it from the maps. Does NOT prune (callers prune once after a batch so a
 // bulk close is a single filesystem sweep, not one per session).
-function closeOne(session) {
-  const closed = session.close();
+function closeOne(session, { reason = "close_session", forced = false } = {}) {
+  // `reason`/`forced` 是给观测台用的:页面要能区分「用户主动关」「批量清场」「强关一个还在跑的」。
+  // 这两个值以前只存在于 `closeSession()` 的作用域里,`close()` 的 options 只有 `removePidRecord`——
+  // 于是钩子挂在类里就填不出真话。additive 地传下去,比在钩子里猜要诚实。
+  const closed = session.close({ reason, forced });
   sessions.delete(session.id);
   logBytesWritten.delete(session.logFile);
   // 会话没了,它的账也就没有意义了(产出已经随之销毁,不存在"还救得回来"这回事)。
@@ -5574,7 +5894,7 @@ function closeSession(sessionId, { force = false } = {}) {
       const session = sessions.get(id);
       if (!session) continue;
       try {
-        closeOne(session);
+        closeOne(session, { reason: "close_all", forced: force });
       } catch (err) {
         failed.push({ sessionId: id, error: err instanceof Error ? err.message : String(err) });
       }
@@ -5596,7 +5916,7 @@ function closeSession(sessionId, { force = false } = {}) {
   if (!force && !sessionSettled(session)) {
     return { closed: false, sessionId: session.id, blocked: true, runningSessionIds: [session.id] };
   }
-  const closed = closeOne(session);
+  const closed = closeOne(session, { reason: "close_session", forced: force });
   prune();
   return closed;
 }
@@ -5779,7 +6099,16 @@ async function runCli(argv) {
       // Reap orphaned backend child processes (omp/codex/claude/cursor/kimi) left behind by an MCP server that
       // was SIGKILLed before it could clean up its own sessions (matched by pid records whose
       // owner MCP is gone), and remove abandoned logs/<runId>/ dirs from those dead servers.
-      printCliResult({ childProcesses: await cleanupStalePidRecords(), staleLogs: reclaimStaleLogs() }, args);
+      // 顺带回收孤儿 viz 目录 —— 这是**唯一**的回收入口。被 SIGKILL 掉的 run 来不及删自己的
+      // 临时目录,而那里面是全量委托明文(STATE.md §7)。判据是 owner 里的 pid 还活不活着,
+      // 判错的方向是"留下一个孤儿"而不是"删掉一个活 run"。
+      // ⚠️ `vizCleanup()` **只读 tmpdir、不建目录**,所以放在 CLI 里不违反零副作用;
+      //    也**只能**出现在这个子命令里(别的 CLI 路径不该碰别人的临时目录)。
+      printCliResult({
+        childProcesses: await cleanupStalePidRecords(),
+        staleLogs: reclaimStaleLogs(),
+        vizDirs: vizCleanup().removed.length,
+      }, args);
       return;
     case "diag": {
       // READ-ONLY diagnostic entry (no sessions, no processes touched) for exercising two pure security/
@@ -5860,7 +6189,7 @@ async function callTool(name, args) {
     throw err;
   }
   if (payload && typeof payload === "object") {
-    collectDeliveries(payload);                       // ① 这一次**真的交付**了什么 → 清账
+    collectDeliveries(payload, 0, VIA_BY_TOOL.get(name) ?? null); // ① 这一次**真的交付**了什么 → 清账
     return mcpText(decorateUncollectedDebt(payload)); // ② 清完之后**还剩**什么 → 挂账
   }
   /* ⚠️ 字符串返回(`doctor`)加不了字段 —— 但**承诺不能只对一部分返回成立**。
@@ -5938,6 +6267,26 @@ function serveMcp() {
   cleanupStalePidRecords().catch(() => {});
   reclaimStaleLogs(); // sweep run dirs left by servers that did not exit cleanly
   pruneExitJournal(); // cap the durable exit journal before this run appends to it
+  // 观测台的**唯一**初始化点。
+  // ⚠️ 只能在这里:`createVizRun()` 一被调用就 `mkdtempSync`,而 `doctor` / `cleanup` / `help` /
+  //    任何测试 import 都走不到 `serveMcp()`。放模块顶层或 `runCli()` 开头,那几条路径
+  //    都会凭空建一个临时目录(STATE.md §7 的零副作用是硬要求)。
+  // ⚠️ 在 `installProcessHandlers()` **之前**:RUN_LOG_DIR 与 ensureDirs 已就绪(会话的 logFile
+  //    路径要进快照),而退出处理器一装上就可能触发 `cleanupAndExit`——那时 recorder 必须已存在。
+  //    代价如实记:这是本设计里唯一一处主动的同步 IO(mkdtempSync + 两次 writeFileSync),
+  //    在 Defender 抖动的机器上确实会阻塞事件循环若干毫秒。失败不影响开服(返回 disabled recorder)。
+  try {
+    viz = createVizRun({
+      bridgeVersion: BRIDGE_VERSION,
+      env: process.env,
+      onDiagnostic: (code, err) => {
+        try {
+          appendLog(path.join(RUN_LOG_DIR, "bridge.log"),
+            `[${nowIso()}] viz ${code}: ${err instanceof Error ? err.message : String(err ?? "")}\n`);
+        } catch {}
+      },
+    });
+  } catch { viz = null; }
   installProcessHandlers();
   // Periodic prune of THIS run's logs while the server is long-lived (the per-file/total caps
   // matter most for chatty OMP sessions), plus a sweep of other servers' abandoned run dirs.
@@ -6164,6 +6513,16 @@ function cleanupAndExit(code = 0, reason = "shutdown", error = null) {
   // startup's cleanupStalePidRecords reap it (see docs/DEVELOPMENT.md). A child that does die
   // removes its own record via its proc "exit" handler.
   cleanupSessions({ removePidRecord: false });
+  // 观测台封账。**顺序不能反**:先 cleanupSessions,让每个 close 钩子把 ledger 收干净,
+  // 再 seal;反过来的话 sessionClosed / finalizeSession 全被封账挡在门外。
+  // ⚠️ **只做 O(1) 的封账 + 停止接收新任务,不同步写大快照**(STATE.md §9)。
+  //    同步文件写没有可执行的超时,Defender 一卡就把退出本身拖死;何况正常退出
+  //    紧接着就把整个 VIZ_DIR 删掉——写完即删的最终快照**没有可靠消费者**。
+  vz(v => v.sealAndStop());
+  // 正常退出连同临时目录一起删:那里面是全量委托明文(STATE.md §7 的隐私代价压在这上面)。
+  // 崩溃(code !== 0)留着,理由和下面留 run 日志目录一样——现场比隐私优先级低,但比"什么都查不到"高;
+  // 留下来的目录随后由别的 run 的 `cleanup` 按 owner 存活性回收。
+  if (code === 0) vz(v => v.cleanup());
   // Clean exit (stdin close / signal) removes this run's ephemeral log dir; a crash (code !== 0)
   // keeps it for debugging. Never touch the base LOG_DIR (one-shot CLI mode never sets a run dir).
   if (code === 0 && RUN_LOG_DIR !== LOG_DIR) {
@@ -6184,6 +6543,10 @@ function installProcessHandlers() {
   process.once("unhandledRejection", err => cleanupAndExit(1, "unhandledRejection", err));
   process.once("exit", () => {
     if (!shuttingDown) cleanupSessions({ removePidRecord: false });
+    // ⚠️ 这一格**严格零 snapshot I/O**(STATE.md §9)。`exit` 回调里只能跑同步代码,
+    //    而同步文件写没有可执行的超时——在这里刷快照就是拿退出去赌磁盘。
+    //    `sealAndStop()` 只是 O(1) 地封账、停止接收新任务,不写盘。
+    vz(v => v.sealAndStop());
   });
   process.once("beforeExit", code => {
     appendLog(path.join(RUN_LOG_DIR, "bridge.log"), `[${nowIso()}] Agent Bridge beforeExit code=${code}\n`);
@@ -6214,5 +6577,8 @@ async function withTimeout(promise, timeoutMs, message) {
 runCli(process.argv.slice(2)).catch(err => {
   process.stderr.write(`${err instanceof Error ? err.message : String(err)}\n`);
   cleanupSessions({ removePidRecord: false });
+  // 这是绕开 `cleanupAndExit` 的第三条退出路(顶层 CLI 抛错)。三条路都必须过同一道封账,
+  // 否则"哪条路会封账"就成了一张要维护的清单。这里 code=1,按崩溃处理:**留下目录**供事后查。
+  vz(v => v.sealAndStop());
   process.exit(1);
 });

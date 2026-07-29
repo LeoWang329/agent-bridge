@@ -913,6 +913,65 @@ sect("S1-R 复审第 1 轮的收口（每条都写死预期，不接受「产生
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+sect("S1-K 正文宽限期里到达的收口不许丢");
+
+// 真实时序就是这样的:结算时正文还在宽限期里(OMP 要等最后一条 message_update),
+// 而调用方的 `wait` 早就返回、正文早就交到它手上了。
+// 按"非 settled 一律丢弃"的老写法,这一条会被静默丢掉 ——
+// 于是**一次已经取走的交付被记成「从未被取走」**,页面挂出"未取结果"的假警报。
+// 这是桥插桩的回归(repro-viz-bridge)先抓到的;判据挪到这里,因为它是 writer 的合同。
+{
+  await withTmp(async () => {
+    const rec = createVizRun({ bridgeVersion: "t", env: on() });
+    rec.sessionOpened({ sessionId: "s1", agent: "omp" });
+    const a = rec.attempt({ sessionId: "s1", input: "x" });
+    rec.dispatch(a, { boundary: "rpc_ack" });
+    rec.bindBackendTurnId(a, "turn-1");
+
+    // 正文供体故意慢 —— 结算期间 attempt 停在 `settling`
+    let release;
+    const slow = new Promise(r => { release = r; });
+    rec.settleOnce(a, { outcome: "completed", bodyKind: "final", body: () => slow });
+
+    // 就在这一刻收口到达(调用方拿到结果了)
+    rec.collected("turn-1", { via: "wait", returnedChars: 6, truncated: false });
+
+    release("最终答复");
+    await settleIo(rec);
+
+    const t = turnsOf(latest(rec.dir), "s1")[0];
+    ok("R-K1 ★ settling 期间到达的 collected 不丢,结算完成时兑现",
+      t.state === "settled" && t.collected?.via === "wait" && t.collected.returnedChars === 6,
+      JSON.stringify({ state: t.state, collected: t.collected }));
+    ok("R-K1 兑现之后仍满足合同蕴含式 3(collected ⟹ settled)", t.collected !== null && t.state === "settled");
+
+    // 幂等仍在:第二次收口不覆盖第一次
+    rec.collected("turn-1", { via: "result", returnedChars: 999 });
+    await settleIo(rec);
+    const t2 = turnsOf(latest(rec.dir), "s1")[0];
+    ok("R-K1 同一轮重复收口只记第一次", t2.collected.via === "wait" && t2.collected.returnedChars === 6,
+      JSON.stringify(t2.collected));
+    rec.cleanup();
+  });
+
+  // 反向:还没 dispatch 就来的收口**不该**被暂存(那时连轮次都还没公开)
+  await withTmp(async () => {
+    const rec = createVizRun({ bridgeVersion: "t", env: on() });
+    rec.sessionOpened({ sessionId: "s1", agent: "omp" });
+    const a = rec.attempt({ sessionId: "s1", input: "x" });
+    rec.bindBackendTurnId(a, "turn-9");
+    rec.collected("turn-9", { via: "result", returnedChars: 1 });
+    rec.dispatch(a, { boundary: "rpc_ack" });
+    rec.settleOnce(a, { outcome: "completed", body: "正文", bodyKind: "final" });
+    await settleIo(rec);
+    const t = turnsOf(latest(rec.dir), "s1")[0];
+    ok("R-K2 未结算(仍 dispatched)时到达的收口不被暂存——它描述的是取走产出,而那时没有产出",
+      t.collected === null, JSON.stringify(t.collected));
+    rec.cleanup();
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 sect("S1-X 交叉核对：writer 的真实产出必须过独立校验器");
 
 // ⚠️ **这一条是这套双实现真正的收口，别的都只是它的特例。**
