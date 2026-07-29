@@ -231,4 +231,86 @@ for (let i = 0; i < 100 && !exited; i++) await sleep(100);
 ok("V4 桥干净退出", !!exited && exited.code === 0, JSON.stringify(exited));
 ok("V4 ★ 正常退出把整个 viz 目录删掉(里面是全量委托明文)", !fs.existsSync(dir), dir);
 
+// ═══════════════════════════════════════════════════════════════════════════
+sect("V5 换一个后端:证据档必须跟着换(claude ⇒ pipe_enqueued)");
+
+// ⚠️ 这一段的价值不在"claude 也能跑",而在**证据强度不是全局常量**。
+//    OMP 有协议级 ACK ⇒ `rpc_ack`;claude 的 `#write` 是无 callback 的裸 stdin.write,
+//    只能证明「字节交给了管道」⇒ `pipe_enqueued`,页面对它只能写「已派发,等待后端输出」。
+//    两个后端都记成同一档,这个字段就退化成一句永远为真的废话。
+{
+  const TMP2 = path.join(BOX, "tmp2");
+  const STATE2 = path.join(BOX, "state2");
+  fs.mkdirSync(TMP2, { recursive: true });
+  fs.mkdirSync(STATE2, { recursive: true });
+  const FAKE_CLAUDE = path.join(HERE, process.platform === "win32" ? "fake-claude.cmd" : "fake-claude.sh");
+
+  const srv2 = spawn("node", [BRIDGE, "mcp"], {
+    stdio: ["pipe", "pipe", "pipe"], windowsHide: true,
+    env: {
+      ...process.env,
+      AGENT_BRIDGE_STATE_DIR: STATE2,
+      CLAUDE_BIN: FAKE_CLAUDE,
+      FAKE_CLAUDE_MODE: "bigresult",
+      AGENT_BRIDGE_VIZ: "on",
+      TEMP: TMP2, TMP: TMP2, TMPDIR: TMP2,
+    },
+  });
+  let exited2 = null;
+  srv2.on("close", (c, s) => { exited2 = { code: c, signal: s }; });
+  srv2.stderr.on("data", d => process.stdout.write(`[srv2-stderr] ${d}`));
+  const resp2 = new Map();
+  let buf2 = "";
+  srv2.stdout.on("data", d => {
+    buf2 += d.toString();
+    let i;
+    while ((i = buf2.indexOf("\n")) >= 0) {
+      const line = buf2.slice(0, i).trim(); buf2 = buf2.slice(i + 1);
+      if (!line) continue;
+      try { const m = JSON.parse(line); if (m && m.id !== undefined) resp2.set(m.id, m); } catch {}
+    }
+  });
+  let id2 = 1;
+  const call2 = async (name, args, ms = 30000) => {
+    const id = id2++;
+    srv2.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } }) + "\n");
+    const t0 = Date.now();
+    while (Date.now() - t0 < ms) {
+      if (resp2.has(id)) { const t = resp2.get(id)?.result?.content?.[0]?.text; return t ? JSON.parse(t) : null; }
+      if (exited2) return null;
+      await sleep(40);
+    }
+    return null;
+  };
+
+  srv2.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: id2++, method: "initialize", params: {} }) + "\n");
+  await sleep(500);
+  const hits2 = fs.readdirSync(TMP2).filter(n => n.startsWith("agent-bridge-viz-"));
+  const dir2 = hits2.length === 1 ? path.join(TMP2, hits2[0]) : null;
+  ok("V5 第二个桥进程有自己的 viz 目录(每个 run 一个,互不干扰)", !!dir2, hits2.join(","));
+
+  if (dir2) {
+    const o2 = await call2("agent_bridge_open_session", { agent: "claude", cwd: ROOT });
+    const sid2 = o2?.session?.id;
+    ok("V5 claude 会话开起来了", !!sid2, JSON.stringify(o2)?.slice(0, 200));
+    if (sid2) {
+      await call2("agent_bridge_send_message", { session_id: sid2, message: "问 claude" });
+      await call2("agent_bridge_wait", { session_ids: [sid2], mode: "all", timeout_ms: 20000 });
+      await sleep(500);
+      const snap2 = snapshot(dir2);
+      const t = snap2?.sessions?.find(x => x.sessionId === sid2)?.turns?.[0];
+      ok("V5 ★ claude 的派发证据是 `pipe_enqueued`,不是协议级的 rpc_ack",
+        t?.boundary === "pipe_enqueued", String(t?.boundary));
+      ok("V5 claude 轮次正常结算并留下正文",
+        t?.outcome === "completed" && t?.bodyKind === "final" && t?.output?.state === "ready",
+        JSON.stringify({ o: t?.outcome, k: t?.bodyKind, s: t?.output?.state }));
+      ok("V5 ★ claude 侧的目录同样通过独立校验器",
+        checkVizDir(dir2).violations.length === 0, JSON.stringify(checkVizDir(dir2).violations));
+    }
+  }
+  try { srv2.stdin.end(); } catch {}
+  for (let i = 0; i < 60 && !exited2; i++) await sleep(100);
+  try { srv2.kill("SIGKILL"); } catch {}
+}
+
 finish();

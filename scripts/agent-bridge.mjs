@@ -3373,6 +3373,23 @@ class CodexAppServerSession {
     // Close the turn clock if a turn was in flight (process crash / stdin EPIPE / close),
     // so durationMs reflects the failed turn instead of staying null.
     if (this.turnStartedAt && !this.turnEndedAt) this.turnEndedAt = nowIso();
+    // 观测台:**第三条绕过 `#settleTurn` 的路径。** stdin error / proc error / proc close /
+    // `close()` 四个入口全汇到这里,它同样是手动 `this.turn = null` + `turn?.reject?.(err)`。
+    // 不挂这里,后端进程崩掉时在途轮次就没有任何结算信号(桥不会再有别的事件),
+    // 只能等关会话兜底 —— 而那时会被合成 `abandoned`(意思是"被我们打断的"),口径是错的。
+    // 挂在这一行**之前**:此刻 `this.turn` 尚未被清、turnEndedAt 刚补完,状态最完整。
+    {
+      const a = vz(v => v.activeAttempt(this.id));
+      if (a) {
+        const vizBody = this.finalAnswer || this.lastAgentMessage || this.lastAssistantText || "";
+        vz(v => v.settleOnce(a, {
+          outcome: "failed",
+          error: err instanceof Error ? err.message : String(err ?? ""),
+          body: vizBody || null,
+          bodyKind: vizBody ? "partial" : "none",
+        }));
+      }
+    }
     for (const pending of this.pending.values()) pending.reject(err);
     this.pending.clear();
     const turn = this.turn;
@@ -3451,6 +3468,23 @@ class CodexAppServerSession {
         // idempotent per turn — when the continuation runs first (the common case), this is a no-op.
         if (this.turn) this.#beginTurn(params.turn?.id || null);
         this.currentTurnId = params.turn?.id || this.currentTurnId;
+        // 观测台:`turn/started` 通知 —— 也是协议级证据,但与 `turn_start_ack` **是两档**
+        // (STATE.md §4.6 要求按证据来源分开钉死)。
+        //
+        // ⚠️ 位置必须落在上面 `if (this.turn) this.#beginTurn(...)` 那道 guard **之外**:
+        //    这一行是本 case 里唯一无条件执行的语句。`turn/start` 超时之后 `this.turn` 已是 null,
+        //    晚到的 `turn/started` 进不去 `#beginTurn` —— 而这里正是它唯一还能被观测到的点。
+        //    挂进 `#beginTurn` 里就等于让「晚到通知认领歧义轮次」**结构上不可达**。
+        // 一次调用同时覆盖两种入态:正常在途(attempted → dispatched)与超时(ambiguous → dispatched),
+        // recorder 的 acceptOrAdopt 两种都收。
+        // ⚠️ **绝不能改用 `adoptByTerminal()`** —— 那个 API 把 boundary 写死成 `terminal_adopted`
+        //    (「没有任何 ACK,只能靠后到的终结事件反推」),而我们这里手上有协议级通知作证据。
+        if (this._vizAttempt) {
+          vz(v => v.dispatch(this._vizAttempt, {
+            boundary: "turn_started_notification",
+            backendTurnId: params.turn?.id || null,
+          }));
+        }
         if (this.turn) setSessionStatus(this, "running", true, { source: "turn/started" });
         pushEvent(this, compactEvent(msg));
         return;
@@ -3460,6 +3494,21 @@ class CodexAppServerSession {
           return;
         }
         if (typeof params.delta === "string") this.lastAssistantText = clampText(this.lastAssistantText + params.delta);
+        // 观测台:codex 唯一的流式正文累加点,而且**已经过了 `staleTurn` 闸**
+        // (被忽略轮次的尾巴不会污染当前轮)。这里同时喂两件事:
+        //   · firstBackendEvent —— 区分「已派发但完全沉默」与「已经在输出了」
+        //   · progress          —— 实时预览
+        // ⚠️ **不要**改用 `#handleLine` 里那句 `this.updatedAt = nowIso();` 当 firstBackendEvent 的漏斗:
+        //    那一行对 `turn/start` 的 response 行本身也会触发,等于把 ACK 当成"后端已开始输出",
+        //    恰好毁掉这个字段唯一的用处。
+        {
+          const a = vz(v => v.activeAttempt(this.id));
+          if (a) {
+            const full = this.lastAssistantText || "";
+            vz(v => v.firstBackendEvent(a));
+            vz(v => v.progress(a, { charCount: full.length, tail: full, generationCount: this.turnCount + 1 }));
+          }
+        }
         pushEvent(this, compactEvent(msg));
         return;
       case "item/completed": {
@@ -3534,6 +3583,28 @@ class CodexAppServerSession {
     // suspended (response + the whole turn lifecycle delivered in one flush) and needs to tell
     // "already ran to completion" apart from "abort()/close() stole the turn" — only the latter
     // should report accepted:false and fire an interrupt.
+    // 观测台:这个后端的结算点。挂在 `if (!turn) return` 那道幂等闸**之后** ——
+    // 挂之前会给一个已经结束的轮次再触发一次结算。
+    //
+    // ⚠️ **正文必须在这里同步抓,而且抓三级 fallback 的原件。**
+    //    canonical 正文是 `result()` 用的那串 fallback,而本函数下面几行会执行
+    //    `this.lastAssistantText = clampText(...)` —— `clampText` 是**保尾截头**。
+    //    挂到函数末尾再读,只要前几级为空(纯 delta 流、没有 final 消息的轮次),
+    //    拿到的就是**被砍掉开头的残件**,而快照还会照常算出 sha256、
+    //    宣称「这就是记录里的那一份」。
+    {
+      const a = vz(v => v.activeAttempt(this.id));
+      if (a) {
+        const vizBody = this.finalAnswer || this.lastAgentMessage || this.lastAssistantText || "";
+        vz(v => v.settleOnce(a, {
+          outcome: err ? "failed" : "completed",
+          error: err ? err.message : null,
+          body: vizBody || null,
+          bodyKind: vizBody ? (err ? "partial" : "final") : "none",
+          backendTurnCount: this.turnCount + 1,
+        }));
+      }
+    }
     turn.settled = { err: err || null, status: status ?? null };
     this.lastTurnError = Boolean(err); // outcome of the turn just completed → health (T9); cleared on success
     this.lastTurnErrorMessage = err ? err.message : null; // reason for THIS turn (T11); not the sticky lastError
@@ -3580,6 +3651,20 @@ class CodexAppServerSession {
     let turnResp;
     // Capture the request id so a turn/start that times out can still handle a late
     // response: the app-server may yet return a turn id and run that turn untracked.
+    // 观测台:attempt 建在四道确定拒绝闸**之后**、`turn/start` 真正下发**之前**。
+    // ⚠️ 不能放到 `#request` 之后:同一次 stdout flush 可能在 await 恢复之前就把
+    //    `turn/started` + deltas + `turn/completed` 全送到,那时 ledger 里还没有 attempt,
+    //    这些事件**无处暂存**。
+    // ⚠️ attemptId 要同时挂在局部变量(给 catch 与晚到 response 的闭包)和会话字段
+    //    (给 `#onNotification` 用——它没有 send() 的闭包)。
+    const vizAttempt = vz(v => v.attempt({
+      sessionId: this.id,
+      input: String(message),
+      source: options.source ?? "send_message",
+      blocking: !!options.wait,
+      hasSchema: !!options.schema,
+    }));
+    this._vizAttempt = vizAttempt ?? null;
     const startReqId = this.nextId;
     try {
       turnResp = await withTimeout(
@@ -3597,11 +3682,29 @@ class CodexAppServerSession {
     } catch (err) {
       // Replace the pending handler so a late turn/start response interrupts and
       // ignores the orphaned turn instead of letting its events drive a later turn.
+      // 观测台:**明确 error 与超时共用这同一个 catch**(`withTimeout` 只 reject 一个裸 Error,
+      // 没有任何 timeout 标记),所以绝不能靠匹配 err.message 分流——那是 PLAN 明令禁止的。
+      // 结构化判据已经在源码里、而且桥自己正在用:`this.pending.has(startReqId)`。
+      //   · 明确 error response → `#handleLine` 先 delete 再 reject ⇒ has=false
+      //   · `#write` 抛(stdin 死) → `#request` 的 catch 里 delete   ⇒ has=false
+      //   · **超时** → 没有任何人删过它                              ⇒ has=true
+      // 判据与桥的拦截判据**共用同一个表达式,结构上不可能漂**。
       if (this.pending.has(startReqId)) {
+        // 超时 ⇒ ambiguous:后端**可能**已经收下并正在跑一轮无人跟踪的活
+        // (源码注释原话:"the app-server may yet return a turn id and run that turn untracked")。
+        // 这正是 ambiguous 这一档存在的全部意义。
+        vz(v => v.ambiguous(vizAttempt, "turn_start_timeout"));
         this.pending.set(startReqId, {
           resolve: result => {
             const lateId = result?.turn?.id;
             if (lateId) {
+              // 晚到的成功 response 认领这个歧义 attempt。证据是 `turn/start` 的成功 response,
+              // 所以 boundary 如实是 `turn_start_ack`,**不是** `terminal_adopted`。
+              vz(v => v.dispatch(vizAttempt, { boundary: "turn_start_ack", backendTurnId: lateId }));
+              // ⚠️ 认领完必须**紧接着**主动收口:下一句 `#ignoreTurn` 之后,这一轮的所有后续
+              //    通知都会被判 stale ⇒ **永远不会有终结事件来 settle 它**,于是它会一直挂在
+              //    dispatched 直到关会话才被合成 abandoned。而它其实是被我们 interrupt 掉的。
+              vz(v => v.settleOnce(vizAttempt, { outcome: "aborted", body: null, bodyKind: "none" }));
               this.#ignoreTurn(lateId);
               if (this.threadId && this.proc && this.proc.exitCode === null) {
                 this.#request("turn/interrupt", { threadId: this.threadId, turnId: lateId }).catch(() => {});
@@ -3623,6 +3726,11 @@ class CodexAppServerSession {
       // died sets proc.exitCode ⇒ deriveHealth's procGone ⇒ dead). THIS turn's failure is reported the only
       // honest way it can be for a turn that never started: by THROWING here (the send()/send_message error),
       // not by mutating the prior turn's outcome. wait() shows the last SETTLED turn by design.
+      // 上一条的 else 侧:`has === false` ⟹ 后端给了明确 error response,或 stdin 写失败——
+      // 两者都**确定没有一轮在跑** ⇒ reject:当场销毁,不分配 turnNo,不发任何公开状态。
+      // ⚠️ 在 catch 开头一律 reject 会错在哪:把超时也做成"确定没跑",恰好抹掉那句
+      //    "the app-server may yet return a turn id and run that turn untracked"。
+      if (!this.pending.has(startReqId)) vz(v => v.reject(vizAttempt, err));
       throw err instanceof Error ? err : new Error(this.lastError);
     }
     const startedTurnId = turnResp?.turn?.id || null;
@@ -3634,6 +3742,15 @@ class CodexAppServerSession {
         // spurious interrupt at a finished turn and mislabeling it accepted:false.
         // T11: a FAILED schema turn is normalized to a schemaError result (wait) / ack (non-blocking)
         // rather than thrown — the caller asked for machine-readable output, so the failure is data.
+        // 观测台:**这一支不补钩子就会整轮消失。**
+        // 常态下 `turn/started` 通知已经 dispatch 过,这里是 no-op;但只要 app-server 那一轮
+        // **没发 `turn/started`**(或它被 staleTurn 挡掉),`#settleTurn` 的钩子只会把终结事件
+        // **暂存**在一个仍是 `attempted` 的 attempt 上(recorder 不在 attempted 上 settle——
+        // 那会造出一个没有 turnNo 的幽灵轮次),而本分支在够到下面那个 ack 钩子之前就 return 了
+        // ⇒ 缓冲的终结永远不归并 ⇒ **一轮既不出现也不结算**。
+        // 此刻我们手上正握着一个成功的 `turn/start` response,所以证据如实是 `turn_start_ack`;
+        // dispatch 会立刻把暂存的终结归并并触发结算。
+        vz(v => v.dispatch(vizAttempt, { boundary: "turn_start_ack", backendTurnId: startedTurnId || this.lastTurnId }));
         if (myTurn.settled.err && !this._requestedSchema) throw myTurn.settled.err;
         if (options.wait) return await this.result({ maxChars: options.maxChars });
         return { accepted: true, sessionId: this.id, status: this.status, turnId: startedTurnId || this.lastTurnId };
@@ -3646,6 +3763,11 @@ class CodexAppServerSession {
           this.#request("turn/interrupt", { threadId: this.threadId, turnId: startedTurnId }).catch(() => {});
         }
       }
+      // 上一支的镜像:abort()/close() 在 `turn/start` 在途时抢走了 turn,续体拿到成功 response
+      // 后主动 interrupt。同样必须先 dispatch,否则 attempt 停在 attempted(abort 钩子的
+      // settleOnce 只会 buffer),整轮不可见。证据仍是成功 response ⇒ `turn_start_ack`。
+      vz(v => v.dispatch(vizAttempt, { boundary: "turn_start_ack", backendTurnId: startedTurnId }));
+      vz(v => v.settleOnce(vizAttempt, { outcome: "aborted", body: null, bodyKind: "none" }));
       return { accepted: false, sessionId: this.id, status: this.status, turnId: startedTurnId };
     }
     // Begin the accepted turn's bookkeeping (stamp timing, adopt the turn id, reset accumulated
@@ -3654,6 +3776,15 @@ class CodexAppServerSession {
     // turn/started notification (same-flush delivery) already ran it, in which case the deltas
     // that preceded this continuation correctly accumulated from empty.
     this.#beginTurn(startedTurnId);
+    // 观测台:`turn/start` 的成功 response —— 协议级证据 ⇒ `turn_start_ack`。
+    // ⚠️ 挂在 `#beginTurn` **之后**而不是之前:`#beginTurn` 才是桥认定「这一轮开始了」的时刻
+    //    (它重置 finalAnswer/lastAssistantText 并 commit `_requestedSchema`)。在它之前 dispatch,
+    //    viz 的 dispatchedAt 会早于桥自己的 turnStartedAt,两个时钟对不上。
+    // ⚠️ 也不能挂在 `await withTimeout(...)` **之前**——那等于把超时也当成已派发,
+    //    直接抹掉 STATE 要保留的那段歧义。
+    // 同 flush 时 `turn/started` 通知会先到并写 `turn_started_notification`,这里就成了幂等的 no-op:
+    // 谁先跑谁定 boundary,这正是"证据强度"的如实记录。
+    vz(v => v.dispatch(vizAttempt, { boundary: "turn_start_ack", backendTurnId: startedTurnId }));
     this.currentTurnId = startedTurnId || this.currentTurnId;
     this.lastTurnId = startedTurnId || this.lastTurnId;
     const initialStatus = turnResp?.turn?.status;
@@ -3751,6 +3882,23 @@ class CodexAppServerSession {
     // Likewise clear the schema flag (T11): a user-aborted turn produced no structured output, so
     // result() should return the (partial) text plainly, not a bogus schemaError parse of it.
     this._requestedSchema = null;
+    // 观测台:**codex 的 abort 完全绕过 `#settleTurn`** —— 源码自己在上面的注释里写死了这件事。
+    // 所以 PLAN §2.2「Codex/Claude 挂 `#settleTurn` 即可」对 codex **不成立**:
+    // 只挂那一处的话,任何被 abort 的轮次都会永远停在 `dispatched`,直到关会话才被合成
+    // `abandoned` —— 页面上就是「用户明明中断了,却显示成被遗弃」。
+    // 挂在 `turn?.resolve?.()` **之前**:让观测的收口先于 send() 续体恢复
+    // (续体可能立刻走 `result()` → 触发 `collected`)。
+    {
+      const a = vz(v => v.activeAttempt(this.id));
+      if (a) {
+        const vizBody = this.finalAnswer || this.lastAgentMessage || this.lastAssistantText || "";
+        vz(v => v.settleOnce(a, {
+          outcome: "aborted",
+          body: vizBody || null,
+          bodyKind: vizBody ? "partial" : "none",
+        }));
+      }
+    }
     turn?.resolve?.();
     return { aborted: true, sessionId: this.id };
   }
@@ -3989,11 +4137,35 @@ class ClaudeCodeSession {
     // PREVIOUS turn's token count as if it were current. Repopulated from the streaming assistant
     // messages in #handleLine.
     this.lastCallContextTokens = null;
+    // 「第 N 稿」是**每轮的**计数,不是会话累计。不在这里清零,页面上第二轮会从"第 7 稿"起步。
+    this._vizDrafts = 0;
   }
 
   #settleTurn(err, status) {
     const turn = this.turn;
     if (!turn) return;
+    // 观测台:这个后端的结算点。挂在 `if (!turn) return` 那道幂等闸**之后** ——
+    // 挂之前会给一个已经结束的轮次再触发一次结算。
+    //
+    // ⚠️ **正文必须在这里同步抓,而且抓三级 fallback 的原件。**
+    //    canonical 正文是 `result()` 用的那串 fallback,而本函数下面几行会执行
+    //    `this.lastAssistantText = clampText(...)` —— `clampText` 是**保尾截头**。
+    //    挂到函数末尾再读,只要前几级为空(纯 delta 流、没有 final 消息的轮次),
+    //    拿到的就是**被砍掉开头的残件**,而快照还会照常算出 sha256、
+    //    宣称「这就是记录里的那一份」。
+    {
+      const a = vz(v => v.activeAttempt(this.id));
+      if (a) {
+        const vizBody = this.finalAnswer || this.lastAssistantText || "";
+        vz(v => v.settleOnce(a, {
+          outcome: err ? "failed" : "completed",
+          error: err ? err.message : null,
+          body: vizBody || null,
+          bodyKind: vizBody ? (err ? "partial" : "final") : "none",
+          backendTurnCount: this.turnCount + 1,
+        }));
+      }
+    }
     turn.settled = { err: err || null, status: status ?? null };
     this.lastTurnError = Boolean(err); // outcome of the turn just completed → health (T9); cleared on success
     this.turn = null;
@@ -4028,6 +4200,20 @@ class ClaudeCodeSession {
       const blocks = Array.isArray(msg.message?.content) ? msg.message.content : [];
       const text = blocks.filter(b => b && b.type === "text" && typeof b.text === "string").map(b => b.text).join("");
       if (text) this.lastAssistantText = clampText(text);
+      // 观测台:claude 的正文观测点。assistant 消息是第一个能证明「后端真的在干活」的信号
+      // (`system/init` 只证明进程起来了)。
+      // ⚠️ **不要**挂到 `#handleLine` 顶部那句 `this.updatedAt = nowIso();`——
+      //    那对 `control_response`、`system` 这些非产出行也会触发,等于把"进程有动静"
+      //    当成"后端已开始输出",恰好毁掉 firstBackendEvent 唯一的用处。
+      // `generationCount`(第 N 稿)按 assistant 消息数记:每条 = 一次真实 API 调用,这是最自然的口径。
+      if (text) {
+        const a = vz(v => v.activeAttempt(this.id));
+        if (a) {
+          this._vizDrafts = (this._vizDrafts || 0) + 1;
+          vz(v => v.firstBackendEvent(a));
+          vz(v => v.progress(a, { charCount: text.length, tail: text, generationCount: this._vizDrafts }));
+        }
+      }
       // Current-context occupancy: the input side of THIS single API call (fresh input + cache read +
       // cache creation) — the input snapshot at the start of the call (excludes this call's output and
       // the next user turn). Each assistant message = one real API call; we keep the LATEST of the turn,
@@ -4087,6 +4273,17 @@ class ClaudeCodeSession {
     if (this.turn) throw new Error(`Claude session ${this.id} already has a running turn.`);
 
     const turnId = `${this.id}-t${this.turnCount + 1}`;
+    // 观测台:同样在三道确定拒绝闸(closed / proc 死 / busy)之后、真正写 stdin 之前。
+    // 挂在 turnId 之后,是为了 attempt 一出生就带上它——claude 的 `lastTurn.id` 就是这个
+    // 桥自造的字符串,`collected()` 反查全靠它。
+    // 挂到 `#writeUser` 之后就晚了:写失败那一支要 reject,得先有 attempt 才有东西可 reject。
+    const vizAttempt = vz(v => v.attempt({
+      sessionId: this.id,
+      input: String(message),
+      source: options.source ?? "send_message",
+      blocking: !!options.wait,
+      hasSchema: false,
+    }));
     setSessionStatus(this, "running", true, { source: "send" });
     const promise = new Promise((resolve, reject) => { this.turn = { resolve, reject }; });
     this.turn.promise = promise;
@@ -4101,6 +4298,10 @@ class ClaudeCodeSession {
       // a send that never happened (mirrors CodexAppServerSession's clean teardown on turn/start
       // failure). #writeUser only throws when stdin is dead, so the session is failed.
       const e = err instanceof Error ? err : new Error(String(err));
+      // 观测台:**确定拒绝**,不是歧义。`#writeUser` 只在 stdin 已死时抛(无 stdin / destroyed /
+      // exitCode 或 signalCode 非 null),**字节从未进管道** —— 源码上面那段注释也是这么写的。
+      // claude 这边不存在「可能已经在跑」的第三态:判据是**同步的进程存活**,不是等待。
+      vz(v => v.reject(vizAttempt, e));
       if (this.turn === myTurn) {
         this.turn = null;
         this.lastError = e.message;
@@ -4113,6 +4314,13 @@ class ClaudeCodeSession {
     // turn/start response). Placing #beginTurn after the write keeps a failed send from clobbering turn
     // metadata or erasing the previous turn's result.
     this.#beginTurn(turnId);
+    // 观测台:claude 的 `#write` 是**无 callback 的裸 `stdin.write`**(返回值都没接、没有背压处理、
+    // 没有 flush 确认),所以这里能证明的**只有「字节交给了 Node/OS 管道」** ⇒ `pipe_enqueued`。
+    // 页面对这一档只能写「已派发,等待后端输出」,**不能写「后端已接受」**(STATE.md §4.6)。
+    // claude 全程没有任何协议级 ACK(首条用户消息之前 stdout 完全沉默),所以不存在更强的证据可等。
+    // ⚠️ 挂在 `#beginTurn` 之后而不是 `#writeUser` 之后:夹在两者之间会让 viz 的时间戳
+    //    早于桥自己的 turnStartedAt。也**不能**挂进 `options.wait` 分支——那样非阻塞 send 永远不产生轮次。
+    vz(v => v.dispatch(vizAttempt, { boundary: "pipe_enqueued", backendTurnId: turnId }));
 
     if (options.wait) {
       try {
@@ -4189,6 +4397,23 @@ class ClaudeCodeSession {
   #failTurn(err) {
     this.pendingAbortedResults = 0;
     if (this.turnStartedAt && !this.turnEndedAt) this.turnEndedAt = nowIso();
+    // 观测台:这是 claude 版的 `#rejectAll` —— stdin error / proc error / proc close / `close()`
+    // 四处都调它,而它**不走 `#settleTurn`**(手动清 turn + reject,不 bump turnCount、不打 endedAt)。
+    // 所以「Claude 挂 `#settleTurn` 即可」只覆盖了正常路径:进程崩掉时的在途轮次
+    // 没有任何结算信号,只能等关会话兜底,而那时会被合成 abandoned —— 口径是错的。
+    // 挂在这一行之前:此刻 `this.turn` 仍在、turnEndedAt 刚补完,状态最完整。
+    {
+      const a = vz(v => v.activeAttempt(this.id));
+      if (a) {
+        const vizBody = this.finalAnswer || this.lastAssistantText || "";
+        vz(v => v.settleOnce(a, {
+          outcome: "failed",
+          error: err instanceof Error ? err.message : String(err ?? ""),
+          body: vizBody || null,
+          bodyKind: vizBody ? "partial" : "none",
+        }));
+      }
+    }
     for (const p of this.controlPending.values()) p.reject(err);
     this.controlPending.clear();
     const turn = this.turn; this.turn = null;
@@ -4458,6 +4683,8 @@ class CursorAgentSession {
   }
 
   #beginTurn(turnId, child) {
+    // 「第 N 稿」是**每轮的**计数,不是会话累计。不在这里清零,页面上第二轮会从「第 7 稿」起步。
+    this._vizDrafts = 0;
     this.turnChild = child;
     this.currentTurnId = turnId;
     this.lastTurnId = turnId;
@@ -4474,6 +4701,28 @@ class CursorAgentSession {
   #settleTurn(err, status) {
     const turn = this.turn;
     if (!turn) return;
+    // 观测台:这个后端的结算点。挂在 `if (!turn) return` 那道幂等闸**之后** ——
+    // 挂之前会给一个已经结束的轮次再触发一次结算。
+    //
+    // ⚠️ **正文必须在这里同步抓,而且抓三级 fallback 的原件。**
+    //    canonical 正文是 `result()` 用的那串 fallback,而本函数下面几行会执行
+    //    `this.lastAssistantText = clampText(...)` —— `clampText` 是**保尾截头**。
+    //    挂到函数末尾再读,只要前几级为空(纯 delta 流、没有 final 消息的轮次),
+    //    拿到的就是**被砍掉开头的残件**,而快照还会照常算出 sha256、
+    //    宣称「这就是记录里的那一份」。
+    {
+      const a = vz(v => v.activeAttempt(this.id));
+      if (a) {
+        const vizBody = this.finalAnswer || this.lastAssistantText || "";
+        vz(v => v.settleOnce(a, {
+          outcome: err ? "failed" : "completed",
+          error: err ? err.message : null,
+          body: vizBody || null,
+          bodyKind: vizBody ? (err ? "partial" : "final") : "none",
+          backendTurnCount: this.turnCount + 1,
+        }));
+      }
+    }
     turn.settled = { err: err || null, status: status ?? null };
     this.lastTurnError = Boolean(err); // cleared to false on a clean turn / user abort
     this.turn = null;
@@ -4525,6 +4774,13 @@ class CursorAgentSession {
   #handleLine(line, child) {
     if (this.proc !== child) return; // ignore a stale child's late output
     if (!line.trim()) return;
+    // 观测台:`firstBackendEvent` 的落点。
+    // ⚠️ 必须在上一行那道**陈旧子进程闸**之后:一个被顶替的旧 child 的迟到输出若被记成
+    //    本轮「后端已开口」,恰好污染这个字段唯一要区分的两种卡死形态
+    //    (已派发但完全沉默 vs 已经在输出)。
+    // ⚠️ 也必须在空行过滤之后 —— 一个空 flush 就把「沉默」抹掉了。
+    // 放进 switch 的某个具体 case 则会漏掉 raw / 未知类型行,同样把沉默说成有输出。
+    if (this.vizAttemptId) vz(v => v.firstBackendEvent(this.vizAttemptId));
     const parsed = parseMessageLine(line);
     if (!parsed.ok) { appendLog(this.logFile, `${line}\n`); pushEvent(this, { type: "raw" }); return; }
     const msg = parsed.value;
@@ -4549,6 +4805,17 @@ class CursorAgentSession {
         // We don't use --stream-partial-output, so each assistant event is a fairly complete block;
         // accumulate across a multi-step turn for the progress tail (final answer comes from `result`).
         if (text) this.lastAssistantText = clampText((this.lastAssistantText || "") + text);
+        // 观测台:cursor 侧唯一的「答案又长了」的位置。
+        // cursor 不开 `--stream-partial-output`,每个 assistant 事件是一个相对完整的块,
+        // 频率天然低(一轮个位数到几十次),直接挂在这里是安全的。
+        // ⚠️ 放到 `case "result"` 就太晚了:那是终结事件,进程马上要退出,
+        //    「看着它在写」的全部价值就没了;放到 switch 之前又会把 thinking/tool_call 也算成正文增长。
+        // charCount 只能取已被 clampText 截过的长度 —— 页面按「尾巴」读,不按「全文长度」读。
+        if (text && this.vizAttemptId) {
+          const full = this.lastAssistantText || "";
+          this._vizDrafts = (this._vizDrafts || 0) + 1;
+          vz(v => v.progress(this.vizAttemptId, { charCount: full.length, tail: full, generationCount: this._vizDrafts }));
+        }
         pushEvent(this, compactEvent({ type: "assistant" }));
         return;
       }
@@ -4595,8 +4862,30 @@ class CursorAgentSession {
     const promise = new Promise((resolve, reject) => { this.turn = { resolve, reject }; });
     this.turn.promise = promise;
     const myTurn = this.turn;
+    // 观测台:attempt 的落点(**不是** dispatch)。此刻三道拒绝闸已全部通过、turn 已被**同步**占住、
+    // `myTurn` 已固化 —— 攻击面最小的一刻。
+    // ⚠️ 放更早(send 第一行)会给已被 busy 闸拒掉的调用也造 attempt,那类本来就属于 rejected,
+    //    造了又立刻销毁是纯噪音;放更晚(compose/spawn 之后)则 `releaseUnbegun` 覆盖的三条前置失败
+    //    就没有 attempt 可 reject —— **spawn 失败在台账上会完全不存在**。
+    // ⚠️ 也必须早于 `releaseUnbegun` 的定义:那个闭包要引用它,否则 TDZ。
+    // 存到 this 上,是因为 `#handleLine` / `#settleTurn` 看不见 send 的局部变量。
+    this.vizAttemptId = vz(v => v.attempt({
+      sessionId: this.id,
+      input: String(message),
+      source: options.source ?? "send_message",
+      blocking: !!options.wait,
+      hasSchema: false,
+    })) ?? null;
     promise.catch(() => {}); // pre-attach so an early rejection can't crash the server
     const releaseUnbegun = err => {
+      // 观测台:这个后端**全部**「确定拒绝」都收敛在这一个闭包上,共三条调用路径——
+      //   ① launcher 解析 / 参数构造 / 命令行长度断言 抛;② `spawn()` **同步**抛(E2BIG);
+      //   ③ `if (!child)`(含 ENOENT 重试耗尽)。
+      // 三条的共同事实是**没有任何进程跑起来过** ⇒ 确定拒绝,不是歧义。
+      // 挂在这里,判据是**结构化的控制流**,不需要匹配 err.message。
+      // 改成在三个 throw 点各挂一次就是一张会漏的清单;挂到 send 的外层 try/catch 又会把
+      // 「已 begun 之后 wait 超时」那类也吞进来,把一个真跑过的轮次说成从未派发。
+      vz(v => v.reject(this.vizAttemptId, err));
       // No process ever began the turn → release WITHOUT #settleTurn (no turnCount bump, previous result
       // preserved), mark failed for health, and reject.
       this.lastError = err.message;
@@ -4664,6 +4953,15 @@ class CursorAgentSession {
     // backstop and orphan the child on a failed kill. The child's own close handler nulls this.proc. In the
     // defensive not-closed case (no close() managing it) terminate the child so it can't leak.
     if (this.status === "closed" || this.turn !== myTurn) {
+      // 观测台:**唯一**一条「进程确实起来了(spawn 事件已 resolve),但桥故意不 begin 这一轮」——
+      // 流水线化的 close() 在 spawn-await 窗口里抢跑。
+      // 不能记 reject:cursor 的 prompt 发往**云端 chat**,子进程被 SIGKILL 之前可能已经把这一轮
+      // 提交给了服务端,说「确定拒绝」是假话。也不能记 dispatch:桥没 begin,`#onChildClose` 会因
+      // `turnChild !== child` 直接 return,**永远不会有结算事件来收它** —— 公开出去就是一个永挂
+      // dispatched 的幽灵轮次。ambiguous 正是为「别把『后端可能仍在跑』抹掉」设的那一档;
+      // 随后由 sessionClosed → finalizeSession 单个认领成 terminal_adopted → abandoned,
+      // 页面上恰好是「有过这么一轮,被关闭放弃了」。
+      vz(v => v.ambiguous(this.vizAttemptId, "closed_during_spawn"));
       if (this.status !== "closed" && child.exitCode === null && child.signalCode === null) {
         try { terminateProcessTree(child.pid, "SIGKILL"); } catch {}
       }
@@ -4675,6 +4973,14 @@ class CursorAgentSession {
     // 5. The process is live — the turn has begun. (No stdout/close can interleave before this: the
     //    spawn-await continuation is a microtask, ahead of any 'close' macrotask.)
     this.#beginTurn(turnId, child);
+    // 观测台:形状 B 唯一可用的证据是 child 的 `spawn` 事件 ⇒ boundary 只能是 `os_spawned`
+    // —— 它只证明**进程起来了**,不证明后端接受了这个 prompt(页面对这一档只能写
+    // 「已派发,等待后端输出」)。
+    // ⚠️ 公开时刻**不能**取在 spawn-await 刚 resolve 的那一行:它与 `#beginTurn` 之间隔着
+    //    抢跑关闭闸门,在那里 dispatch 会给一个**桥自己都不认**的轮次分配 turnNo,
+    //    而且再没有任何结算路径能收它。
+    // 放在这里,`turnId`(= `lastTurnOf().id`)已经落定,顺手绑上 —— 那是 collected 唯一的映射键。
+    vz(v => v.dispatch(this.vizAttemptId, { boundary: "os_spawned", backendTurnId: turnId }));
     if (injectSystem) this.appendSystemPending = false; // system instructions delivered on this committed turn
     this.#writePidRecord(winner.node, winner.args);
     appendLog(this.logFile, `[agent-bridge] spawned cursor turn pid=${child.pid} chatId=${this.chatId}\n`);
@@ -4735,6 +5041,25 @@ class CursorAgentSession {
       if (this.turn === turn) {
         this.userAborted = false;
         const err = new Error("cursor abort: turn process did not terminate; session blocked until it exits");
+        // 观测台:**这一档施工图之前漏了。** 源码注释自称 `#settleTurn` 是
+        // 「The ONE idempotent settlement point」,但 abort 超时的毒化分支是**手工结算**——
+        // 它自己 `this.turn=null` / `turnCount+=1` / `setSessionStatus(failed)` / `turn.reject(err)`,
+        // 完全绕开 `#settleTurn`。只挂 `#settleTurn` 的话,这一轮在 viz 上会永远停在 dispatched,
+        // 直到会话被 close 才被收成 abandoned —— 而它其实早就结束了,页面会长时间显示一个假的「仍在运行」。
+        // outcome 取 `failed` 而不是 `aborted`:桥自己对外报的就是 `status:"failed"` + `lastTurnError`。
+        // **viz 与桥的口径打架一次,这块表就没人信了。**
+        {
+          const a = vz(v => v.activeAttempt(this.id));
+          if (a) {
+            const vizBody = this.finalAnswer || this.lastAssistantText || "";
+            vz(v => v.settleOnce(a, {
+              outcome: "failed",
+              error: err.message,
+              body: vizBody || null,
+              bodyKind: vizBody ? "partial" : "none",
+            }));
+          }
+        }
         this.lastError = err.message;
         this.lastTurnError = true;
         this.turn = null;
@@ -4968,6 +5293,8 @@ class KimiCodeSession {
   }
 
   #beginTurn(turnId, child) {
+    // 「第 N 稿」是**每轮的**计数,不是会话累计。不在这里清零,页面上第二轮会从「第 7 稿」起步。
+    this._vizDrafts = 0;
     this.turnChild = child;
     this.currentTurnId = turnId;
     this.lastTurnId = turnId;
@@ -4987,6 +5314,28 @@ class KimiCodeSession {
   #settleTurn(err, status) {
     const turn = this.turn;
     if (!turn) return;
+    // 观测台:这个后端的结算点。挂在 `if (!turn) return` 那道幂等闸**之后** ——
+    // 挂之前会给一个已经结束的轮次再触发一次结算。
+    //
+    // ⚠️ **正文必须在这里同步抓,而且抓三级 fallback 的原件。**
+    //    canonical 正文是 `result()` 用的那串 fallback,而本函数下面几行会执行
+    //    `this.lastAssistantText = clampText(...)` —— `clampText` 是**保尾截头**。
+    //    挂到函数末尾再读,只要前几级为空(纯 delta 流、没有 final 消息的轮次),
+    //    拿到的就是**被砍掉开头的残件**,而快照还会照常算出 sha256、
+    //    宣称「这就是记录里的那一份」。
+    {
+      const a = vz(v => v.activeAttempt(this.id));
+      if (a) {
+        const vizBody = this.finalAnswer || this.lastAssistantText || "";
+        vz(v => v.settleOnce(a, {
+          outcome: err ? "failed" : "completed",
+          error: err ? err.message : null,
+          body: vizBody || null,
+          bodyKind: vizBody ? (err ? "partial" : "final") : "none",
+          backendTurnCount: this.turnCount + 1,
+        }));
+      }
+    }
     turn.settled = { err: err || null, status: status ?? null };
     this.lastTurnError = Boolean(err); // cleared to false on a clean turn / user abort
     this.turn = null;
@@ -5046,6 +5395,13 @@ class KimiCodeSession {
   #handleLine(line, child) {
     if (this.proc !== child) return; // ignore a stale child's late output
     if (!line.trim()) return;
+    // 观测台:`firstBackendEvent` 的落点。
+    // ⚠️ 必须在上一行那道**陈旧子进程闸**之后:一个被顶替的旧 child 的迟到输出若被记成
+    //    本轮「后端已开口」,恰好污染这个字段唯一要区分的两种卡死形态
+    //    (已派发但完全沉默 vs 已经在输出)。
+    // ⚠️ 也必须在空行过滤之后 —— 一个空 flush 就把「沉默」抹掉了。
+    // 放进 switch 的某个具体 case 则会漏掉 raw / 未知类型行,同样把沉默说成有输出。
+    if (this.vizAttemptId) vz(v => v.firstBackendEvent(this.vizAttemptId));
     const parsed = parseMessageLine(line);
     if (!parsed.ok) { appendLog(this.logFile, `${line}\n`); pushEvent(this, { type: "raw" }); return; }
     const msg = parsed.value;
@@ -5061,6 +5417,15 @@ class KimiCodeSession {
         if (typeof msg.content === "string" && msg.content) {
           this.finalAnswer = (this.finalAnswer || "") + msg.content; // accumulate the full answer (§5.6)
           this.lastAssistantText = clampText(this.finalAnswer);      // clamped tail for the progress view
+        // 观测台:kimi 的 assistant 是**逐块流式**,一轮可能几百上千次 —— 节流不在这里做,
+        // 在 writer 的合并槽里做(每路径最小写入间隔)。五个后端各自自律的话迟早有一处忘,
+        // 而它一旦漏进有界队列,一个正常跑着的轮次几百毫秒就能把队列打满 → queue_full →
+        // 页面挂出「本次记录不完整」。**观测把被观测者报成了病人。**
+        if (this.vizAttemptId) {
+          const full = this.lastAssistantText || "";
+          this._vizDrafts = (this._vizDrafts || 0) + 1;
+          vz(v => v.progress(this.vizAttemptId, { charCount: full.length, tail: full, generationCount: this._vizDrafts }));
+        }
         }
         if (Array.isArray(msg.tool_calls) && msg.tool_calls.length) {
           for (const tc of msg.tool_calls) pushEvent(this, compactEvent({ type: "tool_call", kind: tc?.function?.name }));
@@ -5115,9 +5480,31 @@ class KimiCodeSession {
     const promise = new Promise((resolve, reject) => { this.turn = { resolve, reject }; });
     this.turn.promise = promise;
     const myTurn = this.turn;
+    // 观测台:attempt 的落点(**不是** dispatch)。此刻三道拒绝闸已全部通过、turn 已被**同步**占住、
+    // `myTurn` 已固化 —— 攻击面最小的一刻。
+    // ⚠️ 放更早(send 第一行)会给已被 busy 闸拒掉的调用也造 attempt,那类本来就属于 rejected,
+    //    造了又立刻销毁是纯噪音;放更晚(compose/spawn 之后)则 `releaseUnbegun` 覆盖的三条前置失败
+    //    就没有 attempt 可 reject —— **spawn 失败在台账上会完全不存在**。
+    // ⚠️ 也必须早于 `releaseUnbegun` 的定义:那个闭包要引用它,否则 TDZ。
+    // 存到 this 上,是因为 `#handleLine` / `#settleTurn` 看不见 send 的局部变量。
+    this.vizAttemptId = vz(v => v.attempt({
+      sessionId: this.id,
+      input: String(message),
+      source: options.source ?? "send_message",
+      blocking: !!options.wait,
+      hasSchema: false,
+    })) ?? null;
     this.userAborted = false;
     promise.catch(() => {}); // pre-attach so an early rejection can't crash the server
     const releaseUnbegun = err => {
+      // 观测台:这个后端**全部**「确定拒绝」都收敛在这一个闭包上,共三条调用路径——
+      //   ① launcher 解析 / 参数构造 / 命令行长度断言 抛;② `spawn()` **同步**抛(E2BIG);
+      //   ③ `if (!child)`(含 ENOENT 重试耗尽)。
+      // 三条的共同事实是**没有任何进程跑起来过** ⇒ 确定拒绝,不是歧义。
+      // 挂在这里,判据是**结构化的控制流**,不需要匹配 err.message。
+      // 改成在三个 throw 点各挂一次就是一张会漏的清单;挂到 send 的外层 try/catch 又会把
+      // 「已 begun 之后 wait 超时」那类也吞进来,把一个真跑过的轮次说成从未派发。
+      vz(v => v.reject(this.vizAttemptId, err));
       this.lastError = err.message;
       this.userAborted = false; // [review M3] clear any pending abort so it can't leak into the next turn
       if (this.turn === myTurn) {
@@ -5176,6 +5563,12 @@ class KimiCodeSession {
     // this.proc or re-kill here — close() already killed this exact child and scheduled a force-kill whose
     // verifier keys on this.proc===child; the child's own close handler nulls this.proc.
     if (this.status === "closed" || this.turn !== myTurn) {
+      // 观测台:**唯一**一条「进程确实起来了(spawn 事件已 resolve),但桥故意不 begin 这一轮」——
+      // 流水线化的 close() 在 spawn-await 窗口里抢跑。
+      // 与 cursor 同形,但**歧义弱得多**:kimi 是纯本地、session id 由它首轮自己铸,此刻还没铸出来,
+      // 没有任何东西被提交到远端。判据仍取 ambiguous 而非 reject —— 进程确实起来过,
+      // 它在被杀之前有没有发出请求,我们**看不到**。宁可说「不知道」,不说「确定没发生」。
+      vz(v => v.ambiguous(this.vizAttemptId, "closed_during_spawn"));
       if (this.status !== "closed" && child.exitCode === null && child.signalCode === null) {
         try { terminateProcessTree(child.pid, "SIGKILL"); } catch {}
       }
@@ -5187,6 +5580,14 @@ class KimiCodeSession {
     // 5. The process is live — the turn has begun. (No stdout/close can interleave before this: the
     //    spawn-await continuation is a microtask, ahead of any 'close' macrotask.)
     this.#beginTurn(turnId, child);
+    // 观测台:形状 B 唯一可用的证据是 child 的 `spawn` 事件 ⇒ boundary 只能是 `os_spawned`
+    // —— 它只证明**进程起来了**,不证明后端接受了这个 prompt(页面对这一档只能写
+    // 「已派发,等待后端输出」)。
+    // ⚠️ 公开时刻**不能**取在 spawn-await 刚 resolve 的那一行:它与 `#beginTurn` 之间隔着
+    //    抢跑关闭闸门,在那里 dispatch 会给一个**桥自己都不认**的轮次分配 turnNo,
+    //    而且再没有任何结算路径能收它。
+    // 放在这里,`turnId`(= `lastTurnOf().id`)已经落定,顺手绑上 —— 那是 collected 唯一的映射键。
+    vz(v => v.dispatch(this.vizAttemptId, { boundary: "os_spawned", backendTurnId: turnId }));
     if (injectSystem) this.appendSystemPending = false; // system instructions delivered on this committed turn
     this.#writePidRecord(winner.bin, winner.args);
     appendLog(this.logFile, `[agent-bridge] spawned kimi turn pid=${child.pid} chatId=${this.chatId || "(first turn)"}\n`);
@@ -5261,6 +5662,25 @@ class KimiCodeSession {
       if (this.turn === turn) {
         this.userAborted = false;
         const err = new Error("kimi abort: turn process did not terminate; session blocked until it exits");
+        // 观测台:**这一档施工图之前漏了。** 源码注释自称 `#settleTurn` 是
+        // 「The ONE idempotent settlement point」,但 abort 超时的毒化分支是**手工结算**——
+        // 它自己 `this.turn=null` / `turnCount+=1` / `setSessionStatus(failed)` / `turn.reject(err)`,
+        // 完全绕开 `#settleTurn`。只挂 `#settleTurn` 的话,这一轮在 viz 上会永远停在 dispatched,
+        // 直到会话被 close 才被收成 abandoned —— 而它其实早就结束了,页面会长时间显示一个假的「仍在运行」。
+        // outcome 取 `failed` 而不是 `aborted`:桥自己对外报的就是 `status:"failed"` + `lastTurnError`。
+        // **viz 与桥的口径打架一次,这块表就没人信了。**
+        {
+          const a = vz(v => v.activeAttempt(this.id));
+          if (a) {
+            const vizBody = this.finalAnswer || this.lastAssistantText || "";
+            vz(v => v.settleOnce(a, {
+              outcome: "failed",
+              error: err.message,
+              body: vizBody || null,
+              bodyKind: vizBody ? "partial" : "none",
+            }));
+          }
+        }
         this.lastError = err.message;
         this.lastTurnError = true;
         this.turn = null;
