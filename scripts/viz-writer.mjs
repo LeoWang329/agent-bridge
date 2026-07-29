@@ -50,6 +50,9 @@ const TAIL_CHARS = 400;
  */
 const PROGRESS_MIN_MS = 400;
 
+/** 正文供体的硬顶。再等下去就是让观测拖住桥。 */
+const BODY_PROVIDER_MAX_MS = 2000;
+
 /** 快照写失败后的自动重试：间隔与连续次数上限。
  *  ⚠️ 有上限是因为磁盘真坏掉时不该一直烧 IO；再有新里程碑会重新开始计数。 */
 const SNAPSHOT_RETRY_MS = 250;
@@ -439,6 +442,10 @@ function disabledRecorder(reason) {
     adoptByTerminal: () => null, firstBackendEvent: noop, progress: noop,
     settleOnce: () => Promise.resolve(), collected: noop, bindBackendTurnId: noop,
     finalizeSession: noop, sealAndStop: noop, cleanup: noop,
+    // ⚠️ 这几个也必须在场。桥会无条件调它们；少一个,**关掉观测就等于当场崩掉桥**——
+    //    而"关掉观测"是默认路径。
+    activeAttempt: () => null, rpcRegister: noop, rpcTake: () => null,
+    rpcDrainSession: () => 0, markSessionTerminal: noop,
     snapshot: () => null, _writer: null, _ledger: null,
   };
 }
@@ -589,7 +596,7 @@ class VizRecorder {
         contextUsage: this.#mapContextUsage(info.contextUsage),
         createdAt: at, updatedAt: at,
         openFailed: null, closed: null,
-        turns: [], attempts: [], turnSeq: 0,
+        turns: [], attempts: [], turnSeq: 0, activeAttemptId: null,
       });
       this.#markDirty();
     });
@@ -682,6 +689,12 @@ class VizRecorder {
       };
       this.#ledger.attempts.set(a.id, a);
       s.attempts.push(a);
+      // ⚠️ **会话级的"当前 attempt"**。没有它，`firstBackendEvent` / `progress` /
+      //    OMP 的 `agent_end` / `abort` 这些**拿不到 attemptId 的调用点**就没法接线:
+      //    它们各自所在的函数(通知处理器、事件分发)没有 send() 的闭包,
+      //    而 `pendingRpc` 在 ACK 之后就被删了。
+      //    桥侧因此只需要传 sessionId,由这里解析——**别让五个后端各自去想办法存这个 id**。
+      s.activeAttemptId = a.id;
       return a.id;
     });
   }
@@ -771,6 +784,83 @@ class VizRecorder {
       // 没有任何 ACK 可依,证据只有"后到的终结事件" → boundary 必须如实是 terminal_adopted。
       const vizTurnId = this.dispatch(attempt.id, { boundary: "terminal_adopted" });
       return vizTurnId ? attempt.id : null;
+    });
+  }
+
+  /**
+   * 把 sessionId 解析成「这个会话当前那个 attempt」。
+   *
+   * 给**拿不到 attemptId 的调用点**用（通知处理器、事件分发、abort）。
+   * 已经 settled 的不再返回——否则一条迟到的事件会打到上一轮头上。
+   */
+  activeAttempt(sessionId) {
+    return this.#safe(() => {
+      const s = this.#ledger.session(sessionId);
+      if (!s?.activeAttemptId) return null;
+      const a = this.#ledger.attempts.get(s.activeAttemptId);
+      if (!a || a.state === "settled" || a.state === "rejected") return null;
+      return a.id;
+    });
+  }
+
+  // ── OMP 的 pendingRpc 观测映射 ────────────────────────────────────────
+  //
+  // ⚠️ **只暴露方法，不暴露那张 Map。** 直接把 `_ledger.pendingRpc` 交给桥去 set/delete，
+  //    就等于把「观测绝不影响桥」这条边界的执行责任推给调用方——而且 disabled recorder
+  //    根本没有 `_ledger`（是 null），照那个写法接线会在关闭观测时**当场崩掉桥**。
+  //    这三个方法在 disabled 时是安全 no-op。
+
+  rpcRegister(sessionId, requestId, attemptId) {
+    return this.#safe(() => { this.#ledger.pendingRpc.set(`${sessionId} ${requestId}`, attemptId); });
+  }
+
+  /** 取出并**删除**——五类出口都调它，重复调用是安全的。 */
+  rpcTake(sessionId, requestId) {
+    return this.#safe(() => {
+      const k = `${sessionId} ${requestId}`;
+      const v = this.#ledger.pendingRpc.get(k) ?? null;
+      this.#ledger.pendingRpc.delete(k);
+      return v;
+    });
+  }
+
+  /**
+   * 批量清一个会话的残留映射（进程崩 / `#markUnresponsive` / close 走这里）。
+   * 每个还挂着的 attempt 一律转 `ambiguous`——**超时或断链不等于后端没接受**。
+   */
+  rpcDrainSession(sessionId, reason) {
+    return this.#safe(() => {
+      const prefix = `${sessionId} `;
+      const drained = [];
+      for (const k of [...this.#ledger.pendingRpc.keys()]) {
+        if (!k.startsWith(prefix)) continue;
+        drained.push(this.#ledger.pendingRpc.get(k));
+        this.#ledger.pendingRpc.delete(k);
+      }
+      for (const id of drained) this.ambiguous(id, reason);
+      return drained.length;
+    });
+  }
+
+  /**
+   * 会话进入终态（后端崩了 / RPC 静默超时 / stdin 断了）时的收口。
+   *
+   * ⚠️ **和 `finalizeSession()` 不是一回事，混用会静默改写事实。**
+   *    `finalizeSession` 把在途轮次收成 `abandoned`（"会话被关掉，这轮从中间截断了"），
+   *    而后端崩掉时事实是 `failed`。PLAN 原本指望一个 poller 去补这个差别，
+   *    但退出期**没有下一拍**——poller 补不上，`abandoned` 就会顶替 `failed` 写进记录。
+   *    所以由调用方**当场说清楚**是哪一种，不靠事后推断。
+   */
+  markSessionTerminal(sessionId, { outcome = "failed", error = null } = {}) {
+    return this.#safe(() => {
+      const s = this.#ledger.session(sessionId);
+      if (!s) return;
+      this.rpcDrainSession(sessionId, error || outcome);
+      const { attempt: amb } = this.#ledger.claimableAmbiguous(sessionId);
+      if (amb) this.dispatch(amb.id, { boundary: "terminal_adopted" });
+      for (const a of s.turns) {
+        if (a.state === "dispatched") this.settleOnce(a.id, { outcome, error, body: null, bodyKind: "none" });
+      }
     });
   }
 
@@ -875,7 +965,34 @@ class VizRecorder {
     return a.settlePromise;
   }
 
-  async #doSettle(a, result) {
+  /**
+   * 正文可以是一个**函数**（可返回 Promise）。
+   *
+   * ⚠️ 这不违反「settleOnce 必须同步转移」——**同步的是状态转移，不是正文**。
+   *    `dispatched → settling` 已经在 `settleOnce()` 里同步完成了，护栏没松；
+   *    这里只是允许调用方晚一点交出正文。
+   *    OMP 需要它：`agent_end` 可能先于最后一条 `message_update` 到达，
+   *    要宽限一小会儿才能救回尾部。硬顶 2 秒——**再等下去就是让观测拖住桥**。
+   */
+  async #resolveBody(result) {
+    if (typeof result.body !== "function") return result;
+    let body = null;
+    try {
+      body = await Promise.race([
+        Promise.resolve().then(() => result.body()),
+        new Promise(r => setTimeout(() => r(undefined), BODY_PROVIDER_MAX_MS)),
+      ]);
+    } catch (err) { this.#diag("body_provider_error", err); }
+    // 供体超时或抛错 ⇒ 当作"没有正文"，**绝不因此改动 outcome**：
+    // 后端确实完成了，只是我们没记下来（STATE.md §4.9 的 completed + none）。
+    if (body === undefined || body === null) {
+      return { ...result, body: null, bodyKind: "none", output: { error: "write_failed" } };
+    }
+    return { ...result, body };
+  }
+
+  async #doSettle(a, rawResult) {
+    const result = await this.#resolveBody(rawResult);
     return new Promise((resolve) => {
       try {
         const at = this.#now();
@@ -901,6 +1018,13 @@ class VizRecorder {
           a.bodyKind = "none";
           a.output.state = "missing"; a.output.ref = null; a.output.sha256 = null;
           a.output.chars = null; a.output.bytes = null;
+          // ⚠️ `completed + none` **只在 `output.error` 非空时合法**（STATE.md §4.9）——
+          //    「后端正常完成，但观测侧没记下来」。所以这一格必须带上原因码，
+          //    否则 writer 会自己造出一个连独立校验器都判非法的快照。
+          //    而它确实**就是**一次观测失败：后端完成了，我们手上没有正文。
+          const code = result.output?.error ?? (a.outcome === "completed" ? "write_failed" : null);
+          a.output.error = code;
+          if (code) this.#noteRecordingError(code);
           a.state = "settled";
           this.#markDirty();
           resolve(); return;

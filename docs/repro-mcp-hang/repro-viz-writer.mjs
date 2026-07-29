@@ -535,6 +535,113 @@ sect("S3a VizLedger 状态转移（零后端，纯单测）");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+sect("S1-N 接线面：桥真的接得上吗（graph 侦察挖出来的四个缺口）");
+
+{
+  await withTmp(async () => {
+    const rec = createVizRun({ bridgeVersion: "t", env: on() });
+    rec.sessionOpened({ sessionId: "n1", agent: "omp" });
+    const a = rec.attempt({ sessionId: "n1" });
+    // ⚠️ `firstBackendEvent` / `progress` / OMP 的 `agent_end` / `abort` 所在的函数
+    //    **没有 send() 的闭包**，而 pendingRpc 在 ACK 之后就删了。
+    //    没有这个解析口，那几个点根本接不上线。
+    ok("N1 sessionId → 当前 attempt 解析得到", rec.activeAttempt("n1") === a);
+    rec.dispatch(a, { boundary: "rpc_ack" });
+    await rec.settleOnce(a, { outcome: "completed", body: "x", bodyKind: "final" });
+    await settleIo(rec);
+    ok("N1 已结算的不再被解析出来（迟到事件不许打到上一轮头上）", rec.activeAttempt("n1") === null);
+    rec.cleanup();
+  });
+
+  await withTmp(async () => {
+    const rec = createVizRun({ bridgeVersion: "t", env: on() });
+    rec.sessionOpened({ sessionId: "n2", agent: "omp" });
+    const a = rec.attempt({ sessionId: "n2" });
+    const b = rec.attempt({ sessionId: "n2" });
+    rec.rpcRegister("n2", 11, a);
+    rec.rpcRegister("n2", 12, b);
+    ok("N2 rpcTake 取出并删除（重复取是安全的）",
+      rec.rpcTake("n2", 11) === a && rec.rpcTake("n2", 11) === null);
+    // 批量清理：进程崩 / #markUnresponsive / close 走这条。
+    // 每个还挂着的一律转 ambiguous —— **超时或断链不等于后端没接受**。
+    ok("N2 rpcDrainSession 清干净并把残留转 ambiguous",
+      rec.rpcDrainSession("n2", "后端崩了") === 1
+      && rec._ledger.pendingRpc.size === 0
+      && rec._ledger.attempts.get(b).state === "ambiguous");
+    rec.cleanup();
+  });
+
+  await withTmp(async () => {
+    const rec = createVizRun({ bridgeVersion: "t", env: on() });
+    rec.sessionOpened({ sessionId: "n3", agent: "omp" });
+    const a = rec.attempt({ sessionId: "n3" });
+    rec.dispatch(a, { boundary: "rpc_ack" });
+    // ⚠️ 后端崩掉时事实是 `failed`，不是 `abandoned`。PLAN 原指望一个 poller 补这个差别，
+    //    但退出期**没有下一拍**——补不上，abandoned 就会顶替 failed 写进记录。
+    rec.markSessionTerminal("n3", { outcome: "failed", error: "OMP 进程意外退出 code=1" });
+    await settleIo(rec);
+    const t = turnsOf(latest(rec.dir), "n3")[0];
+    ok("N3 后端终态收成 failed 而不是 abandoned",
+      t.outcome === "failed" && /意外退出/.test(t.error || ""), JSON.stringify({ o: t.outcome, e: t.error }));
+    rec.cleanup();
+  });
+
+  await withTmp(async () => {
+    const rec = createVizRun({ bridgeVersion: "t", env: on() });
+    rec.sessionOpened({ sessionId: "n4", agent: "omp" });
+    // 两阶段正文：**同步转移状态，异步交正文**（OMP 的 250ms 宽限救尾巴）。
+    const a = rec.attempt({ sessionId: "n4" });
+    rec.dispatch(a, { boundary: "rpc_ack" });
+    let late = "早到的一半";
+    const p = rec.settleOnce(a, {
+      outcome: "completed", bodyKind: "final",
+      body: async () => { await sleep(120); return late; },
+    });
+    // 供体还没返回，但状态**已经**同步转过去了——护栏没松。
+    ok("N4 供体在途时状态已同步转出 dispatched",
+      rec._ledger.attempts.get(a).state === "settling");
+    late = "早到的一半 + 迟到的尾巴";
+    await p; await settleIo(rec);
+    const t = turnsOf(latest(rec.dir), "n4")[0];
+    const body = fs.readFileSync(path.join(rec.dir, t.output.ref), "utf8");
+    ok("N4 落盘的是供体最终交出的那一份（尾巴救回来了）",
+      body === "早到的一半 + 迟到的尾巴", body);
+    rec.cleanup();
+  });
+
+  await withTmp(async () => {
+    const rec = createVizRun({ bridgeVersion: "t", env: on() });
+    rec.sessionOpened({ sessionId: "n5", agent: "omp" });
+    const a = rec.attempt({ sessionId: "n5" });
+    rec.dispatch(a, { boundary: "rpc_ack" });
+    // 供体永不 resolve —— **绝不能让观测拖住桥**。
+    const t0 = Date.now();
+    await rec.settleOnce(a, { outcome: "completed", bodyKind: "final", body: () => new Promise(() => {}) });
+    await settleIo(rec);
+    const t = turnsOf(latest(rec.dir), "n5")[0];
+    ok("N5 供体挂死时有硬顶（不超过 ~2.5s 就收口）", Date.now() - t0 < 2500, `${Date.now() - t0}ms`);
+    // ⚠️ 供体挂了**绝不改动 outcome**：后端确实完成了，只是我们没记下来。
+    ok("N5 outcome 保持 completed，降级只体现在 bodyKind/error 上",
+      t.outcome === "completed" && t.bodyKind === "none" && t.output.error === "write_failed",
+      JSON.stringify({ o: t.outcome, b: t.bodyKind, e: t.output.error }));
+    ok("N5 且这是 §4.9 里 completed+none 唯一合法的形态（error 非空 + degraded）",
+      latest(rec.dir).run.degraded === true);
+    rec.cleanup();
+  });
+
+  {
+    // 关掉观测是**默认路径**。桥会无条件调这些方法——少一个就是当场崩桥。
+    const off = createVizRun({ bridgeVersion: "t", env: {} });
+    let threw = null;
+    try {
+      off.activeAttempt("x"); off.rpcRegister("x", 1, "y"); off.rpcTake("x", 1);
+      off.rpcDrainSession("x", "r"); off.markSessionTerminal("x", { outcome: "failed" });
+    } catch (e) { threw = e; }
+    ok("N6 disabled recorder 上这五个新方法全在且不抛", threw === null, String(threw));
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 sect("S1-P 进度通道：高频不该把健康会话报成故障");
 
 {
