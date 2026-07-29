@@ -743,6 +743,13 @@ class VizRecorder {
       //    它们各自所在的函数(通知处理器、事件分发)没有 send() 的闭包,
       //    而 `pendingRpc` 在 ACK 之后就被删了。
       //    桥侧因此只需要传 sessionId,由这里解析——**别让五个后端各自去想办法存这个 id**。
+      // ⚠️ **记住被顶掉的那个。** 一个 attempt 完全可能刚建出来就被 reject
+      //    （最常见：并发 send 撞上 busy 闸）。它注定永不公开，却已经把
+      //    `activeAttemptId` 换成了自己 —— 于是**真正在跑的那一轮失去了结算坐标**：
+      //    它的 `agent_end` 查 `activeAttempt()` 得到 null，桥正常完成了，
+      //    而页面上它一直是 dispatched，关会话时又被记成 abandoned。
+      //    所以 `reject()` 必须能把指针还回去。
+      a.prevActiveAttemptId = s.activeAttemptId ?? null;
       s.activeAttemptId = a.id;
       return a.id;
     });
@@ -788,7 +795,14 @@ class VizRecorder {
       a.state = "rejected"; a.error = boundError(reason);
       this.#ledger.attempts.delete(attemptId);
       const s = this.#ledger.session(a.sessionId);
-      if (s) s.attempts = s.attempts.filter(x => x !== a);
+      if (s) {
+        s.attempts = s.attempts.filter(x => x !== a);
+        // **把「当前 attempt」还给它顶掉的那个。** 见 `attempt()` 里的说明:
+        // 不还回去,一次被 busy 闸拒掉的并发 send 就会让真正在跑的那一轮
+        // 永远结算不了。只在指针确实还指着自己时还——中间若已有更新的 attempt
+        // 接手,那是它的位置,不该被一个更早的 reject 抢回来。
+        if (s.activeAttemptId === a.id) s.activeAttemptId = a.prevActiveAttemptId ?? null;
+      }
       // **不 markDirty**:它从来没公开过,快照里本来就没有它。
     });
   }
@@ -900,15 +914,27 @@ class VizRecorder {
    *    但退出期**没有下一拍**——poller 补不上，`abandoned` 就会顶替 `failed` 写进记录。
    *    所以由调用方**当场说清楚**是哪一种，不靠事后推断。
    */
-  markSessionTerminal(sessionId, { outcome = "failed", error = null } = {}) {
+  markSessionTerminal(sessionId, { outcome = "failed", error = null, body = null, bodyKind = "none" } = {}) {
     return this.#safe(() => {
       const s = this.#ledger.session(sessionId);
       if (!s) return;
       this.rpcDrainSession(sessionId, error || outcome);
       const { attempt: amb } = this.#ledger.claimableAmbiguous(sessionId);
       if (amb) this.dispatch(amb.id, { boundary: "terminal_adopted" });
+      // ⚠️ **正文只归当前那一轮**（`activeAttemptId`）。后端崩掉时调用方手上那截流式正文
+      //    属于正在跑的那个 attempt；一视同仁地写给每个 dispatched 轮次，就是把一轮的产出
+      //    复制到另一轮头上——**比丢掉更糟**：丢掉是缺数据，复制是假数据。
+      //    （给不给正文由调用方决定：后端崩了那一刻，"刚才流出来的是什么"只有它知道，
+      //      而观测侧一次 RPC 都不许发，事后补不回来。）
+      const activeId = s.activeAttemptId ?? null;
       for (const a of s.turns) {
-        if (a.state === "dispatched") this.settleOnce(a.id, { outcome, error, body: null, bodyKind: "none" });
+        if (a.state !== "dispatched") continue;
+        const mine = Boolean(body) && a.id === activeId;
+        this.settleOnce(a.id, {
+          outcome, error,
+          body: mine ? body : null,
+          bodyKind: mine ? bodyKind : "none",
+        });
       }
     });
   }
@@ -1080,9 +1106,19 @@ class VizRecorder {
         a.settledAt = at;
         // ⚠️ 归一化必须在**任何**分支之前：下面每一条路径都会读 `a.outcome` / `kind`，
         //    放到某一条分支里就等于只归一了那一条。
+        // ⚠️ `bodyKind` 也允许是**函数**，入参是最终到手的正文。理由与正文晚交同源：
+        //    正文可以晚 250ms 才交（见 `#resolveBody`），那么「这份正文算不算最终答复」
+        //    这个判断也只能等正文到手再做——宽限期里流进来的字可能恰好把它推过后端的
+        //    截断上限。结算那一瞬间先把 kind 定死，就会拿一份被砍掉开头的残件宣称 `final`。
+        //    抛错按「没标」处理，绝不因此改动 outcome（§4.9）。
+        let rawKind = result.bodyKind;
+        if (typeof rawKind === "function") {
+          try { rawKind = rawKind(result.body); }
+          catch (err) { this.#diag("body_kind_provider_error", err); rawKind = undefined; }
+        }
         const norm = normalizeOutcomeKind(
           result.outcome ?? "failed",
-          result.bodyKind ?? (result.body ? "final" : "none"));
+          rawKind ?? (result.body ? "final" : "none"));
         a.outcome = norm.outcome;
         a.error = boundError(result.error ?? null);
         if (result.backendTurnCount !== undefined) a.backendTurnCount = safeCount(result.backendTurnCount);

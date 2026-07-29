@@ -1394,6 +1394,11 @@ const DELIVERED_TURN = Symbol("agent-bridge.deliveredTurn");
 //    所以所有插桩一律走 `vz()`,不许在别处直接碰 `viz`。
 let viz = null;
 
+/** 观测侧的诊断行。**只进内存,不落盘**——理由见 `createVizRun` 的 `onDiagnostic`。
+ *  退出时随 shutdown 那一行一起写出去;满了丢新的(先发生的更接近根因)。 */
+const VIZ_DIAG_MAX = 16;
+const vizDiagnostics = [];
+
 /**
  * 唯一的观测调用入口。**同步、不抛、不阻塞核心。**
  *
@@ -1412,6 +1417,23 @@ function vz(fn) {
     if (r && typeof r.then === "function") { r.catch(() => {}); return undefined; }
     return r;
   } catch { return undefined; }
+}
+
+/** 这份正文算不算「完整的最终答复」。**五个后端共用一处,别在结算点各写各的三元式。**
+ *
+ *  两件事会让它降级成 partial:
+ *  1. **收场本身不是 completed** —— 被打断/失败的那一轮,手上这截按定义就不是最终答复。
+ *  2. **正文撞上了 `MAX_TEXT`** —— 五个后端的 `lastAssistantText` 都过 `clampText`,而
+ *     `clampText` **砍的是开头**、砍完恰好剩 `MAX_TEXT` 个字符。所以 `length >= MAX_TEXT`
+ *     就是「这是个残件」的唯一可判信号。
+ *
+ *  ⚠️ 为什么观测不能像 `result()` 那样再去后端补全文:**观测侧一次 RPC 都不许发**(X9)。
+ *     桥自己补得回来,观测补不回来 —— 那就老实标 `partial`,而不是拿着残件宣称
+ *     「这就是最终答复」还附上 sha256。**能记多少是能力问题,标错是诚信问题。** */
+function vizBodyKind(text, outcome) {
+  if (!text) return "none";
+  if (outcome !== "completed") return "partial";
+  return text.length >= MAX_TEXT ? "partial" : "final";
 }
 
 /** `appendSystemPrompt` 到底是怎么注进去的(STATE.md §4.3 三档,**照抄源码枚举,不许自创**)。
@@ -2443,7 +2465,14 @@ class OmpRpcSession {
         // 观测台:stdin 断了 ⇒ 在途的这些轮次到底被后端收下没有,**无从得知** ⇒ ambiguous。
         // 说"确定拒绝"是假话(prompt 可能早就写进去了),说"已派发"也是假话。
         vz(v => v.rpcDrainSession(this.id, "stdin_error"));
-        vz(v => v.markSessionTerminal(this.id, { outcome: "failed" }));
+        // ⚠️ 把已经流出来的那截带上。sidecar 在结算时就被删了，**这是最后一次机会**——
+        //    后端已经死了，观测侧又不许发 RPC，不在这儿交出去就永远没有了。
+        //    而「后端崩之前它说到哪儿」往往正是排障要看的第一样东西。
+        vz(v => v.markSessionTerminal(this.id, {
+          outcome: "failed",
+          body: this.lastAssistantText || null,
+          bodyKind: vizBodyKind(this.lastAssistantText || "", "failed"),
+        }));
         this.readyReject?.(err);
         for (const pending of this.pending.values()) pending.reject(err);
         this.pending.clear();
@@ -2475,7 +2504,14 @@ class OmpRpcSession {
       if (this.turnStartedAt && !this.turnEndedAt) this.turnEndedAt = nowIso();
       setSessionStatus(this, "failed", false, { source: "process_error", error: err.message });
       vz(v => v.rpcDrainSession(this.id, "process_error"));
-      vz(v => v.markSessionTerminal(this.id, { outcome: "failed" }));
+      // ⚠️ 把已经流出来的那截带上。sidecar 在结算时就被删了，**这是最后一次机会**——
+      //    后端已经死了，观测侧又不许发 RPC，不在这儿交出去就永远没有了。
+      //    而「后端崩之前它说到哪儿」往往正是排障要看的第一样东西。
+      vz(v => v.markSessionTerminal(this.id, {
+        outcome: "failed",
+        body: this.lastAssistantText || null,
+        bodyKind: vizBodyKind(this.lastAssistantText || "", "failed"),
+      }));
       this.readyReject?.(err);
       for (const pending of this.pending.values()) pending.reject(err);
       this.pending.clear();
@@ -2501,7 +2537,14 @@ class OmpRpcSession {
       //    但那是"后端自己正常退出",不是"我们关的"——会话仍在 `sessions` 里、result() 还取得回。
       //    这里只说清在途轮次的归属:后端没了 ⇒ 它们再也不会有结果 ⇒ failed。
       vz(v => v.rpcDrainSession(this.id, "process_close"));
-      vz(v => v.markSessionTerminal(this.id, { outcome: "failed" }));
+      // ⚠️ 把已经流出来的那截带上。sidecar 在结算时就被删了，**这是最后一次机会**——
+      //    后端已经死了，观测侧又不许发 RPC，不在这儿交出去就永远没有了。
+      //    而「后端崩之前它说到哪儿」往往正是排障要看的第一样东西。
+      vz(v => v.markSessionTerminal(this.id, {
+        outcome: "failed",
+        body: this.lastAssistantText || null,
+        bodyKind: vizBodyKind(this.lastAssistantText || "", "failed"),
+      }));
       this.readyReject?.(new Error(this.lastError || "OMP RPC exited before ready."));
       for (const pending of this.pending.values()) pending.reject(new Error(this.lastError || "OMP RPC exited."));
       this.pending.clear();
@@ -2744,12 +2787,16 @@ class OmpRpcSession {
           vz(v => v.settleOnce(a, {
             outcome: errored ? "failed" : "completed",
             error: errored ? this.lastError : null,
-            bodyKind: errored ? "partial" : "final",
             backendTurnCount: this.turnGeneration,
             body: () => new Promise(r => {
               const t = setTimeout(() => r(this.lastAssistantText || ""), OMP_VIZ_SETTLE_GRACE_MS);
               t.unref?.();
             }),
+            // ⬆ 正文晚交，**那么「这份正文算不算最终答复」也只能晚判**：
+            //   嬽限期里还会流进来的字可能恰好把它推过 `MAX_TEXT`。
+            //   结算那一瞬间先把 bodyKind 定死，就会拿一份已经被保尾截掉开头的
+            //   残件宣称 `final`。writer 会把这个函数拿到的正文回传给它。
+            bodyKind: (text) => vizBodyKind(text, errored ? "failed" : "completed"),
           }));
         }
       }
@@ -2870,7 +2917,14 @@ class OmpRpcSession {
     vz(v => v.rpcDrainSession(this.id, "backend_unresponsive"));
     // 会话终态是「后端崩了」,不是「被关了」——说清楚,否则退出期 finalizeSession
     // 会把它们一律收成 abandoned,而 abandoned 的意思是"被我们打断的",两回事。
-    vz(v => v.markSessionTerminal(this.id, { outcome: "failed" }));
+    // ⚠️ 把已经流出来的那截带上。sidecar 在结算时就被删了，**这是最后一次机会**——
+    //    后端已经死了，观测侧又不许发 RPC，不在这儿交出去就永远没有了。
+    //    而「后端崩之前它说到哪儿」往往正是排障要看的第一样东西。
+    vz(v => v.markSessionTerminal(this.id, {
+      outcome: "failed",
+      body: this.lastAssistantText || null,
+      bodyKind: vizBodyKind(this.lastAssistantText || "", "failed"),
+    }));
     for (const pending of this.pending.values()) pending.reject(new Error(this.lastError));
     this.pending.clear();
     const pid = this.proc?.pid;
@@ -3039,7 +3093,7 @@ class OmpRpcSession {
         vz(v => v.settleOnce(a, {
           outcome: "aborted",
           body: partial || null,
-          bodyKind: partial ? "partial" : "none",
+          bodyKind: vizBodyKind(partial, "aborted"),
           backendTurnCount: this.turnGeneration,
         }));
       }
@@ -3133,6 +3187,12 @@ class OmpRpcSession {
     // `closed` 对象保持 null,而且那时会话仍在 sessions 里、result() 照样取得回。
     // ⚠️ 必须在 close 的**任何**实际拆除动作之前:writer 的 `sessionClosed()` 会顺带 finalizeSession,
     //    把仍在途的轮次收成 abandoned;放到后面,那些轮次已经被 reject 掉、连收都收不着了。
+    //
+    // ⚠️ **顺序:先 drain,再 sessionClosed。** prompt 已写出但 ACK 还没回来时关会话,
+    //    那个 attempt 还停在 `attempted` —— 而 `finalizeSession` 只收 `dispatched` 与 `ambiguous`,
+    //    **`attempted` 没有任何回收路径**。不先转成 ambiguous,这次调用就彻底不进快照:
+    //    页面上只剩一个已关闭的会话,而用户明明发过那条消息。
+    vz(v => v.rpcDrainSession(this.id, "closed_before_ack"));
     vz(v => v.sessionClosed(this.id, { reason: options.reason ?? "close", forced: !!options.forced }));
     this.dead = true;
     if (this.turnStartedAt && !this.turnEndedAt) this.turnEndedAt = nowIso();
@@ -3386,7 +3446,7 @@ class CodexAppServerSession {
           outcome: "failed",
           error: err instanceof Error ? err.message : String(err ?? ""),
           body: vizBody || null,
-          bodyKind: vizBody ? "partial" : "none",
+          bodyKind: vizBodyKind(vizBody, "failed"),
         }));
       }
     }
@@ -3596,11 +3656,19 @@ class CodexAppServerSession {
       const a = vz(v => v.activeAttempt(this.id));
       if (a) {
         const vizBody = this.finalAnswer || this.lastAgentMessage || this.lastAssistantText || "";
+        // ⚠️ **只看 `err` 会把「被打断」读成「完成」。** 用户主动 abort 走的是
+        //    `#settleTurn(null, "aborted")`（codex 端叫 `"interrupted"`）—— err 为空。
+        //    只按 err 映射，这一轮就被记成 `completed`，有正文时还盖上 `final`
+        //    （「这就是最终答复」），而桥对外报的是 aborted。
+        //    **viz 与桥的口径打架一次，这块表就没人信了。**
+        //    无正文时更坏：completed + none 会被 writer 当成「记录失败」，凭空点亮 degraded。
+        const vizAborted = status === "aborted" || status === "interrupted";
+        const vizOutcome = vizAborted ? "aborted" : (err ? "failed" : "completed");
         vz(v => v.settleOnce(a, {
-          outcome: err ? "failed" : "completed",
+          outcome: vizOutcome,
           error: err ? err.message : null,
           body: vizBody || null,
-          bodyKind: vizBody ? (err ? "partial" : "final") : "none",
+          bodyKind: vizBodyKind(vizBody, vizOutcome),
           backendTurnCount: this.turnCount + 1,
         }));
       }
@@ -3895,7 +3963,7 @@ class CodexAppServerSession {
         vz(v => v.settleOnce(a, {
           outcome: "aborted",
           body: vizBody || null,
-          bodyKind: vizBody ? "partial" : "none",
+          bodyKind: vizBodyKind(vizBody, "aborted"),
         }));
       }
     }
@@ -4157,11 +4225,19 @@ class ClaudeCodeSession {
       const a = vz(v => v.activeAttempt(this.id));
       if (a) {
         const vizBody = this.finalAnswer || this.lastAssistantText || "";
+        // ⚠️ **只看 `err` 会把「被打断」读成「完成」。** 用户主动 abort 走的是
+        //    `#settleTurn(null, "aborted")`（codex 端叫 `"interrupted"`）—— err 为空。
+        //    只按 err 映射，这一轮就被记成 `completed`，有正文时还盖上 `final`
+        //    （「这就是最终答复」），而桥对外报的是 aborted。
+        //    **viz 与桥的口径打架一次，这块表就没人信了。**
+        //    无正文时更坏：completed + none 会被 writer 当成「记录失败」，凭空点亮 degraded。
+        const vizAborted = status === "aborted" || status === "interrupted";
+        const vizOutcome = vizAborted ? "aborted" : (err ? "failed" : "completed");
         vz(v => v.settleOnce(a, {
-          outcome: err ? "failed" : "completed",
+          outcome: vizOutcome,
           error: err ? err.message : null,
           body: vizBody || null,
-          bodyKind: vizBody ? (err ? "partial" : "final") : "none",
+          bodyKind: vizBodyKind(vizBody, vizOutcome),
           backendTurnCount: this.turnCount + 1,
         }));
       }
@@ -4410,7 +4486,7 @@ class ClaudeCodeSession {
           outcome: "failed",
           error: err instanceof Error ? err.message : String(err ?? ""),
           body: vizBody || null,
-          bodyKind: vizBody ? "partial" : "none",
+          bodyKind: vizBodyKind(vizBody, "failed"),
         }));
       }
     }
@@ -4714,11 +4790,19 @@ class CursorAgentSession {
       const a = vz(v => v.activeAttempt(this.id));
       if (a) {
         const vizBody = this.finalAnswer || this.lastAssistantText || "";
+        // ⚠️ **只看 `err` 会把「被打断」读成「完成」。** 用户主动 abort 走的是
+        //    `#settleTurn(null, "aborted")`（codex 端叫 `"interrupted"`）—— err 为空。
+        //    只按 err 映射，这一轮就被记成 `completed`，有正文时还盖上 `final`
+        //    （「这就是最终答复」），而桥对外报的是 aborted。
+        //    **viz 与桥的口径打架一次，这块表就没人信了。**
+        //    无正文时更坏：completed + none 会被 writer 当成「记录失败」，凭空点亮 degraded。
+        const vizAborted = status === "aborted" || status === "interrupted";
+        const vizOutcome = vizAborted ? "aborted" : (err ? "failed" : "completed");
         vz(v => v.settleOnce(a, {
-          outcome: err ? "failed" : "completed",
+          outcome: vizOutcome,
           error: err ? err.message : null,
           body: vizBody || null,
-          bodyKind: vizBody ? (err ? "partial" : "final") : "none",
+          bodyKind: vizBodyKind(vizBody, vizOutcome),
           backendTurnCount: this.turnCount + 1,
         }));
       }
@@ -4962,6 +5046,12 @@ class CursorAgentSession {
       // 随后由 sessionClosed → finalizeSession 单个认领成 terminal_adopted → abandoned,
       // 页面上恰好是「有过这么一轮,被关闭放弃了」。
       vz(v => v.ambiguous(this.vizAttemptId, "closed_during_spawn"));
+      // ⚠️ **标完 ambiguous 还得再收一次口。** `sessionClosed()` 按 sessionId 幂等,
+      //    而这条路上 close() 是**抢跑**的 —— 它的 finalizeSession 早就跑过了,
+      //    那时这个 attempt 还是 `attempted`(被忽略),等它变成 ambiguous 已经没人来认领。
+      //    不补这一次,这次调用永远不进快照:进程真的起来过、prompt 可能真的发出去了,
+      //    而页面上什么都没有。
+      vz(v => v.finalizeSession(this.id));
       if (this.status !== "closed" && child.exitCode === null && child.signalCode === null) {
         try { terminateProcessTree(child.pid, "SIGKILL"); } catch {}
       }
@@ -5056,7 +5146,7 @@ class CursorAgentSession {
               outcome: "failed",
               error: err.message,
               body: vizBody || null,
-              bodyKind: vizBody ? "partial" : "none",
+              bodyKind: vizBodyKind(vizBody, "failed"),
             }));
           }
         }
@@ -5327,11 +5417,19 @@ class KimiCodeSession {
       const a = vz(v => v.activeAttempt(this.id));
       if (a) {
         const vizBody = this.finalAnswer || this.lastAssistantText || "";
+        // ⚠️ **只看 `err` 会把「被打断」读成「完成」。** 用户主动 abort 走的是
+        //    `#settleTurn(null, "aborted")`（codex 端叫 `"interrupted"`）—— err 为空。
+        //    只按 err 映射，这一轮就被记成 `completed`，有正文时还盖上 `final`
+        //    （「这就是最终答复」），而桥对外报的是 aborted。
+        //    **viz 与桥的口径打架一次，这块表就没人信了。**
+        //    无正文时更坏：completed + none 会被 writer 当成「记录失败」，凭空点亮 degraded。
+        const vizAborted = status === "aborted" || status === "interrupted";
+        const vizOutcome = vizAborted ? "aborted" : (err ? "failed" : "completed");
         vz(v => v.settleOnce(a, {
-          outcome: err ? "failed" : "completed",
+          outcome: vizOutcome,
           error: err ? err.message : null,
           body: vizBody || null,
-          bodyKind: vizBody ? (err ? "partial" : "final") : "none",
+          bodyKind: vizBodyKind(vizBody, vizOutcome),
           backendTurnCount: this.turnCount + 1,
         }));
       }
@@ -5569,6 +5667,12 @@ class KimiCodeSession {
       // 没有任何东西被提交到远端。判据仍取 ambiguous 而非 reject —— 进程确实起来过,
       // 它在被杀之前有没有发出请求,我们**看不到**。宁可说「不知道」,不说「确定没发生」。
       vz(v => v.ambiguous(this.vizAttemptId, "closed_during_spawn"));
+      // ⚠️ **标完 ambiguous 还得再收一次口。** `sessionClosed()` 按 sessionId 幂等,
+      //    而这条路上 close() 是**抢跑**的 —— 它的 finalizeSession 早就跑过了,
+      //    那时这个 attempt 还是 `attempted`(被忽略),等它变成 ambiguous 已经没人来认领。
+      //    不补这一次,这次调用永远不进快照:进程真的起来过、prompt 可能真的发出去了,
+      //    而页面上什么都没有。
+      vz(v => v.finalizeSession(this.id));
       if (this.status !== "closed" && child.exitCode === null && child.signalCode === null) {
         try { terminateProcessTree(child.pid, "SIGKILL"); } catch {}
       }
@@ -5677,7 +5781,7 @@ class KimiCodeSession {
               outcome: "failed",
               error: err.message,
               body: vizBody || null,
-              bodyKind: vizBody ? "partial" : "none",
+              bodyKind: vizBodyKind(vizBody, "failed"),
             }));
           }
         }
@@ -6699,11 +6803,17 @@ function serveMcp() {
     viz = createVizRun({
       bridgeVersion: BRIDGE_VERSION,
       env: process.env,
+      // ⚠️ **这里绝不能落盘。** 诊断回调是从 recorder 的 `#safe` catch 里叫出来的,
+      //    而那意味着它可能在**任何**核心路径上同步触发(`#settleTurn` / `#handleLine` / `close`)。
+      //    `appendLog` 是同步的(mkdirSync + renameSync + appendFileSync),同步文件写
+      //    **没有可执行的超时** —— Defender 或文件系统卡一下,事件循环就停在这里,
+      //    后面的 `turn.resolve/reject`、MCP 响应、调用方的 wait 全部推不动。
+      //    这正是本设计自己立的规矩:主动同步 IO 只允许出现在启动与退出两个边界。
+      //    所以这里只往一个**有界内存环**里记,退出时随 shutdown 那一行一起写出去
+      //    (那时本来就在做同步 appendLog,不新增暴露面)。
       onDiagnostic: (code, err) => {
-        try {
-          appendLog(path.join(RUN_LOG_DIR, "bridge.log"),
-            `[${nowIso()}] viz ${code}: ${err instanceof Error ? err.message : String(err ?? "")}\n`);
-        } catch {}
+        if (vizDiagnostics.length >= VIZ_DIAG_MAX) return;   // 满了丢新的:先发生的更接近根因
+        vizDiagnostics.push(`${nowIso()} ${code}: ${err instanceof Error ? err.message : String(err ?? "")}`.slice(0, 300));
       },
     });
   } catch { viz = null; }
@@ -6924,6 +7034,13 @@ function cleanupAndExit(code = 0, reason = "shutdown", error = null) {
     }, sessionStates))}\n`);
   } catch {}
   appendLog(path.join(RUN_LOG_DIR, "bridge.log"), `[${nowIso()}] Agent Bridge shutdown code=${code} reason=${reason}\n`);
+  // 观测侧攒的诊断在这里一次性写出去。放在退出边界是刻意的:热路径上一个字节都不写。
+  if (vizDiagnostics.length) {
+    try {
+      appendLog(path.join(RUN_LOG_DIR, "bridge.log"),
+        vizDiagnostics.map(l => `[viz] ${l}\n`).join(""));
+    } catch {}
+  }
   if (error) {
     process.stderr.write(`${reason}: ${error instanceof Error ? error.stack || error.message : String(error)}\n`);
   }

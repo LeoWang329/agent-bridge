@@ -1048,6 +1048,150 @@ sect("S1-X 交叉核对：writer 的真实产出必须过独立校验器");
   });
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+sect("S1-T 复审第 2 轮的收口：晚交的正文，标签也得晚判");
+
+const { checkVizDir: checkDirT } = await import(`file://${INVARIANTS}`);
+
+// 这一节钉住两条在复审第 2 轮才浮出来的合同,它们有一个共同的根:
+// **观测侧手上的正文,未必是后端产出的全部** —— 而"标错"比"记少"严重得多。
+{
+  // ── T1:`bodyKind` 允许是函数,入参就是最终到手的正文 ──────────────────────
+  // 为什么必须允许:OMP 的正文晚 250ms 才交(等最后一条 message_update)。
+  // 结算那一瞬间把 kind 定死,宽限期里流进来的字就再也影响不了它 ——
+  // 于是一份"其实还在长、最后被截断了"的正文,顶着结算瞬间算出的 `final` 落盘。
+  await withTmp(async () => {
+    const rec = createVizRun({ bridgeVersion: "t", env: on() });
+    rec.sessionOpened({ sessionId: "s1", agent: "omp" });
+    const a = rec.attempt({ sessionId: "s1", input: "x" });
+    rec.dispatch(a, { boundary: "rpc_ack" });
+
+    let release;
+    const slow = new Promise(r => { release = r; });
+    let sawBody = null;
+    rec.settleOnce(a, {
+      outcome: "completed",
+      body: () => slow,
+      bodyKind: (text) => { sawBody = text; return text.length >= 8 ? "partial" : "final"; },
+    });
+    release("这份正文已经超过阈值了");     // 长度 > 12 ⇒ 判据必须看见完整的它
+    await settleIo(rec);
+
+    const t = turnsOf(latest(rec.dir), "s1")[0];
+    ok("R-T1 ★ bodyKind 函数拿到的是**最终到手的正文**,不是结算瞬间的空值",
+      sawBody === "这份正文已经超过阈值了", JSON.stringify(sawBody));
+    ok("R-T1 ★ 晚判出来的 partial 真的落进了快照(没有被结算瞬间的值顶掉)",
+      t.bodyKind === "partial" && t.outcome === "completed",
+      JSON.stringify({ o: t.outcome, k: t.bodyKind }));
+    rec.cleanup();
+  });
+
+  // 短正文走同一条路 ⇒ final。**没有这一条,上面那条可以靠"永远返回 partial"作弊通过。**
+  await withTmp(async () => {
+    const rec = createVizRun({ bridgeVersion: "t", env: on() });
+    rec.sessionOpened({ sessionId: "s1", agent: "omp" });
+    const a = rec.attempt({ sessionId: "s1", input: "x" });
+    rec.dispatch(a, { boundary: "rpc_ack" });
+    rec.settleOnce(a, {
+      outcome: "completed",
+      body: () => Promise.resolve("短"),
+      bodyKind: (text) => (text.length >= 8 ? "partial" : "final"),
+    });
+    await settleIo(rec);
+    const t = turnsOf(latest(rec.dir), "s1")[0];
+    ok("R-T2 同一个判据在短正文上给出 final(证明上一条不是恒 partial 蒙对的)",
+      t.bodyKind === "final", JSON.stringify({ k: t.bodyKind }));
+    rec.cleanup();
+  });
+
+  // ── T3:判据函数抛错,按「没标」处理,**绝不因此改动 outcome** ─────────────
+  await withTmp(async () => {
+    const rec = createVizRun({ bridgeVersion: "t", env: on() });
+    rec.sessionOpened({ sessionId: "s1", agent: "omp" });
+    const a = rec.attempt({ sessionId: "s1", input: "x" });
+    rec.dispatch(a, { boundary: "rpc_ack" });
+    rec.settleOnce(a, {
+      outcome: "completed",
+      body: () => Promise.resolve("正文还在"),
+      bodyKind: () => { throw new Error("boom"); },
+    });
+    await settleIo(rec);
+    const t = turnsOf(latest(rec.dir), "s1")[0];
+    ok("R-T3 ★ 判据抛错不牵连 outcome(后端确实完成了,只是我们没标好)",
+      t.outcome === "completed", JSON.stringify({ o: t.outcome }));
+    ok("R-T3 抛错时退回默认判据(有正文 ⇒ final),正文本身不丢",
+      t.bodyKind === "final" && t.output.state === "ready",
+      JSON.stringify({ k: t.bodyKind, s: t.output.state }));
+    rec.cleanup();
+  });
+
+  // ── T4:后端崩了,已经流出来的那截必须留下,而且**只留给正在跑的那一轮** ────
+  // 为什么"只留给一轮"是硬要求:`markSessionTerminal` 会遍历所有 dispatched 轮次。
+  // 一视同仁地把同一段正文写给每一轮,就是**把一轮的产出复制到另一轮头上** ——
+  // 丢掉只是缺数据,复制是假数据,后者更难发现也更致命。
+  await withTmp(async () => {
+    const rec = createVizRun({ bridgeVersion: "t", env: on() });
+    rec.sessionOpened({ sessionId: "s1", agent: "omp", access: "read", cwd: "D:\repo" });
+    const a1 = rec.attempt({ sessionId: "s1", input: "第一问" });
+    rec.dispatch(a1, { boundary: "rpc_ack" });
+    const a2 = rec.attempt({ sessionId: "s1", input: "第二问" });   // a2 成为 activeAttempt
+    rec.dispatch(a2, { boundary: "rpc_ack" });
+
+    rec.markSessionTerminal("s1", {
+      outcome: "failed", error: "backend died",
+      body: "崩之前它说到这儿", bodyKind: "partial",
+    });
+    await settleIo(rec);
+
+    const ts = turnsOf(latest(rec.dir), "s1");
+    const t1 = ts.find(t => t.turnNo === 1), t2 = ts.find(t => t.turnNo === 2);
+    ok("R-T4 ★ 崩溃前流出来的那截留在了**正在跑的那一轮**上",
+      t2.bodyKind === "partial" && t2.output.state === "ready" && t2.outcome === "failed",
+      JSON.stringify({ o: t2.outcome, k: t2.bodyKind, s: t2.output.state }));
+    ok("R-T4 ★ 同一段正文**没有**被复制到另一轮头上(丢数据不可接受,假数据更不可接受)",
+      t1.bodyKind === "none" && t1.output.state === "missing" && t1.outcome === "failed",
+      JSON.stringify({ o: t1.outcome, k: t1.bodyKind, s: t1.output.state }));
+    ok("R-T4 两轮都被结算了(终态不能只收一半)",
+      t1.state === "settled" && t2.state === "settled");
+    const v = checkDirT(rec.dir);
+    ok("R-T4 ★ 终态目录通过独立校验器", v.violations.length === 0, JSON.stringify(v.violations));
+    rec.cleanup();
+  });
+
+  // ── T5:不给正文时,行为与从前一致(向后兼容,别把老路径改坏) ─────────────
+  await withTmp(async () => {
+    const rec = createVizRun({ bridgeVersion: "t", env: on() });
+    rec.sessionOpened({ sessionId: "s1", agent: "omp" });
+    const a = rec.attempt({ sessionId: "s1", input: "x" });
+    rec.dispatch(a, { boundary: "rpc_ack" });
+    rec.markSessionTerminal("s1", { outcome: "failed", error: "dead" });
+    await settleIo(rec);
+    const t = turnsOf(latest(rec.dir), "s1")[0];
+    ok("R-T5 不带正文的终态仍是 failed + none(老调用点不受影响)",
+      t.outcome === "failed" && t.bodyKind === "none" && t.state === "settled",
+      JSON.stringify({ o: t.outcome, k: t.bodyKind, st: t.state }));
+    rec.cleanup();
+  });
+
+  // ── T6:归一化对 `aborted` 生效 —— 中断的轮次不许自称 final ────────────────
+  // 桥侧现在按 `status` 优先映射 outcome(用户 abort 时 err 为空,只看 err 会记成 completed)。
+  // 万一某个结算点漏了这一步、传上来 aborted + final,writer 这道归一必须兜住。
+  await withTmp(async () => {
+    const rec = createVizRun({ bridgeVersion: "t", env: on() });
+    rec.sessionOpened({ sessionId: "s1", agent: "claude" });
+    const a = rec.attempt({ sessionId: "s1", input: "x" });
+    rec.dispatch(a, { boundary: "pipe_enqueued" });
+    rec.settleOnce(a, { outcome: "aborted", body: "被打断前写到这儿", bodyKind: "final" });
+    await settleIo(rec);
+    const t = turnsOf(latest(rec.dir), "s1")[0];
+    ok("R-T6 ★ aborted + final 被归一成 aborted + partial(§4.9 矩阵里 final 只配 completed)",
+      t.outcome === "aborted" && t.bodyKind === "partial",
+      JSON.stringify({ o: t.outcome, k: t.bodyKind }));
+    ok("R-T6 正文本身不丢(降的是标签,不是内容)", t.output.state === "ready");
+    rec.cleanup();
+  });
+}
+
 console.log(`\n========================================================`);
 console.log(`  repro-viz-writer: ${pass} passed, ${fail} failed`);
 console.log(`========================================================\n`);

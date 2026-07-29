@@ -10,7 +10,7 @@
 //
 // 跑法:node docs/repro-mcp-hang/repro-viz-bridge.mjs
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -134,7 +134,10 @@ await sleep(300);
 {
   const snap = snapshot(dir);
   const s = snap?.sessions?.find(x => x.sessionId === sid);
-  ok("V2 ★ 会话在 `start()` **之前**就已登记(否则启动失败的会话根本没有卡片)",
+  // ⚠️ 这句只证明"开完之后卡片在",**不**证明"登记发生在 start() 之前"——后端正常时
+  //    两种实现写出来的快照一模一样。那个更强的命题由 V5 用 `deafstart` 来考。
+  //    (原先这里挂着 ★ 说自己证了后者,是一句**不具判别力**的断言:插桩挪到 start() 之后它照样绿。)
+  ok("V2 会话开完后在快照里有卡片",
     !!s, JSON.stringify(snap?.sessions?.map(x => x.sessionId)));
   ok("V2 会话字段是逐字段白名单来的(agent/cwd/access 都在,且没有多余键)",
     s?.agent === "omp" && s?.cwd === ROOT && s?.access === "read");
@@ -232,85 +235,249 @@ ok("V4 桥干净退出", !!exited && exited.code === 0, JSON.stringify(exited));
 ok("V4 ★ 正常退出把整个 viz 目录删掉(里面是全量委托明文)", !fs.existsSync(dir), dir);
 
 // ═══════════════════════════════════════════════════════════════════════════
-sect("V5 换一个后端:证据档必须跟着换(claude ⇒ pipe_enqueued)");
+// 通用台架:起一个独立的桥进程(自带 TMPDIR/STATE 隔离)、开一个会话、跑一轮、把
+// 快照交回来。V5~V9 五段各要一个不同后端的真桥进程,**照抄五遍 MCP 客户端就等于
+// 维护一张会漏的清单**——本仓在"每处都记得改"上已经栽过好几次,不再重来一次。
+async function bridgeRun({ tag, env, agent, openArgs = {}, message = "问一句", waitMs = 25000 }) {
+  const tmp = path.join(BOX, `tmp-${tag}`);
+  const state = path.join(BOX, `state-${tag}`);
+  fs.mkdirSync(tmp, { recursive: true });
+  fs.mkdirSync(state, { recursive: true });
 
-// ⚠️ 这一段的价值不在"claude 也能跑",而在**证据强度不是全局常量**。
-//    OMP 有协议级 ACK ⇒ `rpc_ack`;claude 的 `#write` 是无 callback 的裸 stdin.write,
-//    只能证明「字节交给了管道」⇒ `pipe_enqueued`,页面对它只能写「已派发,等待后端输出」。
-//    两个后端都记成同一档,这个字段就退化成一句永远为真的废话。
-{
-  const TMP2 = path.join(BOX, "tmp2");
-  const STATE2 = path.join(BOX, "state2");
-  fs.mkdirSync(TMP2, { recursive: true });
-  fs.mkdirSync(STATE2, { recursive: true });
-  const FAKE_CLAUDE = path.join(HERE, process.platform === "win32" ? "fake-claude.cmd" : "fake-claude.sh");
-
-  const srv2 = spawn("node", [BRIDGE, "mcp"], {
+  const proc = spawn("node", [BRIDGE, "mcp"], {
     stdio: ["pipe", "pipe", "pipe"], windowsHide: true,
     env: {
       ...process.env,
-      AGENT_BRIDGE_STATE_DIR: STATE2,
-      CLAUDE_BIN: FAKE_CLAUDE,
-      FAKE_CLAUDE_MODE: "bigresult",
+      AGENT_BRIDGE_STATE_DIR: state,
       AGENT_BRIDGE_VIZ: "on",
-      TEMP: TMP2, TMP: TMP2, TMPDIR: TMP2,
+      TEMP: tmp, TMP: tmp, TMPDIR: tmp,
+      ...env,
     },
   });
-  let exited2 = null;
-  srv2.on("close", (c, s) => { exited2 = { code: c, signal: s }; });
-  srv2.stderr.on("data", d => process.stdout.write(`[srv2-stderr] ${d}`));
-  const resp2 = new Map();
-  let buf2 = "";
-  srv2.stdout.on("data", d => {
-    buf2 += d.toString();
+  let dead = null;
+  proc.on("close", (code, signal) => { dead = { code, signal }; });
+  proc.stderr.on("data", d => process.stdout.write(`[${tag}-stderr] ${d}`));
+  const resps = new Map();
+  let rbuf = "";
+  proc.stdout.on("data", d => {
+    rbuf += d.toString();
     let i;
-    while ((i = buf2.indexOf("\n")) >= 0) {
-      const line = buf2.slice(0, i).trim(); buf2 = buf2.slice(i + 1);
+    while ((i = rbuf.indexOf("\n")) >= 0) {
+      const line = rbuf.slice(0, i).trim(); rbuf = rbuf.slice(i + 1);
       if (!line) continue;
-      try { const m = JSON.parse(line); if (m && m.id !== undefined) resp2.set(m.id, m); } catch {}
+      try { const m = JSON.parse(line); if (m && m.id !== undefined) resps.set(m.id, m); } catch {}
     }
   });
-  let id2 = 1;
-  const call2 = async (name, args, ms = 30000) => {
-    const id = id2++;
-    srv2.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } }) + "\n");
+  let seq = 1;
+  const send = o => proc.stdin.write(JSON.stringify(o) + "\n");
+  // 工具调用失败时返回 `{ __error }`,而不是 null —— "开会话失败了"与"没收到响应"
+  // 是两件不同的事,混成同一个 null,V5 那段就没法证明它考的是前者。
+  const rcall = async (name, args, ms = 30000) => {
+    const id = seq++;
+    send({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } });
     const t0 = Date.now();
     while (Date.now() - t0 < ms) {
-      if (resp2.has(id)) { const t = resp2.get(id)?.result?.content?.[0]?.text; return t ? JSON.parse(t) : null; }
-      if (exited2) return null;
+      if (resps.has(id)) {
+        const r = resps.get(id);
+        if (r.error) return { __error: r.error.message || JSON.stringify(r.error) };
+        const t = r?.result?.content?.[0]?.text;
+        return t ? JSON.parse(t) : null;
+      }
+      if (dead) return null;
       await sleep(40);
     }
     return null;
   };
+  const stop = async () => {
+    try { proc.stdin.end(); } catch {}
+    for (let i = 0; i < 60 && !dead; i++) await sleep(100);
+    try { proc.kill("SIGKILL"); } catch {}
+  };
 
-  srv2.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: id2++, method: "initialize", params: {} }) + "\n");
+  send({ jsonrpc: "2.0", id: seq++, method: "initialize", params: {} });
   await sleep(500);
-  const hits2 = fs.readdirSync(TMP2).filter(n => n.startsWith("agent-bridge-viz-"));
-  const dir2 = hits2.length === 1 ? path.join(TMP2, hits2[0]) : null;
-  ok("V5 第二个桥进程有自己的 viz 目录(每个 run 一个,互不干扰)", !!dir2, hits2.join(","));
+  const hits = fs.readdirSync(tmp).filter(n => n.startsWith("agent-bridge-viz-"));
+  const rdir = hits.length === 1 ? path.join(tmp, hits[0]) : null;
+  if (!rdir) { await stop(); return { dir: null, hits, stop: async () => {} }; }
 
-  if (dir2) {
-    const o2 = await call2("agent_bridge_open_session", { agent: "claude", cwd: ROOT });
-    const sid2 = o2?.session?.id;
-    ok("V5 claude 会话开起来了", !!sid2, JSON.stringify(o2)?.slice(0, 200));
-    if (sid2) {
-      await call2("agent_bridge_send_message", { session_id: sid2, message: "问 claude" });
-      await call2("agent_bridge_wait", { session_ids: [sid2], mode: "all", timeout_ms: 20000 });
-      await sleep(500);
-      const snap2 = snapshot(dir2);
-      const t = snap2?.sessions?.find(x => x.sessionId === sid2)?.turns?.[0];
-      ok("V5 ★ claude 的派发证据是 `pipe_enqueued`,不是协议级的 rpc_ack",
-        t?.boundary === "pipe_enqueued", String(t?.boundary));
-      ok("V5 claude 轮次正常结算并留下正文",
-        t?.outcome === "completed" && t?.bodyKind === "final" && t?.output?.state === "ready",
-        JSON.stringify({ o: t?.outcome, k: t?.bodyKind, s: t?.output?.state }));
-      ok("V5 ★ claude 侧的目录同样通过独立校验器",
-        checkVizDir(dir2).violations.length === 0, JSON.stringify(checkVizDir(dir2).violations));
+  const opened = await rcall("agent_bridge_open_session", { agent, cwd: ROOT, ...openArgs });
+  const rsid = opened?.session?.id;
+  const openError = opened?.__error ?? (rsid ? null : JSON.stringify(opened)?.slice(0, 300) ?? "no response");
+  const pick = () => {
+    const snap = snapshot(rdir);
+    const sess = snap?.sessions?.find(x => (rsid ? x.sessionId === rsid : true)) ?? null;
+    return { snap, session: sess, turn: sess?.turns?.[0] ?? null };
+  };
+  if (!rsid) { await sleep(400); return { dir: rdir, sid: null, openError, call: rcall, pick, stop, ...pick() }; }
+
+  await rcall("agent_bridge_send_message", { session_id: rsid, message });
+  await rcall("agent_bridge_wait", { session_ids: [rsid], mode: "all", timeout_ms: waitMs });
+  await sleep(600);
+  return { dir: rdir, sid: rsid, openError: null, call: rcall, pick, stop, ...pick() };
+}
+
+/** 五个后端共用的一段收口断言:结算干净 + 整目录过独立校验器。 */
+function assertSettledAndValid(tag, r) {
+  ok(`${tag} 轮次正常结算并留下正文`,
+    r.turn?.outcome === "completed" && r.turn?.bodyKind === "final" && r.turn?.output?.state === "ready",
+    JSON.stringify({ o: r.turn?.outcome, k: r.turn?.bodyKind, s: r.turn?.output?.state }));
+  const v = checkVizDir(r.dir);
+  ok(`${tag} ★ 该后端产出的目录同样通过独立校验器`, v.violations.length === 0 && v.chosen !== null,
+    JSON.stringify(v.violations));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+sect("V5 起不来的会话也必须有卡片(open_session 失败 ⇒ openFailed)");
+
+// ⚠️ 这一段替换了原来那句「会话在 start() 之前就已登记」。
+//    那句断言**不具判别力**:后端正常时,登记早于还是晚于 `start()` 写出来的快照长得一样,
+//    把插桩挪到 `start()` 之后它照样绿。**能被这条断言杀死的实现,才值得写这条断言。**
+//    真正要证的是:**后端根本起不来的那一次,页面上也要有卡片**——那正是最需要看见它的时候。
+//
+//    用 `hang-bin`(进程正常起来、却永远不吐 `ready`)⇒ OMP 的 ready 等待超时 ⇒ `start` 阶段失败。
+//    ⚠️ 这里**不能**用 `FAKE_OMP_MODE=deafstart`:那个模式只对**请求**装聋,启动时照样
+//       `say({type:"ready"})`,于是 open_session 反而成功——第一版就是这么写的,两条断言当场变红。
+//       "名字听起来对"不等于"行为对",挑桩子要看它到底吐什么。
+{
+  const r = await bridgeRun({
+    tag: "deaf",
+    agent: "omp",
+    // 把 ready 超时从默认 45s 压到 2.5s:这一段考的是"超时之后留下什么",
+    // 不是"要等多久"。默认值会让整份回归多跑 45 秒,没人会长期忍受一个这么慢的闸门。
+    env: {
+      OMP_BIN: path.join(HERE, process.platform === "win32" ? "hang-bin.cmd" : "hang-bin.sh"),
+      AGENT_BRIDGE_OMP_READY_TIMEOUT_MS: "2500",
+    },
+    waitMs: 8000,
+  });
+  ok("V5 后端永远不吐 ready 时 open_session 确实失败了(否则这段考不到任何东西)",
+    !!r.openError, String(r.openError).slice(0, 200));
+  ok("V5 ★ 起不来的会话在快照里仍有卡片(登记发生在 start() 之前)",
+    !!r.session, JSON.stringify(r.snap?.sessions?.map(x => x.sessionId)));
+  ok("V5 ★ 卡片上写明是在哪一步倒下的(openFailed.phase=start)",
+    r.session?.openFailed?.phase === "start" && typeof r.session?.openFailed?.error === "string",
+    JSON.stringify(r.session?.openFailed));
+  ok("V5 这种会话没有轮次(start 都没过去,谈不上派发)",
+    (r.session?.turns?.length ?? 0) === 0, JSON.stringify(r.session?.turns));
+  const v = checkVizDir(r.dir);
+  ok("V5 open 失败的目录也通过独立校验器", v.violations.length === 0, JSON.stringify(v.violations));
+  await r.stop();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+sect("V6~V9 证据档必须跟着后端走,不是全局常量");
+
+// ⚠️ 这四段的价值不在"这些后端也能跑",而在**`boundary` 不是一句永远为真的废话**。
+//    OMP 有协议级 ACK ⇒ `rpc_ack`;codex 有 turn/start 的响应或 turn_started 通知
+//    ⇒ `turn_start_ack` / `turn_started_notification`;claude 的 `#write` 是无 callback 的
+//    裸 `stdin.write`,只能证明「字节交给了管道」⇒ `pipe_enqueued`;cursor/kimi 是形状 B,
+//    每轮短进程,只知道「进程起来了」⇒ `os_spawned`。
+//    后三档页面只能写「已派发,等待后端输出」——**四个后端都记成同一档,这个字段就废了**。
+//    (另外:cursor / kimi 的插桩此前从未被任何测试执行过,那里的笔误只能靠这里抓。)
+
+{
+  const r = await bridgeRun({
+    tag: "claude", agent: "claude",
+    env: {
+      CLAUDE_BIN: path.join(HERE, process.platform === "win32" ? "fake-claude.cmd" : "fake-claude.sh"),
+      FAKE_CLAUDE_MODE: "bigresult",
+    },
+  });
+  ok("V6 claude 会话开起来了", !!r.sid, String(r.openError).slice(0, 200));
+  ok("V6 ★ claude 的派发证据是 `pipe_enqueued`,不是协议级的 rpc_ack",
+    r.turn?.boundary === "pipe_enqueued", String(r.turn?.boundary));
+  assertSettledAndValid("V6", r);
+  await r.stop();
+}
+
+{
+  const r = await bridgeRun({
+    tag: "codex", agent: "codex",
+    env: { CODEX_BIN: path.join(HERE, process.platform === "win32" ? "fake-codex.cmd" : "fake-codex.sh") },
+  });
+  ok("V7 codex 会话开起来了", !!r.sid, String(r.openError).slice(0, 200));
+  // 两个值都合法:一次 stdout flush 可能把 turn_started 通知排在 turn/start 响应的续体之前。
+  // **写死其中一个就是把一场竞态钉成必然**,那种断言会在别人的机器上随机变红。
+  ok("V7 ★ codex 的派发证据是它自己那两档之一(turn_start_ack / turn_started_notification)",
+    r.turn?.boundary === "turn_start_ack" || r.turn?.boundary === "turn_started_notification",
+    String(r.turn?.boundary));
+  ok("V7 ★ codex 绑上了后端自己的轮次 id(这一档比 os_spawned 强就强在这儿)",
+    typeof r.turn?.backendTurnId === "string" && r.turn.backendTurnId.length > 0,
+    String(r.turn?.backendTurnId));
+  assertSettledAndValid("V7", r);
+  await r.stop();
+}
+
+if (process.platform !== "win32") {
+  console.log("  [SKIP] V8/V9 cursor 与 kimi 是 Windows-only 后端(v1),本平台跳过");
+} else {
+  // ── cursor:装一套假的 cursor-agent 目录(versions/<ver>/{node.exe,index.js}) ──
+  {
+    const root = path.join(BOX, "cursor-install");
+    const ver = path.join(root, "versions", "2026.07.09-deadbeef");
+    fs.mkdirSync(ver, { recursive: true });
+    const nodeTarget = path.join(ver, "node.exe");
+    try { fs.linkSync(process.execPath, nodeTarget); } catch { fs.copyFileSync(process.execPath, nodeTarget); }
+    fs.copyFileSync(path.join(HERE, "fake-cursor-index.js"), path.join(ver, "index.js"));
+
+    const r = await bridgeRun({
+      tag: "cursor", agent: "cursor",
+      env: { CURSOR_AGENT_BIN: root, FAKE_CURSOR_MODE: "ok" },
+    });
+    ok("V8 cursor 会话开起来了", !!r.sid, String(r.openError).slice(0, 200));
+    ok("V8 ★ cursor 的派发证据只能是 `os_spawned`(形状 B:每轮短进程,只知道进程起来了)",
+      r.turn?.boundary === "os_spawned", String(r.turn?.boundary));
+    assertSettledAndValid("V8", r);
+    await r.stop();
+  }
+
+  // ── kimi:需要一个 argv0 就是 kimi.exe 的转发 stub(resolveKimiBin 认这个名字)。
+  //    编译方式照抄 repro-kimi.mjs —— 那边已经证明这条路在本机可行。
+  {
+    const kroot = path.join(BOX, "kimi-bin");
+    fs.mkdirSync(kroot, { recursive: true });
+    const stubExe = path.join(kroot, "kimi.exe");
+    const CS_SRC = `using System;
+using System.Diagnostics;
+class KimiStub {
+  static int Main() {
+    string full = Environment.CommandLine;
+    int idx;
+    if (full.Length > 0 && full[0] == '"') { int q = full.IndexOf('"', 1); idx = (q < 0) ? full.Length : q + 1; }
+    else { int sp = full.IndexOf(' '); idx = (sp < 0) ? full.Length : sp; }
+    string tail = full.Substring(idx);
+    string script = Environment.GetEnvironmentVariable("FAKE_KIMI_SCRIPT");
+    string node = Environment.GetEnvironmentVariable("FAKE_KIMI_NODE");
+    if (node == null || node.Length == 0) node = "node";
+    var psi = new ProcessStartInfo(node, "\\"" + script + "\\"" + tail);
+    psi.UseShellExecute = false;
+    var p = Process.Start(psi);
+    p.WaitForExit();
+    return p.ExitCode;
+  }
+}`;
+    const csFile = path.join(BOX, "kimi-stub.cs");
+    fs.writeFileSync(csFile, CS_SRC, "utf8");
+    const ps = `$ErrorActionPreference='Stop'; Add-Type -TypeDefinition (Get-Content -Raw -LiteralPath '${csFile}') -OutputType ConsoleApplication -OutputAssembly '${stubExe}'`;
+    spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", ps], { encoding: "utf8", windowsHide: true });
+    // ⚠️ 编译不出来就**判红**,不"静默跳过"。跳过等于把一段从没跑过的插桩记成绿的。
+    ok("V9 假 kimi.exe 转发 stub 编译成功(依赖 in-box .NET C# 编译器)", fs.existsSync(stubExe), stubExe);
+
+    if (fs.existsSync(stubExe)) {
+      const r = await bridgeRun({
+        tag: "kimi", agent: "kimi",
+        env: {
+          KIMI_BIN: stubExe, FAKE_KIMI_MODE: "ok",
+          FAKE_KIMI_SCRIPT: path.join(HERE, "fake-kimi.js"), FAKE_KIMI_NODE: process.execPath,
+        },
+      });
+      ok("V9 kimi 会话开起来了", !!r.sid, String(r.openError).slice(0, 200));
+      ok("V9 ★ kimi 的派发证据同样只能是 `os_spawned`",
+        r.turn?.boundary === "os_spawned", String(r.turn?.boundary));
+      assertSettledAndValid("V9", r);
+      await r.stop();
     }
   }
-  try { srv2.stdin.end(); } catch {}
-  for (let i = 0; i < 60 && !exited2; i++) await sleep(100);
-  try { srv2.kill("SIGKILL"); } catch {}
 }
 
 finish();

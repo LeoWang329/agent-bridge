@@ -260,6 +260,15 @@ recorder 是一个公开 API，调用方没给的时候，writer 只剩两条路
 体现为 `status: "closed"`。**绝不能在状态钩子里挂 `sessionClosed()`**——那会让
 `finalizeSession` 把一批**还救得回来**的轮次说成 `abandoned`。
 
+⚠️ **后端崩掉时，已经流出来的那截正文必须交给 `markSessionTerminal()` 带走。**
+sidecar（§5）在结算那一刻就被删掉，后端又已经死了，观测侧还不许发 RPC ——
+**这是最后一次机会**，不在这儿交出去就永远没有了。而「后端崩之前它说到哪儿」
+往往正是排障要看的第一样东西。
+
+同时：**那段正文只归 `activeAttempt` 那一轮**。`markSessionTerminal` 会遍历该会话所有
+`dispatched` 轮次，一视同仁地写下去就是**把一轮的产出复制到另一轮头上**——
+丢掉只是缺数据，复制是假数据，**后者更难发现也更致命**。
+
 ### 4.3 `appendSystemPrompt`
 
 ```jsonc
@@ -434,6 +443,26 @@ dispatch 时输入文件还没写完 → 先 `state:"pending"` 且 `ref:null`，
 ⚠️ **`completed + none` 是「后端正常完成，但观测侧写失败」这一种情况**。
 既不能一律判非法（那会把真实发生的事判红），**也不能无条件允许**——否则实现者会把
 「正常完成但没记下正文」当成普通情况混过去。**判据就是 `output.error` 非空。**
+
+⚠️ **`final` 的含义是「这份落盘正文就是后端的最终答复，完整」**，不是「这一轮成功了」。
+两个独立原因会把它降成 `partial`：
+
+1. **收场不是 `completed`**（上表已覆盖）——被打断／失败时，手上那截按定义不是最终答复。
+   ⚠️ 桥侧映射 `outcome` 时**必须看后端的 `status`，不能只看有没有 `err`**：用户主动
+   abort 走的是 `settleTurn(null, "aborted")`（codex 叫 `"interrupted"`），`err` 是空的。
+   只按 `err` 判，一次中断会被记成 `completed + final`，而桥对外报的是 aborted——
+   **viz 与桥的口径打架一次，这块表就没人信了**；无正文时更会凭空点亮 `degraded`。
+2. **正文撞上了桥的 `MAX_TEXT` 截断上限**。五个后端的 `lastAssistantText` 都过 `clampText`，
+   而 `clampText` **砍的是开头**、砍完恰好剩 `MAX_TEXT` 个字符 —— 所以 `length >= MAX_TEXT`
+   就是「这是残件」的唯一可判信号。桥自己的 `result()` 能再走一次后端调用取全文，
+   **观测侧不许**（§7 X9：观测一次 RPC 都不发）。补不回来就老实标 `partial`，
+   而不是拿着残件宣称「这就是最终答复」还附上 sha256。**能记多少是能力问题，标错是诚信问题。**
+
+⚠️ 由此产生一条 recorder 侧的合同：**`settleOnce` 的 `bodyKind` 允许是函数**，入参是最终
+到手的正文。理由与「正文可以晚交」同源——OMP 的正文晚 250ms 才交（等最后一条
+`message_update`），那么「这份正文算不算最终答复」也只能等正文到手再判：宽限期里流进来的
+字可能恰好把它推过上限。结算那一瞬间先把 `bodyKind` 定死，就会拿一份已经被砍掉开头的
+残件宣称 `final`。函数抛错按「没标」处理，**绝不因此改动 `outcome`**。
 
 **六条蕴含式：**
 
