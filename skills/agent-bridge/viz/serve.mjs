@@ -21,8 +21,41 @@ import {
   resolveWithin, sendArchivedFile, sendPlain, sendMethodNotAllowed,
 } from "../../../scripts/viz-http.mjs";
 
-const VIZ_DIR = process.env.VIZ_DIR;
-if (!VIZ_DIR) { console.error("需要 VIZ_DIR 环境变量"); process.exit(2); }
+/**
+ * 起法（**两种都认**，STATE.md §1.2）：
+ *   VIZ_DIR=<目录> node serve.mjs [端口]
+ *   node serve.mjs <目录> [端口]
+ *
+ * ⚠️ 位置参数必须**先判是不是合法端口**再判是不是目录，且**非法输入要给人话**。
+ *    早先这里是 `Number(process.argv[2] || …)` 一把梭：传进来任何非数字都变成 `NaN`，
+ *    然后在 `server.listen` 里炸出一个 `ERR_SOCKET_BAD_PORT`——
+ *    看到那条报错的人根本猜不到自己是把目录传到端口位上了。
+ */
+function isPort(s) {
+  if (!/^\d+$/.test(String(s))) return false;
+  const n = Number(s);
+  return Number.isInteger(n) && n >= 0 && n < 65536;
+}
+const argv = process.argv.slice(2).filter(Boolean);
+let argDir = null, argPort = null;
+for (const a of argv) {
+  if (argPort === null && isPort(a)) { argPort = Number(a); continue; }
+  if (argDir === null) { argDir = a; continue; }
+  console.error(`多余的参数：${a}`); process.exit(2);
+}
+
+const VIZ_DIR = process.env.VIZ_DIR || argDir;
+if (!VIZ_DIR) {
+  console.error("用法：VIZ_DIR=<目录> node serve.mjs [端口]   或   node serve.mjs <目录> [端口]");
+  process.exit(2);
+}
+if (!fs.existsSync(VIZ_DIR)) { console.error(`目录不存在：${VIZ_DIR}`); process.exit(2); }
+
+const portEnv = process.env.VIZ_PORT ?? process.env.PORT;
+if (portEnv != null && String(portEnv).trim() !== "" && !isPort(portEnv)) {
+  console.error(`端口不合法：${portEnv}（要 0~65535 的整数）`); process.exit(2);
+}
+const port = argPort ?? (isPort(portEnv) ? Number(portEnv) : 0);
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const INDEX_HTML = path.join(HERE, "index.html");
@@ -390,7 +423,6 @@ const server = http.createServer((req, res) => {
   sendPlain(res, 404, "没有这个地址");
 });
 
-const port = Number(process.argv[2] || process.env.VIZ_PORT || 0);
 server.listen(port, "127.0.0.1", () => {
   const a = server.address();
   console.log(`session-viz  http://127.0.0.1:${a.port}/   run=${META.runId}`);

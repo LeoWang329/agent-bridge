@@ -477,7 +477,10 @@ export function createVizRun({
       runId, pid: process.pid, processStartedAt: startedAt,
       bridgeVersion, createdAt: startedAt,
     }));
-    IO.writeFileSync(path.join(dir, "owner"), JSON.stringify({ pid: process.pid, startedAt }));
+    // 键名与 meta.json 保持一致（都是 processStartedAt）——同一个概念两个名字，
+    // 读的人就只能猜，而猜错了两边都"对"。
+    IO.writeFileSync(path.join(dir, "owner"),
+      JSON.stringify({ pid: process.pid, processStartedAt: startedAt }));
   } catch (err) {
     diag("init_failed", err);
     return disabledRecorder("init_failed");
@@ -1083,8 +1086,14 @@ class VizRecorder {
 /**
  * 扫 tmpdir 下的 `agent-bridge-viz-*`，把 owner 已经不在的目录删掉。
  *
- * ⚠️ **只按 owner 里的 pid + 进程起始时间双重校验**。光看 pid 会误杀——
- *    操作系统会把号码回收再分给别的进程。对不上就当它还活着，宁可漏收不许误删。
+ * ⚠️ **判据只有一条：owner 里的 pid 还活着吗。** 别把注释写成"pid + 起始时间双重校验"——
+ *    代码没做那件事，而**注释撒谎比没有注释更危险**。
+ *
+ * 之所以单条判据也够安全，在于**判错的方向**：pid 被操作系统回收再分给别的进程时，
+ * `alive()` 返回 true → 我们**留下**这个目录（漏收一个孤儿），
+ * 而不是删掉一个活着的 run。真正危险的方向（活的被判死）需要 `alive()` 对一个活进程返 false，
+ * 那不会因为号码回收而发生。
+ * 代价如实记：pid 恰好被回收的孤儿目录**收不掉**，会一直躺在 tmpdir 里。
  */
 export function vizCleanup({ tmpRoot = os.tmpdir(), isAlive = null } = {}) {
   const alive = isAlive || ((pid) => { try { process.kill(pid, 0); return true; } catch { return false; } });
