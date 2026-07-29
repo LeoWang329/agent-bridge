@@ -1,0 +1,94 @@
+{
+  "schemaVersion": 1,
+  "runId": "mcp-3f9a2c7e",
+  "generation": 4,
+  "updatedAt": "2026-07-29T02:11:12.044Z",
+  "run": {
+    "pid": 1234,
+    "bridgeVersion": "0.10.0",
+    "startedAt": "2026-07-29T02:11:04.221Z",
+    "status": "running",
+    "degraded": false,
+    "recordingErrors": []
+  },
+  "sessions": [
+    {
+      "sessionId": "omp-s9f4t7-61c2b8",
+      "name": "架构师 architect",
+      "agent": "omp",
+      "model": "deepseek-v3.2-exp",
+      "effort": "xhigh",
+      "access": "read",
+      "cwd": "D:\\cc\\agent-bridge",
+      "returnMode": "full",
+      "logFile": "C:\\Temp\\ab\\omp-s9f4t7-61c2b8.log",
+      "appendSystemPrompt": {
+        "file": "D:\\cc\\agent-bridge\\roles\\architect.md",
+        "bytes": 3096,
+        "injectionMode": "system"
+      },
+      "backendPid": 10236,
+      "status": "starting",
+      "health": "healthy",
+      "isStreaming": false,
+      "contextUsage": null,
+      "createdAt": "2026-07-29T02:11:09.331Z",
+      "updatedAt": "2026-07-29T02:11:09.774Z",
+      "openFailed": null,
+      "closed": null,
+      "turns": []
+    },
+    {
+      "sessionId": "codex-u1z8e3-df4096",
+      "name": null,
+      "agent": "codex",
+      "model": "gpt-5.2-codex",
+      "effort": "high",
+      "access": "write",
+      "cwd": "D:\\cc\\agent-bridge",
+      "returnMode": "full",
+      "logFile": "C:\\Temp\\ab\\codex-u1z8e3-df4096.log",
+      "appendSystemPrompt": {
+        "file": "D:\\cc\\agent-bridge\\roles\\implementer.md",
+        "bytes": 1820,
+        "injectionMode": "developer"
+      },
+      "backendPid": 18452,
+      "status": "starting",
+      "health": "healthy",
+      "isStreaming": false,
+      "contextUsage": null,
+      "createdAt": "2026-07-29T02:11:10.602Z",
+      "updatedAt": "2026-07-29T02:11:11.008Z",
+      "openFailed": null,
+      "closed": null,
+      "turns": []
+    },
+    {
+      "sessionId": "kimi-o7l2a5-8b13ec",
+      "name": null,
+      "agent": "kimi",
+      "model": null,
+      "effort": null,
+      "access": "read",
+      "cwd": "D:\\cc\\agent-bridge",
+      "returnMode": "full",
+      "logFile": "C:\\Temp\\ab\\kimi-o7l2a5-8b13ec.log",
+      "appendSystemPrompt": {
+        "file": "D:\\cc\\agent-bridge\\roles\\debugger.md",
+        "bytes": 1477,
+        "injectionMode": "first-turn-user-prefix"
+      },
+      "backendPid": null,
+      "status": "starting",
+      "health": "healthy",
+      "isStreaming": false,
+      "contextUsage": null,
+      "createdAt": "2026-07-29T02:11:11.845Z",
+      "updatedAt": "2026-07-29T02:11:12.020Z",
+      "openFailed": null,
+      "closed": null,
+      "turns": []
+    }
+  ]
+}

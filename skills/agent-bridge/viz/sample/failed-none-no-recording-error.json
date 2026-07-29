@@ -1,0 +1,87 @@
+{
+  "schemaVersion": 1,
+  "runId": "mcp-3f9a2c7e",
+  "generation": 12,
+  "updatedAt": "2026-07-29T02:13:05.004Z",
+  "run": {
+    "pid": 1234,
+    "bridgeVersion": "0.10.0",
+    "startedAt": "2026-07-29T02:11:04.221Z",
+    "status": "running",
+    "degraded": false,
+    "recordingErrors": []
+  },
+  "sessions": [
+    {
+      "sessionId": "claude-q7t4n1-5e08b2",
+      "name": "复评员 reviewer-b",
+      "agent": "claude",
+      "model": "claude-opus-5",
+      "effort": "high",
+      "access": "read",
+      "cwd": "D:\\cc\\agent-bridge",
+      "returnMode": "full",
+      "logFile": "C:\\Temp\\ab\\claude-q7t4n1-5e08b2.log",
+      "appendSystemPrompt": {
+        "file": "D:\\cc\\agent-bridge\\roles\\reviewer.md",
+        "bytes": 2144,
+        "injectionMode": "system"
+      },
+      "backendPid": 20488,
+      "status": "idle",
+      "health": "degraded",
+      "isStreaming": false,
+      "contextUsage": {
+        "tokens": 41277,
+        "live": false
+      },
+      "createdAt": "2026-07-29T02:12:39.660Z",
+      "updatedAt": "2026-07-29T02:13:04.981Z",
+      "openFailed": null,
+      "closed": null,
+      "turns": [
+        {
+          "turnNo": 1,
+          "vizTurnId": "vt-5e0b2d74",
+          "backendTurnId": null,
+          "backendTurnCount": null,
+          "state": "settled",
+          "boundary": "pipe_enqueued",
+          "attemptedAt": "2026-07-29T02:12:40.002Z",
+          "dispatchedAt": "2026-07-29T02:12:40.115Z",
+          "settledAt": "2026-07-29T02:13:04.870Z",
+          "firstBackendEventAt": "2026-07-29T02:12:41.508Z",
+          "source": "initial_prompt",
+          "blocking": true,
+          "hasSchema": false,
+          "input": {
+            "state": "ready",
+            "ref": "turns/claude-q7t4n1-5e08b2/t1.in.md",
+            "sha256": "5e0b2d749ac16f38b402e97d1f6c85a073d9e14b28cf60a7e5b1938c4a7d02f6",
+            "chars": 2077,
+            "bytes": 5931,
+            "truncated": false,
+            "originalBytes": 5931,
+            "error": null
+          },
+          "output": {
+            "state": "missing",
+            "ref": null,
+            "sha256": null,
+            "chars": null,
+            "bytes": null,
+            "previewBytes": null,
+            "previewSha256": null,
+            "error": null
+          },
+          "outcome": "failed",
+          "bodyKind": "none",
+          "generationCount": 0,
+          "collected": null,
+          "error": "claude 后端在产出任何 result 之前退出：exit code 1，stderr 末段 \"Error: upstream connect error or disconnect/reset before headers\"。本轮无正文可记。",
+          "durationMs": 24755
+        }
+      ]
+    }
+  ]
+}

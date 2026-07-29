@@ -1,0 +1,85 @@
+{
+  "schemaVersion": 1,
+  "runId": "mcp-3f9a2c7e",
+  "generation": 21,
+  "updatedAt": "2026-07-29T02:21:30.446Z",
+  "run": {
+    "pid": 1234,
+    "bridgeVersion": "0.10.0",
+    "startedAt": "2026-07-29T02:11:04.221Z",
+    "status": "running",
+    "degraded": false,
+    "recordingErrors": []
+  },
+  "sessions": [
+    {
+      "sessionId": "omp-x4m8s1-7b02ed",
+      "name": null,
+      "agent": "omp",
+      "model": "deepseek-v3.2-exp",
+      "effort": "high",
+      "access": "write",
+      "cwd": "D:\\cc\\agent-bridge",
+      "returnMode": "full",
+      "logFile": "C:\\Temp\\ab\\omp-x4m8s1-7b02ed.log",
+      "appendSystemPrompt": null,
+      "backendPid": 18004,
+      "status": "idle",
+      "health": "degraded",
+      "isStreaming": false,
+      "contextUsage": {
+        "tokens": 47029,
+        "live": true,
+        "isCompacting": false,
+        "autoCompactionEnabled": true
+      },
+      "createdAt": "2026-07-29T02:20:40.221Z",
+      "updatedAt": "2026-07-29T02:21:30.410Z",
+      "openFailed": null,
+      "closed": null,
+      "turns": [
+        {
+          "turnNo": 1,
+          "vizTurnId": "vt-83d40c7a",
+          "backendTurnId": "omp-turn-6b04f28d",
+          "backendTurnCount": 1,
+          "state": "settled",
+          "boundary": "rpc_ack",
+          "attemptedAt": "2026-07-29T02:20:40.554Z",
+          "dispatchedAt": "2026-07-29T02:20:40.702Z",
+          "settledAt": "2026-07-29T02:21:30.221Z",
+          "firstBackendEventAt": "2026-07-29T02:20:41.330Z",
+          "source": "send_message",
+          "blocking": true,
+          "hasSchema": false,
+          "input": {
+            "state": "ready",
+            "ref": "turns/omp-x4m8s1-7b02ed/t1.in.md",
+            "sha256": "83d40c7a1e29f6b82c8ea7056f14b39dd0a52c86b91f7e4047c3a8d2e0619fb5",
+            "chars": 812,
+            "bytes": 2244,
+            "truncated": false,
+            "originalBytes": 2244,
+            "error": null
+          },
+          "output": {
+            "state": "ready",
+            "ref": "turns/omp-x4m8s1-7b02ed/t1.out.md",
+            "sha256": "d582b1e7306a9c484e91c3a058d7b26fe103a94db6f80c152a7d5e3997cb04f6",
+            "chars": 3540,
+            "bytes": 10188,
+            "previewBytes": null,
+            "previewSha256": null,
+            "error": null
+          },
+          "outcome": "failed",
+          "bodyKind": "final",
+          "generationCount": 2,
+          "collected": null,
+          "error": "上游返回 429 rate_limited，重试 3 次后放弃本轮。",
+          "durationMs": 49519
+        }
+      ]
+    }
+  ]
+}

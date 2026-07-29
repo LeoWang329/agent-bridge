@@ -1,0 +1,85 @@
+{
+  "schemaVersion": 1,
+  "runId": "mcp-3f9a2c7e",
+  "generation": 9,
+  "updatedAt": "2026-07-29T02:12:40.880Z",
+  "run": {
+    "pid": 1234,
+    "bridgeVersion": "0.10.0",
+    "startedAt": "2026-07-29T02:11:04.221Z",
+    "status": "running",
+    "degraded": false,
+    "recordingErrors": []
+  },
+  "sessions": [
+    {
+      "sessionId": "omp-r1c8v4-70bd25",
+      "name": null,
+      "agent": "omp",
+      "model": null,
+      "effort": "medium",
+      "access": "write",
+      "cwd": "D:\\cc\\agent-bridge",
+      "returnMode": "full",
+      "logFile": "C:\\Temp\\ab\\omp-r1c8v4-70bd25.log",
+      "appendSystemPrompt": null,
+      "backendPid": 15880,
+      "status": "running",
+      "health": "healthy",
+      "isStreaming": true,
+      "contextUsage": {
+        "tokens": 12008,
+        "live": true,
+        "isCompacting": false,
+        "autoCompactionEnabled": true
+      },
+      "createdAt": "2026-07-29T02:12:39.114Z",
+      "updatedAt": "2026-07-29T02:12:40.862Z",
+      "openFailed": null,
+      "closed": null,
+      "turns": [
+        {
+          "turnNo": 1,
+          "vizTurnId": "vt-b7089f1e",
+          "backendTurnId": "omp-turn-9d21c604",
+          "backendTurnCount": 1,
+          "state": "dispatched",
+          "boundary": "rpc_ack",
+          "attemptedAt": "2026-07-29T02:12:39.554Z",
+          "dispatchedAt": "2026-07-29T02:12:39.702Z",
+          "settledAt": null,
+          "firstBackendEventAt": "2026-07-29T02:12:40.117Z",
+          "source": "initial_prompt",
+          "blocking": true,
+          "hasSchema": false,
+          "input": {
+            "state": "ready",
+            "ref": "turns/omp-r1c8v4-70bd25/t1.in.md",
+            "sha256": "3f2a9c81b7d4e650a1c8f39b2e7d6045c9a1b8f2d3e4c5a6b7089f1e2d3c4b5a",
+            "chars": 1024,
+            "bytes": 2880,
+            "truncated": false,
+            "originalBytes": 2880,
+            "error": null
+          },
+          "output": {
+            "state": "pending",
+            "ref": null,
+            "sha256": null,
+            "chars": null,
+            "bytes": null,
+            "previewBytes": null,
+            "previewSha256": null,
+            "error": null
+          },
+          "outcome": "completed",
+          "bodyKind": null,
+          "generationCount": 1,
+          "collected": null,
+          "error": null,
+          "durationMs": null
+        }
+      ]
+    }
+  ]
+}

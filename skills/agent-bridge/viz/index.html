@@ -1,0 +1,1413 @@
+
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Agent Bridge · 委托会话观察台</title>
+<style>
+/* ============================================================
+   Agent Bridge · 委托会话史 只读观察台
+   零外部请求 · 系统字体 · 浅色为默认，深色可切换
+   视觉语言对齐 skills/agent-bridge-roundtable/viz
+   ============================================================ */
+
+:root{
+  --bg:#eef1f5; --canvas:#f6f8fb; --surface:#ffffff; --surface-2:#f1f4f8; --surface-3:#e8edf4;
+  --ink:#16202c; --ink-soft:#4a5765; --faint:#5d6b80;   /* 小字也要 ≥4.5:1 */
+  --line:#e2e8f0; --line-2:#cdd6e2;
+
+  --accent:#3061d6;
+
+  /* 四档状态（§5）——颜色 + 形态双编码 */
+  --st-run:#0f875b;      /* 进行中 */
+  --st-idle:#8090a1;     /* 空闲——仅用于圆点描边 */
+  --st-idle-ink:#647388; /* 空闲——文字用，满足 4.5:1 */
+  --st-warn:#a8540a;     /* 有问题 */
+  --st-end:#5b6b7d;      /* 已结束 */
+
+  /* 三档权限（§4.1）——「只读（约定）」刻意不用绿色 */
+  --pm-write:#7b52d1;
+  --pm-hard:#0f875b;
+  --pm-soft:#8d6510;
+
+  --danger:#c23b3b;
+
+  --shadow:0 1px 2px rgba(16,32,48,.05), 0 6px 18px -12px rgba(16,32,48,.22);
+  --shadow-lift:0 2px 6px rgba(16,32,48,.07), 0 14px 34px -18px rgba(16,32,48,.30);
+  --radius:12px;
+
+  --mono: ui-monospace,"Cascadia Code","SFMono-Regular","JetBrains Mono",Consolas,"Liberation Mono",monospace;
+  --sans: system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue","PingFang SC","Microsoft YaHei","Noto Sans CJK SC",sans-serif;
+}
+:root[data-theme="dark"]{
+  --bg:#0b0f15; --canvas:#0e131b; --surface:#141b24; --surface-2:#1a222e; --surface-3:#212b39;
+  --ink:#e7eef6; --ink-soft:#a4b2c2; --faint:#7d8d9f;
+  --line:#232d3a; --line-2:#313d4d;
+  --accent:#6e97f7;
+  --st-run:#42cf95; --st-idle:#7c8b9d; --st-idle-ink:#93a2b4; --st-warn:#f0953f; --st-end:#8496aa;
+  --pm-write:#a98cf0; --pm-hard:#42cf95; --pm-soft:#d8a83f;
+  --danger:#ef7676;
+  --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 22px -14px rgba(0,0,0,.7);
+  --shadow-lift:0 2px 6px rgba(0,0,0,.5), 0 18px 40px -20px rgba(0,0,0,.8);
+}
+
+*{box-sizing:border-box}
+html,body{margin:0;height:100%}
+body{
+  background:var(--bg); color:var(--ink);
+  font:14.5px/1.6 var(--sans);
+  -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility;
+  display:flex; flex-direction:column; overflow:hidden;
+}
+::selection{background:color-mix(in oklab,var(--accent) 26%,transparent)}
+button{font:inherit;color:inherit;background:none;border:none;padding:0;cursor:pointer}
+/* 键盘焦点：全局一条，任何地方都不写 outline:none */
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.scard:focus-visible{outline-offset:-3px}
+.mini,.fchip,.tbtn,.jump,.io-toggle,.collapse,.io-more{
+  transition:background-color .12s ease,border-color .12s ease,color .12s ease,transform .08s ease}
+.mini:active,.fchip:active,.tbtn:active,.jump:active,.collapse:active{transform:translateY(1px)}
+.ic{width:15px;height:15px;flex:0 0 auto;vertical-align:-3px}
+.mono{font-family:var(--mono)}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+
+/* ---------- 顶栏 ---------- */
+.topbar{
+  flex:0 0 auto; display:flex; align-items:center; gap:10px 14px; flex-wrap:wrap;
+  padding:9px 18px; min-height:56px;
+  background:var(--surface); border-bottom:1px solid var(--line); z-index:30;
+}
+.brand{display:flex;align-items:center;gap:10px;min-width:0}
+.brand .glyph{
+  width:28px;height:28px;border-radius:9px;flex:0 0 auto;display:grid;place-items:center;color:#fff;
+  background:var(--accent);
+  box-shadow:inset 0 0 0 1px rgba(255,255,255,.18);
+}
+.brand .glyph svg{width:16px;height:16px}
+.brand h1{margin:0;font-size:14.5px;font-weight:650;letter-spacing:.01em;white-space:nowrap}
+.brand .sub{font:11px/1 var(--mono);color:var(--faint);letter-spacing:.06em;margin-top:3px;display:block}
+
+.runmeta{display:flex;align-items:center;gap:9px;flex-wrap:wrap;min-width:0;font:12px/1 var(--mono);color:var(--faint)}
+.runmeta .sep{opacity:.45}
+.runmeta b{color:var(--ink-soft);font-weight:600}
+.deeplink{
+  font:11.5px/1 var(--mono);color:var(--ink-soft);background:var(--surface-2);
+  border:1px solid var(--line);border-radius:6px;padding:4px 8px;
+  max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+}
+.spacer{flex:1 1 auto}
+
+.conn{display:inline-flex;align-items:center;gap:7px;font:12px/1 var(--mono);color:var(--ink-soft);
+  padding:6px 11px;border:1px solid var(--line);border-radius:999px;background:var(--surface-2);white-space:nowrap}
+.conn .led{width:8px;height:8px;border-radius:50%;background:var(--faint);flex:0 0 auto}
+.conn[data-s="live"] .led{background:var(--st-run);box-shadow:0 0 0 3px color-mix(in oklab,var(--st-run) 24%,transparent)}
+.conn[data-s="reconnect"] .led{background:var(--st-warn);animation:blink 1.2s steps(2) infinite}
+.conn[data-s="ended"] .led{background:var(--st-end)}
+.conn[data-s="connecting"] .led{background:var(--accent);animation:breathe 2.4s ease-in-out infinite}
+
+.tbtn{display:inline-flex;align-items:center;gap:6px;font:12px/1 var(--sans);color:var(--ink-soft);
+  padding:7px 11px;border:1px solid var(--line);border-radius:999px;background:var(--surface-2)}
+.tbtn:hover{border-color:var(--line-2);color:var(--ink)}
+.tbtn svg{width:14px;height:14px}
+
+.protobox{display:inline-flex;align-items:center;gap:7px;padding:4px 5px 4px 10px;border:1px dashed var(--line-2);
+  border-radius:999px;background:var(--canvas)}
+.protobox label{font:10.5px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--faint)}
+.protobox select{font:12px/1 var(--sans);color:var(--ink-soft);background:var(--surface);border:1px solid var(--line);
+  border-radius:999px;padding:5px 8px;cursor:pointer}
+
+/* ---------- 通知条 ---------- */
+.notice{flex:0 0 auto;display:flex;align-items:flex-start;gap:10px;padding:9px 18px;font-size:13px;
+  border-bottom:1px solid var(--line)}
+.notice[hidden]{display:none}
+.notice svg{width:15px;height:15px;margin-top:2px;flex:0 0 auto}
+.notice.warn{color:color-mix(in oklab,var(--st-warn) 80%,var(--ink));
+  background:color-mix(in oklab,var(--st-warn) 13%,var(--surface));
+  border-bottom-color:color-mix(in oklab,var(--st-warn) 34%,var(--line))}
+.notice .n-sub{color:color-mix(in oklab,var(--st-warn) 55%,var(--ink-soft));font-size:12.3px;margin-top:2px}
+
+/* ---------- 主体两栏 ---------- */
+.shell{flex:1 1 auto;display:grid;grid-template-columns:352px 1fr;min-height:0}
+.shell.collapsed{grid-template-columns:0 1fr}
+.shell.collapsed .sidebar{display:none}
+
+/* ---------- 左栏 ---------- */
+.sidebar{display:flex;flex-direction:column;min-height:0;background:var(--canvas);border-right:1px solid var(--line)}
+.side-head{flex:0 0 auto;padding:11px 13px 9px;border-bottom:1px solid var(--line);background:var(--surface)}
+.side-title{display:flex;align-items:center;gap:8px;font:11px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;
+  color:var(--faint);margin-bottom:9px}
+.side-title .count{margin-left:auto;color:var(--ink-soft);letter-spacing:0}
+.side-title .collapse{color:var(--faint);display:grid;place-items:center;width:26px;height:26px;border-radius:6px;margin:-2px -4px -2px 0}
+.side-title .collapse:hover{background:var(--surface-2);color:var(--ink)}
+
+.searchbox{position:relative;margin-bottom:9px}
+.searchbox svg{position:absolute;left:9px;top:50%;transform:translateY(-50%);width:14px;height:14px;color:var(--faint)}
+.searchbox input{width:100%;font:12.5px/1 var(--sans);color:var(--ink);background:var(--surface-2);
+  border:1px solid var(--line);border-radius:8px;padding:8px 10px 8px 29px}
+.searchbox input:focus{border-color:color-mix(in oklab,var(--accent) 45%,var(--line));background:var(--surface)}
+.searchbox input::placeholder{color:var(--faint)}
+
+.filters{display:flex;gap:6px}
+.fchip{font:12px/1 var(--sans);color:var(--ink-soft);background:var(--surface-2);border:1px solid var(--line);
+  border-radius:999px;padding:5px 11px;display:inline-flex;align-items:center;gap:6px}
+.fchip:hover{border-color:var(--line-2)}
+.fchip[aria-pressed="true"]{color:var(--accent);border-color:color-mix(in oklab,var(--accent) 42%,var(--line));
+  background:color-mix(in oklab,var(--accent) 10%,var(--surface));font-weight:600}
+.fchip .n{font:10.5px/1 var(--mono);opacity:.75}
+
+.slist{flex:1 1 auto;overflow-y:auto;padding:9px 9px 14px}
+.sgroup{font:10.5px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--faint);
+  padding:11px 5px 6px;display:flex;align-items:center;gap:7px}
+.sgroup::after{content:"";flex:1 1 auto;height:1px;background:var(--line)}
+
+/* 状态轨齐左边缘、左侧不圆角——避开「圆角卡 + 左色条」那张模板脸 */
+.scard{width:100%;text-align:left;display:block;position:relative;
+  background:var(--surface);border:1px solid var(--line);border-left:3px solid var(--st-idle);
+  border-radius:0 10px 10px 0;padding:9px 11px 9px 12px;margin-bottom:7px;box-shadow:var(--shadow)}
+.scard:hover{border-color:var(--line-2)}
+.scard[aria-current]{border-color:color-mix(in oklab,var(--accent) 55%,var(--line));
+  box-shadow:0 0 0 2px color-mix(in oklab,var(--accent) 22%,transparent),var(--shadow)}
+.scard.s-run{border-left-color:var(--st-run)}
+.scard.s-warn{border-left-color:var(--st-warn)}
+.scard.s-end{border-left-color:var(--st-end);opacity:.78}
+.scard.s-end:hover,.scard.s-end:focus-visible,.scard.s-end[aria-current]{opacity:1}
+
+.sc-r1{display:flex;align-items:center;gap:8px;min-width:0}
+.dot{width:9px;height:9px;border-radius:50%;flex:0 0 auto}
+.dot.d-run{background:var(--st-run);box-shadow:0 0 0 3px color-mix(in oklab,var(--st-run) 22%,transparent);
+  animation:breathe 3s ease-in-out infinite}
+.dot.d-idle{background:transparent;border:1.8px solid var(--st-idle)}
+.dot.d-warn{background:var(--st-warn);box-shadow:0 0 0 3px color-mix(in oklab,var(--st-warn) 20%,transparent)}
+.dot.d-end{background:var(--st-end)}
+.sc-name{font-weight:650;font-size:13.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.sc-name.anon{font-family:var(--mono);font-weight:600;font-size:12.5px;color:var(--ink-soft)}
+.sc-state{margin-left:auto;font:11px/1 var(--sans);font-weight:600;white-space:nowrap;padding-left:6px}
+.st-run{color:var(--st-run)} .st-idle{color:var(--st-idle-ink)} .st-warn{color:var(--st-warn)} .st-end{color:var(--st-end)}
+
+.sc-r2{display:flex;align-items:center;gap:6px;margin-top:5px;font:11.5px/1 var(--mono);color:var(--ink-soft);min-width:0}
+.eng{display:inline-flex;align-items:center;gap:5px;flex:0 0 auto}
+.eng .eb{width:15px;height:15px;border-radius:4px;display:grid;place-items:center;font:600 9px/1 var(--mono);
+  color:var(--ink-soft);background:var(--surface-3);border:1px solid var(--line)}
+.sc-model{color:var(--faint);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+
+.sc-r3{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:6px}
+.perm{display:inline-flex;align-items:center;gap:4px;font:10.5px/1 var(--mono);padding:3px 6px;border-radius:5px;
+  white-space:nowrap;border:1px solid var(--line)}
+.perm svg{width:11px;height:11px}
+.perm.p-write{color:var(--pm-write);border-color:color-mix(in oklab,var(--pm-write) 38%,var(--line));
+  background:color-mix(in oklab,var(--pm-write) 11%,var(--surface))}
+.perm.p-hard{color:var(--pm-hard);border-color:color-mix(in oklab,var(--pm-hard) 38%,var(--line));
+  background:color-mix(in oklab,var(--pm-hard) 11%,var(--surface))}
+.perm.p-soft{color:var(--pm-soft);border-style:dashed;border-color:color-mix(in oklab,var(--pm-soft) 45%,var(--line-2));
+  background:var(--surface-2)}
+.sc-meta{font:10.5px/1 var(--mono);color:var(--faint);white-space:nowrap}
+.flag{display:inline-flex;align-items:center;gap:4px;font:10.5px/1 var(--mono);padding:3px 6px;border-radius:5px;white-space:nowrap}
+.flag svg{width:11px;height:11px}
+.flag.f-pending{color:var(--st-warn);background:color-mix(in oklab,var(--st-warn) 14%,var(--surface));
+  border:1px solid color-mix(in oklab,var(--st-warn) 36%,var(--line))}
+.flag.f-err{color:var(--danger);background:color-mix(in oklab,var(--danger) 12%,var(--surface));
+  border:1px solid color-mix(in oklab,var(--danger) 32%,var(--line))}
+.flag.f-match{color:var(--accent);background:color-mix(in oklab,var(--accent) 11%,var(--surface));
+  border:1px solid color-mix(in oklab,var(--accent) 30%,var(--line))}
+
+.sc-prev{margin-top:7px;padding:6px 8px;border-radius:7px;background:var(--surface-2);border:1px solid var(--line)}
+.sc-prev .pv-t{font:11px/1.55 var(--mono);color:var(--ink-soft);display:-webkit-box;-webkit-line-clamp:2;
+  -webkit-box-orient:vertical;overflow:hidden;overflow-wrap:anywhere}
+.sc-prev .pv-m{margin-top:5px;font:10px/1 var(--mono);color:var(--faint);display:flex;gap:8px;align-items:center}
+
+.side-foot{flex:0 0 auto;border-top:1px solid var(--line);background:var(--surface);padding:0}
+details.legend summary{list-style:none;cursor:pointer;padding:10px 13px;font:11px/1 var(--mono);letter-spacing:.09em;
+  text-transform:uppercase;color:var(--faint);display:flex;align-items:center;gap:7px}
+details.legend summary::-webkit-details-marker{display:none}
+details.legend summary:hover{color:var(--ink-soft)}
+details.legend summary .chev{transition:transform .18s ease;width:13px;height:13px}
+details.legend[open] summary .chev{transform:rotate(90deg)}
+.legend-body{padding:0 13px 13px;display:grid;gap:10px}
+.legend-body h4{margin:0;font:10.5px/1 var(--mono);letter-spacing:.09em;text-transform:uppercase;color:var(--faint)}
+.legend-row{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--ink-soft)}
+.legend-row .lw{color:var(--faint);font-size:11.5px}
+
+/* ---------- 右栏 ---------- */
+.detailwrap{position:relative;min-width:0;min-height:0;display:flex;flex-direction:column}
+.detail{flex:1 1 auto;overflow-y:auto;padding:0 0 90px;scroll-behavior:auto}
+.dpad{max-width:1000px;padding:0 26px}
+
+/* 会话信息条 */
+.infobar{position:sticky;top:0;z-index:12;background:color-mix(in oklab,var(--surface) 94%,transparent);
+  backdrop-filter:saturate(1.4) blur(10px);border-bottom:1px solid var(--line);padding:14px 26px 12px}
+.ib-r1{display:flex;align-items:center;gap:10px;flex-wrap:wrap;max-width:1000px}
+.ib-name{font-size:17px;font-weight:650;letter-spacing:.01em}
+.ib-id{font:11.5px/1 var(--mono);color:var(--faint);background:var(--surface-2);border:1px solid var(--line);
+  border-radius:6px;padding:4px 7px}
+.ib-state{display:inline-flex;align-items:center;gap:7px;font:12px/1 var(--sans);font-weight:650;
+  padding:5px 11px;border-radius:999px;border:1px solid var(--line);background:var(--surface-2)}
+.ib-kv{display:flex;flex-wrap:wrap;gap:5px 20px;margin-top:11px;max-width:1000px}
+.kv{display:flex;flex-direction:column;gap:3px;min-width:0}
+.kv .k{font:10px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--faint)}
+.kv .v{font:12.5px/1.35 var(--mono);color:var(--ink-soft);overflow-wrap:anywhere}
+.kv .v.na{color:var(--faint);font-style:normal}
+.ctx{display:flex;align-items:center;gap:8px}
+.ctx .bar{width:88px;height:5px;border-radius:3px;background:var(--surface-3);overflow:hidden;flex:0 0 auto}
+.ctx .bar i{display:block;height:100%;border-radius:3px;background:var(--st-run)}
+.ctx .bar i.mid{background:var(--st-warn)} .ctx .bar i.hi{background:var(--danger)}
+.ctx .lab{font:11px/1 var(--mono)}
+.ctx .lab.mid{color:var(--st-warn)} .ctx .lab.hi{color:var(--danger)}
+.ctx .unknown{display:inline-flex;align-items:center;gap:5px;font:11.5px/1 var(--mono);color:var(--pm-soft);
+  border:1px dashed color-mix(in oklab,var(--pm-soft) 45%,var(--line-2));border-radius:6px;padding:3px 7px;background:var(--surface-2)}
+.ctx .unknown svg{width:12px;height:12px;flex:0 0 auto}
+
+/* 会话内提示条 */
+.sbar{display:flex;align-items:flex-start;gap:9px;margin:16px 0 0;padding:10px 13px;border-radius:10px;font-size:12.8px;line-height:1.6}
+.sbar svg{width:15px;height:15px;flex:0 0 auto;margin-top:2px}
+.sbar.amber{color:color-mix(in oklab,var(--st-warn) 82%,var(--ink));
+  background:color-mix(in oklab,var(--st-warn) 12%,var(--surface));
+  border:1px solid color-mix(in oklab,var(--st-warn) 32%,var(--line))}
+.sbar.red{color:color-mix(in oklab,var(--danger) 82%,var(--ink));
+  background:color-mix(in oklab,var(--danger) 10%,var(--surface));
+  border:1px solid color-mix(in oklab,var(--danger) 30%,var(--line))}
+
+/* 轮次 */
+.turns{padding-top:14px}
+.turn{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);
+  margin:14px 0;box-shadow:var(--shadow);overflow:hidden}
+.turn.running{border-color:color-mix(in oklab,var(--st-run) 40%,var(--line));box-shadow:var(--shadow-lift)}
+.turn.hit{box-shadow:0 0 0 2px color-mix(in oklab,var(--accent) 28%,transparent),var(--shadow)}
+.t-head{display:flex;align-items:center;gap:9px;flex-wrap:wrap;padding:11px 15px;
+  background:var(--surface-2);border-bottom:1px solid var(--line)}
+.turn.running .t-head{background:color-mix(in oklab,var(--st-run) 9%,var(--surface))}
+.t-no{font:650 12px/1 var(--mono);letter-spacing:.04em;color:var(--ink);background:var(--surface);
+  border:1px solid var(--line-2);border-radius:7px;padding:5px 9px}
+.t-time{font:11.5px/1 var(--mono);color:var(--faint)}
+.t-dur{font:11.5px/1 var(--mono);color:var(--ink-soft)}
+.rbadge{display:inline-flex;align-items:center;gap:5px;font:11.5px/1 var(--sans);font-weight:650;
+  padding:4px 9px;border-radius:999px;border:1px solid var(--line);background:var(--surface)}
+.rbadge svg{width:12px;height:12px}
+.rb-completed{color:var(--st-run);border-color:color-mix(in oklab,var(--st-run) 38%,var(--line));
+  background:color-mix(in oklab,var(--st-run) 10%,var(--surface))}
+.rb-failed{color:var(--danger);border-color:color-mix(in oklab,var(--danger) 36%,var(--line));
+  background:color-mix(in oklab,var(--danger) 9%,var(--surface))}
+.rb-aborted{color:var(--st-end);border-color:var(--line-2);background:var(--surface-2)}
+.rb-abandoned{color:var(--st-warn);border:1px dashed color-mix(in oklab,var(--st-warn) 52%,var(--line-2));
+  background:color-mix(in oklab,var(--st-warn) 10%,var(--surface))}
+.rb-running{color:var(--st-run);border-color:color-mix(in oklab,var(--st-run) 40%,var(--line));
+  background:color-mix(in oklab,var(--st-run) 11%,var(--surface))}
+.bbadge{font:10.5px/1 var(--mono);padding:4px 7px;border-radius:5px;color:var(--faint);background:var(--surface)}
+.bbadge.partial{color:var(--st-warn);background:color-mix(in oklab,var(--st-warn) 11%,var(--surface));
+  border:1px solid color-mix(in oklab,var(--st-warn) 30%,var(--line))}
+.bbadge.none{color:var(--ink-soft);background:var(--surface-3);border:1px solid var(--line)}
+.t-head .right{margin-left:auto;display:inline-flex;align-items:center;gap:8px}
+
+/* 输入 / 输出块 */
+.io{border-top:1px solid var(--line)}
+.io:first-of-type{border-top:none}
+.io-head{display:flex;align-items:center;gap:9px;padding:10px 15px}
+/* 折叠头是真正的 <button>——键盘能到、Enter/Space 能开 */
+.io-toggle{display:flex;align-items:center;gap:9px;flex:1 1 auto;min-width:0;text-align:left;
+  padding:5px 7px;margin:-5px -7px;border-radius:7px;user-select:none}
+.io-toggle:hover{background:var(--canvas)}
+.io-static{display:flex;align-items:center;gap:9px;flex:1 1 auto;min-width:0}
+.io-head .chev{width:13px;height:13px;color:var(--faint);transition:transform .18s ease;flex:0 0 auto}
+.io-toggle[aria-expanded="true"] .chev{transform:rotate(90deg)}
+.io-k{font:11px/1 var(--mono);letter-spacing:.11em;text-transform:uppercase;color:var(--faint);font-weight:600}
+.io-k.out{color:var(--ink)}
+.io-n{font:11.5px/1 var(--mono);color:var(--faint)}
+.io-acts{margin-left:auto;display:inline-flex;align-items:center;gap:5px}
+.mini{display:inline-flex;align-items:center;gap:5px;font:11.5px/1 var(--sans);color:var(--ink-soft);
+  border:1px solid var(--line);border-radius:7px;padding:5px 9px;background:var(--surface)}
+.mini:hover{border-color:var(--line-2);color:var(--ink);background:var(--surface-2)}
+.mini svg{width:12px;height:12px}
+.mini.done{color:var(--st-run);border-color:color-mix(in oklab,var(--st-run) 40%,var(--line));
+  background:color-mix(in oklab,var(--st-run) 10%,var(--surface))}
+.mini[aria-pressed="true"]{color:var(--accent);border-color:color-mix(in oklab,var(--accent) 40%,var(--line));
+  background:color-mix(in oklab,var(--accent) 9%,var(--surface))}
+
+.io-body{padding:0 15px 14px;position:relative}
+.io-body[hidden]{display:none}
+.io-text{font:13px/1.72 var(--sans);color:var(--ink-soft);white-space:pre-wrap;overflow-wrap:anywhere;max-width:72ch}
+.io-body.clip .io-text{max-height:10.4em;overflow:hidden;
+  -webkit-mask-image:linear-gradient(#000 58%,transparent);mask-image:linear-gradient(#000 58%,transparent)}
+.io-more{margin-top:8px;font:12px/1 var(--sans);color:var(--accent)}
+.io-more:hover{text-decoration:underline}
+.raw-pre{font:12px/1.65 var(--mono);color:var(--ink-soft);background:var(--surface-2);border:1px solid var(--line);
+  border-radius:9px;padding:12px 13px;overflow-x:auto;white-space:pre;margin:0}
+.nobody{display:flex;align-items:center;gap:9px;padding:14px 15px;border:1px dashed var(--line-2);border-radius:9px;
+  color:var(--faint);font-size:12.8px;background:var(--canvas)}
+.nobody svg{width:15px;height:15px}
+
+/* Markdown 正文 */
+.md{color:var(--ink);font-size:14px;line-height:1.75;overflow-wrap:anywhere}
+.md h3,.md h4,.md h5{margin:16px 0 7px;line-height:1.4}
+.md h3{font-size:15.5px} .md h4{font-size:13.8px;color:var(--ink-soft)}
+.md h3:first-child,.md h4:first-child{margin-top:0}
+.md p{margin:8px 0;max-width:72ch;text-wrap:pretty}
+.md ul,.md ol{margin:8px 0;padding-left:23px;max-width:72ch}
+.md li{margin:4px 0;text-wrap:pretty}
+.md strong{font-weight:650;color:var(--ink)}
+.md code{font:12.5px/1 var(--mono);background:var(--surface-2);border:1px solid var(--line);border-radius:5px;padding:1px 5px}
+.md hr{border:none;border-top:1px solid var(--line);margin:14px 0}
+.cb{margin:11px 0;border:1px solid var(--line);border-radius:9px;overflow:hidden;background:var(--surface-2)}
+.cb-h{font:10.5px/1 var(--mono);letter-spacing:.09em;text-transform:uppercase;color:var(--faint);
+  padding:7px 11px;border-bottom:1px solid var(--line);background:var(--canvas)}
+.cb pre{margin:0;padding:11px 13px;overflow-x:auto}
+.cb code{font:12.3px/1.62 var(--mono);background:none;border:none;padding:0;white-space:pre;color:var(--ink-soft)}
+.tw{margin:11px 0;overflow-x:auto;border:1px solid var(--line);border-radius:9px}
+.tw table{border-collapse:collapse;width:100%;font-size:12.8px}
+.tw th,.tw td{padding:8px 11px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+.tw th{background:var(--surface-2);font-weight:650;font-size:11.5px;color:var(--ink-soft);white-space:nowrap}
+.tw tr:last-child td{border-bottom:none}
+
+/* 实时预览区 */
+.live{margin:2px 15px 14px;border:1px solid color-mix(in oklab,var(--st-run) 34%,var(--line));border-radius:10px;
+  background:color-mix(in oklab,var(--st-run) 5%,var(--surface));overflow:hidden}
+.live-head{display:flex;align-items:center;gap:9px;flex-wrap:wrap;padding:9px 12px;
+  border-bottom:1px solid color-mix(in oklab,var(--st-run) 22%,var(--line))}
+.live-k{display:inline-flex;align-items:center;gap:7px;font:12px/1 var(--sans);font-weight:650;
+  color:color-mix(in oklab,var(--st-run) 72%,var(--ink))}
+.live-k .wdot{width:7px;height:7px;border-radius:50%;background:var(--st-run);animation:breathe 3s ease-in-out infinite}
+/* 中性但明确——紫色只留给「可写」权限，不让两个不相干的意思共用一种颜色 */
+.draft{display:inline-flex;align-items:center;gap:5px;font:11.5px/1 var(--sans);font-weight:650;
+  color:var(--ink);border:1px solid var(--line-2);
+  background:var(--surface);border-radius:999px;padding:4px 9px}
+.draft svg{width:12px;height:12px}
+.draft.bump{animation:bump .5s cubic-bezier(.2,.7,.3,1)}
+.live-meta{margin-left:auto;display:inline-flex;align-items:center;gap:10px;font:11px/1 var(--mono);color:var(--faint)}
+/* 滚动预览窗：内容贴底，旧文字从顶部滑出被裁掉——与顶部渐隐方向一致 */
+.live-win{position:relative;display:flex;align-items:flex-end;max-height:11.5em;overflow:hidden;padding:12px 13px;
+  -webkit-mask-image:linear-gradient(transparent,#000 22%);mask-image:linear-gradient(transparent,#000 22%)}
+.live-win p{margin:0;font:12.5px/1.72 var(--mono);color:var(--ink-soft);white-space:pre-wrap;overflow-wrap:anywhere}
+.live-foot{padding:0 13px 11px;font:11px/1.6 var(--mono);color:var(--faint);max-width:74ch}
+.settled{margin:2px 15px 0;display:inline-flex;align-items:center;gap:7px;font:11.5px/1 var(--sans);font-weight:650;
+  color:var(--st-run);background:color-mix(in oklab,var(--st-run) 11%,var(--surface));
+  border:1px solid color-mix(in oklab,var(--st-run) 34%,var(--line));border-radius:999px;padding:5px 11px;
+  animation:cardIn .4s ease both}
+.settled svg{width:12px;height:12px}
+
+/* 回到底部 */
+.jump{position:absolute;left:50%;bottom:20px;transform:translateX(-50%);display:inline-flex;align-items:center;gap:7px;
+  font:12.5px/1 var(--sans);font-weight:600;color:#fff;background:var(--accent);border-radius:999px;padding:9px 15px;
+  box-shadow:0 8px 24px -8px color-mix(in oklab,var(--accent) 70%,transparent);z-index:14}
+.jump[hidden]{display:none}
+.jump svg{width:13px;height:13px}
+
+/* 加载态骨架：静态色块，不做持续闪烁——这页可能开十几小时 */
+.skel{padding:4px 0}
+.skel-card{background:var(--surface);border:1px solid var(--line);border-left:3px solid var(--line-2);
+  border-radius:0 10px 10px 0;padding:11px 12px;margin-bottom:7px}
+.skel-card i{display:block;height:9px;border-radius:5px;background:var(--surface-3);margin-bottom:7px}
+.skel-card i:nth-child(1){width:52%}
+.skel-card i:nth-child(2){width:74%}
+.skel-card i:nth-child(3){width:38%;margin-bottom:0}
+
+/* 空态 */
+.empty{max-width:460px;margin:88px auto;text-align:center;color:var(--faint)}
+.empty .e-ic{width:46px;height:46px;margin:0 auto 15px;border:1.5px dashed var(--line-2);border-radius:14px;
+  display:grid;place-items:center}
+.empty .e-ic svg{width:22px;height:22px;opacity:.7}
+.empty h2{margin:0 0 7px;font-size:15px;font-weight:650;color:var(--ink-soft)}
+.empty p{margin:0;font-size:13px;line-height:1.7;text-wrap:pretty}
+.empty .path{margin-top:12px;font:11.5px/1 var(--mono);color:var(--faint);background:var(--surface-2);
+  border:1px solid var(--line);border-radius:7px;padding:7px 10px;display:inline-block;overflow-wrap:anywhere}
+
+/* 终态：运行已结束 */
+.ended-screen{flex:1 1 auto;display:none;place-items:center;padding:30px;background:var(--canvas)}
+body.run-ended .ended-screen{display:grid}
+body.run-ended .shell{display:none}
+.ended-card{max-width:560px;text-align:center}
+.ended-card .e-ic{width:54px;height:54px;margin:0 auto 18px;border-radius:16px;display:grid;place-items:center;
+  color:var(--ink-soft);background:var(--surface-2);border:1px solid var(--line)}
+.ended-card .e-ic svg{width:26px;height:26px}
+.ended-card h2{margin:0 0 10px;font-size:19px;font-weight:650;color:var(--ink)}
+.ended-card p{margin:0 0 8px;font-size:13.5px;line-height:1.78;color:var(--ink-soft);text-wrap:pretty}
+.ended-card .calm{display:inline-flex;align-items:center;gap:7px;margin-top:14px;font:11.5px/1 var(--mono);
+  color:var(--faint);border:1px solid var(--line);border-radius:999px;padding:6px 12px;background:var(--surface)}
+
+/* 动画（长时间挂机，克制） */
+@keyframes breathe{0%,100%{opacity:1}50%{opacity:.38}}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.25}}
+@keyframes cardIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+@keyframes bump{0%{transform:scale(1)}40%{transform:scale(1.13)}100%{transform:scale(1)}}
+@media (prefers-reduced-motion:reduce){*{animation:none!important}}
+
+/* 窄窗口：左右退化为上下 */
+@media (max-width:1080px){
+  .shell{grid-template-columns:1fr;grid-template-rows:minmax(190px,34vh) 1fr}
+  .sidebar{border-right:none;border-bottom:1px solid var(--line)}
+  .shell.collapsed{grid-template-rows:0 1fr}
+  .runmeta,.deeplink{display:none}
+  .dpad{padding:0 16px}
+  .infobar{padding:12px 16px 10px}
+  .live,.settled{margin-left:11px;margin-right:11px}
+}
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="glyph" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 3v4M12 17v4M5.6 5.6l2.8 2.8M15.6 15.6l2.8 2.8M3 12h4M17 12h4"/><circle cx="12" cy="12" r="3.2"/>
+      </svg>
+    </span>
+    <span>
+      <b>委托会话观察台</b>
+      <span class="sub">AGENT BRIDGE · READ ONLY</span>
+    </span>
+  </div>
+
+  <div class="runmeta">
+    <span>本次运行 <b id="runElapsed">35分33秒</b></span>
+    <span class="sep">·</span>
+    <span id="runCount">7 个会话 · 2 进行中</span>
+  </div>
+
+  <span class="deeplink mono" id="deeplink" title="刷新后按此链接恢复选中会话与展开的轮次">#/</span>
+
+  <span class="spacer"></span>
+
+  <span class="conn" id="conn" data-s="live"><i class="led"></i><span id="connText">实时</span></span>
+
+  <button class="tbtn" id="themeBtn" title="切换深浅色">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+    <span id="themeLabel">深色</span>
+  </button>
+</header>
+
+<div class="notice warn" id="connNotice" hidden>
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M1 1l22 22M16.7 16.7A6 6 0 0 0 12 8a6 6 0 0 0-2.7.6M5 12.5a10 10 0 0 1 2.3-2.3M2 8.8a15 15 0 0 1 4-2.6M12 20h.01"/></svg>
+  <div>
+    <div><b>与本地服务的连接已断开，正在自动重连…</b>（第 <span id="retryN">2</span> 次尝试）</div>
+    <div class="n-sub">以下内容为断连前的最后状态，不是最新的。这只是「暂时看不到」——记录本身仍在主 agent 手里。</div>
+  </div>
+</div>
+
+<div class="shell" id="shell">
+
+  <!-- ======================= 左栏 ======================= -->
+  <aside class="sidebar">
+    <div class="side-head">
+      <div class="side-title">
+        <span>会话</span>
+        <span class="count mono" id="listCount">7</span>
+        <button class="collapse" id="collapseBtn" title="折叠左栏">
+          <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M15 6l-6 6 6 6"/></svg>
+        </button>
+      </div>
+      <div class="searchbox">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.2-3.2"/></svg>
+        <input id="search" type="search" placeholder="搜索会话名、引擎，或轮次正文…" autocomplete="off" />
+      </div>
+      <div class="filters" role="group" aria-label="会话筛选">
+        <button class="fchip" data-f="all" aria-pressed="true">全部 <span class="n" id="fAll">7</span></button>
+        <button class="fchip" data-f="running" aria-pressed="false">只看进行中 <span class="n" id="fRun">2</span></button>
+        <button class="fchip" data-f="problem" aria-pressed="false">只看有问题 <span class="n" id="fWarn">3</span></button>
+      </div>
+    </div>
+
+    <div class="slist" id="slist"></div>
+
+    <div class="side-foot">
+      <details class="legend">
+        <summary>
+          <svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 6l6 6-6 6"/></svg>
+          状态与权限规范
+        </summary>
+        <div class="legend-body">
+          <h4>四档状态</h4>
+          <div class="legend-row"><i class="dot d-run"></i><b class="st-run">进行中</b><span class="lw">starting / running</span></div>
+          <div class="legend-row"><i class="dot d-idle"></i><b class="st-idle">空闲</b><span class="lw">idle + healthy，随时可继续</span></div>
+          <div class="legend-row"><i class="dot d-warn"></i><b class="st-warn">有问题</b><span class="lw">degraded，或上一轮失败但可复用</span></div>
+          <div class="legend-row"><i class="dot d-end"></i><b class="st-end">已结束</b><span class="lw">closed / dead，降级但不隐藏</span></div>
+          <h4>三档权限</h4>
+          <div class="legend-row"><span class="perm p-write"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>可写</span><span class="lw">明确授权改文件</span></div>
+          <div class="legend-row"><span class="perm p-hard"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v6c0 4.4-3 8.3-7 9-4-.7-7-4.6-7-9V6z"/><path d="M9 12l2 2 4-4"/></svg>只读（强制）</span><span class="lw">系统级沙箱，真的写不了盘（仅 Codex）</span></div>
+          <div class="legend-row"><span class="perm p-soft"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v6c0 4.4-3 8.3-7 9-4-.7-7-4.6-7-9V6z" stroke-dasharray="3 2.4"/><path d="M9.5 12.5l5-5M14.5 12.5l-5-5"/></svg>只读（约定）</span><span class="lw">它仍有能力写盘，只是被要求不要写</span></div>
+        </div>
+      </details>
+    </div>
+  </aside>
+
+  <!-- ======================= 右栏 ======================= -->
+  <div class="detailwrap">
+    <div class="detail" id="detail"></div>
+    <button class="jump" id="jumpBtn" hidden>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M6 13l6 6 6-6"/></svg>
+      回到底部
+    </button>
+  </div>
+</div>
+
+<!-- ======================= 终态 ======================= -->
+<div class="ended-screen">
+  <div class="ended-card">
+    <div class="e-ic">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M4 7h16M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"/><path d="M6 7l1 12.2A2 2 0 0 0 9 21h6a2 2 0 0 0 2-1.8L18 7"/>
+      </svg>
+    </div>
+    <h2>该运行已结束，实时记录已随之清除</h2>
+    <p>主 agent 已经下线。这一次运行的会话与轮次内容，连同它的临时目录一起被删除了——这是有意的设计：不在你的电脑上长期留存对话内容。</p>
+    <p>下一次主 agent 上线会开启一次新的运行，这个页面会重新有内容。这里没有历史列表可以翻回去。</p>
+    <span class="calm">
+      <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M20 6L9 17l-5-5"/></svg>
+      正常收尾，不是错误
+    </span>
+  </div>
+</div>
+
+<script type="module">
+/* ⚠️ 这是 module：DOM 已就绪才执行，所以顶部直接取元素是安全的。 */
+import {
+  statusKind, permKind, contextLevel, isUncollected, shortName,
+  OUTCOME_LABEL, BODY_LABEL,
+} from "./reconcile.mjs";
+
+/* ============================================================
+   1. 图标
+   ============================================================ */
+var SVG = {
+  copy:'<path d="M9 9h10v10a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2z"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
+  check:'<path d="M20 6L9 17l-5-5"/>',
+  chev:'<path d="M9 6l6 6-6 6"/>',
+  raw:'<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M8 13h8M8 17h5"/>',
+  ok:'<circle cx="12" cy="12" r="9"/><path d="M8.5 12.2l2.4 2.4 4.6-4.8"/>',
+  fail:'<circle cx="12" cy="12" r="9"/><path d="M15 9l-6 6M9 9l6 6"/>',
+  stop:'<rect x="4.5" y="4.5" width="15" height="15" rx="3"/><rect x="9.5" y="9.5" width="5" height="5" rx="1"/>',
+  ghost:'<path d="M12 3a7 7 0 0 0-7 7v10l2.4-1.8L9.8 20l2.2-1.8L14.2 20l2.4-1.8L19 20V10a7 7 0 0 0-7-7z" stroke-dasharray="3.2 2.4"/><path d="M9.6 10.5h.01M14.4 10.5h.01"/>',
+  alert:'<path d="M10.3 3.6L1.9 18a2 2 0 0 0 1.7 3h16.8a2 2 0 0 0 1.7-3L13.7 3.6a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/>',
+  write:'<path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/>',
+  shield:'<path d="M12 3l7 3v6c0 4.4-3 8.3-7 9-4-.7-7-4.6-7-9V6z"/><path d="M9 12l2 2 4-4"/>',
+  shieldSoft:'<path d="M12 3l7 3v6c0 4.4-3 8.3-7 9-4-.7-7-4.6-7-9V6z" stroke-dasharray="3 2.4"/><path d="M9.5 12.5l5-5M14.5 12.5l-5-5"/>',
+  inbox:'<path d="M3 13h5l1.6 3h4.8L16 13h5"/><path d="M5.4 5.6L3 13v5a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-5l-2.4-7.4A2 2 0 0 0 16.7 4H7.3a2 2 0 0 0-1.9 1.6z"/>',
+  redo:'<path d="M20.5 12a8.5 8.5 0 1 1-2.6-6.1"/><path d="M20.5 4v5h-5"/>',
+  clock:'<circle cx="12" cy="12" r="9"/><path d="M12 7.5V12l3 1.8"/>',
+  none:'<circle cx="12" cy="12" r="9" stroke-dasharray="3.4 2.6"/><path d="M8.5 12h7"/>',
+  plug:'<path d="M9 3v6M15 3v6"/><path d="M6 9h12v3a6 6 0 0 1-12 0z"/><path d="M12 18v3"/>'
+};
+/* 所有图标默认带 .ic 兜底尺寸；容器自己的 svg 规则特异性更高，仍然优先 */
+function ico(n,cls){ return '<svg class="ic '+(cls||'')+'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'+SVG[n]+'</svg>'; }
+
+/* ============================================================
+   2. 数据层：wire 快照 → 展示模型（合同见同目录 STATE.md）
+   ============================================================ */
+
+/* ⚠️ **页面不改写快照。** 快照是 writer 的产物、`contract-invariants.mjs` 验的就是它；
+      页面在这里做的是**另建一份展示模型**，两者并存、互不覆盖。
+      viewer 一旦就地改写快照，页面吃的就不再是"那份快照"，中间那道缝正是漂移的产地。 */
+
+var SESSIONS = [];                 /* 展示模型，由 applyState() 整体重建 */
+var SNAP = null;                   /* 最近一份快照原文（只读） */
+var RUN = { runId:null, vizDir:null, degraded:false, recordingErrors:[], gone:false,
+            readFailure:false, startedAt:null };
+var PROGRESS = new Map();          /* vizTurnId -> §5 sidecar */
+var BODY = new Map();              /* ref -> {text} | {pending:true} | {tamper:true} | {error} */
+
+var ENGINE = {
+  omp:    { name:"Oh My Pi",     eb:"OM" },
+  codex:  { name:"Codex",        eb:"CX" },
+  claude: { name:"Claude Code",  eb:"CC" },
+  cursor: { name:"Cursor Agent", eb:"CU" },
+  kimi:   { name:"Kimi Code",    eb:"KM" },
+};
+
+function hhmmss(iso){
+  if(!iso) return "--:--:--";
+  var d=new Date(iso); if(isNaN(d)) return "--:--:--";
+  var p=function(x){return String(x).padStart(2,"0");};
+  return p(d.getHours())+":"+p(d.getMinutes())+":"+p(d.getSeconds());
+}
+function secsSince(iso){
+  if(!iso) return 0;
+  var t=Date.parse(iso); if(!isFinite(t)) return 0;
+  return Math.max(0, Math.round((Date.now()-t)/1000));
+}
+function mb(bytes){
+  if(!isFinite(bytes)) return "?";
+  if(bytes >= 1048576) return (bytes/1048576).toFixed(1)+" MB";
+  if(bytes >= 1024) return Math.round(bytes/1024)+" KB";
+  return bytes+" B";
+}
+
+/* ---- 正文按需取，并**当场对证** ---- */
+/* ⚠️ 服务端会用**实际发出去的字节**实时算一遍 SHA-256 放在 X-Viz-Sha256 里；
+      这里拿它和快照里 writer 记下的指纹比。不一致 = 文件在落盘之后被改过 ——
+      这时候**绝不能照常展示**，否则页面等于替一份被篡改的内容背书。 */
+function bodyOf(ref, expectSha){
+  if(!ref) return { text:"" };
+  var hit = BODY.get(ref);
+  if(hit) return hit;
+  BODY.set(ref, { pending:true });
+  fetch("/file?ref="+encodeURIComponent(ref)).then(function(r){
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    var got = r.headers.get("X-Viz-Sha256");
+    var truncated = r.headers.get("X-Viz-Truncated") === "1";
+    var fullBytes = Number(r.headers.get("X-Viz-Full-Bytes") || 0);
+    return r.text().then(function(text){
+      if(expectSha && got && !truncated && got !== expectSha){
+        BODY.set(ref, { tamper:true, expected:expectSha, actual:got });
+      }else{
+        BODY.set(ref, { text:text, truncated:truncated, fullBytes:fullBytes });
+      }
+    });
+  }).catch(function(e){
+    BODY.set(ref, { error:String(e && e.message || e) });
+  }).then(function(){ scheduleRender(); });
+  return BODY.get(ref);
+}
+
+var PLACEHOLDER = "（正在读取原文…）";
+function textFrom(b){
+  if(!b) return "";
+  if(b.pending) return PLACEHOLDER;
+  if(b.tamper)  return "⚠️ 这份文件在落盘之后被改动过（指纹对不上），已拒绝展示。";
+  if(b.error)   return "⚠️ 读取失败：" + b.error;
+  return b.text || "";
+}
+function isUsable(b){ return !!(b && !b.pending && !b.tamper && !b.error); }
+
+/* ---- 一轮 ---- */
+function adaptTurn(s, t){
+  /* run gone 时把仍是 dispatched 的轮次**合成**为 abandoned（STATE.md §9）。
+     快照永远发不出终态——run.status 只有一档，终态是传输层的一帧。 */
+  var synthesized = RUN.gone && t.state === "dispatched";
+  var running = t.state === "dispatched" && !synthesized;
+  var result = running ? "running" : (synthesized ? "abandoned" : t.outcome);
+  var body = running ? "none" : (synthesized ? "none" : t.bodyKind);
+
+  var inB = bodyOf(t.input.ref, t.input.sha256);
+  var o = {
+    n: t.turnNo,
+    result: result,
+    body: body,
+    from: hhmmss(t.dispatchedAt),
+    to: t.settledAt ? hhmmss(t.settledAt) : null,
+    dur: Math.round((t.durationMs || 0) / 1000),
+    elapsed: running ? secsSince(t.dispatchedAt) : 0,
+    /* 「未取结果」——UIREQ §2 场景 3，这套系统里最常见的一类事故。 */
+    unfetched: isUncollected(t) && !synthesized,
+    error: t.error || null,
+    __vizTurnId: t.vizTurnId,
+    __pending: false,
+    input: {
+      chars: t.input.chars || 0,
+      text: textFrom(inB),
+      truncated: t.input.truncated
+        ? { orig: mb(t.input.originalBytes), saved: mb(t.input.bytes) } : null,
+    },
+  };
+  if(!isUsable(inB)) o.__pending = true;
+
+  if(running){
+    /* §5 的四条前提：只有仍是 dispatched、且 sidecar 的 vizTurnId 对得上才合并。
+       快照一旦标 settled，迟到的 sidecar **永远无法让它回退**。 */
+    var p = PROGRESS.get(t.vizTurnId);
+    var ok = p && p.vizTurnId === t.vizTurnId;
+    o.live = {
+      chars: ok ? (p.charCount || 0) : 0,
+      draft: (ok ? p.generationCount : t.generationCount) || 1,
+      preview: ok ? (p.tail || "") : "",
+      age: ok ? secsSince(p.updatedAt) : 0,
+      bump: ok && LAST_DRAFT.get(t.vizTurnId) != null && LAST_DRAFT.get(t.vizTurnId) !== p.generationCount,
+    };
+    if(ok) LAST_DRAFT.set(t.vizTurnId, p.generationCount);
+  } else if(body !== "none"){
+    var ob = bodyOf(t.output.ref, t.output.sha256);
+    o.output = { chars: t.output.chars || 0, md: textFrom(ob) };
+    if(ob && ob.truncated){
+      o.output.capped = {
+        shown: mb((o.output.md || "").length),
+        total: mb(ob.fullBytes),
+        path: (RUN.vizDir ? RUN.vizDir + "\\" : "") + String(t.output.ref).replace(/\//g, "\\"),
+      };
+    }
+    if(!isUsable(ob)) o.__pending = true;
+  } else {
+    o.output = { chars: 0, md: "" };
+  }
+  return o;
+}
+var LAST_DRAFT = new Map();
+
+/* ---- 一个会话 ---- */
+function adaptSession(s){
+  var eng = ENGINE[s.agent] || { name: s.agent || "未知", eb: "??" };
+  var turns = (s.turns || []).map(function(t){ return adaptTurn(s, t); });
+  /* ⚠️ 存活**只看 status + health**，绝不看 backendPid：cursor / kimi 在两轮之间
+        不占任何进程，但会话完全健康、随时可以继续。 */
+  var kind = statusKind(s);
+  return {
+    id: s.sessionId,
+    alias: s.name || null,
+    engine: s.agent, engineName: eng.name, eb: eng.eb,
+    model: s.model || null,
+    effort: s.effort || null,
+    perm: permKind(s),
+    state: s.status, health: s.health,
+    /* ⚠️ null 是**未知**，不是 0。显示成 0 会让人以为"很空闲、很安全"——是反的。 */
+    ctx: (s.contextUsage && isFinite(s.contextUsage.tokens)) ? s.contextUsage.tokens : null,
+    cwd: s.cwd || "",
+    createdAt: hhmmss(s.createdAt),
+    lastActive: kind === "run" ? 0 : secsSince(s.updatedAt),
+    incomplete: RUN.degraded,
+    startupError: s.openFailed ? s.openFailed.error : null,
+    logFile: s.logFile || null,
+    turns: turns,
+  };
+}
+
+function applyState(snap){
+  SNAP = snap;
+  RUN.degraded = !!(snap.run && snap.run.degraded);
+  RUN.recordingErrors = (snap.run && snap.run.recordingErrors) || [];
+  RUN.startedAt = snap.run && snap.run.startedAt;
+  SESSIONS = (snap.sessions || []).map(adaptSession);
+  /* 已结算的轮次立刻忘掉 sidecar——留着它只会让迟到的内容有机会回来。 */
+  var alive = new Set();
+  (snap.sessions || []).forEach(function(s){
+    (s.turns || []).forEach(function(t){ if(t.state === "dispatched") alive.add(t.vizTurnId); });
+  });
+  for(var k of Array.from(PROGRESS.keys())) if(!alive.has(k)) PROGRESS.delete(k);
+  scheduleRender();
+}
+/* ============================================================
+   3. 工具函数
+   ============================================================ */
+function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function num(n){ return String(n).replace(/\B(?=(\d{3})+(?!\d))/g,','); }
+function fmtDur(s){
+  if(s<60) return s+'秒';
+  var h=Math.floor(s/3600), m=Math.floor(s%3600/60), ss=s%60;
+  if(h>0) return h+'小时'+m+'分';
+  return m+'分'+ss+'秒';
+}
+function fmtRel(s){
+  if(s<10) return '刚刚';
+  if(s<60) return s+' 秒前';
+  if(s<3600) return Math.floor(s/60)+' 分钟前';
+  return Math.floor(s/3600)+' 小时前';
+}
+function statusOf(s){
+  if(s.state==='running'||s.state==='starting') return 'run';
+  if(s.state==='closed'||s.health==='dead') return 'end';
+  if(s.state==='failed'||s.health==='degraded') return 'warn';
+  return 'idle';
+}
+var ST_LABEL={run:'进行中',idle:'空闲',warn:'有问题',end:'已结束'};
+var ST_ORDER={run:0,warn:1,idle:2,end:3};
+var PERM={
+  write:{cls:'p-write',label:'可写',icon:'write',title:'明确授权改文件'},
+  hard :{cls:'p-hard', label:'只读（强制）',icon:'shield',title:'操作系统级沙箱拦截，真的写不了盘'},
+  soft :{cls:'p-soft', label:'只读（约定）',icon:'shieldSoft',title:'它仍有能力写盘，只是被要求不要写——这不是一道墙'}
+};
+var RES={
+  completed:{cls:'rb-completed',icon:'ok',label:'完成'},
+  failed   :{cls:'rb-failed',   icon:'fail',label:'失败'},
+  aborted  :{cls:'rb-aborted',  icon:'stop',label:'被中断'},
+  abandoned:{cls:'rb-abandoned',icon:'ghost',label:'未收场 · 结果永久缺失'},
+  running  :{cls:'rb-running',  icon:'clock',label:'进行中'}
+};
+var BODYB={ final:{cls:'',label:'完整正文'}, partial:{cls:'partial',label:'只有片段 · 可能不完整'}, none:{cls:'none',label:'无正文'} };
+
+function sessionName(s){ return s.alias || (s.id.slice(0,s.id.indexOf('-',s.id.indexOf('-')+1))+'…'+s.id.slice(-4)); }
+function slug(s){ return s.alias || s.id; }
+
+/* 迷你 Markdown 渲染（标题 / 列表 / 表格 / 代码块 / 粗体 / 行内码） */
+function inl(s){
+  return esc(s).replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>');
+}
+function cells(l){ return l.replace(/^\||\|$/g,'').split('|').map(function(x){return x.trim();}); }
+function md(src){
+  var lines=String(src).replace(/\r/g,'').split('\n'), out='', i=0;
+  while(i<lines.length){
+    var L=lines[i];
+    if(L.slice(0,3)==='```'){
+      var lang=L.slice(3).trim(), buf=[]; i++;
+      while(i<lines.length && lines[i].slice(0,3)!=='```'){ buf.push(lines[i]); i++; }
+      i++;
+      out+='<div class="cb"><div class="cb-h">'+esc(lang||'text')+'</div><pre><code>'+esc(buf.join('\n'))+'</code></pre></div>';
+      continue;
+    }
+    if(L.charAt(0)==='|' && /^\s*\|[\s:|-]+\|\s*$/.test(lines[i+1]||'')){
+      var head=cells(L); i+=2; var rows=[];
+      while(i<lines.length && lines[i].charAt(0)==='|'){ rows.push(cells(lines[i])); i++; }
+      out+='<div class="tw"><table><thead><tr>'+head.map(function(c){return '<th>'+inl(c)+'</th>';}).join('')+'</tr></thead><tbody>'+
+        rows.map(function(r){return '<tr>'+r.map(function(c){return '<td>'+inl(c)+'</td>';}).join('')+'</tr>';}).join('')+'</tbody></table></div>';
+      continue;
+    }
+    var h=/^(#{2,5})\s+(.*)$/.exec(L);
+    if(h){ var lv=Math.min(h[1].length+1,6); out+='<h'+lv+'>'+inl(h[2])+'</h'+lv+'>'; i++; continue; }
+    if(/^\s*(-{3,})\s*$/.test(L)){ out+='<hr>'; i++; continue; }
+    if(/^\s*[-*]\s+/.test(L)){
+      var li=[]; while(i<lines.length && /^\s*[-*]\s+/.test(lines[i])){ li.push(lines[i].replace(/^\s*[-*]\s+/,'')); i++; }
+      out+='<ul>'+li.map(function(x){return '<li>'+inl(x)+'</li>';}).join('')+'</ul>'; continue;
+    }
+    if(/^\s*\d+[.)]\s+/.test(L)){
+      var ol=[]; while(i<lines.length && /^\s*\d+[.)]\s+/.test(lines[i])){ ol.push(lines[i].replace(/^\s*\d+[.)]\s+/,'')); i++; }
+      out+='<ol>'+ol.map(function(x){return '<li>'+inl(x)+'</li>';}).join('')+'</ol>'; continue;
+    }
+    if(L.trim()===''){ i++; continue; }
+    var p=[];
+    while(i<lines.length && lines[i].trim()!=='' && !/^(```|#{2,5}\s|\s*[-*]\s|\s*\d+[.)]\s|\|)/.test(lines[i])){ p.push(lines[i]); i++; }
+    out+='<p>'+inl(p.join(' '))+'</p>';
+  }
+  return out;
+}
+
+/* ============================================================
+   4. 状态
+   ============================================================ */
+var UI = {
+  selected:null,
+  filter:'all',
+  query:'',
+  expanded:{},          /* key: sid|turnN|in|out -> bool */
+  raw:{},
+  tick:0,
+  atBottom:true,
+  settledFlash:{}
+};
+var elSlist=document.getElementById('slist');
+var elDetail=document.getElementById('detail');
+var elJump=document.getElementById('jumpBtn');
+
+/* ---- 筛选与搜索 ---- */
+function matchCount(s,q){
+  if(!q) return 0;
+  var n=0, ql=q.toLowerCase();
+  if((s.alias||'').toLowerCase().indexOf(ql)>=0) n++;
+  if(s.id.toLowerCase().indexOf(ql)>=0) n++;
+  if((s.engineName+' '+(s.model||'')).toLowerCase().indexOf(ql)>=0) n++;
+  s.turns.forEach(function(t){
+    if((t.input.text||'').toLowerCase().indexOf(ql)>=0) n++;
+    if(t.output && (t.output.md||'').toLowerCase().indexOf(ql)>=0) n++;
+    if(t.settled && (t.settled.md||'').toLowerCase().indexOf(ql)>=0) n++;
+  });
+  return n;
+}
+function hasPending(s){ return s.turns.some(function(t){return t.unfetched;}); }
+function isProblem(s){ var k=statusOf(s); return k==='warn' || !!s.startupError || hasPending(s); }
+function visibleSessions(){
+  return SESSIONS.filter(function(s){
+    if(UI.filter==='running' && statusOf(s)!=='run') return false;
+    if(UI.filter==='problem' && !isProblem(s)) return false;
+    if(UI.query && matchCount(s,UI.query)===0) return false;
+    return true;
+  }).sort(function(a,b){
+    var d=ST_ORDER[statusOf(a)]-ST_ORDER[statusOf(b)];
+    return d!==0?d:(a.lastActive-b.lastActive);
+  });
+}
+
+/* ============================================================
+   5. 左栏渲染
+   ============================================================ */
+function renderList(){
+  var list=visibleSessions();
+  document.getElementById('listCount').textContent=list.length;
+  document.getElementById('fAll').textContent=SESSIONS.length;
+  document.getElementById('fRun').textContent=SESSIONS.filter(function(s){return statusOf(s)==='run';}).length;
+  document.getElementById('fWarn').textContent=SESSIONS.filter(isProblem).length;
+
+  if(list.length===0){
+    elSlist.innerHTML='<div class="empty" style="margin:48px auto"><div class="e-ic">'+ico('inbox')+'</div>'+
+      '<h2>'+(SESSIONS.length===0?'还没有会话':'没有符合条件的会话')+'</h2>'+
+      '<p>'+(SESSIONS.length===0
+        ? '主 agent 已经在线，但还没有把任务派给任何子 AI。它一旦拉起会话，这里会立刻出现。'
+        : '换个筛选或清空搜索词试试。')+'</p></div>';
+    return;
+  }
+
+  var html='', lastGroup=null;
+  list.forEach(function(s){
+    var k=statusOf(s);
+    if(k!==lastGroup){ html+='<div class="sgroup">'+ST_LABEL[k]+'</div>'; lastGroup=k; }
+    html+=cardHTML(s,k);
+  });
+  elSlist.innerHTML=html;
+
+  Array.prototype.forEach.call(elSlist.querySelectorAll('.scard'),function(el){
+    el.addEventListener('click',function(){ select(el.getAttribute('data-sid')); });
+  });
+}
+
+function cardHTML(s,k){
+  var running=(k==='run');
+  var live=s.turns.filter(function(t){return t.result==='running';})[0];
+  var perm=PERM[s.perm];
+  var mc=matchCount(s,UI.query);
+  var sel=(UI.selected===s.id);
+  var nameCls='sc-name'+(s.alias?'':' anon');
+
+  var flags='';
+  if(hasPending(s)) flags+='<span class="flag f-pending">'+ico('alert')+'未取结果</span>';
+  if(s.startupError) flags+='<span class="flag f-err">'+ico('fail')+'启动失败</span>';
+  else if(k==='warn') flags+='<span class="flag f-err">'+ico('fail')+'上一轮报错</span>';
+  if(mc) flags+='<span class="flag f-match">'+mc+' 处匹配</span>';
+
+  var prev='';
+  if(running && live && live.live){
+    prev='<div class="sc-prev"><div class="pv-t">'+esc(tailOf(live.live.preview||'',120))+'</div>'+
+      '<div class="pv-m"><span>预览 '+num(live.live.chars)+' 字</span><span>·</span><span>第 '+live.live.draft+' 稿</span></div></div>';
+  }
+
+  return '<button class="scard s-'+k+'" data-sid="'+s.id+'" aria-selected="'+sel+'">'+
+    '<div class="sc-r1"><i class="dot d-'+k+'"></i><span class="'+nameCls+'">'+esc(sessionName(s))+'</span>'+
+      '<span class="sc-state st-'+k+'">'+ST_LABEL[k]+(running&&live?' · '+fmtDur(live.elapsed):'')+'</span></div>'+
+    '<div class="sc-r2"><span class="eng"><i class="eb">'+s.eb+'</i>'+esc(s.engineName)+'</span>'+
+      '<span class="sc-model">/ '+esc(s.model||'默认')+'</span></div>'+
+    '<div class="sc-r3">'+
+      '<span class="perm '+perm.cls+'" title="'+esc(perm.title)+'">'+ico(perm.icon)+esc(perm.label)+'</span>'+
+      '<span class="sc-meta">'+s.turns.length+' 轮</span>'+
+      '<span class="sc-meta">'+(running?'':fmtRel(s.lastActive))+'</span>'+
+      flags+
+    '</div>'+ prev +'</button>';
+}
+function tailOf(t,n){ t=t.replace(/\n+/g,' '); return t.length>n? '…'+t.slice(-n) : t; }
+
+/* ============================================================
+   6. 右栏渲染
+   ============================================================ */
+function renderDetail(){
+  var s=SESSIONS.filter(function(x){return x.id===UI.selected;})[0];
+  if(!s){
+    elDetail.innerHTML='<div class="empty"><div class="e-ic">'+ico('inbox')+'</div>'+
+      '<h2>还没有可查看的会话</h2><p>主 agent 一旦把任务派出去，左侧会出现会话卡片，选中即可在这里逐轮查看它问了什么、答了什么。</p></div>';
+    return;
+  }
+  var k=statusOf(s), perm=PERM[s.perm];
+
+  /* --- 信息条 --- */
+  var ctxHTML;
+  if(s.ctx===null){
+    ctxHTML='<span class="unknown" title="Cursor / Kimi 引擎不上报上下文用量，这里永远是未知——不要当作 0">'+ico('none')+'未知 / 不适用</span>';
+  }else{
+    var pct=Math.min(100,Math.round(s.ctx/450000*100));
+    var lv = s.ctx>=400000?'hi' : (s.ctx>=300000?'mid':'');
+    var lab = s.ctx>=400000?'该换新会话了' : (s.ctx>=300000?'该收尾了':'正常');
+    ctxHTML='<span class="ctx"><span class="bar"><i class="'+lv+'" style="width:'+pct+'%"></i></span>'+
+      '<span class="lab '+lv+'">'+num(s.ctx)+' tokens · '+lab+'</span></span>';
+  }
+
+  var head='<div class="infobar">'+
+    '<div class="ib-r1">'+
+      '<span class="ib-name">'+esc(s.alias||'（无别名）')+'</span>'+
+      '<span class="ib-id">'+esc(s.id)+'</span>'+
+      '<span class="ib-state"><i class="dot d-'+k+'"></i><span class="st-'+k+'">'+ST_LABEL[k]+'</span></span>'+
+      '<span class="perm '+perm.cls+'" title="'+esc(perm.title)+'">'+ico(perm.icon)+esc(perm.label)+'</span>'+
+    '</div>'+
+    '<div class="ib-kv">'+
+      kv('引擎', s.engineName+' · '+s.engine)+
+      kv('模型', s.model||'默认（引擎自选）', !s.model)+
+      kv('思考强度', s.effort||'不适用', !s.effort)+
+      kv('工作区', s.cwd)+
+      kv('创建于', s.createdAt)+
+      kv('总轮次', s.turns.length+' 轮')+
+      '<div class="kv"><span class="k">上下文占用</span><span class="v">'+ctxHTML+'</span></div>'+
+    '</div>'+
+  '</div>';
+
+  /* --- 提示条 --- */
+  var bars='';
+  if(s.incomplete){
+    bars+='<div class="sbar amber">'+ico('alert')+
+      '<div><b>本次记录不完整。</b>写入过程中有部分内容未能保存，下面看到的轮次可能缺了片段。这不影响已显示内容的真实性。</div></div>';
+  }
+  if(hasPending(s)){
+    var pn=s.turns.filter(function(t){return t.unfetched;}).map(function(t){return '第 '+t.n+' 轮';}).join('、');
+    bars+='<div class="sbar amber">'+ico('inbox')+
+      '<div><b>有产出被晾着了：'+pn+'。</b>这些轮次已经跑完，但主 agent 从未来取过结果。</div></div>';
+  }
+
+  /* --- 轮次 --- */
+  var body;
+  if(s.startupError){
+    body='<div class="sbar red" style="margin-top:20px">'+ico('fail')+
+      '<div><b>这个会话生下来就死了。</b><div style="margin-top:5px;font-family:var(--mono);font-size:12px;line-height:1.65">'+esc(s.startupError)+'</div>'+
+      '<div style="margin-top:7px;opacity:.8">它没有发起过任何轮次，因此下面没有对话可看。卡片保留在左栏，是为了让你知道这次派活里有一位没能就位。</div></div></div>';
+  }else if(s.turns.length===0){
+    body='<div class="empty"><div class="e-ic">'+ico('clock')+'</div><h2>尚未发起任何轮次</h2>'+
+      '<p>会话已经就位，但主 agent 还没有向它发问。先开会话再派活是常见顺序，等第一轮发出后，这里会按轮次从上到下排列。</p></div>';
+  }else{
+    body='<div class="turns">'+s.turns.map(function(t){return turnHTML(s,t);}).join('')+'</div>';
+  }
+
+  elDetail.innerHTML=head+'<div class="dpad">'+bars+body+'</div>';
+  bindDetail(s);
+}
+function kv(k,v,na){ return '<div class="kv"><span class="k">'+k+'</span><span class="v'+(na?' na':'')+'">'+esc(v)+'</span></div>'; }
+
+function turnHTML(s,t){
+  var last=(t.n===s.turns.length);
+  var running=(t.result==='running');
+  var res=RES[t.result], bb=BODYB[t.body];
+
+  var timeHTML = running
+    ? '<span class="t-time">'+t.from+' 开始</span><span class="t-dur">已进行 '+fmtDur(t.elapsed)+'</span>'
+    : '<span class="t-time">'+t.from+' → '+t.to+'</span><span class="t-dur">用时 '+fmtDur(t.dur)+'</span>';
+
+  var head='<div class="t-head">'+
+    '<span class="t-no">第 '+t.n+' 轮</span>'+ timeHTML +
+    '<span class="rbadge '+res.cls+'">'+ico(res.icon)+esc(res.label)+'</span>'+
+    (running?'':'<span class="bbadge '+bb.cls+'">'+esc(bb.label)+'</span>')+
+    (t.unfetched?'<span class="flag f-pending">'+ico('alert')+'未取结果</span>':'')+
+  '</div>';
+
+  /* 输入 */
+  var kIn=s.id+'|'+t.n+'|in';
+  var openIn = (kIn in UI.expanded) ? UI.expanded[kIn] : last;
+  var trunc = t.input.truncated
+    ? '<div class="sbar amber" style="margin:0 0 11px">'+ico('alert')+
+      '<div><b>已截断 · 原始 '+t.input.truncated.orig+' / 保存 '+t.input.truncated.saved+'。</b>'+
+      '「复制输入原文」拿到的是保存下来的截断件，不是完整原文。</div></div>' : '';
+  var inBlock='<div class="io" data-io="in">'+
+    '<div class="io-head'+(openIn?' open':'')+'" data-toggle="'+kIn+'">'+ico('chev','chev')+
+      '<span class="io-k">输入</span><span class="io-n">'+num(t.input.chars)+' 字</span>'+
+      '<span class="io-acts"><button class="mini" data-copy="'+kIn+'">'+ico('copy')+'复制</button></span></div>'+
+    '<div class="io-body'+(openIn?'':' clip')+'" '+(openIn||true?'':'hidden')+' data-body="'+kIn+'">'+
+      trunc+'<div class="io-text">'+esc(t.input.text)+'</div>'+
+      '<button class="io-more" data-toggle="'+kIn+'">'+(openIn?'收起':'展开全文')+'</button>'+
+    '</div></div>';
+
+  /* 输出 / 实时预览 */
+  var outBlock;
+  if(running && t.live){
+    outBlock='<div class="io" data-io="out">'+
+      '<div class="io-head open" style="cursor:default"><span style="width:13px"></span>'+
+        '<span class="io-k out">输出</span><span class="io-n">尚未落定</span></div></div>'+
+      liveHTML(t);
+  }else{
+    var kOut=s.id+'|'+t.n+'|out';
+    var openOut = (kOut in UI.expanded) ? UI.expanded[kOut] : true;
+    var isRaw = !!UI.raw[kOut];
+    var out=t.output||{chars:0,md:''};
+    var inner;
+    if(t.body==='none'){
+      inner='<div class="nobody">'+ico('none')+'<div>这轮没有留下可查看的输出。'+
+        (t.error?'<div style="margin-top:4px;font-family:var(--mono);font-size:11.5px;color:var(--danger)">'+esc(t.error)+'</div>':'')+
+        (t.result==='abandoned'?'<div style="margin-top:4px">会话被关闭时这一轮被从中间截断，它到底成没成也无从得知。</div>':'')+'</div></div>';
+    }else{
+      var warn = t.body==='partial'
+        ? '<div class="sbar amber" style="margin:0 0 11px">'+ico('alert')+
+          '<div><b>只有片段，可能不完整。</b>引擎在收尾前被打断，下面是它当时已经写出来的部分，不是最终答案。</div></div>' : '';
+      var cap = out.capped
+        ? '<div class="sbar amber" style="margin:12px 0 0">'+ico('alert')+
+          '<div><b>正文过长，仅加载前 '+out.capped.shown+'（完整 '+out.capped.total+'）。</b>'+
+          '余下部分请直接打开文件：<div style="margin-top:5px;font-family:var(--mono);font-size:11.5px;overflow-wrap:anywhere">'+esc(out.capped.path)+'</div></div></div>' : '';
+      inner = warn + (isRaw ? '<pre class="raw-pre">'+esc(out.md)+'</pre>' : '<div class="md">'+md(out.md)+'</div>') + cap;
+    }
+    var acts = t.body==='none' ? '' :
+      '<button class="mini" data-copy="'+kOut+'">'+ico('copy')+'复制</button>'+
+      '<button class="mini" data-raw="'+kOut+'" aria-pressed="'+isRaw+'">'+ico('raw')+'原文</button>';
+    var flash = UI.settledFlash[s.id+'|'+t.n]
+      ? '<div class="settled">'+ico('check')+'正文已落定，这份是最终答案</div>' : '';
+
+    outBlock='<div class="io" data-io="out">'+
+      '<div class="io-head'+(openOut?' open':'')+'" data-toggle="'+kOut+'">'+ico('chev','chev')+
+        '<span class="io-k out">输出</span><span class="io-n">'+num(out.chars)+' 字</span>'+
+        '<span class="io-acts">'+acts+'</span></div>'+
+      flash+
+      '<div class="io-body" '+(openOut?'':'hidden')+' data-body="'+kOut+'">'+inner+'</div></div>';
+  }
+
+  var hit = UI.query && ((t.input.text||'').toLowerCase().indexOf(UI.query.toLowerCase())>=0 ||
+            ((t.output&&t.output.md)||'').toLowerCase().indexOf(UI.query.toLowerCase())>=0);
+
+  return '<article class="turn'+(running?' running':'')+(hit?' hit':'')+'">'+head+inBlock+outBlock+'</article>';
+}
+
+function liveHTML(t){
+  var lv=t.live;
+  return '<div class="live">'+
+    '<div class="live-head">'+
+      '<span class="live-k"><i class="wdot"></i>正在生成（内容可能被改写）</span>'+
+      '<span class="draft'+(lv.bump?' bump':'')+'">'+ico('redo')+'已重新组织答案（第 '+lv.draft+' 稿）</span>'+
+      '<span class="live-meta"><span>预览 '+num(lv.chars)+' 字</span><span>更新于 '+(lv.age||0)+' 秒前</span></span>'+
+    '</div>'+
+    '<div class="live-win"><p>'+esc(lv.preview||'')+'</p></div>'+
+    '<div class="live-foot">这是一个约 400 字的滚动预览窗，不保留完整过程文稿。预览长度可能下降或长时间不动，都属正常——判断它有没有卡住，看的是这段内容有没有在变，不是字数在不在涨。</div>'+
+  '</div>';
+}
+
+/* ---- 右栏事件绑定 ---- */
+function bindDetail(s){
+  /* ⚠️ 正文未就绪时禁用复制。这是用户唯一的留档手段，交出去的必须是真东西。 */
+  Array.prototype.forEach.call(elDetail.querySelectorAll("[data-copy]"), function(el){
+    var n = el.getAttribute("data-copy").split("|")[1];
+    var t = s.turns.filter(function(x){ return String(x.n) === n; })[0];
+    if(t && t.__pending){ el.disabled = true; el.title = "原文尚未读取完成"; }
+  });
+  Array.prototype.forEach.call(elDetail.querySelectorAll('[data-toggle]'),function(el){
+    el.addEventListener('click',function(ev){
+      ev.stopPropagation();
+      var k=el.getAttribute('data-toggle');
+      var cur=(k in UI.expanded)?UI.expanded[k]:defaultOpen(k,s);
+      UI.expanded[k]=!cur;
+      renderDetail(); syncHash();
+    });
+  });
+  Array.prototype.forEach.call(elDetail.querySelectorAll('[data-copy]'),function(el){
+    el.addEventListener('click',function(ev){
+      ev.stopPropagation();
+      var parts=el.getAttribute('data-copy').split('|');
+      var t=s.turns.filter(function(x){return String(x.n)===parts[1];})[0];
+      var text = parts[2]==='in' ? t.input.text : (t.output?t.output.md:'');
+      copy(text, el);
+    });
+  });
+  Array.prototype.forEach.call(elDetail.querySelectorAll('[data-raw]'),function(el){
+    el.addEventListener('click',function(ev){
+      ev.stopPropagation();
+      var k=el.getAttribute('data-raw');
+      UI.raw[k]=!UI.raw[k];
+      renderDetail();
+    });
+  });
+}
+function defaultOpen(k,s){
+  var parts=k.split('|');
+  if(parts[2]==='out') return true;
+  return String(s.turns.length)===parts[1];
+}
+function copy(text, btn){
+  var done=function(){
+    var old=btn.innerHTML;
+    btn.innerHTML=ico('check')+'已复制';
+    btn.classList.add('done');
+    setTimeout(function(){ btn.innerHTML=old; btn.classList.remove('done'); },1500);
+  };
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(text).then(done,function(){ fallback(text); done(); });
+  }else{ fallback(text); done(); }
+}
+function fallback(text){
+  var ta=document.createElement('textarea');
+  ta.value=text; ta.style.position='fixed'; ta.style.opacity='0';
+  document.body.appendChild(ta); ta.select();
+  try{ document.execCommand('copy'); }catch(e){}
+  document.body.removeChild(ta);
+}
+
+/* ============================================================
+   7. 选中 / hash 路由
+   ============================================================ */
+function select(id){
+  if(UI.selected===id) return;
+  UI.selected=id;
+  UI.atBottom=true;
+  renderList(); renderDetail(); syncHash();
+  elDetail.scrollTop=0;
+}
+function syncHash(){
+  var s=SESSIONS.filter(function(x){return x.id===UI.selected;})[0];
+  if(!s){ setHash('#/'); return; }
+  var open=[];
+  s.turns.forEach(function(t){
+    var kIn=s.id+'|'+t.n+'|in';
+    if((kIn in UI.expanded) ? UI.expanded[kIn] : (t.n===s.turns.length)) open.push(t.n);
+  });
+  setHash('#/s/'+slug(s)+(open.length?'/t/'+open.join(','):''));
+}
+function setHash(h){
+  if(location.hash!==h){ history.replaceState(null,'',h); }
+  document.getElementById('deeplink').textContent=h;
+}
+function readHash(){
+  var m=/^#\/s\/([^/]+)(?:\/t\/([\d,]+))?/.exec(location.hash||'');
+  if(!m) return false;
+  var key=decodeURIComponent(m[1]);
+  var s=SESSIONS.filter(function(x){return x.alias===key||x.id===key;})[0];
+  if(!s) return false;
+  UI.selected=s.id;
+  if(m[2]){
+    var ns=m[2].split(',');
+    s.turns.forEach(function(t){ UI.expanded[s.id+'|'+t.n+'|in'] = ns.indexOf(String(t.n))>=0; });
+  }
+  return true;
+}
+
+/* ============================================================
+   8. SSE 客户端 · 连接态 · 走字时钟
+   ============================================================ */
+
+/* 渲染合并：一秒内多次 state/progress 只重画一次。
+   ⚠️ 重画**必须保住滚动位置与展开态**——这个页面可能开着几个小时。 */
+var renderPending = false;
+function scheduleRender(){
+  if(renderPending) return;
+  renderPending = true;
+  requestAnimationFrame(function(){
+    renderPending = false;
+    var keepTop = elDetail.scrollTop;
+    var stick = UI.atBottom;
+    renderList();
+    renderDetail();
+    elDetail.scrollTop = stick ? elDetail.scrollHeight : keepTop;
+    updateHeader();
+    updateJump();
+  });
+}
+
+function updateHeader(){
+  var nRun = SESSIONS.filter(function(s){ return statusOf(s) === "run"; }).length;
+  document.getElementById("runCount").textContent = SESSIONS.length + " 个会话 · " + nRun + " 进行中";
+  document.getElementById("runElapsed").textContent =
+    RUN.startedAt ? fmtDur(secsSince(RUN.startedAt)) : "--";
+}
+
+/* ---- 三种"看不到内容"必须严格区分（STATE.md §6.2）----
+   混成一句话，页面就会做错事：
+     run-gone             = 它**已经没有了**   → 终态画面，语气是正常收尾
+     history-read-failure = 我**暂时读不到**   → 提示条，记录其实还在
+     断连                  = 传输层的事         → 提示条 + 自动重连          */
+var conn = document.getElementById("conn"),
+    connText = document.getElementById("connText"),
+    connNotice = document.getElementById("connNotice"),
+    retryN = document.getElementById("retryN");
+
+function setConn(kind, extra){
+  conn.setAttribute("data-s", kind === "live" ? "live" : (kind === "ended" ? "ended" : "reconnect"));
+  connText.textContent = { live:"实时", reconnect:"重连中", ended:"已结束", stale:"读取中" }[kind] || kind;
+  connNotice.hidden = (kind !== "reconnect" && kind !== "stale");
+  if(extra) {
+    var b = connNotice.querySelector("b");
+    if(b) b.textContent = extra;
+  }
+}
+
+var retries = 0, es = null;
+
+function connect(){
+  if(es) { try{ es.close(); }catch(e){} }
+  es = new EventSource("/events");
+
+  es.addEventListener("hello", function(ev){
+    var h = JSON.parse(ev.data);
+    RUN.runId = h.runId;
+    RUN.vizDir = h.vizDir || null;
+    retries = 0;
+    if(!RUN.gone) setConn("live");
+  });
+
+  es.addEventListener("state", function(ev){
+    RUN.readFailure = false;
+    if(!RUN.gone) setConn("live");
+    applyState(JSON.parse(ev.data));
+  });
+
+  es.addEventListener("progress", function(ev){
+    var p = JSON.parse(ev.data);
+    if(!p || !p.vizTurnId) return;
+    PROGRESS.set(p.vizTurnId, p);
+    if(SNAP) applyState(SNAP);
+  });
+
+  es.addEventListener("control", function(ev){
+    var c = JSON.parse(ev.data);
+    if(c.kind === "run-gone"){
+      RUN.gone = true;
+      document.body.classList.add("run-ended");
+      setConn("ended");
+      if(SNAP) applyState(SNAP);
+    } else if(c.kind === "history-read-failure"){
+      /* ⚠️ 这**不是** run.degraded（那是"桥没记下来"）、**不是**断连、**不是**已清除。
+            当成后两者里任何一个，页面都会进入错误的终态，而记录其实还在。 */
+      RUN.readFailure = true;
+      setConn("stale", "暂时读不到记录，正在重试…");
+    }
+  });
+
+  es.addEventListener("viz:overflow", function(){ /* 合并掉的代次，不必打扰用户 */ });
+
+  es.onerror = function(){
+    if(RUN.gone) return;
+    retries++;
+    retryN.textContent = String(retries);
+    setConn("reconnect", "与本地服务的连接已断开，正在自动重连…");
+    /* EventSource 自己会重连；这里只更新提示。 */
+  };
+}
+
+/* 走字时钟：只动"已进行 / 多久前"这些跟着墙钟走的字，**不重新取数**。 */
+setInterval(function(){
+  if(RUN.gone) return;
+  var hasRunning = SESSIONS.some(function(s){
+    return s.turns.some(function(t){ return t.result === "running"; });
+  });
+  SESSIONS.forEach(function(s){
+    if(statusOf(s) !== "run") s.lastActive++;
+    s.turns.forEach(function(t){
+      if(t.result === "running"){ t.elapsed++; if(t.live) t.live.age++; }
+    });
+  });
+  updateHeader();
+  if(hasRunning) scheduleRender();
+}, 1000);
+/* ============================================================
+   9. 交互
+   ============================================================ */
+elDetail.addEventListener('scroll',function(){
+  var near = elDetail.scrollHeight - elDetail.scrollTop - elDetail.clientHeight < 48;
+  UI.atBottom=near;
+  updateJump();
+});
+function updateJump(){
+  var s=SESSIONS.filter(function(x){return x.id===UI.selected;})[0];
+  var show = s && statusOf(s)==='run' && !UI.atBottom && !RUN.gone;
+  elJump.hidden=!show;
+}
+elJump.addEventListener('click',function(){
+  UI.atBottom=true;
+  elDetail.scrollTop=elDetail.scrollHeight;
+  updateJump();
+});
+
+Array.prototype.forEach.call(document.querySelectorAll('.fchip'),function(b){
+  b.addEventListener('click',function(){
+    UI.filter=b.getAttribute('data-f');
+    Array.prototype.forEach.call(document.querySelectorAll('.fchip'),function(x){
+      x.setAttribute('aria-pressed', String(x===b));
+    });
+    renderList();
+  });
+});
+document.getElementById('search').addEventListener('input',function(e){
+  UI.query=e.target.value.trim();
+  renderList(); renderDetail();
+});
+document.getElementById('collapseBtn').addEventListener('click',function(){
+  document.getElementById('shell').classList.toggle('collapsed');
+});
+document.addEventListener('keydown',function(e){
+  if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT') return;
+  if(e.key!=='ArrowDown'&&e.key!=='ArrowUp') return;
+  var list=visibleSessions(); if(!list.length) return;
+  var i=list.map(function(s){return s.id;}).indexOf(UI.selected);
+  i = e.key==='ArrowDown' ? Math.min(list.length-1,i+1) : Math.max(0,i-1);
+  e.preventDefault();
+  select(list[i].id);
+});
+
+/* 主题 */
+var themeBtn=document.getElementById('themeBtn'), themeLabel=document.getElementById('themeLabel');
+function applyTheme(t){
+  document.documentElement.setAttribute('data-theme',t);
+  themeLabel.textContent = (t==='dark'?'浅色':'深色');
+  try{ localStorage.setItem('ab-viz-theme',t); }catch(e){}
+}
+themeBtn.addEventListener('click',function(){
+  applyTheme(document.documentElement.getAttribute('data-theme')==='dark'?'light':'dark');
+});
+try{ applyTheme(localStorage.getItem('ab-viz-theme')||'light'); }catch(e){ applyTheme('light'); }
+
+
+/* ============================================================
+   10. 启动
+   ============================================================ */
+
+if(!readHash()) UI.selected = null;
+setConn("reconnect", "正在连接本地服务…");
+connect();
+</script>
+</body>
+</html>

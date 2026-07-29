@@ -1,0 +1,90 @@
+{
+  "schemaVersion": 1,
+  "runId": "mcp-3f9a2c7e",
+  "generation": 18,
+  "updatedAt": "2026-07-29T02:17:26.502Z",
+  "run": {
+    "pid": 1234,
+    "bridgeVersion": "0.10.0",
+    "startedAt": "2026-07-29T02:11:04.221Z",
+    "status": "running",
+    "degraded": true,
+    "recordingErrors": [
+      "queue_full"
+    ]
+  },
+  "sessions": [
+    {
+      "sessionId": "codex-h5v3b8-2e64da",
+      "name": null,
+      "agent": "codex",
+      "model": null,
+      "effort": "high",
+      "access": "write",
+      "cwd": "D:\\cc\\agent-bridge",
+      "returnMode": "full",
+      "logFile": "C:\\Temp\\ab\\codex-h5v3b8-2e64da.log",
+      "appendSystemPrompt": null,
+      "backendPid": 24680,
+      "status": "idle",
+      "health": "degraded",
+      "isStreaming": false,
+      "contextUsage": {
+        "tokens": 88430,
+        "live": false
+      },
+      "createdAt": "2026-07-29T02:11:44.311Z",
+      "updatedAt": "2026-07-29T02:17:26.480Z",
+      "openFailed": null,
+      "closed": null,
+      "turns": [
+        {
+          "turnNo": 1,
+          "vizTurnId": "vt-1b9f6c40",
+          "backendTurnId": "019fa3d1-0c47-7a12-8bd3-6e0921f45ac8",
+          "backendTurnCount": 1,
+          "state": "settled",
+          "boundary": "turn_started_notification",
+          "attemptedAt": "2026-07-29T02:11:44.702Z",
+          "dispatchedAt": "2026-07-29T02:11:44.900Z",
+          "settledAt": "2026-07-29T02:17:26.118Z",
+          "firstBackendEventAt": "2026-07-29T02:11:44.900Z",
+          "source": "send_message",
+          "blocking": true,
+          "hasSchema": false,
+          "input": {
+            "state": "ready",
+            "ref": "turns/codex-h5v3b8-2e64da/t1.in.md",
+            "sha256": "1b9f6c40782ae3d594c0b71f6d3e8a2905f4c1b8e29d73604a8b1fc3d6708e95",
+            "chars": 744,
+            "bytes": 2018,
+            "truncated": false,
+            "originalBytes": 2018,
+            "error": null
+          },
+          "output": {
+            "state": "missing",
+            "ref": null,
+            "sha256": null,
+            "chars": null,
+            "bytes": null,
+            "previewBytes": null,
+            "previewSha256": null,
+            "error": "queue_full"
+          },
+          "outcome": "completed",
+          "bodyKind": "none",
+          "generationCount": 4,
+          "collected": {
+            "at": "2026-07-29T02:17:26.455Z",
+            "via": "wait",
+            "returnedChars": 12048,
+            "truncated": false
+          },
+          "error": null,
+          "durationMs": 341218
+        }
+      ]
+    }
+  ]
+}

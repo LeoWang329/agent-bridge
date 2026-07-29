@@ -1,0 +1,80 @@
+{
+  "schemaVersion": 1,
+  "runId": "mcp-3f9a2c7e",
+  "generation": 2,
+  "updatedAt": "2026-07-29T02:11:05.640Z",
+  "run": {
+    "pid": 1234,
+    "bridgeVersion": "0.10.0",
+    "startedAt": "2026-07-29T02:11:04.221Z",
+    "status": "running",
+    "degraded": false,
+    "recordingErrors": []
+  },
+  "sessions": [
+    {
+      "sessionId": "claude-t3g8k5-9c02fe",
+      "name": null,
+      "agent": "claude",
+      "model": null,
+      "effort": null,
+      "access": "read",
+      "cwd": "D:\\cc\\agent-bridge\\docs",
+      "returnMode": "full",
+      "logFile": "C:\\Temp\\ab\\claude-t3g8k5-9c02fe.log",
+      "appendSystemPrompt": null,
+      "backendPid": 7788,
+      "status": "running",
+      "health": "healthy",
+      "isStreaming": true,
+      "contextUsage": null,
+      "createdAt": "2026-07-29T02:11:05.002Z",
+      "updatedAt": "2026-07-29T02:11:05.611Z",
+      "openFailed": null,
+      "closed": null,
+      "turns": [
+        {
+          "turnNo": 1,
+          "vizTurnId": "vt-4e91c3a0",
+          "backendTurnId": null,
+          "backendTurnCount": null,
+          "state": "dispatched",
+          "boundary": "pipe_enqueued",
+          "attemptedAt": "2026-07-29T02:11:05.480Z",
+          "dispatchedAt": "2026-07-29T02:11:05.533Z",
+          "settledAt": null,
+          "firstBackendEventAt": null,
+          "source": "initial_prompt",
+          "blocking": true,
+          "hasSchema": false,
+          "input": {
+            "state": "pending",
+            "ref": null,
+            "sha256": null,
+            "chars": null,
+            "bytes": null,
+            "truncated": false,
+            "originalBytes": null,
+            "error": null
+          },
+          "output": {
+            "state": "pending",
+            "ref": null,
+            "sha256": null,
+            "chars": null,
+            "bytes": null,
+            "previewBytes": null,
+            "previewSha256": null,
+            "error": null
+          },
+          "outcome": null,
+          "bodyKind": null,
+          "generationCount": 0,
+          "collected": null,
+          "error": null,
+          "durationMs": null
+        }
+      ]
+    }
+  ]
+}

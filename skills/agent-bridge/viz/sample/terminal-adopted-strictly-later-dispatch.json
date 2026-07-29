@@ -1,0 +1,88 @@
+{
+  "schemaVersion": 1,
+  "runId": "mcp-3f9a2c7e",
+  "generation": 27,
+  "updatedAt": "2026-07-29T02:24:02.914Z",
+  "run": {
+    "pid": 1234,
+    "bridgeVersion": "0.10.0",
+    "startedAt": "2026-07-29T02:11:04.221Z",
+    "status": "running",
+    "degraded": false,
+    "recordingErrors": []
+  },
+  "sessions": [
+    {
+      "sessionId": "claude-g3w6r8-24e0b7",
+      "name": null,
+      "agent": "claude",
+      "model": "claude-opus-5",
+      "effort": "xhigh",
+      "access": "write",
+      "cwd": "D:\\cc\\agent-bridge",
+      "returnMode": "full",
+      "logFile": "C:\\Temp\\ab\\claude-g3w6r8-24e0b7.log",
+      "appendSystemPrompt": null,
+      "backendPid": 8916,
+      "status": "idle",
+      "health": "healthy",
+      "isStreaming": false,
+      "contextUsage": {
+        "tokens": 96204,
+        "live": false
+      },
+      "createdAt": "2026-07-29T02:20:10.336Z",
+      "updatedAt": "2026-07-29T02:24:02.880Z",
+      "openFailed": null,
+      "closed": null,
+      "turns": [
+        {
+          "turnNo": 1,
+          "vizTurnId": "vt-2c8ea705",
+          "backendTurnId": null,
+          "backendTurnCount": null,
+          "state": "settled",
+          "boundary": "terminal_adopted",
+          "attemptedAt": "2026-07-29T02:20:11.004Z",
+          "dispatchedAt": "2026-07-29T02:20:19.877Z",
+          "settledAt": "2026-07-29T02:24:02.560Z",
+          "firstBackendEventAt": "2026-07-29T02:20:14.220Z",
+          "source": "send_message",
+          "blocking": false,
+          "hasSchema": false,
+          "input": {
+            "state": "ready",
+            "ref": "turns/claude-g3w6r8-24e0b7/t1.in.md",
+            "sha256": "9a40d1f7c26b58e331fd0a947e8c26b1b5309fd80c47e2a66f19b3d0a8e5471c",
+            "chars": 630,
+            "bytes": 1702,
+            "truncated": false,
+            "originalBytes": 1702,
+            "error": null
+          },
+          "output": {
+            "state": "ready",
+            "ref": "turns/claude-g3w6r8-24e0b7/t1.out.md",
+            "sha256": "7d1e50a9c3b846f20928edb54f17c60ae8592d3bb04a7f183c6d9e02a5f1b874",
+            "chars": 4408,
+            "bytes": 12690,
+            "previewBytes": null,
+            "previewSha256": null,
+            "error": null
+          },
+          "outcome": "completed",
+          "bodyKind": "final",
+          "generationCount": 1,
+          "collected": {
+            "at": "2026-07-29T02:24:02.845Z",
+            "via": "wait",
+            "returnedChars": 4408,
+            "truncated": false
+          },
+          "error": null,
+          "durationMs": 222683
+        }
+      ]
+    }
+  ]
+}

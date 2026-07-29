@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "runId": "mcp-3f9a2c7e",
+  "generation": 6,
+  "updatedAt": "2026-07-29T02:12:20.771Z",
+  "run": {
+    "pid": 1234,
+    "bridgeVersion": "0.10.0",
+    "startedAt": "2026-07-29T02:11:04.221Z",
+    "status": "running",
+    "degraded": false,
+    "recordingErrors": []
+  },
+  "sessions": [
+    {
+      "sessionId": "cursor-d1p6h9-5c93b7",
+      "name": null,
+      "agent": "cursor",
+      "model": null,
+      "effort": null,
+      "access": "read",
+      "cwd": "C:\\Users\\leo.wang\\src\\viz-lab",
+      "returnMode": "full",
+      "logFile": "C:\\Temp\\ab\\cursor-d1p6h9-5c93b7.log",
+      "appendSystemPrompt": null,
+      "backendPid": null,
+      "status": "idle",
+      "health": "healthy",
+      "isStreaming": false,
+      "contextUsage": null,
+      "createdAt": "2026-07-29T02:12:18.114Z",
+      "updatedAt": "2026-07-29T02:12:20.660Z",
+      "openFailed": null,
+      "closed": null,
+      "transport": "stdio",
+      "turns": []
+    }
+  ]
+}

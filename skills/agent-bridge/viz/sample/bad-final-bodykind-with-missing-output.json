@@ -1,0 +1,83 @@
+{
+  "schemaVersion": 1,
+  "runId": "mcp-3f9a2c7e",
+  "generation": 13,
+  "updatedAt": "2026-07-29T02:17:40.118Z",
+  "run": {
+    "pid": 1234,
+    "bridgeVersion": "0.10.0",
+    "startedAt": "2026-07-29T02:11:04.221Z",
+    "status": "running",
+    "degraded": false,
+    "recordingErrors": []
+  },
+  "sessions": [
+    {
+      "sessionId": "claude-v8h2n5-3f61ad",
+      "name": null,
+      "agent": "claude",
+      "model": "claude-opus-5",
+      "effort": "high",
+      "access": "read",
+      "cwd": "D:\\cc\\agent-bridge\\docs",
+      "returnMode": "full",
+      "logFile": "C:\\Temp\\ab\\claude-v8h2n5-3f61ad.log",
+      "appendSystemPrompt": null,
+      "backendPid": 7020,
+      "status": "idle",
+      "health": "healthy",
+      "isStreaming": false,
+      "contextUsage": {
+        "tokens": 33150,
+        "live": false
+      },
+      "createdAt": "2026-07-29T02:16:55.008Z",
+      "updatedAt": "2026-07-29T02:17:40.090Z",
+      "openFailed": null,
+      "closed": null,
+      "turns": [
+        {
+          "turnNo": 1,
+          "vizTurnId": "vt-2d3c4b5a",
+          "backendTurnId": null,
+          "backendTurnCount": null,
+          "state": "settled",
+          "boundary": "pipe_enqueued",
+          "attemptedAt": "2026-07-29T02:16:55.330Z",
+          "dispatchedAt": "2026-07-29T02:16:55.446Z",
+          "settledAt": "2026-07-29T02:17:39.902Z",
+          "firstBackendEventAt": "2026-07-29T02:16:56.771Z",
+          "source": "initial_prompt",
+          "blocking": true,
+          "hasSchema": false,
+          "input": {
+            "state": "ready",
+            "ref": "turns/claude-v8h2n5-3f61ad/t1.in.md",
+            "sha256": "e29d73604a8b1fc3d6708e951b9f6c40782ae3d594c0b71f6d3e8a2905f4c1b8",
+            "chars": 902,
+            "bytes": 2508,
+            "truncated": false,
+            "originalBytes": 2508,
+            "error": null
+          },
+          "output": {
+            "state": "missing",
+            "ref": null,
+            "sha256": null,
+            "chars": null,
+            "bytes": null,
+            "previewBytes": null,
+            "previewSha256": null,
+            "error": null
+          },
+          "outcome": "completed",
+          "bodyKind": "final",
+          "generationCount": 1,
+          "collected": null,
+          "error": null,
+          "durationMs": 44456
+        }
+      ]
+    }
+  ]
+}

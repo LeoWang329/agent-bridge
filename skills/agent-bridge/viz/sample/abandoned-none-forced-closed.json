@@ -1,0 +1,84 @@
+{
+  "schemaVersion": 1,
+  "runId": "mcp-3f9a2c7e",
+  "generation": 31,
+  "updatedAt": "2026-07-29T02:23:05.220Z",
+  "run": {
+    "pid": 1234,
+    "bridgeVersion": "0.10.0",
+    "startedAt": "2026-07-29T02:11:04.221Z",
+    "status": "running",
+    "degraded": false,
+    "recordingErrors": []
+  },
+  "sessions": [
+    {
+      "sessionId": "kimi-w4r7c2-b90e51",
+      "name": null,
+      "agent": "kimi",
+      "model": null,
+      "effort": null,
+      "access": "read",
+      "cwd": "C:\\Users\\leo.wang\\src\\viz-lab",
+      "returnMode": "full",
+      "logFile": "C:\\Temp\\ab\\kimi-w4r7c2-b90e51.log",
+      "appendSystemPrompt": null,
+      "backendPid": null,
+      "status": "closed",
+      "health": "dead",
+      "isStreaming": false,
+      "contextUsage": null,
+      "createdAt": "2026-07-29T02:16:10.905Z",
+      "updatedAt": "2026-07-29T02:23:05.190Z",
+      "openFailed": null,
+      "closed": {
+        "reason": "cleanupAndExit：run 收尾时同步关闭全部会话，本会话仍有 1 轮在途",
+        "forced": true,
+        "at": "2026-07-29T02:23:05.004Z"
+      },
+      "turns": [
+        {
+          "turnNo": 1,
+          "vizTurnId": "vt-7d1e50a9",
+          "backendTurnId": null,
+          "backendTurnCount": null,
+          "state": "settled",
+          "boundary": "os_spawned",
+          "attemptedAt": "2026-07-29T02:16:11.402Z",
+          "dispatchedAt": "2026-07-29T02:16:11.730Z",
+          "settledAt": "2026-07-29T02:23:05.004Z",
+          "firstBackendEventAt": null,
+          "source": "initial_prompt",
+          "blocking": false,
+          "hasSchema": false,
+          "input": {
+            "state": "ready",
+            "ref": "turns/kimi-w4r7c2-b90e51/t1.in.md",
+            "sha256": "7d1e50a9c3b846f20928edb54f17c60ae8592d3bb04a7f183c6d9e02a5f1b874",
+            "chars": 1502,
+            "bytes": 4310,
+            "truncated": false,
+            "originalBytes": 4310,
+            "error": null
+          },
+          "output": {
+            "state": "missing",
+            "ref": null,
+            "sha256": null,
+            "chars": null,
+            "bytes": null,
+            "previewBytes": null,
+            "previewSha256": null,
+            "error": null
+          },
+          "outcome": "abandoned",
+          "bodyKind": "none",
+          "generationCount": 0,
+          "collected": null,
+          "error": "会话被强制关闭时本轮仍是 dispatched：kimi child 已退出且从未产出终结事件，按 abandoned 封账。",
+          "durationMs": 413274
+        }
+      ]
+    }
+  ]
+}

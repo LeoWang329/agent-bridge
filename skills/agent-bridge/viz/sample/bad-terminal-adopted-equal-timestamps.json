@@ -1,0 +1,88 @@
+{
+  "schemaVersion": 1,
+  "runId": "mcp-3f9a2c7e",
+  "generation": 24,
+  "updatedAt": "2026-07-29T02:22:47.118Z",
+  "run": {
+    "pid": 1234,
+    "bridgeVersion": "0.10.0",
+    "startedAt": "2026-07-29T02:11:04.221Z",
+    "status": "running",
+    "degraded": false,
+    "recordingErrors": []
+  },
+  "sessions": [
+    {
+      "sessionId": "claude-s2f7j4-be1039",
+      "name": null,
+      "agent": "claude",
+      "model": "claude-opus-5",
+      "effort": "high",
+      "access": "write",
+      "cwd": "D:\\cc\\agent-bridge",
+      "returnMode": "full",
+      "logFile": "C:\\Temp\\ab\\claude-s2f7j4-be1039.log",
+      "appendSystemPrompt": null,
+      "backendPid": 6688,
+      "status": "idle",
+      "health": "healthy",
+      "isStreaming": false,
+      "contextUsage": {
+        "tokens": 39004,
+        "live": false
+      },
+      "createdAt": "2026-07-29T02:21:55.221Z",
+      "updatedAt": "2026-07-29T02:22:47.090Z",
+      "openFailed": null,
+      "closed": null,
+      "turns": [
+        {
+          "turnNo": 1,
+          "vizTurnId": "vt-e0619fb5",
+          "backendTurnId": null,
+          "backendTurnCount": null,
+          "state": "settled",
+          "boundary": "terminal_adopted",
+          "attemptedAt": "2026-07-29T02:21:55.660Z",
+          "dispatchedAt": "2026-07-29T02:21:55.660Z",
+          "settledAt": "2026-07-29T02:22:46.902Z",
+          "firstBackendEventAt": "2026-07-29T02:21:58.114Z",
+          "source": "send_message",
+          "blocking": false,
+          "hasSchema": false,
+          "input": {
+            "state": "ready",
+            "ref": "turns/claude-s2f7j4-be1039/t1.in.md",
+            "sha256": "e0619fb583d40c7a1e29f6b82c8ea7056f14b39dd0a52c86b91f7e4047c3a8d2",
+            "chars": 522,
+            "bytes": 1408,
+            "truncated": false,
+            "originalBytes": 1408,
+            "error": null
+          },
+          "output": {
+            "state": "ready",
+            "ref": "turns/claude-s2f7j4-be1039/t1.out.md",
+            "sha256": "6f19b3d0a8e5471c9a40d1f7c26b58e331fd0a947e8c26b1b5309fd80c47e2a6",
+            "chars": 2988,
+            "bytes": 8602,
+            "previewBytes": null,
+            "previewSha256": null,
+            "error": null
+          },
+          "outcome": "completed",
+          "bodyKind": "final",
+          "generationCount": 1,
+          "collected": {
+            "at": "2026-07-29T02:22:47.004Z",
+            "via": "wait",
+            "returnedChars": 2988,
+            "truncated": false
+          },
+          "error": null,
+          "durationMs": 51242
+        }
+      ]
+    }
+  ]
+}

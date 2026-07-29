@@ -1,0 +1,89 @@
+{
+  "schemaVersion": 1,
+  "runId": "mcp-3f9a2c7e",
+  "generation": 19,
+  "updatedAt": "2026-07-29T02:15:47.660Z",
+  "run": {
+    "pid": 1234,
+    "bridgeVersion": "0.10.0",
+    "startedAt": "2026-07-29T02:11:04.221Z",
+    "status": "running",
+    "degraded": false,
+    "recordingErrors": []
+  },
+  "sessions": [
+    {
+      "sessionId": "cursor-b6y2q9-3af710",
+      "name": null,
+      "agent": "cursor",
+      "model": null,
+      "effort": null,
+      "access": "read",
+      "cwd": "D:\\cc\\agent-bridge\\skills\\agent-bridge\\viz",
+      "returnMode": "ref",
+      "logFile": "C:\\Temp\\ab\\cursor-b6y2q9-3af710.log",
+      "appendSystemPrompt": {
+        "file": "D:\\cc\\agent-bridge\\roles\\reviewer.md",
+        "bytes": 2144,
+        "injectionMode": "first-turn-user-prefix"
+      },
+      "backendPid": null,
+      "status": "idle",
+      "health": "healthy",
+      "isStreaming": false,
+      "contextUsage": null,
+      "createdAt": "2026-07-29T02:13:20.104Z",
+      "updatedAt": "2026-07-29T02:15:47.630Z",
+      "openFailed": null,
+      "closed": null,
+      "turns": [
+        {
+          "turnNo": 1,
+          "vizTurnId": "vt-0d573b9e",
+          "backendTurnId": null,
+          "backendTurnCount": null,
+          "state": "settled",
+          "boundary": "os_spawned",
+          "attemptedAt": "2026-07-29T02:13:20.418Z",
+          "dispatchedAt": "2026-07-29T02:13:20.665Z",
+          "settledAt": "2026-07-29T02:15:47.201Z",
+          "firstBackendEventAt": "2026-07-29T02:13:22.774Z",
+          "source": "initial_prompt",
+          "blocking": true,
+          "hasSchema": false,
+          "input": {
+            "state": "ready",
+            "ref": "turns/cursor-b6y2q9-3af710/t1.in.md",
+            "sha256": "0d573b9ea1f8264cb7390de548c2f61a9e05b7d33fa16c82c9048e7b512da6f0",
+            "chars": 3311,
+            "bytes": 9024,
+            "truncated": false,
+            "originalBytes": 9024,
+            "error": null
+          },
+          "output": {
+            "state": "ready",
+            "ref": "turns/cursor-b6y2q9-3af710/t1.out.md",
+            "sha256": "4e91c3a058d7b26fe103a94db6f80c152a7d5e3997cb04f6d582b1e7306a9c48",
+            "chars": 15702,
+            "bytes": 44118,
+            "previewBytes": null,
+            "previewSha256": null,
+            "error": null
+          },
+          "outcome": "completed",
+          "bodyKind": "final",
+          "generationCount": 1,
+          "collected": {
+            "at": "2026-07-29T02:15:47.588Z",
+            "via": "result",
+            "returnedChars": 0,
+            "truncated": false
+          },
+          "error": null,
+          "durationMs": 146536
+        }
+      ]
+    }
+  ]
+}

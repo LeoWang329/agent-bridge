@@ -1,0 +1,135 @@
+{
+  "schemaVersion": 1,
+  "runId": "mcp-3f9a2c7e",
+  "generation": 15,
+  "updatedAt": "2026-07-29T02:13:12.703Z",
+  "run": {
+    "pid": 1234,
+    "bridgeVersion": "0.10.0",
+    "startedAt": "2026-07-29T02:11:04.221Z",
+    "status": "running",
+    "degraded": false,
+    "recordingErrors": []
+  },
+  "sessions": [
+    {
+      "sessionId": "omp-n8c1x6-05fb27",
+      "name": "主实现 implementer",
+      "agent": "omp",
+      "model": "kimi-k2-thinking",
+      "effort": "high",
+      "access": "write",
+      "cwd": "D:\\cc\\agent-bridge",
+      "returnMode": "full",
+      "logFile": "C:\\Temp\\ab\\omp-n8c1x6-05fb27.log",
+      "appendSystemPrompt": {
+        "file": "D:\\cc\\agent-bridge\\roles\\implementer.md",
+        "bytes": 1820,
+        "injectionMode": "system"
+      },
+      "backendPid": 13372,
+      "status": "running",
+      "health": "healthy",
+      "isStreaming": true,
+      "contextUsage": {
+        "tokens": 52918,
+        "live": true,
+        "isCompacting": false,
+        "autoCompactionEnabled": true
+      },
+      "createdAt": "2026-07-29T02:11:09.220Z",
+      "updatedAt": "2026-07-29T02:13:12.688Z",
+      "openFailed": null,
+      "closed": null,
+      "turns": [
+        {
+          "turnNo": 1,
+          "vizTurnId": "vt-e6304b8d",
+          "backendTurnId": "omp-turn-1c93b407",
+          "backendTurnCount": 1,
+          "state": "settled",
+          "boundary": "rpc_ack",
+          "attemptedAt": "2026-07-29T02:11:09.640Z",
+          "dispatchedAt": "2026-07-29T02:11:09.842Z",
+          "settledAt": "2026-07-29T02:12:58.416Z",
+          "firstBackendEventAt": "2026-07-29T02:11:10.377Z",
+          "source": "initial_prompt",
+          "blocking": true,
+          "hasSchema": false,
+          "input": {
+            "state": "ready",
+            "ref": "turns/omp-n8c1x6-05fb27/t1.in.md",
+            "sha256": "e6304b8d1af79c25b58e012673dc4fa92098bd61cf3a5e748d21609b40e7c3fa",
+            "chars": 1806,
+            "bytes": 5122,
+            "truncated": false,
+            "originalBytes": 5122,
+            "error": null
+          },
+          "output": {
+            "state": "ready",
+            "ref": "turns/omp-n8c1x6-05fb27/t1.out.md",
+            "sha256": "2c8ea7056f14b39dd0a52c86b91f7e4047c3a8d2e0619fb583d40c7a1e29f6b8",
+            "chars": 6021,
+            "bytes": 17440,
+            "previewBytes": null,
+            "previewSha256": null,
+            "error": null
+          },
+          "outcome": "completed",
+          "bodyKind": "final",
+          "generationCount": 2,
+          "collected": {
+            "at": "2026-07-29T02:12:58.902Z",
+            "via": "send_message",
+            "returnedChars": 6021,
+            "truncated": false
+          },
+          "error": null,
+          "durationMs": 108574
+        },
+        {
+          "turnNo": 2,
+          "vizTurnId": "vt-9a40d1f7",
+          "backendTurnId": "omp-turn-4d80ae62",
+          "backendTurnCount": 2,
+          "state": "dispatched",
+          "boundary": "rpc_ack",
+          "attemptedAt": "2026-07-29T02:13:01.118Z",
+          "dispatchedAt": "2026-07-29T02:13:01.294Z",
+          "settledAt": null,
+          "firstBackendEventAt": "2026-07-29T02:13:02.006Z",
+          "source": "send_message",
+          "blocking": false,
+          "hasSchema": false,
+          "input": {
+            "state": "ready",
+            "ref": "turns/omp-n8c1x6-05fb27/t2.in.md",
+            "sha256": "9a40d1f7c26b58e331fd0a947e8c26b1b5309fd80c47e2a66f19b3d0a8e5471c",
+            "chars": 412,
+            "bytes": 1104,
+            "truncated": false,
+            "originalBytes": 1104,
+            "error": null
+          },
+          "output": {
+            "state": "pending",
+            "ref": null,
+            "sha256": null,
+            "chars": null,
+            "bytes": null,
+            "previewBytes": null,
+            "previewSha256": null,
+            "error": null
+          },
+          "outcome": null,
+          "bodyKind": null,
+          "generationCount": 1,
+          "collected": null,
+          "error": null,
+          "durationMs": null
+        }
+      ]
+    }
+  ]
+}

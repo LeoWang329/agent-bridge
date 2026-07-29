@@ -1,0 +1,88 @@
+{
+  "schemaVersion": 1,
+  "runId": "mcp-3f9a2c7e",
+  "generation": 22,
+  "updatedAt": "2026-07-29T02:19:41.702Z",
+  "run": {
+    "pid": 1234,
+    "bridgeVersion": "0.10.0",
+    "startedAt": "2026-07-29T02:11:04.221Z",
+    "status": "running",
+    "degraded": false,
+    "recordingErrors": []
+  },
+  "sessions": [
+    {
+      "sessionId": "codex-j4d7m1-fe3820",
+      "name": null,
+      "agent": "codex",
+      "model": "gpt-5.2-codex",
+      "effort": "xhigh",
+      "access": "write",
+      "cwd": "D:\\cc\\agent-bridge",
+      "returnMode": "ref",
+      "logFile": "C:\\Temp\\ab\\codex-j4d7m1-fe3820.log",
+      "appendSystemPrompt": null,
+      "backendPid": 22140,
+      "status": "idle",
+      "health": "healthy",
+      "isStreaming": false,
+      "contextUsage": {
+        "tokens": 231508,
+        "live": false
+      },
+      "createdAt": "2026-07-29T02:12:02.884Z",
+      "updatedAt": "2026-07-29T02:19:41.680Z",
+      "openFailed": null,
+      "closed": null,
+      "turns": [
+        {
+          "turnNo": 1,
+          "vizTurnId": "vt-c48f0b17",
+          "backendTurnId": "019fa3e9-77b2-7c40-a1de-90356f8b2c41",
+          "backendTurnCount": 1,
+          "state": "settled",
+          "boundary": "turn_start_ack",
+          "attemptedAt": "2026-07-29T02:12:03.221Z",
+          "dispatchedAt": "2026-07-29T02:12:03.510Z",
+          "settledAt": "2026-07-29T02:19:41.284Z",
+          "firstBackendEventAt": "2026-07-29T02:12:04.960Z",
+          "source": "initial_prompt",
+          "blocking": true,
+          "hasSchema": false,
+          "input": {
+            "state": "ready",
+            "ref": "turns/codex-j4d7m1-fe3820/t1.in.md",
+            "sha256": "c48f0b172e6a9d35801fc7b6d94e2a085b7c31ef60a2d894137be5c09ad4f612",
+            "chars": 1439021,
+            "bytes": 4194304,
+            "truncated": true,
+            "originalBytes": 9337218,
+            "error": null
+          },
+          "output": {
+            "state": "ready",
+            "ref": "turns/codex-j4d7m1-fe3820/t1.out.md",
+            "sha256": "e6304b8d1af79c25b58e012673dc4fa92098bd61cf3a5e748d21609b40e7c3fa",
+            "chars": 2874016,
+            "bytes": 8402551,
+            "previewBytes": 262144,
+            "previewSha256": "3f2a9c81b7d4e650a1c8f39b2e7d6045c9a1b8f2d3e4c5a6b7089f1e2d3c4b5a",
+            "error": null
+          },
+          "outcome": "completed",
+          "bodyKind": "final",
+          "generationCount": 6,
+          "collected": {
+            "at": "2026-07-29T02:19:41.655Z",
+            "via": "wait",
+            "returnedChars": 0,
+            "truncated": false
+          },
+          "error": null,
+          "durationMs": 457774
+        }
+      ]
+    }
+  ]
+}

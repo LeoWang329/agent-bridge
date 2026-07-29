@@ -1,0 +1,85 @@
+{
+  "schemaVersion": 1,
+  "runId": "mcp-3f9a2c7e",
+  "generation": 8,
+  "updatedAt": "2026-07-29T02:13:33.004Z",
+  "run": {
+    "pid": 1234,
+    "bridgeVersion": "0.10.0",
+    "startedAt": "2026-07-29T02:11:04.221Z",
+    "status": "running",
+    "degraded": false,
+    "recordingErrors": []
+  },
+  "sessions": [
+    {
+      "sessionId": "kimi-c3n7f1-6b25de",
+      "name": null,
+      "agent": "kimi",
+      "model": null,
+      "effort": null,
+      "access": "read",
+      "cwd": "D:\\cc\\agent-bridge",
+      "returnMode": "full",
+      "logFile": "C:\\Temp\\ab\\kimi-c3n7f1-6b25de.log",
+      "appendSystemPrompt": null,
+      "backendPid": 25576,
+      "status": "running",
+      "health": "healthy",
+      "isStreaming": true,
+      "contextUsage": null,
+      "createdAt": "2026-07-29T02:13:30.221Z",
+      "updatedAt": "2026-07-29T02:13:32.980Z",
+      "openFailed": null,
+      "closed": null,
+      "turns": [
+        {
+          "turnNo": 1,
+          "vizTurnId": "vt-6d4e7c19",
+          "backendTurnId": null,
+          "backendTurnCount": null,
+          "state": "dispatched",
+          "boundary": "os_spawned",
+          "attemptedAt": "2026-07-29T02:13:30.554Z",
+          "dispatchedAt": "2026-07-29T02:13:30.771Z",
+          "settledAt": null,
+          "firstBackendEventAt": "2026-07-29T02:13:31.902Z",
+          "source": "initial_prompt",
+          "blocking": true,
+          "hasSchema": false,
+          "input": {
+            "state": "ready",
+            "ref": "turns/kimi-c3n7f1-6b25de/t1.in.md",
+            "sha256": "6d4e7c19af03b8e5c2719d640be5a37f8c1f47de0a93b562e71d4c8835f9a20b",
+            "chars": 388,
+            "bytes": 1042,
+            "truncated": false,
+            "originalBytes": 1042,
+            "error": null
+          },
+          "output": {
+            "state": "pending",
+            "ref": null,
+            "sha256": null,
+            "chars": null,
+            "bytes": null,
+            "previewBytes": null,
+            "previewSha256": null,
+            "error": null
+          },
+          "outcome": null,
+          "bodyKind": null,
+          "generationCount": 1,
+          "collected": {
+            "at": "2026-07-29T02:13:32.660Z",
+            "via": "wait",
+            "returnedChars": 4096,
+            "truncated": false
+          },
+          "error": null,
+          "durationMs": null
+        }
+      ]
+    }
+  ]
+}

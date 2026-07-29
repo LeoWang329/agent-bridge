@@ -1,0 +1,155 @@
+{
+  "note": "按 STATE.md 手工构造的冻结样例。**不是** writer 输出的录制——录出来的样例只会把 writer 当时的 bug 一起冻住。",
+  "samples": [
+    {
+      "name": "normal-completed-final-collected",
+      "why": "钉 §4.9 settled 行全项（outcome/settledAt/durationMs/bodyKind 非空、output.state=ready）+ 矩阵 completed×final ✅ + 蕴含式 1、3；并钉 §4.7 ref 为相对 VIZ_DIR 的 POSIX 路径、ready 必有 sha256，§4.4 codex 只给 tokens/live 两键，§4.3 codex ⟹ developer。",
+      "expectValid": true,
+      "violates": null
+    },
+    {
+      "name": "failed-none-no-recording-error",
+      "why": "钉 §4.9 矩阵 failed×none + 蕴含式 2。关键：missing 不必然伴随 output.error —— 后端自己失败没产出正文，观测侧一切正常，故 error=null、run.degraded 保持 false。若把 missing 一律点亮 degraded，就把后端故障误报成记录缺口（§4.1）。附钉 §4.6 claude 只能是 pipe_enqueued，settled 允许 collected=null。",
+      "expectValid": true,
+      "violates": null
+    },
+    {
+      "name": "aborted-partial-collected",
+      "why": "钉 §4.9 矩阵 aborted×partial ✅ —— partial 与 final 同样落在蕴含式 1 上（output.state 必须 ready 且 ref 非空），不能因为被中断就记成 missing。附钉 §4.4 仅 OMP 给 isCompacting/autoCompactionEnabled 且 live=true、§4.6 rpc_ack、§4.8 via=result。",
+      "expectValid": true,
+      "violates": null
+    },
+    {
+      "name": "abandoned-none-forced-closed",
+      "why": "钉 §4.9 矩阵 abandoned×none + 蕴含式 2；并钉 §4.6 cursor/kimi 只能给 os_spawned、§4.2 closed 三键形状与 kimi 轮间 backendPid 可空（形状 B）。abandoned 属后端事实，不点亮 degraded（§4.1）。",
+      "expectValid": true,
+      "violates": null
+    },
+    {
+      "name": "completed-none-recording-write-failed",
+      "why": "钉 §4.9 最易被混过去的格子：completed×none 仅当 output.error 非空时合法；并钉三处连带同步（§4.9 末段 + §8.1）：error=queue_full ⟹ output.state=missing（蕴含式 5）+ run.degraded=true + 原因码入 recordingErrors。outcome 仍是 completed（§4.1 观测失败绝不改后端结论）；collected.returnedChars=12048 而 output.chars=null，钉 §4.8「不等于正文 chars」。",
+      "expectValid": true,
+      "violates": null
+    },
+    {
+      "name": "dispatched-in-flight-after-settled-turn",
+      "why": "钉 §4.9 dispatched 行五项（outcome/settledAt/durationMs/bodyKind 必须 null、output.state=pending、collected=null）+ §4.7「output 在 dispatched 阶段 chars/bytes 恒 null」与「state!==ready ⟹ ref=null」（蕴含式 4 不得有悬空 ref）；同时钉 §4.5 turns 按 turnNo 升序。",
+      "expectValid": true,
+      "violates": null
+    },
+    {
+      "name": "input-not-yet-published-pending",
+      "why": "钉 §4.7 末段与 §8「输入同理」：dispatch 时输入文件还没写完，不能公布可读 inputRef —— input.state=pending 且 ref=null（蕴含式 4）；pending 阶段没落盘故 sha256/chars/bytes/originalBytes 全 null，且 error 必须 null（蕴含式 6）。",
+      "expectValid": true,
+      "violates": null
+    },
+    {
+      "name": "open-failed-session-keeps-its-slot",
+      "why": "钉 §4.2「启动失败的会话也要占一个位置，sessions 按 attempt 创建顺序排」：openFailed 会话夹在两个健康会话中间，既不能被过滤也不能挪到末尾。并钉 openFailed 形状（phase=start，error ≤300 字）与 §4.1：openFailed 是后端事实不是观测失败，run.degraded 仍为 false。turns 为空数组而非 null。",
+      "expectValid": true,
+      "violates": null
+    },
+    {
+      "name": "cursor-session-null-observability",
+      "why": "钉 §4.4「cursor/kimi 的 contextUsage 恒为 null，null 表示未知不表示 0」+ §4.2 backendPid 可空（形状 B 轮间没有进程）+ effort 可 null。三处 null 必须原样活到 wire 上。附钉 §4.6 os_spawned、§4.8「returnMode=ref 时 returnedChars 可为 0 且不等于正文 chars」。",
+      "expectValid": true,
+      "violates": null
+    },
+    {
+      "name": "injection-modes-three-backends",
+      "why": "钉 §4.3 injectionMode 三档与后端绑定：omp/claude ⟹ system、codex ⟹ developer、cursor/kimi ⟹ first-turn-user-prefix（软注入，页面不得宣称已注入 system prompt）。附钉 appendSystemPrompt 三键形状与 bytes 的 UTF-8 口径（§3）。",
+      "expectValid": true,
+      "violates": null
+    },
+    {
+      "name": "terminal-adopted-strictly-later-dispatch",
+      "why": "钉 §4.6 末行硬蕴含：boundary=terminal_adopted ⟹ dispatchedAt > attemptedAt（严格大于，认领必晚于原派发）。同时钉 §4.5「firstBackendEventAt 允许早于 dispatchedAt，且不作轮次出现的门槛」：此处 02:20:14.220 < dispatchedAt 02:20:19.877，正是「先看到输出、后才敢认领」。",
+      "expectValid": true,
+      "violates": null
+    },
+    {
+      "name": "large-output-preview-and-truncated-input",
+      "why": "钉 §4.7 两组单侧字段：input 的 truncated/originalBytes（bytes 4194304 < originalBytes 9337218，截断必须如实标出）与 output 的 previewBytes/previewSha256（超过 VIZ_FILE_MAX_MB 时另记预览段长度与指纹）。四个数是 UTF-8 字节口径、chars 是 UTF-16 口径（§3），两者不可互换；sha256 与 previewSha256 是两份不同指纹（§6.3 对证依据）。",
+      "expectValid": true,
+      "violates": null
+    },
+    {
+      "name": "twenty-sessions-creation-order",
+      "why": "钉 §4.2「sessions 按 attempt 创建顺序排，不是 sessionId 字典序、不是 updatedAt」：本样例三种序两两不同（字典序会变成 claude-*<codex-*<cursor-*<kimi-*<omp-*；updatedAt 升序也与数组序不同）。§4.5「turns 按 turnNo 升序」由第 5 个会话的 t1/t2/t3 钉住。附钉启动失败会话占位（第 4、12 位分别是 phase=start 与 phase=initialTurn）与 §2.3 的 20 会话规模基线。",
+      "expectValid": true,
+      "violates": null
+    },
+    {
+      "name": "bad-runid-mismatch-with-higher-generation",
+      "why": "钉 §2.1 校验 1 及其警告：generation 更高但 runId 与同目录 meta.json 不符者不得胜出。本语料约定 meta.json 的 runId 恒为 mcp-3f9a2c7e；此槽为 mcp-91b0d4aa、generation 99，正是上一个 run 被 SIGKILL 留下的残槽。只按 generation 排序的 viewer 会渲染上一个 run 的内容。除此之外内部处处合法。",
+      "expectValid": false,
+      "violates": "§2.1 校验 1：runId 必须与 meta.json 的 runId 完全相等（meta 为 mcp-3f9a2c7e，此处为 mcp-91b0d4aa）"
+    },
+    {
+      "name": "bad-dispatched-with-outcome",
+      "why": "钉 §4.9 dispatched 行：state=dispatched 时 outcome 必须 null。其余五项（settledAt/durationMs/bodyKind/output.state/collected）都保持该行合法取值，唯一越界的是 outcome 被提前填成 completed —— 典型「先写 outcome、忘了推进 state」的漂移。",
+      "expectValid": false,
+      "violates": "§4.9 矩阵 dispatched 行：outcome 必须为 null，此处为 \"completed\""
+    },
+    {
+      "name": "bad-settled-output-still-pending",
+      "why": "钉 §4.9 settled 行「output.state 必须 ready 或 missing，禁止 pending」。这是 §8 提交顺序被违反后的残留：内存里已 settled，正文写回调还没跑完就发了这一代快照。其他字段都按 settled 行填满，定位点唯一（与 bodyKind:final 的冲突是同一事实的另一面，不是第二处错误）。",
+      "expectValid": false,
+      "violates": "§4.9 矩阵 settled 行：output.state 禁止 pending（必须是 ready 或 missing）"
+    },
+    {
+      "name": "bad-final-bodykind-with-missing-output",
+      "why": "钉 §4.9 蕴含式 1：bodyKind ∈ {final,partial} ⟺ output.state=ready 且 ref 非空。这里 bodyKind 声称有完整正文，output 却是 missing/ref=null —— 页面会渲染一个点得开却取不到的「最终答复」。outcome×bodyKind 落在 ✅ 格，故只有这一处越界。",
+      "expectValid": false,
+      "violates": "§4.9 蕴含式 1：bodyKind=\"final\" 却 output.state=\"missing\" 且 output.ref=null"
+    },
+    {
+      "name": "bad-ready-state-with-error-code",
+      "why": "钉 §4.9 蕴含式 6：state ∈ {pending,ready} ⟹ 该 error 必须 null。{state:ready, error:queue_full} 自相矛盾 —— 既称正文完好可读、又称写队列拒绝了它；规格明确警告缺了第 5、6 条这种组合仍能通过校验。为使定位点唯一，连带项已补齐（degraded=true、recordingErrors 含 queue_full）。",
+      "expectValid": false,
+      "violates": "§4.9 蕴含式 6：output.state=\"ready\" 时 output.error 必须为 null，此处为 \"queue_full\""
+    },
+    {
+      "name": "bad-collected-while-still-dispatched",
+      "why": "钉 §4.9 蕴含式 3：collected 非空 ⟹ state=settled（也是 dispatched 行「collected 必须 null」的另一面）。轮次还在途就记下收取记录，页面会同时显示「已取走」和运行中指示。其余字段全部保持 dispatched 行合法取值。",
+      "expectValid": false,
+      "violates": "§4.9 蕴含式 3 / dispatched 行：collected 非空但 state 仍为 \"dispatched\""
+    },
+    {
+      "name": "bad-null-count-generation-count",
+      "why": "钉 §3：所有计数（含 generationCount）必须是有限非负安全整数，schema 里它没有 null 这一档。§3 警告 NaN/Infinity 经 JSON.stringify 会静默变 null，而 null 在本 schema 里到处合法 —— 算错的数字于是伪装成「这项没有」，「第 N 稿」徽章直接失去唯一数据源（§4.5）。其余字段合法。",
+      "expectValid": false,
+      "violates": "§3：generationCount 必须是有限非负安全整数，此处为 null（NaN/Infinity 序列化后的伪装）"
+    },
+    {
+      "name": "bad-negative-returned-chars",
+      "why": "钉 §3：所有计数一律 Number.isSafeInteger 且 >= 0。collected.returnedChars 为负（-8932）是「0 − 已返回长度」这类实现错误的残留，只检查 typeof===\"number\" 的校验器会放它过去。其余字段合法。",
+      "expectValid": false,
+      "violates": "§3：collected.returnedChars 必须是非负安全整数，此处为 -8932"
+    },
+    {
+      "name": "bad-unknown-session-field",
+      "why": "钉 §4.2「未知字段一律不允许：不许直接 spread session.summary()，必须逐字段白名单映射，校验器要显式拒绝 schema 之外的键」。多出的 session 级 \"transport\" 正是后端 summary 被整体展开后漏进 wire 的形态 —— 今天无害，但白名单纪律已失效，明天任何新增字段都会自动落盘。除该键外一切合法。",
+      "expectValid": false,
+      "violates": "§4.2：session 出现 schema 之外的键 \"transport\""
+    },
+    {
+      "name": "bad-failed-with-final-body",
+      "why": "钉 §4.9 outcome×bodyKind 矩阵的 ❌ 格：failed 永远不能配 final —— 「最终答复」只属于跑完的轮次，失败轮最多留 partial 或 none。output 侧完全按 ready 填齐（蕴含式 1 满足），故唯一越界就是这个格子。",
+      "expectValid": false,
+      "violates": "§4.9 outcome × bodyKind 矩阵：failed × final 是 ❌ 格"
+    },
+    {
+      "name": "bad-terminal-adopted-equal-timestamps",
+      "why": "钉 §4.6 末行硬蕴含：terminal_adopted ⟹ dispatchedAt > attemptedAt。此处两刻完全相等，说明实现把派发时刻直接复制成了认领时刻 —— 这一档的全部意义就是「没有任何 ACK，只能靠后到的终结事件反推」，抹掉时间差后页面再也分不清它与有 ACK 的轮次。",
+      "expectValid": false,
+      "violates": "§4.6：terminal_adopted 要求 dispatchedAt 严格大于 attemptedAt，此处二者相等"
+    },
+    {
+      "name": "bad-recording-error-code-outside-enum",
+      "why": "钉 §4.1 封闭枚举：recordingErrors 只允许 queue_full / queue_item_too_large / write_failed / snapshot_write_failed。混进自创的 \"disk_full\" 会让页面的原因码→文案映射落空，且封闭枚举一旦被当成开放集合，去重与 16 条上限的语义也随之松掉。本轮真实的观测失败（write_failed）与三处连带都已正确写好，定位点唯一。",
+      "expectValid": false,
+      "violates": "§4.1：recordingErrors 是封闭枚举，\"disk_full\" 不在四个原因码之内"
+    }
+  ]
+}

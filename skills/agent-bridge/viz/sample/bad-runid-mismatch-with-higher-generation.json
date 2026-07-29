@@ -1,0 +1,88 @@
+{
+  "schemaVersion": 1,
+  "runId": "mcp-91b0d4aa",
+  "generation": 99,
+  "updatedAt": "2026-07-29T01:52:18.004Z",
+  "run": {
+    "pid": 9981,
+    "bridgeVersion": "0.10.0",
+    "startedAt": "2026-07-29T01:40:02.117Z",
+    "status": "running",
+    "degraded": false,
+    "recordingErrors": []
+  },
+  "sessions": [
+    {
+      "sessionId": "codex-old7z1-c40b92",
+      "name": null,
+      "agent": "codex",
+      "model": "gpt-5.2-codex",
+      "effort": "high",
+      "access": "write",
+      "cwd": "D:\\cc\\agent-bridge",
+      "returnMode": "full",
+      "logFile": "C:\\Temp\\ab\\codex-old7z1-c40b92.log",
+      "appendSystemPrompt": null,
+      "backendPid": 30012,
+      "status": "idle",
+      "health": "healthy",
+      "isStreaming": false,
+      "contextUsage": {
+        "tokens": 20118,
+        "live": false
+      },
+      "createdAt": "2026-07-29T01:40:03.660Z",
+      "updatedAt": "2026-07-29T01:52:17.980Z",
+      "openFailed": null,
+      "closed": null,
+      "turns": [
+        {
+          "turnNo": 1,
+          "vizTurnId": "vt-old3b7a1",
+          "backendTurnId": "019fa2aa-1188-7e40-9c31-4b6d0e2f7715",
+          "backendTurnCount": 1,
+          "state": "settled",
+          "boundary": "turn_start_ack",
+          "attemptedAt": "2026-07-29T01:40:04.002Z",
+          "dispatchedAt": "2026-07-29T01:40:04.221Z",
+          "settledAt": "2026-07-29T01:52:17.914Z",
+          "firstBackendEventAt": "2026-07-29T01:40:05.330Z",
+          "source": "initial_prompt",
+          "blocking": true,
+          "hasSchema": false,
+          "input": {
+            "state": "ready",
+            "ref": "turns/codex-old7z1-c40b92/t1.in.md",
+            "sha256": "2c8ea7056f14b39dd0a52c86b91f7e4047c3a8d2e0619fb583d40c7a1e29f6b8",
+            "chars": 704,
+            "bytes": 1902,
+            "truncated": false,
+            "originalBytes": 1902,
+            "error": null
+          },
+          "output": {
+            "state": "ready",
+            "ref": "turns/codex-old7z1-c40b92/t1.out.md",
+            "sha256": "9a40d1f7c26b58e331fd0a947e8c26b1b5309fd80c47e2a66f19b3d0a8e5471c",
+            "chars": 5210,
+            "bytes": 15044,
+            "previewBytes": null,
+            "previewSha256": null,
+            "error": null
+          },
+          "outcome": "completed",
+          "bodyKind": "final",
+          "generationCount": 1,
+          "collected": {
+            "at": "2026-07-29T01:52:18.002Z",
+            "via": "wait",
+            "returnedChars": 5210,
+            "truncated": false
+          },
+          "error": null,
+          "durationMs": 733693
+        }
+      ]
+    }
+  ]
+}

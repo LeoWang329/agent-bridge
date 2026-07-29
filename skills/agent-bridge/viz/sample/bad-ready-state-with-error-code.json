@@ -1,0 +1,87 @@
+{
+  "schemaVersion": 1,
+  "runId": "mcp-3f9a2c7e",
+  "generation": 16,
+  "updatedAt": "2026-07-29T02:18:52.660Z",
+  "run": {
+    "pid": 1234,
+    "bridgeVersion": "0.10.0",
+    "startedAt": "2026-07-29T02:11:04.221Z",
+    "status": "running",
+    "degraded": true,
+    "recordingErrors": [
+      "queue_full"
+    ]
+  },
+  "sessions": [
+    {
+      "sessionId": "omp-y5b1t8-92ce04",
+      "name": null,
+      "agent": "omp",
+      "model": "deepseek-v3.2-exp",
+      "effort": "medium",
+      "access": "write",
+      "cwd": "D:\\cc\\agent-bridge",
+      "returnMode": "full",
+      "logFile": "C:\\Temp\\ab\\omp-y5b1t8-92ce04.log",
+      "appendSystemPrompt": null,
+      "backendPid": 13664,
+      "status": "idle",
+      "health": "degraded",
+      "isStreaming": false,
+      "contextUsage": {
+        "tokens": 65533,
+        "live": true,
+        "isCompacting": false,
+        "autoCompactionEnabled": true
+      },
+      "createdAt": "2026-07-29T02:18:01.114Z",
+      "updatedAt": "2026-07-29T02:18:52.630Z",
+      "openFailed": null,
+      "closed": null,
+      "turns": [
+        {
+          "turnNo": 1,
+          "vizTurnId": "vt-af03b8e5",
+          "backendTurnId": "omp-turn-2f76b0c1",
+          "backendTurnCount": 1,
+          "state": "settled",
+          "boundary": "rpc_ack",
+          "attemptedAt": "2026-07-29T02:18:01.446Z",
+          "dispatchedAt": "2026-07-29T02:18:01.702Z",
+          "settledAt": "2026-07-29T02:18:52.408Z",
+          "firstBackendEventAt": "2026-07-29T02:18:02.330Z",
+          "source": "send_message",
+          "blocking": true,
+          "hasSchema": false,
+          "input": {
+            "state": "ready",
+            "ref": "turns/omp-y5b1t8-92ce04/t1.in.md",
+            "sha256": "af03b8e5c2719d640be5a37f8c1f47de0a93b562e71d4c8835f9a20b6d4e7c19",
+            "chars": 660,
+            "bytes": 1804,
+            "truncated": false,
+            "originalBytes": 1804,
+            "error": null
+          },
+          "output": {
+            "state": "ready",
+            "ref": "turns/omp-y5b1t8-92ce04/t1.out.md",
+            "sha256": "0d573b9ea1f8264cb7390de548c2f61a9e05b7d33fa16c82c9048e7b512da6f0",
+            "chars": 4021,
+            "bytes": 11607,
+            "previewBytes": null,
+            "previewSha256": null,
+            "error": "queue_full"
+          },
+          "outcome": "completed",
+          "bodyKind": "final",
+          "generationCount": 3,
+          "collected": null,
+          "error": null,
+          "durationMs": 50706
+        }
+      ]
+    }
+  ]
+}
