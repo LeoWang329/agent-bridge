@@ -27,6 +27,7 @@ import {
   createEventWriter, boundPayload, boundedSummary, utf8Len,
   RecordingError, MAX_LINE_BYTES, DEGRADE_THRESHOLD,
 } from "../../skills/agent-bridge-graph/tools/viz-events.mjs";
+import { trimLoneSurrogate } from "../../skills/agent-bridge-graph/tools/viz-node.mjs";
 
 const RUN_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "viz-events-"));
 const GRAPH_ID = "11111111-2222-3333-4444-555555555555";
@@ -147,6 +148,15 @@ console.log("\nW2 BoundedSummary(§3.3)");
   ok("W2.17 errorSummary 同档降级", typeof pe.errorSummary === "object");
 }
 
+/** `node:progress` 的最小合法 payload。
+ *  ⚠️ 合同(§5.7)要求 `n` / `charCount` / `lastEvent` / `contextUsage` **恒在**
+ *  (后两个可 null)。写成工厂是为了以后再加必需字段时**只改一处** ——
+ *  早先这几处各写各的字面量,加一个 `n` 就红了五条。 */
+const progressPayload = (o = {}) => ({
+  nodeSeq: 1, turnKey: "main", n: 1, status: "running", charCount: 1, tail: "t",
+  lastEvent: null, contextUsage: null, ...o,
+});
+
 /* ============================================================
    W3 结构字段超限 → recording-failed(不是换类型)
    ============================================================ */
@@ -179,7 +189,32 @@ console.log("\nW3 结构字段超限(§3.4 负对照)");
   // progress.tail 天生有界,不许降级
   throwsRecording("W3.8 progress.tail 超 240 code unit → 报错不降级", () =>
     boundPayload("node:progress",
-      { nodeSeq: 1, turnKey: "main", status: "running", charCount: 1, tail: "t".repeat(241) }), /UTF-16/);
+      progressPayload({ tail: "t".repeat(241) })), /UTF-16/);
+
+  /* W3.9 **按 code unit 截断会切开代理对**(半个 emoji)。§5.7 定死:切完之后若首字符是
+     落单的**低代理**,把它丢掉。
+     ⚠️ W3.8 只考"超长会被拒",考不到这个边界 —— 把 `trimLoneSurrogate` 整个删掉、
+        或者把高低代理判反,它照样全绿,而页面会收到一个孤立低代理、显示成 U+FFFD。 */
+  {
+    const emoji = "\u{1F600}";                      // 一个代理对:D83D DE00
+    const lo = emoji.charAt(1);                     // 落单的**低**代理 DE00
+    const hi = emoji.charAt(0);                     // 落单的**高**代理 D83D
+    ok("W3.9 ★ 首字符是落单低代理 → 丢掉它", trimLoneSurrogate(lo + "abc") === "abc",
+      JSON.stringify(trimLoneSurrogate(lo + "abc")));
+    ok("W3.9 ★ 完整的代理对**不许**动(它不是半个)", trimLoneSurrogate(emoji + "x") === emoji + "x");
+    ok("W3.9 ★ 落单的**高**代理在首位时不动(合同只说丢低代理)",
+      trimLoneSurrogate(hi + "abc") === hi + "abc");
+    ok("W3.9 普通字符不动", trimLoneSurrogate("abc") === "abc");
+    ok("W3.9 空串不炸", trimLoneSurrogate("") === "");
+    /* ⚠️ **光考 helper 不够** —— 把 `node:progress` 的调用点改回裸 `slice(-240)`,
+          上面每一条照样全绿,而 wire 上重新出现落单低代理。所以这里直接读源码,
+          坐实**那个调用点确实经过了它**。(读源码是笨办法,但它考的正是"有没有接上"。) */
+    const src = fs.readFileSync(
+      new URL("../../skills/agent-bridge-graph/tools/viz-node.mjs", import.meta.url), "utf8");
+    const tailLine = src.split("\n").find((l) => /^\s*tail:/.test(l)) || "";
+    ok("W3.9 ★ node:progress 的 tail 真的经过 trimLoneSurrogate(不是只导出了没接上)",
+      /trimLoneSurrogate\s*\(/.test(tailLine), tailLine.trim());
+  }
 }
 
 /* ============================================================
@@ -212,10 +247,7 @@ console.log("\nW4 数值域");
   throwsRecording("W4.10 durationMs 不可空", () =>
     boundPayload("node:settled", settled({ turns: [turnSummary({ durationMs: null })] })));
   // contextUsage.tokens 允许小数但必须有限非负
-  const cu = boundPayload("node:progress", {
-    nodeSeq: 1, turnKey: "main", status: "running", charCount: 1, tail: "t",
-    contextUsage: { tokens: 1234.5, live: true },
-  });
+  const cu = boundPayload("node:progress", progressPayload({ contextUsage: { tokens: 1234.5, live: true } }));
   ok("W4.11 contextUsage.tokens 允许小数", cu.contextUsage.tokens === 1234.5);
 }
 
@@ -361,11 +393,11 @@ console.log("\nW6 schema 严格性(「漏字段写不出来」)");
    ============================================================ */
 console.log("\nW7 白名单:多余键丢弃 vs 判不符");
 {
-  const p = boundPayload("node:progress", {
-    nodeSeq: 1, turnKey: "main", status: "running", charCount: 5, tail: "…",
+  const p = boundPayload("node:progress", progressPayload({
+    charCount: 5, tail: "…",
     contextUsage: { tokens: 100, live: true, windowSize: 1000000, percent: 0.1 },
     lastEvent: { at: "2026-07-28T00:00:00Z", type: "engine.chunk", raw: { huge: "x".repeat(10000) } },
-  });
+  }));
   ok("W7.1 contextUsage 白名单内保留", p.contextUsage.tokens === 100 && p.contextUsage.live === true);
   ok("W7.2 contextUsage 白名单外丢弃(不报错)",
     !("windowSize" in p.contextUsage) && !("percent" in p.contextUsage));
@@ -373,15 +405,10 @@ console.log("\nW7 白名单:多余键丢弃 vs 判不符");
   ok("W7.4 lastEvent 白名单外丢弃", !("raw" in p.lastEvent));
   // ⚠️ "来自后端"不是免检理由:白名单**内**的字段照样受上限约束
   throwsRecording("W7.5 白名单内超限照样报错", () =>
-    boundPayload("node:progress", {
-      nodeSeq: 1, turnKey: "main", status: "running", charCount: 1, tail: "t",
-      lastEvent: { at: "x".repeat(300), type: "y" },
-    }), /结构字符串超限/);
+    boundPayload("node:progress", progressPayload({ lastEvent: { at: "x".repeat(300), type: "y" } })), /结构字符串超限/);
   // 对照:同样是"多一个键",顶层就必须判不符(W6.2)。两条规则的分界要说得清。
   throwsRecording("W7.6 对照:顶层多一个键仍判不符", () =>
-    boundPayload("node:progress", {
-      nodeSeq: 1, turnKey: "main", status: "running", charCount: 1, tail: "t", extra: 1,
-    }), /没有这个键/);
+    boundPayload("node:progress", progressPayload({ extra: 1 })), /没有这个键/);
 }
 
 /* ============================================================
@@ -400,7 +427,7 @@ console.log("\nW8 行上限(§7 推论 1)");
   // 用一个合法 payload 但把 MAX 临时逼近是不可能的,于是改用**事实断言**:
   // progress 的所有字段都有界 ⇒ 它天然写得下。这条断言本身就是设计的一部分。
   const maxProgress = {
-    nodeSeq: 2 ** 53 - 1, turnKey: "k".repeat(200), status: "s".repeat(200),
+    nodeSeq: 2 ** 53 - 1, turnKey: "k".repeat(200), n: 2, status: "s".repeat(200),
     charCount: 2 ** 53 - 1, tail: "中".repeat(240),
     contextUsage: { tokens: 1e15, live: true, isCompacting: true, autoCompactionEnabled: true },
     lastEvent: { at: "a".repeat(200), type: "t".repeat(200) },

@@ -288,9 +288,14 @@ bridge.runNode({ id: "implement", agent: "claude", cwd: REPO, outDir,
 `schema` / `outputShape` / **`timeoutMs`** / **`reask`** / **`baseRef`** 全算进去(凡是会改变执行结局的都算,
 键序无关)。同 id 重跑默认被拒;加 `reuseIfSame` 则"指纹一致才复用"。
 
-复用还要再过几道闸:**上次必须是 `ok`**(不复用失败结果)、产出文件存在且非空、**内容 SHA-256
-与回执记录一致**(防文件被换过)、write 环节还要**基线 `baseCommit` 没变**。**没有这些,就会把上一版任务的
-结果当成这一版——静默出错,最难查的一类。**
+复用还要再过几道闸:**上次必须是 `ok`**(不复用失败结果)、产出文件**存在**、**内容 SHA-256
+与回执记录一致**(防文件被换过)、**每次尝试的审计原件逐项对得上**(次序 `n` 严格递增、末次必是
+被采纳的那次、路径与内容指纹逐字节核对)、write 环节还要**基线 `baseCommit` 没变**。
+**没有这些,就会把上一版任务的结果当成这一版——静默出错,最难查的一类。**
+
+⚠️ **别把"非空"写进这道闸。** 零字节是一次**合法的成功**(`no-output` = 「已经确认产出是零字节」),
+把它当"文件坏了"拒掉,同一个任务第二次就**永远复用不了**、只能 `force` 覆盖 —— 而 `force` 会销毁上一次的产出。
+空文件的 sha256 是良定义的,内容指纹那道闸照常管得住"被换成另一份文件"。
 
 ## 看运行:观测台(`viz`)
 
@@ -319,8 +324,12 @@ await withBridge(async (b) => { … }, { viz: true, outDir });
 - **推断的依赖画成虚线**,声明的画成实线。虚线是**系统按文件名猜的**,点开有依据。别当事实用。
 
 ⚠️ **回执升到了 v2,既有回执全部失去复用资格。** `reuseIfSame` 认的是 `RECEIPT_VERSION`,
-v1 的回执**一律不复用**(不是报错,是当成没有)。所以升级后第一次跑,**上一批产出会全部重跑一遍** ——
-这是一次性代价,心里有数就行;不想付就换个 `outDir`,把旧的留在原地。
+碰到 v1 的回执会**当场报错停下**(`UsageError`),**不会**自动重跑 ——
+要重跑得显式加 `force`(那会覆盖上次那次执行的产出),或者换个 `outDir` 把旧的留在原地。
+⚠️ 本段早先写的是"不是报错,是当成没有…上一批产出会全部重跑一遍"—— **与代码相反**:
+照那句话去理解,升级后第一次跑会以为"等着它自己刷新就行",而实际是**卡在复用闸上不动**。
+(响亮地拒而不是静默降级是刻意的:v1 没有 `attempts[]`,拿它当"支持新 UI 的回执"用,
+ 页面上逐次尝试那一段只会是空白。)
 
 离线看一眼它长什么样(不起桥、不花钱):
 
@@ -360,6 +369,20 @@ node docs/repro-mcp-hang/repro-graph-node.mjs        # 环节生命周期 / 失�
 node docs/repro-mcp-hang/repro-graph-worktree.mjs    # write 隔离 / 基线闸 / 复用闸 / 并发闸
 node docs/repro-mcp-hang/repro-viz-events.mjs        # 事件 writer:schema / 有界化 / 半行安全
 node docs/repro-mcp-hang/repro-viz-graph.mjs         # graph 作用域与归档写入器
+node docs/repro-mcp-hang/repro-graph-conversation.mjs # 多轮对话:轮的生命周期 / 会话毒化 / 记忆边界
 node docs/repro-mcp-hang/repro-graph-viz.mjs         # viz 开着时的事件流 / SSE / /file 四道闸
 node skills/agent-bridge-graph/viz/test-viz.mjs      # 页面这一侧:事件流 → 页面上写了什么
+```
+
+⚠️ 上面两条**都**会跑 `viz/contract-invariants.mjs` —— 合同里那些**跨字段的等式**
+(「这两处 sha256 必须相等」「这个字段只在那个字段不是 present 时才许出现」)。
+它**刻意不 import `tools/viz-events.mjs`**:schema 只管单个字段的形状,
+拿写方的 schema 去验写方造的事件,验的只是"我和我自己一致"。
+`repro-graph-viz` 用它验**每一次真跑出来的 transcript**,`test-viz` 用它验**冻结样例** ——
+写方与样例任何一侧漂离合同,当场变红。
+
+真后端 e2e(**真花钱**,改了归档布局 / 事件形状 / 页面读法之后跑一次):
+
+```sh
+node docs/repro-mcp-hang/e2e-graph-viz.mjs           # 真跑 → 观测台上看到的就是磁盘上那份
 ```

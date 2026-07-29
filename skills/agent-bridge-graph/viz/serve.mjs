@@ -182,15 +182,16 @@ function controlFramesFor(c) {
       kind: "owner-final", result: state.ownerFinal.result, endedAt: state.ownerFinal.endedAt,
     }));
   }
-  // ⚠️ 页面判「运行状态」的四档里,第 3、4 档(`log_broken_unknown` / `no_finish`)都要求知道
-  //    **owner 已经结束**。没有这一帧,页面分不开「还在跑、暂时没消息」与「跑完了、就是没有 final」,
-  //    只能一直显示"运行中" —— 一次被强杀的运行会永远装作还活着。
-  //    「已结束」不等于「成功完成」:drain 失败照样算结束(见 ownerEnded 的注释)。
+  // `owner-lost`(§10.4 第四个形状)——**管道 EOF 且最终 drain 已结束,而 owner 一句话没留下**。
   //
-  // ⚠️ **transcript 里已经有 run:final 时不发**:那一档由 transcript 自己说了算(判定第 1 档),
-  //    这一帧一个字的新信息都不带。健康路径**一条 control 帧都不发**是有用的不变量 ——
-  //    它本身就等于一句"没出任何异常"。
-  if (!sawRunFinal && ownerEnded()) c.frame("control", JSON.stringify({ kind: "owner-ended" }));
+  // ⚠️ **与 `owner-final` 互斥,不是它的超集。** 页面判定的第 2、3 档靠这两条帧**分开**:
+  //    第 2 档要 `owner-final`(受控结束),第 3 档是 EOF 无 `owner-final`(owner 也丢了)。
+  //    把两者归并成一个"结束了"的布尔,两档就共用同一句文案了 —— §10.1 明令禁止。
+  // ⚠️ **transcript 里已经有 run:final 时不发**:那一档由 transcript 自己说了算(第 1 档),
+  //    这一帧一个字的新信息都不带。于是健康路径**一条 control 帧都不发**。
+  if (!sawRunFinal && !state.ownerFinal && state.pipeEnded && state.drainSettled) {
+    c.frame("control", JSON.stringify({ kind: "owner-lost" }));
+  }
 }
 
 /** 把一条控制消息广播给所有**已经转 live** 的客户端;还在回放的那些等回放完再补。 */

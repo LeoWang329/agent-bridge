@@ -427,6 +427,8 @@ button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:poin
 .asset .a-b{flex:1 1 auto;min-width:0}
 .asset .a-why{color:var(--faint);font-size:11.5px;line-height:1.55;margin-top:3px;overflow-wrap:anywhere}
 .asset .a-why code{font-family:var(--mono);font-size:10.5px;background:var(--surface-2);border:1px solid var(--line);border-radius:4px;padding:1px 4px;color:var(--ink-soft)}
+/* 「取回来的字节与记录对不上」——这一条不能长得跟旁边的灰色注脚一样。 */
+.asset .a-why[data-warn]{color:var(--c-fail);border-left:2px solid var(--c-fail);padding-left:7px}
 .a-open{display:inline-flex;align-items:center;gap:5px;color:var(--ink);font-size:12.5px;border-bottom:1px solid var(--line-2)}
 .asset:hover .a-open{color:var(--accent);border-bottom-color:currentColor}
 .a-na{color:var(--faint)}
@@ -671,7 +673,16 @@ const UNAVAIL = {
   'write-failed':        '这一项写盘失败。',
   'source-missing':      '源头就没有可拷的东西。',
   'sha-failed':          '拷下来了，但算不出指纹 —— 所以不能当成「拿得到」（指纹是复用与防篡改的判据）。',
-  'fingerprint-only':    '当初那次运行没有开可视化，只保留了指纹。<b>这是当时的选择，不是故障。</b>',
+  /* ⚠️ **别一口咬定"这是当时的选择、不是故障"。** 这个 code 今天有好几种成因：
+        原运行没开可视化（确实是选择）、复用时 n≥2 的重说提示这一次没有、输入指纹对不上
+        因而拒绝落盘（那是**保护**）、以及产出原件当时**复制失败**（那就是故障）。
+        wire 上分不出是哪一种，所以这里只说**这一层拿不到正文、指纹还在**，
+        把"是不是故障"留给人判断 —— 说满了会在真出故障时反过来安慰用户。 */
+  'fingerprint-only':    '这一层<b>拿不到正文，只留下了指纹</b>。成因可能是当初没开可视化、这一项本次没有原文可复原、或者当时那次复制没成 —— 记录里分不出是哪一种。',
+  /* ⚠️ 这个 code 是**页面自己造的**（wire 上没有）：记录说"东西在"，却没给可打开的位置，
+        或者没给指纹与字节数。**那等于没有** —— 指纹是"页面上这份 = 磁盘上那份"的唯一对证手段，
+        缺了它，即使文件真在，这一份也不能当权威记录展示。 */
+  'record-broken':       '记录说这一项在，却<b>缺了打开它所必需的东西</b>（位置、指纹或字节数）。东西可能真在磁盘上，但这一层没法证明打开的就是当时那一份，所以不给入口。',
   /* ⚠️ 字面量 unknown 与「没见过的 code」**必须是两句不同的话**：
         前者是「已知的未知」——生产方尝试过、也知道失败了，只是没分辨出是哪一类；
         后者是「这个版本的页面还不认识它」。混成一句就把两件事抹平了。 */
@@ -924,7 +935,6 @@ SCENES.push({
      t:{q:[712,726],r:[726,1604]},words:1980,ctx:null,
      attempts:[{n:1,verdict:'accepted',input:have('修复 nodes/audit-auth.md 指出的会话续期竞态。允许改文件。改完给一份工作报告。'),output:have(MD_PATCH_REPORT)}],
      write:{outcome:'delivered',branch:'agent/patch-session-guard-8b1c',base:'a91c04e',
-       files:[['M','src/auth/session.ts'],['M','src/auth/const.ts'],['M','src/auth/index.ts'],['A','src/auth/__tests__/session.concurrent-refresh.test.ts'],['M','src/api/middleware/auth.ts'],['M','src/api/routes/refresh.ts'],['D','src/auth/legacy-revoke.ts'],['R','src/auth/token.ts → src/auth/token/issue.ts']],
        worktree:{state:'cleaned',path:'D:\\cc\\agent-bridge\\.worktrees\\patch-session-guard-8b1c'},
        diff:asset('have')},
      scene:{session:asset('na',{why:'正常收场'}),answer:asset('have'),snapshot:asset('na',{why:'正常收场'})}},
@@ -932,14 +942,14 @@ SCENES.push({
     {seq:5,id:'patch-retry-logic',engine:'omp',mode:'write',model:'deepseek-v3.2',effort:'high',status:'ok',
      t:{q:[712,730],r:[730,1388]},words:1120,ctx:29000,
      attempts:[{n:1,verdict:'accepted',input:have('修复 nodes/audit-data-flow.md 指出的重试退避问题。允许改文件。'),output:have('## 工作报告 · 重试退避\n\n读了 `src/transport/retry.ts` 与它的三处调用点。\n\n现有实现已经是带抖动的指数退避，上限 30s，与上游结论描述的"固定 1s 重试"不符——上游看的是 2 个月前的版本。\n\n**因此本次没有落下任何修改。** 建议把这条结论回退给 audit 环节复核。')}],
-     write:{outcome:'no-changes',branch:'agent/patch-retry-logic-8b1c',base:'a91c04e',files:[],
+     write:{outcome:'no-changes',branch:'agent/patch-retry-logic-8b1c',base:'a91c04e',
        worktree:{state:'cleaned',path:'D:\\cc\\agent-bridge\\.worktrees\\patch-retry-logic-8b1c'},diff:asset('na',{why:'没有可交付的改动'})},
      scene:{session:asset('na',{why:'正常收场'}),answer:asset('have'),snapshot:asset('na',{why:'正常收场'})}},
 
     {seq:6,id:'patch-config-schema',engine:'claude',mode:'write',model:'claude-opus-5',effort:'medium',status:'ok',
      t:{q:[712,741],r:[741,1219]},words:860,ctx:31000,
      attempts:[{n:1,verdict:'accepted',input:have('给 config schema 补上 slots 上限的校验。允许改文件。'),output:have('## 工作报告 · config schema\n\n先加了 `slots` 的 min/max 校验，随后发现 `src/config/schema.ts` 已经在上游合并里加过等价校验，于是把自己的改动撤了回去，只留下提交本身作为记录。')}],
-     write:{outcome:'delivered',branch:'agent/patch-config-schema-8b1c',base:'a91c04e',files:[],netEmpty:true,
+     write:{outcome:'delivered',branch:'agent/patch-config-schema-8b1c',base:'a91c04e',changesKnown:true,netEmpty:true,
        worktree:{state:'cleaned',path:'D:\\cc\\agent-bridge\\.worktrees\\patch-config-schema-8b1c'},diff:asset('have',{empty:true})},
      scene:{session:asset('na',{why:'正常收场'}),answer:asset('have'),snapshot:asset('na',{why:'正常收场'})}},
 
@@ -947,7 +957,6 @@ SCENES.push({
      t:{q:[712,758],r:[758,1502]},words:1440,ctx:47000,
      attempts:[{n:1,verdict:'accepted',input:have('把节点生命周期事件补进 telemetry。允许改文件。'),output:have('## 工作报告 · telemetry\n\n补了 `node.queued` / `node.slot_acquired` / `node.worktree_ready` 三个事件，并在前端消费侧加了对应的分支。')}],
      write:{outcome:'delivered',branch:'agent/patch-telemetry-8b1c',base:'a91c04e',
-       files:[['M','src/telemetry/events.ts'],['M','src/graph/node.ts'],['A','src/telemetry/__tests__/lifecycle.test.ts']],
        worktree:{state:'unconfirmed',path:'D:\\cc\\agent-bridge\\.worktrees\\patch-telemetry-8b1c',
                  why:'收尾时没能确认后端已经停下，此时删掉副本可能丢代码，于是没有删。'},
        diff:asset('have')},
@@ -959,7 +968,6 @@ SCENES.push({
             bounded:BOUNDED_ERR, diagnostics:['engine.code = upstream_closed','engine.http_status = 200 (stream aborted)','engine.retryable = true']},
      attempts:[{n:1,verdict:'failed',input:have('给 CLI 补上 --slots 与 --no-viz 两个开关。允许改文件。'),output:have('## 工作报告（未写完）\n\n已经改了 `src/cli/args.ts`，正在补文档时流断了。')}],
      write:{outcome:'delivered',branch:'agent/patch-cli-flags-8b1c',base:'a91c04e',
-       files:[['M','src/cli/args.ts'],['M','src/cli/index.ts'],['M','docs/cli.md']],
        worktree:{state:'cleaned',path:'D:\\cc\\agent-bridge\\.worktrees\\patch-cli-flags-8b1c'},diff:asset('have')},
      scene:{session:asset('have'),answer:asset('gone'),snapshot:asset('have')}},
 
@@ -969,7 +977,6 @@ SCENES.push({
             diagnostics:['result.write = failed (ENOSPC)','engine.ack = received','engine.final_chunk = received']},
      attempts:[{n:1,verdict:'unknown',input:have('调大 SSE 环形缓冲并在超限时主动断开慢客户端。允许改文件。'),output:have('## 工作报告 · SSE 缓冲\n\n把环形缓冲从 4096 提到 16384，并在游标落后超过一半容量时主动断开该客户端，让它重连后走完整回放。\n\n改动集中在 `src/transport/sse.ts` 与 `src/transport/const.ts`。')}],
      write:{outcome:'delivered',branch:'agent/patch-sse-buffer-8b1c',base:'a91c04e',
-       files:[['M','src/transport/sse.ts'],['M','src/transport/const.ts'],['M','src/transport/__tests__/sse.test.ts']],
        worktree:{state:'cleaned',path:'D:\\cc\\agent-bridge\\.worktrees\\patch-sse-buffer-8b1c'},diff:asset('have')},
      scene:{session:asset('have'),answer:asset('have'),snapshot:asset('unavailable',{code:'write-failed'})}},
 
@@ -1318,7 +1325,6 @@ SCENES.push({
     if (reused){ n.reused = true; n.origRun = 2547; n.reuseFrom = 'gr-20260726-1130-2a77'; }
     if (write){
       n.write = {outcome:'delivered', branch:'agent/'+kind+'-'+String(i).padStart(2,'0')+'-9f1d', base:'a91c04e',
-        files:[['M','src/'+kind+'/index.ts'],['M','src/'+kind+'/const.ts'],['A','src/'+kind+'/__tests__/'+kind+'.test.ts']],
         worktree:{state:'cleaned', path:'D:\\cc\\agent-bridge\\.worktrees\\'+kind+'-'+i+'-9f1d'}, diff:asset('have')};
     }
     if (!ok){
@@ -1389,8 +1395,15 @@ function mapAsset(a, naWhy){
   if (a == null || typeof a !== 'object') return {s:'unlogged'};
   switch (a.state){
     case 'present':
-      /* ⚠️ 缺 ref 当**记录损坏**处理，不当 have（映射表 §6）。 */
+      /* ⚠️ `present` 的 `ref`/`sha256`/`byteCount` **三样恒有，一个都不能少**（EVENTS.md §3.1）。
+            缺 ref → 页面知道"东西在"却点不开，等于没有；
+            缺 sha256 / byteCount → **"页面上这份 = 磁盘上那份"的唯一对证手段没了** ——
+            照样渲染成可打开的 have，就是在把一份无法验证的字节当成权威记录展示。
+            ⚠️ `byteCount` **可以是 0**（空产出是合法的 present），所以判据是"是不是非负整数"，
+            **不是**真值判断 —— 写成 `!a.byteCount` 会把每一份空产出判成损坏。 */
       if (typeof a.ref !== 'string' || !a.ref) return {s:'unavailable', code:REC_BROKEN_CODE};
+      if (!/^[0-9a-f]{64}$/.test(String(a.sha256))) return {s:'unavailable', code:REC_BROKEN_CODE};
+      if (!Number.isSafeInteger(a.byteCount) || a.byteCount < 0) return {s:'unavailable', code:REC_BROKEN_CODE};
       return {s:'have', ref:a.ref, sha256:a.sha256, byteCount:a.byteCount};
     case 'not-applicable':
       return naWhy ? {s:'na', why:naWhy} : {s:'na'};
@@ -1411,7 +1424,10 @@ function mapScene(sc){
   if (sc.state === 'present'){
     const f = sc.files || {};
     return {sceneNone:false, scene:{
-      session: mapAsset(f['session.log']), answer: mapAsset(f['answer.txt']), snapshot: mapAsset(f['status.json']),
+      /* ⚠️ **键是逻辑名,不是磁盘上的文件名**(EVENTS.md §3.2)——合同刻意让两者不同。
+            读成 f['session.log'] 会**三样全部落空**,于是每一份真实存在的现场都被显示成
+            「没有这一项的记录」。而它长得像一次正常的缺席,没人会去查。 */
+      session: mapAsset(f.sessionLog), answer: mapAsset(f.answer), snapshot: mapAsset(f.status),
     }};
   }
   if (sc.state === 'not-applicable'){
@@ -1459,7 +1475,8 @@ function newLiveState(){
     order: [],
     /* 控制槽。⚠️ 这四样**不来自 transcript**，来自服务端的控制帧；
        它们是「运行状态四档判定」(§10.1) 里除 run:final 之外的全部依据。 */
-    ctl: {recordingFailed:null, historyReadFailure:null, ownerFinal:null, ownerEnded:false, overflow:null},
+    /* ⚠️ `ownerFinal` 与 `ownerLost` **是两个事实,不是一个布尔的两种来源**(§10.1 第 2/3 档)。 */
+    ctl: {recordingFailed:null, historyReadFailure:null, ownerFinal:null, ownerLost:false, overflow:null},
     replay: {mode:'connecting', done:0},
     /* transcript 里读到的坏行数。⚠️ 只统计、不据此推断任何节点的状态。 */
     badLines: 0,
@@ -1495,6 +1512,12 @@ function turnOf(n, key){
   }
   return t;
 }
+/** 把一处推断出来的依赖并进节点。**按首次出现顺序去重**，截断标志用 OR。 */
+function mergeDeps(n, deps, truncated){
+  if (Array.isArray(deps)) for (const d of deps) if (!n.inferredDeps.includes(d)) n.inferredDeps.push(d);
+  if (truncated) n.inferredDepsTruncated = true;
+}
+
 /** 当前这一轮 = 最后一条被宣告的轮。节点级的「排队 / 运行」看它。 */
 const lastTurn = n => n.turnOrder.length ? n.turns.get(n.turnOrder[n.turnOrder.length-1]) : null;
 
@@ -1522,6 +1545,9 @@ function applyEvent(R, ev){
       n.id = p.id; n.agent = p.agent; n.access = p.access; n.cwd = p.cwd;
       n.model = p.model; n.effort = p.effort;
       n.specA = p.spec; n.promptA = p.prompt; n.roleA = p.role;
+      /* §3.1 / §5.2:**对话节点没有节点级 prompt**。这是判"是不是一段对话"的**唯一**判据,
+         合同点名不许为此新加字段。 */
+      n.isConversation = !!(p.prompt && p.prompt.state === 'not-applicable');
       n.declaredDeps = p.declaredDeps || []; n.inferredDeps = p.inferredDeps || [];
       n.inferredDepsTruncated = !!p.inferredDepsTruncated;
       n.group = 'group' in p ? p.group : null;
@@ -1542,10 +1568,10 @@ function applyEvent(R, ev){
       const t = turnOf(n, p.turnKey);
       t.announcedTs = ts; t.input = p.input; t.timeoutMs = p.timeoutMs; t.reask = p.reask;
       n.turnCalls++;
-      /* 每一轮都可能带上它自己那一刻推断出的依赖 —— 后来的覆盖先前的（同一份推断在演进）。 */
-      if (p.inferredDeps && p.inferredDeps.length){
-        n.inferredDeps = p.inferredDeps; n.inferredDepsTruncated = !!p.inferredDepsTruncated;
-      }
+      /* ⚠️ **取并集,不是覆盖。** 第 1 轮推断出 A、第 2 轮推断出 B,覆盖的话页面上只剩 B ——
+            而两条边都是真的(那两轮各自读了不同的产出)。截断标志同理用 OR:
+            任何一处截断过,页面就该说"还有更多没显示"。 */
+      mergeDeps(n, p.inferredDeps, p.inferredDepsTruncated);
       t.lastTs = ts; touch(n, 'turn');
       break;
     }
@@ -1618,6 +1644,10 @@ function applyEvent(R, ev){
                    outcome: 'outcome' in p ? p.outcome : undefined,
                    workspaceSummary: p.workspaceSummary || null,
                    errorSummary: p.errorSummary || null};
+      /* ⚠️ 复用命中时**这是唯一一份**推断依赖:那条路一条 turn 事件都不发,
+            而 node:observed.inferredDeps 对对话节点恒为 []（那一刻一个字的正文都还没有）。
+            少了这一步,一命中复用整段对话的推断边就全没了。 */
+      for (const t of (p.turns || [])) mergeDeps(n, t.inferredDeps, t.inferredDepsTruncated);
       n.endTs = ts; touch(n, 'settled');
       break;
     }
@@ -1645,12 +1675,14 @@ function applyControl(R, c){
       if (!R.ctl.historyReadFailure) R.ctl.historyReadFailure = {reason:c.reason};
       break;
     case 'owner-final':
+      /* **受控结束** —— owner 亲口说了它收场了(以及成没成)。 */
       if (!R.ctl.ownerFinal) R.ctl.ownerFinal = {result:c.result, endedAt:c.endedAt};
-      R.ctl.ownerEnded = true;
       break;
-    case 'owner-ended':
-      /* ⚠️ 「已结束」不等于「成功完成」——drain 失败照样算结束。 */
-      R.ctl.ownerEnded = true;
+    case 'owner-lost':
+      /* **管道 EOF、owner 一句话没留下。** ⚠️ 与上面那条**必须分开存** ——
+         归并成一个"结束了"的布尔,第 2、3 档就共用同一句文案了,而 EVENTS.md §10.1 明令禁止:
+         「受控结束但记录损坏」与「记录损坏且 owner 也丢了」是两种处置完全不同的事。 */
+      R.ctl.ownerLost = true;
       break;
   }
 }
@@ -1659,9 +1691,19 @@ function applyControl(R, c){
 
 /** §10.1 四档判定，**按顺序取第一个匹配**，reducer 不许换序。 */
 function runStateOf(R){
+  // 1. transcript 里有 run:final ⇒ 按 transcript 说的算
   if (R.run.final) return R.run.final.result === 'completed' ? 'ended' : 'ended_failed';
-  if (R.ctl.recordingFailed) return R.ctl.ownerEnded ? 'log_broken_ended' : 'log_broken_unknown';
-  if (R.ctl.ownerEnded) return 'no_finish';
+  if (R.ctl.recordingFailed){
+    // 2. recording-failed + **owner-final** ⇒ 受控结束,但观测记录损坏
+    if (R.ctl.ownerFinal) return 'log_broken_ended';
+    // 3. recording-failed + EOF、**没有** owner-final ⇒ 观测损坏,且 owner 也丢了
+    if (R.ctl.ownerLost) return 'log_broken_unknown';
+    /* ⚠️ 记录坏了但 owner 还没结束:**两档都不是**。此时说"且不知道后来怎么样了"是提前下结论 ——
+          owner 很可能还好好地在跑,只是我们记不下来了。落回"运行中"+ 损坏横幅。 */
+    return 'running';
+  }
+  // 4. 以上都没有、EOF 前也没 final
+  if (R.ctl.ownerFinal || R.ctl.ownerLost) return 'no_finish';
   return R.run.started ? 'running' : 'waiting';
 }
 
@@ -1682,6 +1724,11 @@ function pendingOr(nodeStatus, whenGone){
   return whenGone;
 }
 
+/** 从来没见过这一项的产生事件 —— **既不是"不适用",也不是"记录时它在、现在没了"。**
+ *  ⚠️ 早先这里给的是 `gone`,那是在**声称**"它曾经在过";给 `na` 更糟,那是在声称"本来就不该有"。
+ *  两句都是我们不知道的事。 */
+const NEVER_SEEN = () => ({s:'unlogged'});
+
 /** 节点状态。判定顺序即优先级，**不许换序**（映射表 §2 / §3.1）。 */
 function nodeStatusOf(R, n){
   if (n.rejected) return 'rejected';
@@ -1689,7 +1736,11 @@ function nodeStatusOf(R, n){
   /* ⚠️ 全局记录损坏**盖过**逐节点推断：这些节点很可能好好跑完了，只是没人记下来。
         把一次记录故障摊派成一堆节点事故，是这个页面能犯的最有误导性的错误之一。 */
   if (R.ctl.recordingFailed) return 'unlogged';
-  if (R.ctl.ownerEnded) return 'abandoned';
+  /* ⚠️ **历史没读全时,禁止据"缺了哪些事件"推断任何节点的状态**(EVENTS.md §10.1 末条)。
+        出问题的是我们读历史这一侧 —— 那个节点很可能早就收场了,只是那几行没读回来。
+        这里如实说"状态未知",而不是继续走 discovered/queued/running/abandoned。 */
+  if (R.ctl.historyReadFailure) return 'unlogged';
+  if (R.ctl.ownerFinal || R.ctl.ownerLost) return 'abandoned';
   const t = lastTurn(n);
   if (!t) return 'discovered';
   /* 轮已宣告但没拿到名额 = 排队中：**一个字都还没发给 AI**。 */
@@ -1715,26 +1766,113 @@ function projectTurn(R, n, t, nodeStatus){
   const st = t.settled;
   const turnStatus = st ? st.status : (t.started ? 'running' : 'queued');
   const sc = st ? mapScene(st.scene)
-                : {sceneNone:false, scene:{session:pendingOr(nodeStatus,{s:'gone'}),
-                                           answer:pendingOr(nodeStatus,{s:'gone'}),
-                                           snapshot:pendingOr(nodeStatus,{s:'gone'})}};
+                : {sceneNone:false, scene:{session:pendingOr(nodeStatus, NEVER_SEEN()),
+                                           answer: pendingOr(nodeStatus, NEVER_SEEN()),
+                                           snapshot:pendingOr(nodeStatus, NEVER_SEEN())}};
 
   const attempts = t.attOrder.slice().sort((a,b)=>a-b).map(k => {
     const a = t.attempts.get(k);
     const v = attemptVerdict(a, nodeStatus);
-    const out = a.settled ? mapAsset(a.settled.output)
-                          : pendingOr(nodeStatus, {s:'na', why:'这次尝试没有看到结局，产出去向不明'});
+    /* ⚠️ 没见过 attempt-settled 就**不知道**产出是什么状态 —— 不许说成「本来就不该有」。 */
+    const out = a.settled ? mapAsset(a.settled.output) : pendingOr(nodeStatus, NEVER_SEEN());
     const o = {n:a.n, verdict:v,
-               input: a.input ? mapAsset(a.input) : pendingOr(nodeStatus, {s:'na', why:'输入原文没有落下来'}),
+               input: a.input ? mapAsset(a.input) : pendingOr(nodeStatus, NEVER_SEEN()),
                output: out};
-    if (a.settled && a.settled.rejectedReason) o.reject = mapBounded(a.settled.rejectedReason);
+    /* 同 errorOf：短的是原样字符串（要当正文显示），长的才有摘要块。两个槽分开给。 */
+    if (a.settled && a.settled.rejectedReason != null){
+      o.reject = mapBounded(a.settled.rejectedReason);
+      o.rejectText = bText(a.settled.rejectedReason);
+    }
     return o;
   });
 
-  const o = {key:t.key, status:turnStatus, scene:sc.scene, sceneNone:sc.sceneNone, attempts};
+  const o = {key:t.key, status:turnStatus, scene:sc.scene, sceneNone:sc.sceneNone, attempts,
+             reusable: st ? st.sessionReusable === true : null};
   /* 「没能开始的轮」的原文照抄，不自己起标题 —— 它的结论一点都不含糊：**它没开始**。 */
-  if (st && st.status === 'not-started' && st.errorSummary) o.error = bText(st.errorSummary);
+  if (st && st.status === 'not-started' && st.errorSummary != null) o.error = bText(st.errorSummary);
   return o;
+}
+
+/**
+ * 把 `node:settled.turns[]` 里的一项(TurnSummary)投影成页面认的轮。
+ *
+ * ⚠️ **复用命中的节点一条 turn 事件都不发**(EVENTS.md §5.9),它那 N 轮的**全部信息
+ * 只存在于这里**。只按实时 turn 事件建轮的话,一个复用节点会被补出
+ * 「一条空的 main 轮 / queued / 没联系过 AI」—— 而回执上白纸黑字写着 ok、七千多字。
+ * **页面直接和回执打架**,这是最难被发现的一类错:它看起来像一次正常的排队。
+ *
+ * ⚠️ TurnSummary **刻意没有 scene 与 errorSummary**(§5.8):这条路上它们必然为空
+ * (本次跑完的轮早由 node:turn-settled 公布过;复用命中的轮全是 ok,ok 的轮既没现场也没错误)。
+ * 所以这里**不编**一个"正常收场"出来 —— 复用说"没跑,自然没有现场",其余说"没有这一项的记录"。
+ */
+function turnFromSummary(t, reused){
+  const attempts = (t.attempts || []).map(a => {
+    const o = {n:a.n, verdict:a.status, input:mapAsset(a.input), output:mapAsset(a.output)};
+    if (a.rejectedReason != null){ o.reject = mapBounded(a.rejectedReason); o.rejectText = bText(a.rejectedReason); }
+    return o;
+  });
+  const why = reused ? '这一次是复用，没有真跑，也就没有现场' : null;
+  const slot = () => why ? {s:'na', why} : {s:'unlogged'};
+  return {key:t.key, status:t.status, attempts, sceneNone:false,
+          reusable: t.sessionReusable === true,
+          scene:{session:slot(), answer:slot(), snapshot:slot()}};
+}
+
+/**
+ * 一个节点的轮列表。**实时事件优先，回执摘要兜底。**
+ *
+ * 实时事件更细(有尝试时间线、有现场、有在途正文),有就用;
+ * 一条都没有而回执里有 `turns[]` —— 那就是复用命中(或事件丢了),用摘要。
+ */
+function turnsOf(R, n, status){
+  const sum = n.settled && Array.isArray(n.settled.turns) ? n.settled.turns : [];
+  const reused = !!(n.settled && n.settled.execution === 'reused');
+  const live = new Set(n.turnOrder);
+
+  /* ⚠️ **逐 key 合并,不是"有实时事件就整份丢掉摘要"。**
+        丢掉的那种写法在"事件掉了一部分"时会静默少画轮:两轮的节点只收到第 1 轮的事件、
+        而回执摘要里明明有两轮 —— 页面就只画一轮,而且**看起来完全正常**。
+        合并之后:见过事件的轮用事件(更细,有尝试时间线、有现场、有在途正文),
+        没见过的轮用摘要补上,并且**按回执里的顺序**排 —— 回执才是权威的轮序。 */
+  /* ⚠️ **顺序以「事件里被宣告的先后」为准,不是回执里的排列。**
+        `not-started` 的轮**不进 `turns[]`**(合同明说),所以一段
+        「`draft` 没能开始 → 回调换个 key → `fix` 跑成了」的对话里,
+        回执里只有 `fix`。按"回执优先"排,页面会把它显示成 `fix → draft` ——
+        **时间倒流**,而每一轮自己看起来都正常。
+        事件里见过的按事件顺序;只在回执里有的(复用命中,或事件丢了)按回执顺序追加 ——
+        它们是在收尾那一刻才被知道的,放在已知顺序之后不会与任何**观测到的**先后矛盾。 */
+  const out = [];
+  for (const k of n.turnOrder) out.push(projectTurn(R, n, n.turns.get(k), status));
+  for (const ts of sum) if (!live.has(ts.key)) out.push(turnFromSummary(ts, reused));
+  return out;
+}
+
+/**
+ * 从**轮**里找一条失败原因。
+ *
+ * 取"最后一条非 ok 且带了原因的轮" —— 不取第一条:一段对话里前面的轮失败过、后面换个 key
+ * 跑成了是常态,拿第一条会把一个已经解决的问题当成这个节点的结局。
+ * ⚠️ `not-started` 的轮**恒有** errorSummary(那是它为什么没能开始的唯一说明),
+ *    但它**不进 turns[]**、也不影响节点结局 —— 所以只在没有别的原因时才轮到它。
+ */
+function turnErrorOf(n, nodeStatus){
+  let same = null, any = null, notStarted = null;
+  for (const k of n.turnOrder){
+    const t = n.turns.get(k); const st = t && t.settled;
+    if (!st || st.errorSummary == null) continue;
+    if (st.status === 'not-started'){ notStarted = {key:k, raw:st.errorSummary}; continue; }
+    if (st.status === 'ok') continue;
+    /* ⚠️ **优先挑与节点结局同一档的那一轮。**
+          节点的 status 是「`turns[]` 里**最严重**的那一轮」(§5.8 第 2 级),而"最后一条失败的轮"
+          未必是它。取错的后果不是少一句话,是**标题与正文互相打架**:
+          第 1 轮 timeout、第 2 轮 contract_error ⇒ 节点是 timeout,标题写"超时被打断",
+          正文却在讲格式不合格 —— 读的人会以为自己看错了,或者以为系统在胡说。 */
+    if (st.status === nodeStatus) same = {key:k, raw:st.errorSummary};
+    any = {key:k, raw:st.errorSummary};
+  }
+  /* 挑不到同档的(比如节点是 callback_error —— 那是**节点级**的结局,轮级压根没有这一档),
+     退回"最后一条失败的轮",但它只是线索,不冒充判词。 */
+  return same || any || notStarted;
 }
 
 /** 节点级的错误块。⚠️ `desc` 一律**照抄 wire 的 errorSummary**，标题才是页面自己的词。 */
@@ -1743,14 +1881,29 @@ function errorOf(n, status){
              timeout:'超时被打断', unknown:'这个环节干没干完，说不清',
              callback_error:'各轮都跑完了，是编排那段 JS 自己抛了异常'};
   if (!T[status]) return null;
-  const b = n.settled && n.settled.errorSummary ? mapBounded(n.settled.errorSummary) : null;
+  /* ⚠️ **正文与摘要块是两件事**：可降级字段 ≤2 KiB 时是**原样字符串**（没有摘要块可画，
+        但正文一个字都不能少），超限才是 BoundedSummary。绝大多数错误走的正是短的那条。 */
+  /* ⚠️ 节点级 `errorSummary` **只在回执没归档成功时才出现**（§5.8）——
+        也就是说,**绝大多数失败节点根本没有它**。只读这一处,一个 timeout 节点会显示成
+        「这一档没有附带错误正文」,而原因正躺在旁边那一轮的 `node:turn-settled.errorSummary` 里
+        （那一处只由"这轮不是 ok"决定,与回执无关）。**看得见的原因不给,是这个页面最没道理的一种沉默。** */
+  const fromTurn = turnErrorOf(n, status);
+  const rawErr = (n.settled && n.settled.errorSummary != null) ? n.settled.errorSummary : (fromTurn ? fromTurn.raw : null);
+  const b = mapBounded(rawErr);
   const diag = [];
   if (n.settled){
     diag.push('node.status = '+status);
     diag.push('node.execution = '+n.settled.execution);
     if (n.settled.durationMs != null) diag.push('node.durationMs = '+n.settled.durationMs);
   }
-  return {title:T[status], desc: b ? bText(b) : '没有更多可显示的错误正文。', bounded:b, diagnostics:diag};
+  const text = bText(rawErr);
+  const o = {title:T[status],
+             desc: text || '这一档没有附带错误正文 —— 回执归档正常时，详细原因在回执里。',
+             bounded:b, diagnostics:diag};
+  /* 原因是从某一轮取来的就**说出来**:多轮节点里"哪一轮出的事"是另一个问题,
+     不标出处会让人以为这是对整个节点的判词。 */
+  if (!(n.settled && n.settled.errorSummary != null) && fromTurn) o.descFrom = fromTurn.key;
+  return o;
 }
 
 /** write 节点的交付结论。⚠️ `outcome` **缺席**即 read 节点 —— 别用 access 字段猜。 */
@@ -1758,13 +1911,37 @@ function writeOf(n, status){
   const s = n.settled;
   if (s){
     if (!('outcome' in s) || s.outcome === undefined) return null;     // read 节点
+    /* ⚠️ workspaceSummary **只在回执没归档成功时**才出现（EVENTS.md §5.8 的两级兜底）。
+          回执在的时候这里是空对象 —— 分支、路径这些要去回执里读，不是"丢了"。
+          ⚠️ 事件里**刻意没有** filesChanged（无上限）与 committed（交付结论只认 outcome）。
+          所以这条路上给不出改动清单，页面必须说清"要看清单去回执"，不能默默显示成零项。 */
     const w = s.workspaceSummary || {};
-    const files = Array.isArray(w.filesChanged) ? w.filesChanged.map(f => ['M', f]) : null;
+    const hasWs = !!s.workspaceSummary;
     return {
-      outcome: s.outcome, branch: w.branch || null, base: w.baseCommit || null, files,
-      netEmpty: s.outcome === 'delivered' && files != null && files.length === 0 && w.committed === true,
+      outcome: s.outcome, branch: w.branch || null, base: w.baseCommit || null,
+      /* null = 「这一层拿不到清单」，与 []（确知零项）不是一回事。 */
+      files: null,
+      changesKnown: typeof w.changesKnown === 'boolean' ? w.changesKnown : null,
+      /* 「分支往前走了，只是净改动为零」——真实存在的形状：一个**空提交**（HEAD 动了、
+         净改动为零），所以它既不是 `no-changes`（那要求 HEAD 也没动），也不该被说成普通交付。
+
+         ⚠️ **判据是 diff 自己是零字节，不是 `changesKnown`。**
+            `changesKnown` 的意思是「git 探测**跑成了**」——生产者在拿到任何正常结果之后
+            就置 true（node-core `out.changesKnown = true`），**包括改了一大堆文件的那些**。
+            拿它当"确知没有改动"，等于把「测出来了」读成「测出来是零」：一个改了十个文件、
+            正常交付的节点，会被页面斩钉截铁地写成"已交付，但这次提交没有净改动"。
+            **一句凭空捏造的结论，而且它长得比真话还确定。**
+         ⚠️ diff 拿不到时**不下这个结论**（宁可少说一句，也不说一句可能是假的）。 */
+      netEmpty: s.outcome === 'delivered' && !!s.diff && s.diff.state === 'present' && s.diff.byteCount === 0,
+      inlineFallback: hasWs,
       reason: s.outcome === 'unknown' ? '提交或收尾步骤没有跑完，改动有没有落到分支上说不清。' : undefined,
-      worktree: {state: w.removed === true ? 'cleaned' : w.removed === false ? 'kept' : 'unconfirmed',
+      /* ⚠️ **removed:false 的准确读法是「收尾时没有确认清理」**（EVENTS.md §5.8）：
+            可能没删、也可能删了但没确认，**推不出「这个目录现在还在磁盘上」**。
+            说"还在"会让人去核对一个可能不存在的目录；说"未确认"，人才知道去看一眼、
+            也知道看不到并不代表出了错。 */
+      worktree: {state: w.removed === true ? 'cleaned'
+                      : w.removed === false ? 'unconfirmed'
+                      : hasWs ? 'unlogged' : 'unlogged',
                  path: w.path || null},
       diff: mapAsset(s.diff, s.outcome === 'no-changes' ? '没有可交付的改动' : undefined),
     };
@@ -1780,22 +1957,22 @@ function writeOf(n, status){
 }
 
 /**
- * 依赖 id → nodeSeq。**id 可以重复**（唯一键是 nodeSeq），所以必须挑一个。
+ * 依赖 id → nodeSeq。**只有本 graph 内该 id 恰好出现一次时才连边。**
  *
- * 规则：先在**本节点之前**找最近的那一个；找不到再往后取**第一个**。
- * ⚠️ 后半条不是凑数：`Promise.all` 扇出里,被依赖的那个节点**可能观测在后**
- * （谁先进 `runNode` 谁先拿号，与依赖方向无关）。只往前找的实现会把这种边**静默丢掉** ——
- * 用户写了一句依赖，页面上什么都没有，而且不报错。
+ * ⚠️ id **可以重复**（唯一键是 nodeSeq）。重复时"挑一个最近的"是在**编造一条因果**：
+ * 用户写的 `deps:["audit"]` 到底指哪一个 audit，事件流里没有这个信息，猜错了就是
+ * 把一条不存在的依赖画成实线。**不唯一就不画**，改为在节点上如实说一句。
+ * ⚠️ 同理，id 在本 graph 里**根本不存在**时也不画（那多半是拼错了）——但同样要说出来，
+ * 静默丢掉会让"我明明写了依赖"变成一个查不到原因的谜。
+ *
+ * 返回 `{seq}` / `{ambiguous:n}` / `{missing:true}`。
  */
-function resolveDep(R, id, beforeSeq){
-  let best = null, after = null;
-  for (const s of R.order){
-    const n = R.nodes.get(s);
-    if (!n || n.id !== id) continue;
-    if (s < beforeSeq) best = s;
-    else if (after == null) after = s;
-  }
-  return best != null ? best : after;
+function resolveDep(R, id){
+  const hits = [];
+  for (const s of R.order){ const x = R.nodes.get(s); if (x && x.id === id) hits.push(s); }
+  if (hits.length === 1) return {seq:hits[0]};
+  if (hits.length === 0) return {missing:true};
+  return {ambiguous:hits.length};
 }
 
 /** 事件流 → 一个 scene（与静态演示场景**同一个形状**，走同一个渲染器）。 */
@@ -1809,7 +1986,7 @@ function buildScene(R){
   const nodes = R.order.map(seq => {
     const n = R.nodes.get(seq);
     const status = nodeStatusOf(R, n);
-    const turns = n.turnOrder.map(k => projectTurn(R, n, n.turns.get(k), status));
+    const turns = turnsOf(R, n, status);
     /* ⚠️ 数据层**不给单轮节点留没有 turn 的旧路径**（EVENTS.md §10.9 第 7 条）；
           「一轮不显示外层控件」是渲染层的事。连一轮都没起过的节点给一条空轮。 */
     if (!turns.length){
@@ -1843,6 +2020,28 @@ function buildScene(R){
     }
     if (status === 'abandoned') o.abandonedAt = abandonedAtOf(n);
     if (status === 'unlogged' && R.ctl.recordingFailed) o.unloggedFrom = R.ctl.recordingFailed.atSeq;
+    /* ⚠️ 这五份是**这个环节留下来的全部可打开的东西**。早先一份都没进 view-model ——
+          于是页面上跑完一个环节，却给不出"产出文件在哪""回执在哪"。
+          产出（artifact）尤其要命：它就是跑这个环节的**全部目的**。 */
+    const st = n.settled;
+    o.files = {
+      artifact: st ? mapAsset(st.artifact) : pendingOr(status, NEVER_SEEN()),
+      receipt:  st ? mapAsset(st.receipt)  : pendingOr(status, NEVER_SEEN()),
+      spec:     mapAsset(n.specA),
+      prompt:   mapAsset(n.promptA),
+      role:     mapAsset(n.roleA),
+    };
+    /* 会话毒化点 = `turns[]` 里**第一个** `sessionReusable === false` 的轮(§5.4)。
+       ⚠️ **前面必须先过一道闸:这个节点得是一段对话** —— 判据是
+          `node:observed.prompt.state === "not-applicable"`(§3.1、§5.2),不新加字段。
+          不过闸的话,一个普通 `runNode` 报 `backend_failed` 时会被显示成"对话被封口",
+          而它根本不是对话:那一轮失败了就是失败了,和"后面本来还想聊"没有关系。
+       ⚠️ 闸只判"是不是对话",**不判聊了几轮**:只聊一轮就被毒化的对话,
+          封口恰恰是"为什么只有一轮"的真正解释。 */
+    if (n.isConversation){
+      const p = o.turns.find(t => t.reusable === false);
+      if (p) o.poisonedAt = p.key;
+    }
     const err = errorOf(n, status); if (err) o.error = err;
     const w = writeOf(n, status); if (w) o.write = w;
     if (status === 'running'){
@@ -1867,17 +2066,24 @@ function buildScene(R){
   const byId = new Map(nodes.map(x => [x.seq, x]));
   for (const seq of R.order){
     const n = R.nodes.get(seq);
-    for (const id of n.declaredDeps){
-      const a = resolveDep(R, id, seq);
-      if (a != null) edges.push({a, b:seq, kind:'declared'});
-    }
-    for (const id of n.inferredDeps){
-      const a = resolveDep(R, id, seq);
-      if (a == null) continue;
-      if (edges.some(e => e.a===a && e.b===seq)) continue;   // 已声明过就不再画一条推断边
-      edges.push({a, b:seq, kind:'inferred',
-        why:'<code>'+id+'</code> 的产出文件出现在 <code>'+n.id+'</code> 的输入原文里。'+
-            '<b>这是猜的</b> —— 系统按文件名做子串匹配，没有校验过因果。'});
+    const bad = [];
+    /* ⚠️ 连不上的依赖**必须说出来**：一条 id 打错的 deps 静默消失，用户看到的是
+          「我明明写了依赖，图上却没有」，且没有任何线索可查。重复 id 同理 ——
+          猜一个"最近的"等于凭空发明一条因果。 */
+    const link = (id, kind, extra) => {
+      const r = resolveDep(R, id);
+      if (r.missing){ bad.push('<code>'+esc(id)+'</code>（本图里没有这个 id）'); return; }
+      if (r.ambiguous){ bad.push('<code>'+esc(id)+'</code>（本图里有 '+r.ambiguous+' 个同名节点，指哪个无从判断）'); return; }
+      if (edges.some(e => e.a===r.seq && e.b===seq)) return;  // 已经有一条了就不重画
+      edges.push(Object.assign({a:r.seq, b:seq, kind}, extra));
+    };
+    for (const id of n.declaredDeps) link(id, 'declared');
+    for (const id of n.inferredDeps) link(id, 'inferred', {
+      why:'<code>'+esc(id)+'</code> 的产出文件出现在 <code>'+esc(n.id)+'</code> 的输入原文里。'+
+          '<b>这是猜的</b> —— 系统按文件名做子串匹配，没有校验过因果。'});
+    if (bad.length){
+      const v = byId.get(seq);
+      if (v) v.note = (v.note ? v.note + ' · ' : '') + '有依赖连不上图里的节点：' + bad.join('、');
     }
   }
   /* 声明的先后与实际执行不符时给一句提醒：那条边只是一句声明。 */
@@ -2017,6 +2223,13 @@ function assetRow(name, a, openLabel){
         : '<span class="a-open">'+esc(openLabel||('打开'+name))+'</span>');
       if (a.byteCount != null) b.push('<div class="a-why">'+fmtN(a.byteCount)+' 字节</div>');
       if (a.empty) b.push('<div class="a-why">这份 diff 是空文件——这次提交没有净改动。</div>');
+      /* ⚠️ 归档区就在磁盘上，谁都能改。取回来的字节与事件里记的指纹对不上时**必须说** ——
+            静默显示等于让人拿一份被改过的字节当证据。合同也明确要求不许因此判 4xx/5xx：
+            文件确实在、也确实读到了，拒绝服务只会让人以为文件丢了（EVENTS.md §11）。 */
+      if (a.verify === 'mismatch') b.push('<div class="a-why" data-warn="1"><b>这不是事件记录的那一份（文件已被改动）。</b>'+
+        '记录里的指纹是 <code>'+esc(String(a.sha256||'').slice(0,16))+'…</code>，'+
+        '刚取回来的是 <code>'+esc(String(a.gotSha||'').slice(0,16))+'…</code>。下面显示的是**磁盘上现在这一份**。</div>');
+      else if (a.verify === 'no-header') b.push('<div class="a-why">服务端没给指纹响应头，这一份**没能与记录对证**。</div>');
       break;
     case 'na':
       b.push('<span class="a-flag" data-s="na">不适用</span>');
@@ -2516,6 +2729,8 @@ function statusBlock(n){
     const v = n.status==='backend_failed' ? 'alert' : 'quiet';
     o.push(box(v, ICO.warn, n.error.title,
       '<p style="margin:0 0 8px">'+esc(n.error.desc)+'</p>'+
+      /* 原因取自某一轮时要标出处 —— 多轮节点里「哪一轮出的事」是另一个问题。 */
+      (n.error.descFrom ? '<div style="margin:-4px 0 8px;font-size:11.5px;color:var(--faint)">这句话来自 <code>'+esc(n.error.descFrom)+'</code> 那一轮（回执归档正常，节点级不再重复一份）。</div>' : '')+
       (n.error.bounded ? bounded(n.error.bounded, '错误详情（有界摘要）') : '')+
       diagList(n.error.diagnostics)));
   }
@@ -2525,10 +2740,10 @@ function statusBlock(n){
 const WT = {
   cleaned:          ['已清理', '收尾时确认删除成功。'],
   unconfirmed:      ['收尾时未确认清理', '这是收尾那一刻的快照，不是现在的事实 —— 那个目录现在可能已经被别的东西清掉了，可去核对。'],
-  /* ⚠️ 这一档的判据是「收尾时它**还在**」，不是「结论不明」——
-        两种成因都会落到这里：①删除试过了、没成功；②关会话没被确认，系统**刻意**没删
-        （后端可能还在写，删了就是丢代码）。别把文案写死成其中一种。 */
-  kept:             ['收尾时这份副本还在', '要么删除没成功，要么关会话没被确认、系统刻意留着它（里面可能有还没进分支的代码）。路径在此，去核对。'],
+  /* ⚠️ **事件流不会产出这一档** —— `removed:false` 按合同读作 `unconfirmed`（见 §5.8）。
+        留着它只为静态演示里那个"系统明确选择保留现场"的场景（交付状态不明时的刻意保留），
+        那是**另一件事**：那条路上系统确实知道自己没删。 */
+  kept:             ['已为你保留', '交付状态不明，系统刻意没删这份副本（里面可能有还没进分支的代码）。路径在此，去核对。'],
   not_started:      ['不会有', '创建动作还没开始，不用去找。'],
   unconfirmed_create:['未确认建成', '可能已经开始建，位置未确认 —— 可能不存在。'],
   failed:           ['建不起来', '创建失败；常见原因是上次残留清不掉，那东西可能还在。'],
@@ -2536,25 +2751,64 @@ const WT = {
   unlogged:         ['状态未记录', '记录从某处起不完整，这一栏的状态未知。'],
 };
 
+/**
+ * 分支 / 基线两行。
+ *
+ * ⚠️ 这两个值来自 `workspaceSummary`，而它**只在回执没归档成功时才出现**（§5.8 的第二级兜底）。
+ * 回执正常在的时候，这里一个字段都没有 —— 那**不是丢了**，是"去回执里读"。
+ * 早先无条件印这两行，回执正常的那条主路径上就会看到两个空的 `<code>`。
+ */
+function wsFields(w){
+  const o = [];
+  if (w.branch) o.push('<div class="kv"><span class="k">分支</span><span class="v"><code style="font-family:var(--mono);font-size:12.5px">'+esc(w.branch)+'</code> '+copyBtn('复制', w.branch)+'</span></div>');
+  if (w.base)   o.push('<div class="kv"><span class="k">基线</span><span class="v"><code style="font-family:var(--mono);font-size:12.5px">'+esc(w.base)+'</code></span></div>');
+  if (!o.length) o.push('<div style="margin:6px 0 0;font-size:12px;line-height:1.65;color:var(--faint)">'+
+    '分支名、基线、工作副本路径这些都记在<b>回执</b>里（这一层只在回执没归档成功时才顺带带上它们）。</div>');
+  return o.join('');
+}
+
+/**
+ * 改动清单那一栏。
+ *
+ * ⚠️ **事件流里没有清单**：一次改动能有几万个文件，把它放进事件就是给页面开一个无上限的口子，
+ * 所以 §5.8 刻意不带。这里的正确做法是**说清楚它在哪**，而不是渲染一个空列表 ——
+ * 空列表长得和"确知零项"一模一样，而两者的意思正相反。
+ */
+function changeList(w){
+  /* ⚠️ `changesKnown` 回答的是「**这棵树的改动状况探到了没有**」，
+        **不是**「有没有改动」。true 只说明收尾那一步的 git 探测跑成了，
+        改了一万个文件的节点同样是 true —— 所以这里一个字都不许提"有/没有改动"。 */
+  const known = w.changesKnown;
+  const line = known === true  ? '收尾时<b>探到了</b>这棵树的改动状况（清单本身不进事件流，见下）。'
+             : known === false ? '收尾时<b>没能确认</b>有没有改动（探测那一步没跑成）—— 有没有改动都说不准。'
+             : '这一层不带改动清单。';
+  return '<div style="margin:9px 0 0;padding:8px 10px;border:1px dashed var(--line);border-radius:8px;'+
+         'font-size:12px;line-height:1.7;color:var(--ink-soft)">'+
+         '<b>改动清单</b> —— '+line+
+         '<div style="color:var(--faint);margin-top:3px">要逐个文件看，去<b>回执</b>或下面的完整 diff。</div></div>';
+}
+
 function writeBlock(n){
   if (n.mode !== 'write') return '';
   const w = n.write || {}, o = [];
   o.push('<h3 class="sec-h">改动区块<span class="hint">write 环节专有</span></h3>');
 
   if (w.outcome === 'delivered'){
-    const zero = w.netEmpty || (w.files && !w.files.length);
+    /* ⚠️ 判据只有 `netEmpty`（= delivered 且 **diff 自己是零字节**）。
+          早先还接受「清单长度为 0」，而事件流里**根本没有清单**（改动清单无上限，
+          §5.8 刻意不带），于是"拿不到清单"被显示成"零项 —— 这次提交没有净改动"，
+          一句**结论**被凭空造了出来。
+       ⚠️ 后来又错过一次，方向相反但同样严重：拿 `changesKnown === true` 当"确知没有改动"。
+          那个键只表示「git 探测**跑成了**」，改了一大堆文件的节点同样是 true —— 于是
+          页面对着一次正常交付说"没有净改动"。**`xKnown` 是认识论的，不是事实的。** */
+    const zero = w.netEmpty === true;
     o.push(box('ok', ICO.info, zero ? '已交付，但这次提交没有净改动' : '已交付',
-      zero ? '<p style="margin:0">分支往前走了，但净改动是空的 —— 改动清单是零项、diff 是空文件。'+
+      zero ? '<p style="margin:0">分支往前走了，但净改动是空的。'+
              '<b>这不是「无改动」</b>：分支上确实有这次提交。</p>'
            : '<p style="margin:0">改动已提交，进了下面这个分支。</p>'+
-             (n.status!=='ok' ? '<p style="margin:7px 0 0"><b>这次执行不合格，但改动是可用的</b> —— 分支与清单照常给出。</p>' : '')));
-    o.push('<div class="kv"><span class="k">分支</span><span class="v"><code style="font-family:var(--mono);font-size:12.5px">'+esc(w.branch)+'</code> '+copyBtn('复制', w.branch)+'</span></div>');
-    o.push('<div class="kv"><span class="k">基线</span><span class="v"><code style="font-family:var(--mono);font-size:12.5px">'+esc(w.base)+'</code></span></div>');
-    o.push('<div style="margin:9px 0 6px;font-size:12.5px;color:var(--ink-soft);display:flex;align-items:center;gap:8px">改动清单'+
-      '<span style="font:10.5px/1 var(--mono);color:var(--faint)">'+(w.files? w.files.length : 0)+' 项</span></div>');
-    o.push('<div class="difflist scroll">'+ (w.files && w.files.length
-      ? w.files.map(f => '<div class="diffrow"><span class="df-t" data-t="'+f[0]+'" title="'+({A:'新增',M:'修改',D:'删除',R:'重命名'}[f[0]])+'">'+f[0]+'</span><span class="df-p">'+esc(f[1])+'</span></div>').join('')
-      : '<div class="zero">零项 —— 这次提交没有净改动</div>')+'</div>');
+             (n.status!=='ok' ? '<p style="margin:7px 0 0"><b>这次执行不合格，但改动是可用的</b> —— 分支照常给出。</p>' : '')));
+    o.push(wsFields(w));
+    o.push(changeList(w));
     o.push('<div style="margin-top:9px">'+assetRow('改动详情', w.diff, '打开完整 diff（超长时按有界摘要折叠）')+'</div>');
   }
   else if (w.outcome === 'no-changes'){
@@ -2562,7 +2816,7 @@ function writeBlock(n){
       '<p style="margin:0"><b>收尾检查未发现可交付的改动。</b></p>'+
       '<p style="margin:7px 0 0;color:var(--faint)">这里只陈述系统看到的事实：收尾快照里没有检测到可交付的改动。'+
       '系统并不知道这个 AI 的意图 —— 也可能它改错了地方，或者改的是被忽略的文件。</p>'));
-    o.push('<div class="kv"><span class="k">分支</span><span class="v"><code style="font-family:var(--mono);font-size:12.5px">'+esc(w.branch)+'</code> '+copyBtn('复制', w.branch)+'</span></div>');
+    o.push(wsFields(w));
     o.push('<div style="margin-top:4px;font-size:12.5px;color:var(--faint)">没有改动清单可看，因此这里不给入口。</div>');
   }
   else if (w.outcome === 'unknown'){
@@ -2570,10 +2824,13 @@ function writeBlock(n){
       '<p style="margin:0"><b>改动有没有落到分支上，说不清。</b></p>'+
       '<p style="margin:7px 0 0">'+esc(w.reason || '收尾流程没有走完。')+'</p>'+
       '<ul class="todo"><li><b>不要自动重跑。</b>重跑可能让同一件事做两遍，或把那份还没保住的代码覆盖掉。</li>'+
-      '<li>先打开下面这个目录核对里面有什么。</li></ul>'+
-      '<div style="margin-top:9px"><div class="bd-lab" style="padding:0 0 4px">工作副本路径（系统当时选择了保留）</div>'+
-      '<code class="path">'+esc(w.worktree.path)+'</code>'+copyBtn('复制路径', w.worktree.path)+'</div>'));
-    if (w.branch) o.push('<div class="kv"><span class="k">分支</span><span class="v"><code style="font-family:var(--mono);font-size:12.5px">'+esc(w.branch)+'</code> '+copyBtn('复制', w.branch)+'</span></div>');
+      '<li>'+(w.worktree && w.worktree.path ? '先打开下面这个目录核对里面有什么。' : '工作副本的路径要去回执里读，先核对那个目录里有什么。')+'</li></ul>'+
+      /* ⚠️ 路径来自 workspaceSummary，而它**只在回执没归档成功时才出现**。回执正常时这里
+            没有路径 —— 印一个空的 <code> 出来，等于叫人去核对一个空字符串。 */
+      (w.worktree && w.worktree.path
+        ? '<div style="margin-top:9px"><div class="bd-lab" style="padding:0 0 4px">工作副本路径（系统当时选择了保留）</div>'+
+          '<code class="path">'+esc(w.worktree.path)+'</code>'+copyBtn('复制路径', w.worktree.path)+'</div>' : '')));
+    o.push(wsFields(w));
     o.push('<div style="margin-top:9px">'+assetRow('改动详情', w.diff)+'</div>');
   }
   else if (w.outcome === 'unlogged'){
@@ -2637,7 +2894,12 @@ function attemptBody(n, a){
     o.push('<div class="fold" style="background:var(--surface)"><div class="fold-body" style="border-top:0;padding-top:11px">'+assetRow('产出', a.output)+'</div></div>');
   }
 
+  /* ⚠️ 可降级字段 ≤2 KiB 时是**原样字符串**（没有摘要块），超限才有摘要块。
+        只画摘要块的话，绝大多数（短的）打回原因**一个字都不显示** —— 而"为什么被打回"
+        正是这一栏存在的全部理由。 */
   if (a.reject) o.push('<div style="margin-top:2px">'+bounded(a.reject, '被打回的原因（有界摘要）')+'</div>');
+  else if (a.rejectText) o.push('<div style="margin-top:2px"><div class="bd-lab" style="padding:0 0 4px">被打回的原因</div>'+
+    '<pre class="raw scroll">'+esc(a.rejectText)+'</pre></div>');
   else if (a.rejectAsset) o.push('<div style="margin-top:2px">'+assetRow('打回原因', a.rejectAsset)+'</div>');
   return o.join('');
 }
@@ -2683,6 +2945,23 @@ function attemptsBlock(n){
       '轮与轮之间的等待<b>不属于任何一轮</b>，也不烧任何一轮的预算 —— 那是编排那段 JS 自己在跑别的东西。</span></div>'
     : '';
 
+  /* 会话毒化点。⚠️ 这一句**只对对话节点显示**（buildScene 已经过了那道闸）：
+         的意思是「工具从这一轮之后把整段封口了，之后任何一轮
+        都会被拒」—— 它常常正是「为什么只聊了这么几轮」的唯一解释。不说出来，
+        用户看到的就是一段莫名其妙戛然而止的对话。 */
+  /* 会话毒化点。⚠️ 这一句**只对对话节点显示**（`buildScene` 已经过了那道闸：
+        `node:observed.prompt.state === "not-applicable"` ⟺ 这是一段对话）。
+        `sessionReusable === false` 的意思是「工具从这一轮之后把整段**封口**了，
+        之后任何一轮都会被拒，而且拒在任何副作用之前 —— 所以它们不留下任何痕迹」。
+        ⚠️ 它常常正是「**为什么只聊了这么几轮**」的唯一解释。不说出来，用户看到的
+        就是一段莫名其妙戛然而止的对话，而页面上每一轮都显示正常。 */
+  const poison = n.poisonedAt
+    ? box('warn', ICO.warn, '这段对话在 <code>'+esc(n.poisonedAt)+'</code> 之后被封口',
+        '<p style="margin:0">那一轮之后，这个会话<b>不能再接着聊</b> —— 工具当场把整段封了口，'+
+        '后面任何一轮都会被拒（拒在任何副作用之前，所以你不会看到它们留下任何痕迹）。</p>'+
+        '<p style="margin:7px 0 0;color:var(--faint)">这通常就是「为什么只有这几轮」的答案。</p>')
+    : '';
+
   /* 没能开始的那一轮：它有开头也有结尾，只是结论是「没开始」，不是「结果不明」。 */
   if (t.status === 'not-started'){
     return '<div class="sec"><h3 class="sec-h">输入与产出<span class="hint">'+ts.length+' 轮</span></h3>'+
@@ -2713,7 +2992,7 @@ function attemptsBlock(n){
     ? ts.length+' 轮 · 本轮 '+as.length+' 次尝试'
     : (as.length>1 ? as.length+' 次尝试' : '单次尝试');
   return '<div class="sec"><h3 class="sec-h">输入与产出<span class="hint">'+hint+'</span></h3>'+
-    turnBar + bar + attemptBody(n, as[idx]) + '</div>';
+    turnBar + poison + bar + attemptBody(n, as[idx]) + '</div>';
 }
 
 /* 现场文件挂在**轮**上,不挂在节点上 —— 一段对话可能有好几份现场(每一轮各一份)。
@@ -2730,6 +3009,29 @@ function sceneBlock(t){
     assetRow('回答原文', s.answer, '打开回答原文')+
     assetRow('状态快照', s.snapshot, '打开状态快照')+
   '</div>';
+}
+
+/**
+ * 这个环节留下来的、可以打开的东西。
+ *
+ * ⚠️ **产出（artifact）就是跑这个环节的全部目的** —— 早先这一份连同回执、任务单、
+ * 提问原文、角色文件一起，一个都没进 view-model：页面把一个环节的执行过程讲得很细，
+ * 却给不出"东西在哪"。
+ * ⚠️ 顺序是刻意的：**产出在最上面**。其余四份是给"要复核这次执行"的人用的。
+ */
+function filesBlock(n){
+  const f = n.files; if (!f) return '';
+  const rows = [
+    ['产出文件', f.artifact, '打开产出'],
+    ['回执',     f.receipt,  '打开回执'],
+    ['任务单',   f.spec,     '打开任务单'],
+    ['提问原文', f.prompt,   '打开提问原文'],
+    ['角色文件', f.role,     '打开角色文件'],
+  ];
+  /* 五样全是"本来就不该有 / 没记录"时整块不画 —— 一屏五行"不适用"没有信息量。 */
+  if (!rows.some(([, a]) => a && (a.s === 'have' || a.s === 'unavailable' || a.s === 'gone'))) return '';
+  return '<div class="sec"><h3 class="sec-h">这个环节留下的文件<span class="hint">点开即是归档里那一份</span></h3>'+
+    rows.map(([name, a, label]) => assetRow(name, a, label)).join('')+'</div>';
 }
 
 function renderDetail(sc, sel){
@@ -2757,6 +3059,7 @@ function renderDetail(sc, sel){
         '<p style="margin:0">这个环节<b>没真跑</b>，直接用了 <code>'+esc(n.reuseFrom)+'</code> 的结果。'+
         '上面的「原执行耗时」是<b>当初那次</b>跑出来的；这次只做了一次 '+fmtDur(n.t.r[1]-n.t.r[0])+' 的复用校验。</p>')+'</div>' : '')+
       statusBlock(n)+
+      filesBlock(n)+
       writeBlock(n)+
       attemptsBlock(n)+
       sceneBlock((curTurn(n)||{}).t)+
@@ -2990,6 +3293,10 @@ function wantFile(ref){
     .then(r => {
       if (r.status === 404){ rec.state = 'gone'; return null; }
       if (!r.ok) { rec.state = 'error'; rec.why = 'HTTP ' + r.status; return null; }
+      /* 归档区**理论上**不可变，但它就在磁盘上，谁都能改。服务端把它读到的那一份的指纹
+         放在这个响应头里，页面拿它和事件里记的对一次 —— 这是"页面上这份 = 事件记录的那份"
+         唯一的对证手段（EVENTS.md §11）。⚠️ 不比 Content-Length：合同明说那两个数**允许**对不上。 */
+      rec.gotSha = r.headers.get('X-Graph-Sha256') || null;
       return r.text();
     })
     .then(t => { if (t != null){ rec.state = 'ok'; rec.text = t; } })
@@ -3009,7 +3316,16 @@ function resolveAsset(a){
   if (!a || a.s !== 'have' || !a.ref) return a;
   const rec = wantFile(a.ref);
   if (!rec) return a;
-  if (rec.state === 'ok') return {s:'have', text:rec.text, ref:a.ref, byteCount:a.byteCount};
+  if (rec.state === 'ok'){
+    /* ⚠️ 对不上**不算取失败**：文件确实在、也确实读到了。所以照常把正文给出去，
+          只是加一条"这不是事件记录的那一份"。藏起来会更糟 —— 人会拿一份被改过的
+          字节当证据；判成错误也更糟 —— 人会以为文件丢了。 */
+    const o = {s:'have', text:rec.text, ref:a.ref, byteCount:a.byteCount, sha256:a.sha256};
+    if (a.sha256 && rec.gotSha) o.verify = rec.gotSha === a.sha256 ? 'ok' : 'mismatch';
+    else if (a.sha256) o.verify = 'no-header';
+    if (o.verify === 'mismatch'){ o.gotSha = rec.gotSha; }
+    return o;
+  }
   if (rec.state === 'gone') return {s:'gone'};
   if (rec.state === 'error') return {s:'unavailable', code:'viewer-fetch-failed', why:'这个页面没能把它取回来：'+rec.why};
   return {s:'have', ref:a.ref, byteCount:a.byteCount, loading:true};

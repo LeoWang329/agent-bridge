@@ -109,7 +109,7 @@ const receipt = await bridge.conversation(
 
 ```jsonc
 {
-  "receiptVersion": 1,
+  "receiptVersion": 2,                          // v1 的回执在复用闸上被**直接拒**(版本严格等值)
   "id": "audit-auth", "specHash": "9f2c…",     // 输入指纹:防止把上一版任务的结果当成这一版
   "agent": "codex", "model": null, "effort": null,
   "status": "ok",                               // ok|contract_error|backend_failed|timeout|unknown
@@ -125,9 +125,29 @@ const receipt = await bridge.conversation(
   "abortConfirmed": null,                       // 超时路径才有:桥**确实回报**打断了才是 true
   "closeConfirmed": true,                       // 关会话是否被桥确认(不是"没抛异常就算成")
   "access": "read",
-  "workspace": null                             // read 恒为 null;write 见下
+  "workspace": null,                            // read 恒为 null;write 见下
+  // v2 起**必有**:这一轮的每次尝试各一条。`n` 在每一轮内从 1 起严格递增,
+  // 每次尝试各存一份审计原件(`<id>.a<n>.md`),**与 viz 开关无关**。
+  // ⚠️ 复用闸会逐项核对它(次序、末次必是 accepted/no-output、路径与内容指纹),
+  //    缺了整个 `attempts` 的 v2 回执**复用不了**。
+  "attempts": [
+    { "n": 1, "status": "rejected",             // 非末次只可能是 rejected
+      "inputSha256": "b1c4…",                   // 这一次问了什么(正文可能没落盘,指纹恒有)
+      "inputRef": null,                          // 只有开了 viz 才有归档可指
+      "artifactPath": "<outDir>/nodes/audit-auth.a1.md",
+      "artifactSha256": "77a0…", "charCount": 900, "byteCount": 1020,
+      "rejectedReason": "缺 findings 键", "durationMs": 41000 },
+    { "n": 2, "status": "accepted",             // 末次:accepted 或 no-output
+      "inputSha256": "c9e2…", "inputRef": null,
+      "artifactPath": "<outDir>/nodes/audit-auth.a2.md",
+      "artifactSha256": "e3b0…", "charCount": 1234, "byteCount": 1400,
+      "rejectedReason": null, "durationMs": 43000 }
+  ]
 }
 ```
+
+⚠️ 顶层的 `artifactPath` / `artifactSha256` 与**末次那一项**指的是同一段字节(顶层是"这一轮当前的产出",
+每次尝试另有自己的原件)。`reaskCount: 0` 时 `attempts` 只有一项。
 
 write 环节的 `workspace` 块:
 

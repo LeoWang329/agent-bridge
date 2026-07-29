@@ -1624,7 +1624,12 @@ export async function prepareRun(bridge, rawSpec, { kind = "node", hold = null }
           files.push("status.json");
         } catch (e) { receipt.diagnostics.push(`现场:取 status 失败(${e.name})`); }
       }
-      const scene = { dir, tag, savedAt: nowIso(), files };
+      /* `hadSession` 是给 §3.2 那张**逐槽表**用的:三个槽里**只有 `status` 有
+         `not-applicable` 这一档**,判据正是「**当时有没有 sessionId**」——
+         没有会话就无状态可查(本来就不该有),有会话却没拿到才是"该保没保成"。
+         ⚠️ 不记下来的话,viz 那边只能看到"文件不在",两种情况分不开;
+            一律说成"该保没保成"会把一次**正常**的缺席报成故障。 */
+      const scene = { dir, tag, savedAt: nowIso(), files, hadSession: !!run.sessionId };
       receipt.scene = scene;
       return scene;
     } catch (e) {
@@ -1686,6 +1691,112 @@ export async function prepareRun(bridge, rawSpec, { kind = "node", hold = null }
   return run;
 }
 
+/**
+ * 复用前逐一坐实**每次尝试的审计原件**,以及 `attempts[]` 本身是不是一份**完好的 v2 清单**。
+ *
+ * ⚠️ **这道闸不是可有可无的。** 复用命中时 `emitReusedSettled` 会把每一次尝试的
+ * `artifactPath` 重新归档进本次的 graph、**按当前磁盘字节现算一个 sha** 发到 wire 上。
+ * 页面据此说"这就是当初第 n 次尝试写下的东西"。若这里不核对,首跑之后手改一下
+ * `<id>.a1.md`(或者把回执里那条路径指到别的文件),复用照样成功,而第二个 graph
+ * 会把**篡改过的字节**包装成一份崭新的 `present` —— 指纹与篡改后的内容自洽,
+ * **页面上一点红都不会有**。而"被打回的那一次到底写了什么"正是复审时最想看的东西。
+ *
+ * ⚠️ **只逐项验文件是不够的,`attempts[]` 的「形状」本身也是承重的。**
+ * `emitReusedSettled` 按**数组顺序**归档、并把**最后一个**当成该轮最终产出;
+ * 不变式③也按同一个数组顺序取"最后一项"。所以把 `[#1 rejected, #2 accepted]`
+ * **对调一下**,两个文件、两个 sha 全都对得上,而页面会把**被打回的那一份**
+ * 当成最终交付物挂出来 —— 生产者与校验器**一起假绿**。
+ * 所以下面把 `n` 定死成 **1..k 严格递增**(顺手也堵死了 `n` 被塞成
+ * `"../../x"` 之类:那会经 `path.join` 逃出 `nodesDir`,而"本次算出来的路径"
+ * 是用同一个 `n` 算的,自己和自己比当然相等)。
+ *
+ * 逐项判定:
+ *   - 有 `artifactPath` ⇒ 它就是一句"我在这里留了一份、指纹是这个"的断言:路径必须是
+ *     **本次算出来的**那个、文件必须在、指纹必须是合法 hex64 且**逐字节对得上**。
+ *   - 没有 `artifactPath` ⇒ 放行。⚠️ **这不是"当初没开 viz"** —— v2 的逐次原件与 viz
+ *     开关无关(见 `attemptArtifactPathFor`),真正会留下无路径项的只有**当时那次复制失败**。
+ *     ⚠️ **老实说清残留风险**:回执里"复制当时就失败"与"事后把证据字段删掉"**长得一模一样**,
+ *     现有结构没有字段能区分,所以这里拒不了。但它的后果是**有界的** —— 那一项会被投影成
+ *     `fingerprint-only`,页面**不会拿到任何字节**,也就不存在"把伪造内容当证据展示"。
+ *     换句话说:删字段能让证据**消失**,不能让证据**变假**。
+ *
+ * ⚠️ **不要求非空**:一次尝试的产出确实可能是零字节(`status:"no-output"` 就是
+ *    「**已经确认**产出是零字节」这一档),空文件的 sha256 是良定义的,照常比对即可。
+ */
+const ATTEMPT_STATUS = new Set(["accepted", "rejected", "no-output", "failed"]);
+
+async function assertAttemptsIntact(run, turnKey, attempts, reask, bail) {
+  if (!Array.isArray(attempts) || attempts.length === 0) {
+    throw bail(`这一轮的回执里没有 attempts[] —— v2 的每一轮都至少有一次尝试,拿不到就没有任何可比对的判据`);
+  }
+  for (let i = 0; i < attempts.length; i++) {
+    const a = attempts[i];
+    // `n` 必须是 1..k 严格递增。**顺序错了不是小事**:见上面那段"对调"。
+    if (!a || a.n !== i + 1) {
+      throw bail(`attempts[] 的次序坏了(第 ${i} 项的 n 是 ${JSON.stringify(a?.n)},应当是 ${i + 1}) —— ` +
+        `顺序决定了"哪一次是最终产出",错位会把被打回的那一份当成交付物挂出来`);
+    }
+  }
+  /* ⚠️ **尝试次数有硬上界**:`reask` 只能是 0 或 1 ⇒ 最多 `reask + 1` 次。
+        而 `reask` 进了 specHash / turnSpecHash,复用时必然与原运行相同 —— 所以这是**可验的**。
+        少了它,往回执里**塞第三次尝试**能一路走到事件层才被 schema 拒,而那里被 `guard()`
+        吞掉:业务照常返回"复用成功",页面却**永远等不到 node:settled**(见下面那条注释)。 */
+  const cap = (reask === 0 || reask === 1 ? reask : 1) + 1;
+  if (attempts.length > cap) {
+    throw bail(`这一轮记了 ${attempts.length} 次尝试,而 reask=${reask} 最多只可能有 ${cap} 次`);
+  }
+  /* ⚠️ **逐字段的形状先查,再查字段之间的关系。** 顺序反了的后果不是"结论不同",
+        而是**下面那几道闸永远考不出来**:一个枚举外的 status 会先被"非末次只能是 rejected"
+        拦下,于是枚举那道闸有没有效**永远没人知道**(测试里它天然撞不到)。 */
+  for (const a of attempts) {
+    // 状态是**封闭枚举**(§5.6)。塞一个枚举外的值同样只会在事件层被拒、而那里被吞掉。
+    if (!ATTEMPT_STATUS.has(a.status)) {
+      throw bail(`第 ${a.n} 次尝试的 status 不在封闭枚举里:${JSON.stringify(a.status)}`);
+    }
+    // 输入指纹是这一次尝试**唯一**能自证的东西(输入原文可能压根没落盘),形状必须合法。
+    if (!/^[0-9a-f]{64}$/.test(a.inputSha256 || "")) {
+      throw bail(`第 ${a.n} 次尝试没有合法的输入指纹(inputSha256):${JSON.stringify(a.inputSha256)}`);
+    }
+    // `no-output` 的字面意思就是「**已经确认**产出是零字节」——它与非零字节数自相矛盾。
+    if (a.status === "no-output" && a.byteCount != null && a.byteCount !== 0) {
+      throw bail(`第 ${a.n} 次尝试记成 no-output,却又记了 ${a.byteCount} 字节 —— 自相矛盾`);
+    }
+  }
+
+  // 一轮收在 ok,**最后那一次必然是被采纳的那一次**(§5.6 的四档判定表:ok ⇒ accepted / no-output)。
+  const last = attempts[attempts.length - 1];
+  if (last.status !== "accepted" && last.status !== "no-output") {
+    throw bail(`这一轮收在 ok,但最后一次尝试是 ${JSON.stringify(last.status)}(应当是 accepted 或 no-output)`);
+  }
+  /* ⚠️ **非末次只可能是 `rejected`。** 走到下一次尝试的**唯一**出口就是"这一次被判不合格"
+        (`settleAttempt(…, "rejected")` 之后才 `continue`)。所以把第 1 次从 `rejected`
+        改成 `accepted`,会生成一份**合法形状、内容却是假的**审计记录:
+        页面上两次都显示"被采纳",而当初真实发生的是"第一稿被打回"。 */
+  for (let i = 0; i < attempts.length - 1; i++) {
+    if (attempts[i].status !== "rejected") {
+      throw bail(`第 ${i + 1} 次尝试记的是 ${JSON.stringify(attempts[i].status)} —— ` +
+        `只有"被判不合格"才会有下一次,所以非末次只可能是 rejected`);
+    }
+  }
+  for (const a of attempts) {
+    if (!a.artifactPath) continue;              // 当时那次复制失败 —— 见上面的残留风险说明
+    const want = run.attemptArtifactPathFor(turnKey, a.n);
+    if (a.artifactPath !== want) {
+      throw bail(`第 ${a.n} 次尝试的审计原件路径与本次算出来的不一致(${a.artifactPath} ≠ ${want})`);
+    }
+    const st = statSafe(want);
+    if (!st || !st.isFile()) throw bail(`第 ${a.n} 次尝试的审计原件缺失:${want}`);
+    // 同顶层那道闸:**"字段缺失就跳过校验"这个坑本仓踩过三次**,所以这里要求指纹
+    // 必须是合法的 64 位 hex —— 回执说"我留了一份"却给不出指纹,就是给不出判据。
+    if (!/^[0-9a-f]{64}$/.test(a.artifactSha256 || "")) {
+      throw bail(`第 ${a.n} 次尝试记了原件路径却没有合法的内容指纹:${want}`);
+    }
+    if (await sha256File(want) !== a.artifactSha256) {
+      throw bail(`第 ${a.n} 次尝试的审计原件内容与回执记录的不一致(可能被改过):${want}`);
+    }
+  }
+}
+
 /** 幂等闸:上一张回执还能不能当成这一次的结果。
  *  ⚠️ **每一条不匹配都是 `throw new UsageError`,没有一条回退去重跑** —— 静默重跑会把
  *  "上一版任务的结果"和"这一版"混在一起,是最难查的一类错。要重跑请显式加 `force`。 */
@@ -1743,8 +1854,12 @@ async function checkReuse(run) {
     throw new UsageError(`回执里的产出路径与本次不一致(${prev.artifactPath} ≠ ${artifactPath}),不复用。`);
   }
   const st = statSafe(artifactPath);
-  if (!st || !st.isFile() || st.size === 0) {
-    throw new UsageError(`回执说成功,但产出文件缺失或为空:${artifactPath}。要重跑请加 force。`);
+  /* ⚠️ **不拿"零字节"当失败。** §5.6 有 `no-output` 这一档:「**已经确认**产出是零字节」——
+        那是一次**合法的成功**(status 仍是 ok)。把它拒掉的后果是:同一个任务第二次
+        **永远复用不了**,只能 `force` 覆盖上一次的结果 —— 而 `force` 会销毁旧产出。
+        空文件的 sha256 是良定义的,下面那道内容指纹闸照常管得住"被换成另一份文件"。 */
+  if (!st || !st.isFile()) {
+    throw new UsageError(`回执说成功,但产出文件缺失:${artifactPath}。要重跑请加 force。`);
   }
   // 内容指纹:只查"非空"挡不住产出被**换成另一份非空文件**。
   // **这道闸不是可选的** —— 写成 `if (prev.artifactSha256)` 会让"回执里没这个字段"
@@ -1758,6 +1873,11 @@ async function checkReuse(run) {
   if (nowSha !== prev.artifactSha256) {
     throw new UsageError(`产出文件内容与回执记录的不一致(可能被改过或被覆盖):${artifactPath}。要重跑请加 force。`);
   }
+  /* ⚠️ 上面查的是**这一轮最终那一份**。复用还会把**每一次尝试的审计原件**重新归档
+        并当成"当初第 n 次写下的东西"发到 wire 上 —— 那些必须在这里一起坐实,
+        否则被查的和被用的不是同一批文件。 */
+  await assertAttemptsIntact(run, "main", prev.attempts, spec.reask,
+    (m) => new UsageError(`${m}。要重跑请加 force。`));
   }
   // write 环节还要多一道:**指纹管不住基线漂移**。baseRef 通常是 "HEAD",
   // 它今天和上周解析到的是两个 commit,而 specHash 里只有字符串 "HEAD" —— 一模一样。
@@ -1874,10 +1994,31 @@ async function settleTurn(run, status, extra = {}) {
   // 这一轮的耗时。**在这里定而不是等 liveTurn 的 finally** —— 事件要带着它出去,
   // 而两处用的是同一个公式(`monoNow() - run.t0`),不会分家。
   rec.durationMs = Math.round(monoNow() - run.t0);
+  /* ⚠️ **单轮节点的回执就是这一轮的 rec,而它的 `durationMs` 稍后会被节点收尾覆写成
+        「节点耗时」**(那是另一个口径:含轮与轮之间回调在干别的事的时间)。
+        于是 `projectMainTurn` 再去读它,投影出来的 `turns[0].durationMs` 就变成了节点耗时 ——
+        与刚刚发出去的 `node:turn-settled.durationMs` **同名不同值**。
+        两个时钟一旦在同一个字段名下混用,页面上"这一轮跑了多久"就永远对不上。
+        所以这里把**轮的**那个值单独存一份。 */
+  run.mainTurnMs = rec.durationMs;
+  /* ⚠️ 同一个数在回执上也留一份:**复用**命中时,这次压根没跑轮,
+        `run.mainTurnMs` 不存在,而要显示的恰恰是**当初那一轮**跑了多久。
+        退回 `receipt.durationMs` 会拿到「当初那个**节点**从头到尾多久」——
+        两者差着关会话与收尾那几步,而页面上它们叫同一个名字。 */
+  rec.turnDurationMs = rec.durationMs;
   // ⚠️ 排在**释放执行闸之前**:定完 status、(非 ok 时)冻结完现场、归档完产出之后。
   //    这一条是**该轮产出与现场唯一的公布渠道** —— 一段 6 轮的对话在第 6 轮被强杀时,
   //    前 5 轮的产出全靠它,`node:settled` 那份 `turns[]` 永远不会来。
-  if (run.viz) await run.viz.turnSettled({ key: run.currentKey }, rec);
+  /* ⚠️ **回执与 wire 在这一格上口径不同,而且是刻意的。**
+        `rec.sessionReusable` 只给对话算(上面那个 `if (run.isConv)`)—— `runNode` 的**回执**
+        不许多出新字段,那是既有调用方与 `reuseIfSame` 的合同。
+        但 **wire 上这一格是必填的**,而 `liveTurn` 给 rec 的初值是 `false` ——
+        直接发出去,**每一个正常完成的单轮节点**都会在事件流里说"这个会话不能再用了",
+        与 §5.4 的判定表正好相反。所以这里**不改回执**,只在发事件时按表补上。 */
+  if (run.viz) {
+    await run.viz.turnSettled({ key: run.currentKey },
+      run.isConv ? rec : { ...rec, sessionReusable: wireReusable(status, rec.abortConfirmed) });
+  }
   return rec;
 }
 
@@ -1914,7 +2055,12 @@ async function closeNotStartedTurn(run, t, e) {
   if (!run.viz || !t?.announced) return;
   await run.viz.turnSettled(t, {
     status: "not-started",
-    sessionReusable: false,
+    /* ⚠️ **不封口**(EVENTS.md §5.4 判定表):这一轮**一条消息都没发出去**,
+          会话(如果已经有)根本没被碰过,工具也确实允许回调换一个 key 再来一轮。
+          写成 false 就是在 wire 上宣布"这段对话已经毒化" —— 而毒化的判据正是
+          「第一个 sessionReusable === false 的轮」,页面会据此说"从这里之后都不能再聊了"。
+          (它不进 turns[],所以对那条派生没有影响;但事件流上这句话本身是假的。) */
+    sessionReusable: true,
     artifactPath: null, scene: null, charCount: null,
     durationMs: Math.round(monoNow() - (run.t0 ?? monoNow())),
     error: e instanceof Error ? e.message : String(e),
@@ -2138,7 +2284,8 @@ export async function runTurn(run, t) {
           const snap = w.pendingSnapshots?.[0];
           if (snap && snap.contextUsage !== undefined) receipt.contextUsage = snap.contextUsage ?? null;
           // 活进度。**快照取不到就不发**;节流 5 秒 —— 它是唯一允许整条丢的事件。
-          if (run.viz) await run.viz.progress(t, snap, monoNow());
+          // ⚠️ 传的是**本轮**第几次尝试(1-based) —— 打回重说时,在途正文要贴到对的那一次上。
+          if (run.viz) await run.viz.progress(t, snap, monoNow(), attempt + 1);
           continue; // 还在跑,接着等
         }
         const got = w?.results?.[0] ?? null;
@@ -2439,10 +2586,55 @@ async function emitReusedSettled(run) {
   const prev = run.reusedReceipt, viz = run.viz;
   const turnRecs = Array.isArray(prev.turns) ? prev.turns : [projectMainTurn(run, prev)];
   for (const tr of turnRecs) {
-    if (tr.artifactPath) await viz.putTurnOutput(tr.key, tr.artifactPath, 1);
-    // ⚠️ 复用一张**原运行没开 viz** 的回执时,输入原文当初压根没落盘,只剩指纹。
-    //    那是**当时的选择,不是故障** —— `fingerprint-only` 这个 code 没有任何"出错了"的含义。
-    for (const a of tr.attempts || []) if (!a.inputRef) viz.markFingerprintOnly(tr.key, a.n);
+    /* ⚠️ **逐次尝试各归档一份,不是只归档"最后那一份"。**
+          canonical 区里**每次尝试各存一份**审计原件(`attemptArtifactPathFor`:
+          `<id>.a<n>.md` / `<id>.t-<key>.a<n>.md`)——v2 起第一次的产出**不再**被第二次覆盖。
+          所以一轮 `#1 rejected / #2 accepted` 复用回来时,**两份原件都还在磁盘上**。
+          早先这里只归档 `tr.artifactPath`(该轮最终那一份)、把其余几次标成"只剩指纹",
+          等于**否认一份确实存在的证据** —— 而"被打回的那一次到底写了什么"正是复审时最想看的东西。
+          ⚠️ 更早的一版还把它无条件塞给 `attempt 1`,于是页面会在**被打回的那次**下面
+          挂出**最终正确答案**:两条信息都错,还互相印证。 */
+    /* ⚠️ **按 `n` 排一遍再走,不吃数组的原始顺序。** 复用闸已经把 `n` 定死成 1..k 严格
+          递增,所以正常情况下两者一致;这里再排一次是**纵深防御** —— 顺序一旦错位,
+          "最后一次"就会指向被打回的那一份,而它会一路当成该轮产出与顶层交付物挂出去。 */
+    const atts = [...(tr.attempts || [])].sort((x, y) => (x.n ?? 0) - (y.n ?? 0));
+    for (const a of atts) {
+      if (!a.artifactPath) continue;
+      await viz.putTurnOutput(tr.key, a.artifactPath, a.n);
+    }
+    /* 该轮的最终产出 **恒等于最后那一次尝试的产出**(闸已坐实:收在 ok 的轮,末次必是
+       accepted / no-output)。它自己那份审计原件够不着时,退回 `tr.artifactPath` 这一份
+       整轮产出,并**挂在它名下**。
+
+       ⚠️ **判据必须是"最后那一次有没有原件",不是"有没有任何一次有原件"。**
+          早先这里写的是 `if (lastN === null && tr.artifactPath)` —— 只要**任意一次**归档到了,
+          回退就整个不跑。于是把**末次(accepted)那一项的 `artifactPath` 单独删掉**、
+          留着前一次 rejected 的:闸门放行(缺路径是允许的),归档器只归档了 rejected 那一份,
+          而"该轮产出 = 最后一份成功复制的 attempt 产出"于是选中了**被打回的那一稿** ——
+          它一路升成轮产出与顶层交付物,不变式③按同一口径选中同一项,**两边一起假绿**。
+          **一个字段被删掉,一份被否决的草稿就成了交付物。**
+          (这也推翻了"删字段只能让证据消失、不能让证据变假"那句话 —— 见 DRIFT §9。) */
+    const last = atts.length ? atts[atts.length - 1] : null;
+    if (last && !last.artifactPath && tr.artifactPath) {
+      await viz.putTurnOutput(tr.key, tr.artifactPath, last.n);
+    } else if (!last && tr.artifactPath) {
+      await viz.putTurnOutput(tr.key, tr.artifactPath, 1);
+    }
+    /* ⚠️ 复用一张**原运行没开 viz** 的回执时,输入原文当初压根没落盘,只剩指纹。
+          那是**当时的选择,不是故障** —— `fingerprint-only` 这个 code 没有任何"出错了"的含义。
+          ⚠️ 产出同理:**只对当初真的没留下原件的那几次**这么标(`!a.artifactPath`)。
+          留空则会被投影成 `source-missing`——那句话是"从来没有过产出",而事实是
+          "有过,只是这一层够不着"。两者对复审的人是完全不同的指示。 */
+    /* ⚠️ 输入:**attempt 1 能找回来,n≥2 只剩指纹**(§5.9)。
+          早先这里只有"没有 inputRef 就标 fingerprint-only"这一句,于是
+          **每一次输入都成了「只剩指纹」** —— 连 attempt 1 那份这一次刚冻结好、
+          就躺在归档里的正文也不例外。 */
+    const body = run.replayBodies?.get(tr.key) ?? run.spec.promptBody;
+    for (const a of atts) {
+      if (a.n === 1) await viz.recoverAttemptInput(tr.key, 1, body, a.inputSha256);
+      else viz.markFingerprintOnly(tr.key, a.n);
+      if (!a.artifactPath) viz.markOutputFingerprintOnly(tr.key, a.n);
+    }
   }
   let diffAsset = NOT_APPLICABLE;
   const wo = prev.workspace?.outcome;
@@ -2457,17 +2649,46 @@ async function emitReusedSettled(run) {
   vizCount(run.bridge, prev.status, true);
 }
 
+/**
+ * §5.4 那张**封闭**判定表。
+ *
+ * ⚠️ 早先这里硬编码 `false` —— 于是**每一个正常完成的单轮节点**都在 wire 上说
+ * "这个会话不能再用了"。合同对这一档写得很死:`ok` 与 `contract_error` 都是 `true`
+ * (后端好好的,只是答得不合格)。
+ * ⚠️ 表里 `timeout` 分两行(abort 被明确回报打断 ⇒ true,没被确认 ⇒ false),
+ * 而**回执上没有这个信号**。拿不准时只能取 `false` —— 那句话的意思是
+ * "那一轮可能还在后台跑,别再往这个会话里发",**误报为 true 会导致一次真正的并发发送**,
+ * 误报为 false 只是保守。方向不对称,所以往保守那边取。
+ * ⚠️ 另外:`runNode` **不是对话节点**,页面那条"封口"派生前面有一道闸
+ * (`node:observed.prompt.state === "not-applicable"` 才是对话),所以这个值在页面上
+ * 根本不会被读成"对话被封口"——它只是把合同要求的事实如实写出来。
+ */
+function wireReusable(status, abortConfirmed) {
+  if (status === "ok" || status === "contract_error" || status === "not-started") return true;
+  if (status === "timeout") return abortConfirmed === true;   // 表里这一档分两行
+  return false;                                               // backend_failed / unknown
+}
+
 /** `runNode` 的回执 → 那一轮的记录。**投影,不是第二份实现**:
  *  单轮节点的回执顶层字段**就是** `main` 这一轮的字段(§2.2 的兼容投影)。 */
 function projectMainTurn(run, receipt) {
   return {
     key: "main",
-    status: receipt.status, sessionReusable: false,
+    status: receipt.status, sessionReusable: wireReusable(receipt.status, receipt.abortConfirmed),
     turnSpecHash: run.spec.specHash,
     artifactPath: receipt.artifactPath, charCount: receipt.charCount,
-    durationMs: receipt.durationMs, attempts: receipt.attempts || [],
-    inferredDeps: receipt.inferredDeps ?? [],
-    inferredDepsTruncated: receipt.inferredDepsTruncated ?? false,
+    /* ⚠️ `receipt.durationMs` 在**节点收尾**时会被覆写成「节点耗时」(含关会话、收尾那几步),
+          所以这里优先用轮自己那个读数。
+          ⚠️ 复用路径没有 `run.mainTurnMs`(这次压根没跑轮),但**旧回执里那一轮的耗时**
+             才是要显示的东西 —— 退回 `receipt.durationMs` 会把"原来那一轮跑了多久"
+             显示成"原来那个节点从头到尾多久"，两个口径差着关会话与收尾的时间。 */
+    durationMs: run.mainTurnMs ?? receipt.turnDurationMs ?? receipt.durationMs,
+    attempts: receipt.attempts || [],
+    /* ⚠️ **本次重算的那份优先**(§5.9)。`run.spec.inferredDeps` 是 `normalizeSpec` 刚用
+          同一个算法扫这一次的提问正文得到的,而 specHash 已经比对过 ⇒ 正文与原运行相同。
+          退回 `receipt.` 那份只是为了兼容"这次压根没扫"(理论上不会发生)。 */
+    inferredDeps: run.spec.inferredDeps ?? receipt.inferredDeps ?? [],
+    inferredDepsTruncated: run.spec.inferredDepsTruncated ?? receipt.inferredDepsTruncated ?? false,
   };
 }
 
@@ -2736,7 +2957,14 @@ async function liveTurn(run, t) {
   } finally {
     rec.startedAt = run.startedAt;
     rec.endedAt = nowIso();
-    rec.durationMs = Math.round(monoNow() - run.t0);
+    /* ⚠️ **别覆盖已经播出去的那个读数。**
+          正常路径上,`node:turn-settled` 在这之前就带着 `rec.durationMs` 发出去了;
+          这里再读一次时钟,拿到的是**几毫秒之后**的另一个值 —— 于是同一轮的耗时,
+          事件里一个数、回执 `turns[]` 里另一个数,**同名不同值**。
+          页面按事件画时间线、按回执补复用节点的轮,两处一对账就永远差那么一点,
+          而这种"差一点"最容易被当成正常抖动放过去。
+          只有**没走到那一步就抛了**的路径这里才第一次给它赋值。 */
+    if (rec.durationMs == null) rec.durationMs = Math.round(monoNow() - run.t0);
     // ⚠️ **执行闸按轮放**:回调期间不持有,好让回调里嵌套的 runNode 拿得到 ——
     // 那正是"复审发生在两轮之间"这个头号用法。(`runNode` 是另一种 lease:持到写完回执,
     // 因为它的 close/finalize 都排在轮之后,提前放会让活会话数越过 maxConcurrent。)
@@ -2764,11 +2992,26 @@ async function replayTurn(run, t, prev) {
   const p = run.artifactPathFor(t.key);
   if (old.artifactPath !== p) throw bail(`旧回执里的产出路径与本次算出来的不一致(${old.artifactPath} ≠ ${p})`);
   const st = statSafe(p);
-  if (!st || !st.isFile() || st.size === 0) throw bail(`产出文件缺失或为空:${p}`);
+  // 同 runNode:零字节是 `no-output` 那一档**合法的成功**,不是"文件坏了"。
+  if (!st || !st.isFile()) throw bail(`产出文件缺失:${p}`);
   // 与 runNode 的复用闸同一个道理:只查"非空"挡不住产出被**换成另一份非空文件**,
   // 而"字段缺失就跳过校验"这个坑本仓踩过三次 —— 这里要求指纹**必须是合法的 64 位 hex**。
   if (!/^[0-9a-f]{64}$/.test(old.artifactSha256 || "")) throw bail(`旧回执里没有合法的产出内容指纹:${p}`);
   if (await sha256File(p) !== old.artifactSha256) throw bail(`产出文件内容与回执记录的不一致(可能被改过):${p}`);
+  // 同 runNode 那道闸:复用会逐次重新归档审计原件,所以逐次都要在这里坐实。
+  await assertAttemptsIntact(run, t.key, old.attempts, t.reask, bail);
+
+  /* 复用收尾时要靠它把 attempt 1 的输入找回来 —— `old` 是**旧回执**里那一项,
+     而这一次冻结的正文在 `t` 上(两者的 `turnSpecHash` 刚比对过 ⇒ 同一份字节)。 */
+  (run.replayBodies ??= new Map()).set(t.key, t.promptBody);
+
+  /* ⚠️ **推断边用本次重算的那份,不用旧回执里存的。**(§5.9 明写「`inferredDeps` 本次重算」)
+        `normalizeTurn` 刚刚用**同一个算法**扫过这一轮的正文,而正文与原运行必然是同一份字节
+        (`turnSpecHash` 逐项比对过)。用旧回执那份的后果是:**推断算法改了之后,
+        复用命中的节点会继续画早已不成立的虚线边** —— 而虚线本来就是"系统按文件名猜的",
+        再叠一层"猜的是上一版算法的结论",页面上没有任何线索能看出来。 */
+  old.inferredDeps = t.inferredDeps ?? [];
+  old.inferredDepsTruncated = t.inferredDepsTruncated ?? false;
 
   run.turns.push(old);
   return old;

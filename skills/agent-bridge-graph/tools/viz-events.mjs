@@ -130,6 +130,9 @@ const OBJ = (f, o = {}) => ({ k: "obj", f, o });
 const WL = (f) => ({ k: "wl", f });
 /** 判别联合:按 `on` 字段的取值选分支。 */
 const UNION = (on, branches) => ({ k: "union", on, branches });
+/** **恒在、可 null** 的字段。⚠️ 与 `OBJ` 的第二个参数(可缺席)是两回事,别混:
+ *  「键不在」与「值是 null」在页面上必须是同一件事(未知),做成可缺席就会有两套分支各写各的。 */
+const NULLABLE = (of) => ({ k: "nullable", of });
 
 /* ---- 公共类型(§3) ---- */
 
@@ -147,7 +150,9 @@ const ASSET = UNION("state", {
 const SCENE = UNION("state", {
   present: OBJ({
     state: ENUM("present"),
-    files: OBJ({ "session.log": ASSET, "answer.txt": ASSET, "status.json": ASSET }),
+    // ⚠️ 键是**逻辑名**,不是文件名(§3.2)。用 `session.log` 这种带点的键读着顺,
+    //    但合同全篇的判据表用的都是逻辑名,而且带点的键让所有 `a.b.c` 取值失效。
+    files: OBJ({ sessionLog: ASSET, answer: ASSET, status: ASSET }),
   }),
   "not-applicable": OBJ({ state: ENUM("not-applicable") }),
   unavailable: OBJ({ state: ENUM("unavailable"), code: S(200) }),
@@ -217,6 +222,8 @@ export const EVENT_SCHEMAS = {
     nodeSeq: NUM("uint"),
     turnKey: S(200),
     input: ASSET,
+    // 这一轮问的正文的指纹。⚠️ 与 `turnSpecHash` 不是一回事:那份覆盖整张任务单。
+    inputSha256: HEX(64),
     timeoutMs: NUM("uint1"),
     reask: NUM("bit"),
     inferredDeps: ARR(S(200), 200, "trunc", "inferredDepsTruncated"),
@@ -246,12 +253,17 @@ export const EVENT_SCHEMAS = {
   // §5.7 唯一可以整条丢的事件。`tail` 天生有界(240 UTF-16 code unit),**不许降级**。
   "node:progress": OBJ({
     nodeSeq: NUM("uint"), turnKey: S(200),
+    // 当前在跑**本轮**第几次尝试。没有它,打回重说时页面没法把在途正文贴到对的那一次上。
+    n: NUM("uint1"),
     status: S(200),
-    charCount: NUM("uint?"),
+    // ⚠️ **恒有,非 null**。快照连长度都给不出时,合同的处置是**整条不发**(§5.7) ——
+    //    发一条 charCount:null 的进度,等于在时间轴上留一个"它还活着而且什么都没产出"的假证据。
+    charCount: NUM("uint"),
     tail: { k: "u16", limit: 240 },
-  }, {
-    contextUsage: WL({ tokens: NUM("finite+"), live: BOOL, isCompacting: BOOL, autoCompactionEnabled: BOOL }),
-    lastEvent: WL({ at: S(200), type: S(200) }),
+    // ⚠️ **恒在、可 null**,不是"可缺席"。「键不在」与「值是 null」在页面上必须是同一件事(未知),
+    //    做成可缺席就会有两套分支各写各的。白名单本身照旧:这两个对象整个来自后端。
+    lastEvent: NULLABLE(WL({ at: S(200), type: S(200) })),
+    contextUsage: NULLABLE(WL({ tokens: NUM("finite+"), live: BOOL, isCompacting: BOOL, autoCompactionEnabled: BOOL })),
   }),
 
   // §5.4 ⚠️ 轮级五档 + `not-started`。「没能开始的轮」恒落在 output:unavailable{source-missing}。
@@ -278,9 +290,25 @@ export const EVENT_SCHEMAS = {
     turns: ARR(TURN_SUMMARY, 20, "fail", null, 1),
   }, {
     outcome: ENUM("delivered", "no-changes", "unknown"),
-    workspaceSummary: OBJ({}, {
-      path: S(512), branch: S(512), baseCommit: S(512), headCommit: S(512),
-      committed: BOOL, removed: BOOL, filesChanged: ARR(S(512), 200, "fail"),
+    // ⚠️ **字段封闭而且六个键全必需**(§5.8):这一层是"回执没归档成功时人怎么找到现场"的
+    //    唯一线索,少一个键就少一条线索,而 `{}` 照样是合法 JSON —— 做成可缺席等于
+    //    兜底没兜住却又不报错。拿不到的用 `null`(**不许用缺席表达未知**,同 §3.1)。
+    // ⚠️ 刻意**没有** `filesChanged`(无上限,内联进事件就是把事件流变成第二个真理源)、
+    //    也没有 `committed`(交付结论的唯一权威判据是 `outcome`)。
+    //    `changesKnown` 不能少 —— 少了它,页面就分不开「**探到了**这棵树的改动状况」与
+    //    「探测那一步没跑成、说不清」。
+    // ⚠️ **它不是「确知没有改动」** —— 生产者只要 git 探测正常返回就置 true,
+    //    改了一万个文件的节点同样是 true。判"净改动为零"要看 diff 自己的字节数。
+    //    (本行早先就写成了"确知没有改动",而页面照着这句话把一次正常交付渲染成
+    //     "已交付,但这次提交没有净改动" —— 一句凭空捏造、却比真话还确定的结论。)
+    // ⚠️ commit 是 `git rev-parse` 给的**完整 40 位 SHA**,不是短 SHA:短 SHA 会随仓库长大而歧义。
+    // ⚠️ 四个字符串**都可 null**:兜底这一层的职责是"能给什么给什么",它自己绝不能
+    //    因为某一项拿不到就把整条 node:settled 变成 recording-failed。
+    //    但 null 是**唯一**的"拿不到"表示 —— 不许省略键、也不许用空串(空串会撞 hex40)。
+    workspaceSummary: OBJ({
+      path: NS(512), branch: NS(512),
+      baseCommit: NULLABLE(HEX(40)), headCommit: NULLABLE(HEX(40)),
+      removed: BOOL, changesKnown: BOOL,
     }),
     errorSummary: DEG,
   }),
@@ -360,6 +388,9 @@ function boundValue(v, d, path) {
       }
       return checkNum(v, d.dom, path);
     }
+    case "nullable":
+      // null **原样留着** —— 它是一个有意义的取值(未知),不是缺席。
+      return v === null ? null : boundValue(v, d.of, path);
     case "bool":
       if (typeof v !== "boolean") throw new RecordingError(`要布尔,拿到 ${typeof v}`, { path });
       return v;

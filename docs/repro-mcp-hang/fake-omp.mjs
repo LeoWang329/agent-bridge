@@ -46,6 +46,8 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 
 const MODE = process.env.FAKE_OMP_MODE || "pipebreak";
+/** reaskturn 用:同一个后端进程里第几次收到 prompt(第 1 次故意答不合格)。 */
+let reaskSeen = 0;
 
 /** 所有"往 cwd 里写文件"的模式。写完之后各自还会再干点别的(自己提交 / 切走 HEAD / 弄坏 git 链接)。 */
 const WRITE_MODES = [
@@ -116,7 +118,7 @@ process.stdin.on("data", d => {
           ? slowsettleStreaming
           : (MODE === "multiturn" || MODE === "multiturn-fast")
           ? multiturnStreaming
-          : !(MODE === "okturn" || MODE === "errturn" || MODE === "echoturn" || WRITE_MODES.includes(MODE) || MODE === "ctxturn" || MODE === "logstress" || MODE === "badline" || MODE === "toolturns" || MODE === "agentenderr");
+          : !(MODE === "okturn" || MODE === "errturn" || MODE === "echoturn" || MODE === "reaskturn" || WRITE_MODES.includes(MODE) || MODE === "ctxturn" || MODE === "logstress" || MODE === "badline" || MODE === "toolturns" || MODE === "agentenderr");
         const data = { isStreaming, queuedMessageCount: 0, sessionId: "fake", messageCount: 1 };
         // ctx* modes: real omp reports current-context occupancy in get_state.data (contextUsage sub-object
         // + isCompacting/autoCompactionEnabled siblings — see the probe dump). The bridge normalizes this to
@@ -218,6 +220,20 @@ process.stdin.on("data", d => {
             say({ type: "turn_end" });
             say({ type: "agent_end" });
           }, Number.isFinite(delay) && delay >= 0 ? delay : 60);
+        } else if (MODE === "reaskturn") {
+          // 第 1 次故意答一段**不是 JSON** 的话(会被 outputShape 弱检查判不合格 → 打回重说),
+          // 第 2 次答合格。于是这一轮以 `ok` 收场,但磁盘上**两次尝试各留下一份原件**,
+          // 且两份内容不同 —— 复用这张回执时,"被打回的那一次写了什么"必须还看得见。
+          reaskSeen++;
+          const body = reaskSeen === 1
+            ? "REASK_BAD_1 这次没按格式说"
+            : `{"findings":["REASK_GOOD_${reaskSeen}"]}`;
+          say({ type: "agent_start" });
+          setTimeout(() => {
+            say({ type: "message_update", message: { type: "text_delta", delta: body } });
+            say({ type: "turn_end" });
+            say({ type: "agent_end" });
+          }, 60);
         } else if (MODE === "echoturn") {
           // Echo the received prompt back as the answer, so a test can confirm the exact prompt body
           // (e.g. a message_file's content) reached the backend.

@@ -86,12 +86,27 @@
 - **目录里有什么,不靠 manifest、不靠目录 ref,全靠事件**:每个资产由**产生它的那条事件** announce(§3)。**没有任何事件字段指向 `<nodeSeq>-<id>/` 这个目录本身**(`archiveRef` 已删)。
 - `<nodeSeq>` 是该节点在本 graph 内的序号(分配时机见 §5.2),**不能只用 `<id>`**:同一个 graph 里带 `force` 顺序重跑同一个 id 是合法的。
 - **归档必须是传递闭包**:写进归档的 `receipt.json`,其内部所有相对 ref(顶层 `artifactRef`/`diffRef`/`sceneRef`,以及**每一轮**的 `turns[].artifactRef`/`turns[].sceneRef`/`turns[].attempts[].inputRef`/`turns[].attempts[].artifactRef`)**一律重写**到当前 `<graphId>/<nodeSeq>-<id>/`;页面能点到的 ref **不得跨 graph、不得指 canonical**。⚠️ **新增一层就要重写一层**:漏掉 `turns[]` 里那些,页面点开的就是 canonical 区里会被下一波覆盖的文件。
+- ⚠️ **重写 ref 的同时,要把 canonical 区的那条绝对路径删掉** —— 顶层与每一层的 `artifactPath`、`diffPath`、`scene.dir` 在归档回执里**一个都不留**。
+  理由与"不得指 canonical"是同一条:canonical 区的 `<outDir>/nodes/<id>.md` 会被同 id 带 `force` 的下一波**原地覆盖**。留着那条路径,等于给读的人一条"打开这个"的指示,而打开之后读到的是**另一次运行**的字节 —— **伪造历史,比缺失更糟**。
+  ⚠️ 这条规则早先只被应用到 `diffPath` 一个字段上,`artifactPath` 三层(顶层 / 轮 / 每次尝试)原样留着 —— **同一条规则只落实到一个字段**,与上面"新增一层就要重写一层"是同一个坑的两种长相。
 - **先原子写成功归档文件,再发引用它的事件。** 顺序反了,页面会读到 404 并当成"文件丢了"。
 - **复用命中的节点也归档**(每一轮的产出与回执各拷一份),且归档时机在**复用闸之后**——那道闸刚刚逐项坐实了每一轮的产出 sha、diff sha、基线 commit 与分支现状,所以归档下来的是**刚被验证过**的东西。
+- ⚠️ **canonical 区里每次尝试各存一份审计原件**(`<id>.a<n>.md` / 对话是 `<id>.t-<key>.a<n>.md`)——**v2 起第一次的产出不再被第二次覆盖**。归档区照抄这个形状:`turns/<key>/attempt-<n>.output.md` **每次尝试各一份**。
+  ⚠️ 本节早先写的是「一轮之内每次尝试都覆盖该轮那一个 `artifactPath`」——那句话**相对 v2 的代码已经过时**,而且它误导过一次真实的实现:复用命中时照它去做,会只归档最后那一份、把早先几次标成"只剩指纹",**否认几份确实还在磁盘上的证据**("被打回的那一次到底写了什么"恰恰是复审时最想看的东西)。**轮级**那一个 `artifactPath` 仍然每次被覆盖(它是"这一轮当前的产出"),但**每次尝试另有自己的原件**。
 - **每一轮的 attempt 1 输入不另存一份**:该轮第一次发的就是这一轮 `prompt` / `promptFile` 的**原文**,所以本轮 `attempts` 中 `.n === 1` 那一项的 `input.ref` 直接指向 `turns/<key>/prompt.md`,且 **它的 `inputSha256` 必然等于 `node:turn.input` 的 `sha256`**(这是可验的断言,不是约定)。
 - **单轮节点的 `node:observed.prompt` 与 `node:turn{turnKey:"main"}.input` 是同一份字节**:两者的 `ref` 与 `sha256` **必须逐字节相同**,都指向 `turns/main/prompt.md`。**不许为 `node:observed` 另存一份 `<nodeSeq>-<id>/prompt.md`**——那是同一段正文的第二个副本,而两份"本该相同"的字节迟早会被改成不同。
   ⚠️ 对话节点**没有节点级的 prompt**(逐轮才有,见 §5.2),那时 `node:observed.prompt` 是 `{state:"not-applicable"}`。
-- **顶层产出同样不另存一份:归档里没有 `artifact.md`。** `node:settled.artifact.ref` 指向**该节点最后一次成功复制产出的那份 `turns/<key>/attempt-<n>.output.md`**——即 `turns[]` 里**最后一个** `output.state === "present"` 的那一轮,再取该轮 `attempts` 中**唯一满足 `.n === n`** 的那一项(`n` 是该轮最后一次成功复制的尝试号)。并且 **`artifact.sha256` 必须等于那一项 `output.sha256`,也必须等于该轮 `TurnSummary.output.sha256`**(可验的断言)。理由:源码在**一轮之内**每次尝试都覆盖该轮那一个 `artifactPath`,而顶层产出就是最后那一轮的那一份——**同一份字节**,存第二份没有新信息。**一次成功复制都没有过** → `artifact` 是 `{state:"unavailable", code:"source-missing"}`(§5.8)。
+- **顶层产出同样不另存一份:归档里没有 `artifact.md`。** `node:settled.artifact` 指向**该节点最后一次成功复制到本地的那份 `turns/<key>/attempt-<n>.output.md`**。
+
+  **"哪一项"与"它是什么状态"是两步,不能合并成一句"取最后一个 present"。**
+
+  1. **先选那一项**:按「**最后一次成功复制到本地**」选——即 `turns[]` 里最后一个"有过本地原件"的轮,再取该轮 `attempts` 中**唯一满足 `.n === n`** 的那一项。⚠️ **消费方从 wire 上就分得出**,按 code 分两类:**没有本地原件** = `source-missing`(从来没有过)与 `fingerprint-only`(有过,但这一次够不着——在上一次运行的归档区里,或当初就没落盘);**有本地原件、只是这一层没保住** = `present` 以及 `write-failed` / `sha-failed` / `archive-root-failed`。
+     ⚠️ **只把 `source-missing` 当"没有"是不够的。** `fingerprint-only` 划错边会让"最后一次只剩指纹"的那一轮,在生产者眼里选中**更早那次**、在校验器眼里选中**最后那次** —— 同一个问题两个答案,而这条规则的全部意义就是让两边选中同一项。
+  2. **再照抄它的状态**:那一项归档成功 ⇒ `artifact` 是 `present` 且 `sha256`/`ref` 与它逐字相同;那一项**归档失败** ⇒ `artifact` 是 `unavailable` 且 **`code` 与它相同**(§5.8 说的"同生同灭")。
+
+  ⚠️ **为什么不能"回退到上一个 present"**:那会把一份**更早的、已经被后一次覆盖掉结论的**产出,当成这个节点的交付物摆在最显眼的位置。用户点开看到的是**旧答案**,而页面上没有任何迹象说明这不是最终那一份——**静默地拿旧内容冒充结果**,比诚实地说一句"这一份没归档成功"坏得多。
+
+  并且 **`artifact.sha256` 必须等于那一项 `output.sha256`,也必须等于该轮 `TurnSummary.output.sha256`**(可验的断言)。**一次成功复制都没有过** → `artifact` 是 `{state:"unavailable", code:"source-missing"}`(§5.8)。
   ⚠️ **`attempts[n]` 这种写法在本文件里一律非法**:`n` 是 **1-based**,而数组是 0-based(attempt 1 躺在下标 0)。任何"第 n 次尝试"都必须表述成「`attempts` 中**唯一满足 `.n === n`** 的那一项」——这条同时也是 writer 的义务:**同一轮的 `attempts` 里 `n` 不得重复**,所以"唯一"是可以断言的。
   ⚠️ `artifact` 与它所指的那一项 `output` **同生同灭**:那一项归档失败(`unavailable`)时,`artifact` 也只能是 `unavailable` 且 **`code` 相同**——ref 指向一个不存在的文件就是死链接,而死链接比"给不出"更坏(页面会显示成"点得开")。
 
@@ -231,7 +246,7 @@
 | `write-failed` | 该资产自己写盘失败 |
 | `source-missing` | 源头就没有可拷的东西(如 `textRef` 取不回来) |
 | `sha-failed` | 拷下来了但算不出指纹。**不能当 present**:指纹是复用与防篡改的判据 |
-| `fingerprint-only` | ⚠️ **不是记录失败**:复用一张 viz-off 的旧回执,输入原文当初就没落盘,只剩指纹(§5.9)。它**没有任何"出错了"的含义** |
+| `fingerprint-only` | 「**这一层拿不到正文,指纹还在**」。成因不止一种:原运行 viz-off(是选择)、复用时 n≥2 的重说提示这一次没有、候选正文与 `inputSha256` 对不上因而**拒绝落盘**(是保护)、产出原件当时**复制失败**(是故障)。⚠️ **它本身不表示"记录失败",但也不等于"一定不是故障"** —— 早先这里写死成"没有任何'出错了'的含义",页面照着它在真故障时反过来安慰用户 |
 | `unknown` | 兜底:**确实拿不到,但连原因都没分辨出来**。它是「已知的未知」 |
 
 **生产方**:分辨得出原因就写具体 code;分辨不出才写 `unknown`。
@@ -838,11 +853,13 @@ node:attempt-settled  { nodeSeq, turnKey, n, output, status, rejectedReason?, du
 
 ⚠️ **这不违反"事件不复制大字段"**:`maxTurns = 20`、每轮 ≤2 次尝试 ⇒ **全节点最多 40 项**,每项只有指纹与状态、不含正文(§7 给了整块的字节上界)。
 
-⚠️ **`inputSha256`(以及整个 `attempts[]`)今天在盘上还没有持久来源**,见下一小节最后那条**施工顺序依赖**。
+⚠️ **`inputSha256`(以及整个 `attempts[]`)在盘上有持久来源**:`RECEIPT_VERSION` 2 起,回执两级(顶层与 `turns[]`)都带 `attempts`。
+⚠️ 本行早先写的是"今天在盘上还没有持久来源"——**那是施工中途的状态,早已过时**,而且它与下一小节末尾那段自相矛盾。照它去实现会重新长出一条"reused 拿不到 attempts"的兼容分支。
 
 #### `turns[]` 从哪儿来(**writer 现构;回执层不是它的来源**)
 
 ⚠️ **`turns[]` 是 writer 现构的,不是从回执里搬过来的。** 这一条必须写死——否则实现者会去回执里找一个**在 `runNode` 上压根不存在**的数组:
+⚠️ **"现构"说的是这个数组本身,不是说它的每一个字段都无中生有。** 复用命中时,`status` / `turnSpecHash` / `charCount` / `attempts[].inputSha256` 等**照抄旧回执**(它们记录的是**原运行**发生了什么);而 `output` / `input` 由归档器按**本次实际拷贝结果**给出,`inferredDeps` **本次重算**。两句话不矛盾:**数组是现构的,里面哪些字段来自旧回执有明确清单**(见 §5.9)。
 
 | 节点 / 路径 | 回执里有 `turns[]` 吗 | writer 怎么给出事件里的 `turns[]` |
 |---|---|---|
@@ -864,9 +881,10 @@ node:attempt-settled  { nodeSeq, turnKey, n, output, status, rejectedReason?, du
 | `inferredDeps` / `inferredDepsTruncated` | 扫**本次冻结的 prompt 正文**、取前 20 项(见上)。⚠️ 单轮节点这一份**不是**唯一来源(`node:observed.inferredDeps` 有同一个集合的完整版),§10.7 取并集即可 |
 | `attempts` | `fresh`:由在途的 `node:attempt*` 构造;`reused`:见下 |
 
-**⚠️ `attempts[]` 的施工顺序依赖(今天盘上还没有这份数据):**
+**⚠️ `attempts[]` 的来源(施工已完成,下面这段记的是历史与理由):**
 
-- 现状:`RECEIPT_VERSION` 还是 **1**,**回执里(顶层与 `turns[]` 两级都)没有 `attempts`**。于是 `fresh` 路径能从在途事件构造出本节要求的 `attempts[]`,**`reused` 路径拿不到** —— 旧回执里既没有那些 `status`,更没有 `inputSha256`。
+- 现状:`RECEIPT_VERSION` 是 **2**,**回执两级(顶层与 `turns[]`)都带 `attempts`**,每次尝试各有自己的产出原件与输入指纹。`fresh` 路径从在途事件构造,`reused` 路径从旧回执里逐项读 —— **两条路都拿得到**。
+  ⚠️ 本段早先写的是「现状 `RECEIPT_VERSION` 还是 1、reused 路径拿不到」——**那是施工中途的状态,早已过时**。照它去实现会以为复用节点没有逐次尝试可展示,于是重新长出一条"reused 没有 attempts"的兼容分支,而 v1 的回执其实**在复用闸上就被拒了**(版本严格等值)。
 - **定死的处置:`attempts[]` 落地那一批必须同时 bump `RECEIPT_VERSION`**(viz 施工第 5 项一次给回执与事件两级加 `attempts[]`)。bump 之后**不存在"没有 `attempts` 的旧回执还能命中复用"这种局面**:复用闸对 `receiptVersion` 做**全等**比对,对不上当场 `UsageError` ⇒ 页面上就是一条 **`node:rejected{phase:"reuse-check"}`**(正文写着"回执存在但版本对不上"),要重跑得显式加 `force`。**旧回执一律不复用,是响亮的拒绝,不是静默降级。**
 - **明确不采用的两种**:①给 `reused` 路径发一个"没有 `attempts` 的降级形状"——那是为一个过渡期往 schema 里加分支,页面得为它写文案,而过渡期结束后那段代码不会有人删;②让 `inputSha256` 变成可缺席——它恒有正是为了上面那条"仅保留指纹"的路。
 - ⚠️ **所以本小节的 `attempts[]` 合同要与那一项一起验收**:在它落地之前,`reused` 节点给不出符合本文件的 `turns[].attempts`。**这不是文档的洞,是施工顺序上的依赖。**
@@ -895,12 +913,22 @@ node:attempt-settled  { nodeSeq, turnKey, n, output, status, rejectedReason?, du
 
 | 字段 | 类型 | 可空 | 含义 |
 |---|---|---|---|
-| `path` | string | 否 | worktree 路径。≤512 字节 |
-| `branch` | string \| null | **可 null** | 交付分支;`no-changes` 且空分支被删掉时源码会把它置 null |
-| `baseCommit` | string | 否 | `hex40`。≤512 字节 |
-| `headCommit` | string \| null | **可 null** | `hex40`;没提交成功时为 null |
+| `path` | string \| null | **可 null** | worktree 路径。≤512 字节 |
+| `branch` | string \| null | **可 null** | 交付分支;`no-changes` 且空分支被删掉时为 `null` |
+| `baseCommit` | **`hex40`** \| null | **可 null** | `git rev-parse` 给的完整 SHA(**不是短 SHA**);拿不到为 `null` |
+| `headCommit` | **`hex40`** \| null | **可 null** | 没提交成功时为 `null` |
 | `removed` | boolean | 否 | ⚠️ **准确读法**:`true` = 收尾时确认删掉了;`false` = **收尾时没有确认清理**(可能没删、可能删了但没确认)。**推不出"这个目录现在还在磁盘上"**,页面文案统一用「收尾时未确认清理」 |
 | `changesKnown` | boolean | 否 | 「我们**确知**这棵工作树里有没有改动」。`false` = git 探测失败,既不能说有也不能说没有 |
+
+⚠️ **`workspaceSummary` 一旦出现,这六个键就一个都不能少**(值可以是 `null`,键不许缺席)。
+理由就是这一层存在的**全部**意义:回执没归档成功时,它是"人怎么找到现场"的唯一线索。
+一份 `{}`(或者只剩 `removed`)照样是合法 JSON、照样能过 schema,而页面这时候连
+**该去核对哪个目录、基于哪个提交**都说不出——那等于兜底没兜住,却又不报错。
+⚠️ **`null` 是唯一的"拿不到"表示 —— 既不许省略这个键,也不许用空字符串顶替。**
+空串会当场撞上 `hex40` 那道校验,把一条**本该合法**的 `node:settled` 变成 `recording-failed`:
+兜底那一层的作用是"回执没了也让人找得到现场",它自己**绝不能**成为记录失败的原因。
+⚠️ **拿不到时用 `null`,不要省略这个键。** 「键不在」与「值是 null」在页面上必须是同一件事(未知),
+做成可缺席就会有两套分支各写各的——同 §3.1 对 `AssetState` 的一贯口径:**不许用缺席表达未知**。
 
 ⚠️ **没有 `diffRef`** —— diff 只有顶层那一个真理源(`node:settled.diff`)。
 ⚠️ **刻意不含 `filesChanged` 与 `diagnostics`**:两者都无上限,内联进事件就是把事件流变成第二个真理源。**兜底的职责是"让人能找到现场",不是"复刻回执"。**
@@ -945,7 +973,7 @@ node:observed  →  node:settled{ execution: "reused" }
 - **`turns[]` 是 writer 现构的,不是"从旧回执整块搬过来"**——逐字段的来源见 §5.8 那张投影表,这里只重申三条最容易写错的:
   - **`conversation` 的复用**:`turnSpecHash` / `status` / `durationMs` / `charCount` / `attempts[].inputSha256` / `attempts[].status` **照抄旧回执**;`output` / `input` 由归档器按**本次实际拷贝结果**给出;**`inferredDeps` 本次重算**(见下一条)。
   - **`runNode` 的复用**:旧回执里**根本没有 `turns[]`**(单轮节点的那一轮就是回执本身),事件里那一项 `key:"main"` 是 writer 从**回执顶层字段**投影出来的,`sessionReusable` 更是**算出来的**(§5.8)。**别去旧回执里找 `turns`,那儿没有。**
-  - **`attempts[]` 今天还拿不到**(`RECEIPT_VERSION` 仍是 1,回执两级都没有 `attempts`)——见 §5.8 末尾那条施工顺序依赖。
+  - **`attempts[]` 拿得到**(`RECEIPT_VERSION` 已是 **2**,回执两级都带 `attempts`,每次尝试各有自己的产出原件与输入指纹)。⚠️ 本行早先写的是「今天还拿不到(`RECEIPT_VERSION` 仍是 1)」——**那是施工中途的状态,早已过时**;照它去实现会以为复用节点没有逐次尝试可展示,于是整段 attempts 被跳过。
 - ⚠️ **`inferredDeps` 是复用命中时拓扑边的唯一来源,而它由 writer 本次重算,不来自旧回执**:对话节点的 `node:observed.inferredDeps` 恒 `[]`、又没有任何 `node:turn`,所以**少了 `turns[].inferredDeps`,一命中复用整段的推断边就全没了**(§10.7 因此规定复用节点从这里取)。重算是安全的:回放时每一轮的正文都被重新冻结过,而 `turnSpecHash` 逐轮比对过 ⇒ **正文与原运行必然是同一份字节**。
 - ⚠️ **复用命中时,每一轮的提问原文只能从该轮 `attempts` 里 `.n === 1` 那一项的 `input` 拿**——`TurnSummary` 本身没有 `input` 槽(它是那一项的第二个副本)。这也是那一项 `inputSha256` 恒有的用处所在。
 - **回放闸要求每一轮的旧 status 都是 `ok`**,所以复用命中的节点里 `turns[].status` 恒为 `"ok"`、`sessionReusable` 恒为 `true`、没有任何一轮有现场。
@@ -1326,6 +1354,8 @@ node:observed
 
 ⚠️ **第 2、3 档不得共用同一句文案。**
 
+⚠️ **表里的「EOF」对页面来说是一条 `control{kind:"owner-lost"}`**(§10.4)——管道的另一端在 viewer 手里,页面自己看不到 EOF。**它与 `owner-final` 是两条不同的帧,不许在消费侧归并成一个布尔**:归并之后第 2、3 档必然共用同一句文案,而那正是上一条禁止的事。
+
 ⚠️ **第 4 档的措辞要留余地**:它**绝大多数**情况确实是强杀,但**两条通道同时坏掉**时 owner 其实可能有序收了场。这是一个**消不掉**的双故障——不必为它加机制(再加一条通道只是把问题挪到第三条上),但页面**不能替它下"进程一定被杀了"的结论**。
 
 ⚠️ **`recording-failed` 之后,viewer 必须整体标注「从 seq N 起记录不完整」,而不是把缺失的节点事件逐个合成 `abandoned`**——那些节点很可能好好地跑完了,只是没人记下来。**把记录故障摊派成一堆节点事故,是这个页面能犯的最有误导性的错误之一。**
@@ -1424,17 +1454,32 @@ data: {"v":1,"seq":11,…}\n
 |---|---|---|
 | `hello` | `{"graphId":"…","v":1}` | 连上之后的**第一帧** |
 | `tx` | **transcript 那一行的原始 JSON,原样一行** | 每条事件——**回放与 live 用同一种 frame** |
-| `control` | 见下面的三个形状 | 控制槽 |
+| `control` | 见下面的**四个**形状 | 控制槽 |
 | `viz:overflow` | `{"queuedBytes":N,"limitBytes":33554432}` | 该客户端积压超限,**发完立刻 `res.end()`** |
 
 - ⚠️ **`tx` 的 data 是原样透传**:viewer **不重新序列化、不加字段、不改键序**。它是 transcript 的搬运工,**不是第二个 writer**——一旦它自己序列化一遍,页面看到的字节就与磁盘上的不是同一份,而 `sha256` 那套对证手段全部建立在"同一份"上。
-- **`event: control` 的 data 恰好是这三个形状之一,靠 `kind` 判别**(与 §8 的 IPC 消息**共用同一个判别字段与同一份字段集**):
+- **`event: control` 的 data 恰好是这四个形状之一,靠 `kind` 判别**(前三个与 §8 的 IPC 消息**共用同一个判别字段与同一份字段集**;`owner-lost` 是 viewer **自己**根据管道 EOF 合成的,父进程那条通道上没有它——同 `history-read-failure`):
 
   ```js
   { "kind": "recording-failed", "atSeq": number, "lastGoodOffset": number, "error": string | BoundedSummary }
   { "kind": "owner-final",      "result": "completed" | "failed", "endedAt": number }
+  { "kind": "owner-lost" }
   { "kind": "history-read-failure", "reason": string | BoundedSummary }
   ```
+
+  - **`owner-lost` 只有 `kind` 一个键**,意思是「**生命管道 EOF 且最终 drain 已结束,而 owner 从没说过它收场了**」。
+    ⚠️ **它与 `owner-final` 互斥**:owner 有序收场时发的是 `owner-final`(带 `result`),
+    这一条**只在 owner 一句话没留下就没了**时发。两者同时下发是实现 bug。
+    ⚠️ **transcript 里已经有 `run:final` 时不发** —— 那一档由 transcript 自己说了算(§10.1 第 1 档),
+    这一帧一个字的新信息都不带。于是**健康路径一条 control 帧都不发**,这本身是个有用的不变量:
+    它等于一句「没出任何异常」。
+    ⚠️ **它不是"运行失败了"**:§10.1 第 4 档的措辞留余地那一条照旧适用。
+
+    **为什么非有它不可**:§10.1 的第 3、4 档判据里都有「EOF」这个事实,而 EOF **只有 viewer 知道**
+    (它是那条生命管道的另一端)。没有这一帧,页面分不开「还在跑、暂时没消息」与「跑完了、就是没有 final」,
+    只能一直显示"运行中" —— **一次被强杀的运行会永远装作还活着**。
+    ⚠️ **消费方不许把它与 `owner-final` 归并成一个布尔**:归并之后第 2、3 档就共用同一句文案了,
+    而 §10.1 明令两档不得共用。
 
   - `history-read-failure` **只有 `kind` 与 `reason` 两个键,都恒在**;`reason` 是 **`string | BoundedSummary`**,阈值 2 KiB:**超过 2 KiB 才降级,`≤2 KiB` 必须原样留字符串**(§3.3 第 1、4 条;§3.4 第四个可降级字段——它与另外两条控制消息的 `error` **同档同阈值**)。⚠️ **这里的口径必须与 §3.3 逐字一致**:写成"≤2 KiB 触发降级"会让两个实现对 `"EACCES"` 这种短正文一个发字符串、一个发对象。它是 **viewer 自己的读侧故障**,父进程管道上没有这种消息(§10.1)。
   - ⚠️ **`history-read-failure` 不是 `recording-failed`**:前者是"我们读不回来",后者是"我们写不下去"。**两条文案不许共用**,更不许把前者显示成「运行被掐断」——owner 可能好端端地在跑。
