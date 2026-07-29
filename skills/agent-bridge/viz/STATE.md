@@ -247,6 +247,19 @@ recorder 是一个公开 API，调用方没给的时候，writer 只剩两条路
 两条都比"承认这次没有日志可指"更坏。页面据此只是不显示那个逃生门链接。
 （同 `backendPid`：可空是因为**确实存在没有值的时刻**，不是因为懒得填。）
 
+⚠️ **`status: "closed"` 有两种，靠 `closed` 对象区分——不是靠 `status`。**
+
+| 情形 | `status` | `closed` 对象 | 会话还在不在 | 产出还救得回吗 |
+|---|---|---|---|---|
+| 桥主动关（`close_session` / 批量清场 / 退出） | `closed` | **非空** | 已从 `sessions` 移除 | **不能**，已随之销毁 |
+| 后端进程自己退出（`process_close`，含 code 0） | `closed` | **保持 `null`** | **仍在** `sessions` 里 | 能，`result()` 照样取得回 |
+
+合同里没有第三种。**只看 `status` 会把两者混成一句"已关闭"**，而它们对用户意味着
+完全相反的事：前者是"这段记录到此为止了"，后者是"后端没了，但你还能把结果取走"。
+所以 `sessionClosed()` 只挂在五个类的 `close()` 上；`process_close` 只经由状态钩子
+体现为 `status: "closed"`。**绝不能在状态钩子里挂 `sessionClosed()`**——那会让
+`finalizeSession` 把一批**还救得回来**的轮次说成 `abandoned`。
+
 ### 4.3 `appendSystemPrompt`
 
 ```jsonc
@@ -366,6 +379,14 @@ Codex 晚到的成功 response → `turn_start_ack`；晚到的 `turn/started` �
 ⚠️ **任何 `state` 下都不得出现悬空 ref**：`ref` 非 `null` ⟹ 该文件存在且可读。
 dispatch 时输入文件还没写完 → 先 `state:"pending"` 且 `ref:null`，写成功后才发布 ref。
 
+⚠️ **`input` 记的是调用方交上来的原始 message，不是实际发给模型的 argv。**
+两种读法都说得通，这里选前者，理由：§0 要回答的是「**这一轮问了什么**」。
+后端各自往前面拼的东西——首轮 system 前缀、只读策略前缀——要么已经在会话级
+`appendSystemPrompt` 里单独呈现（连注入档位一起），要么是与轮次无关的常量。
+把它们混进每一轮的输入，页面上就是同一段前缀在每张卡片里重复几十遍，
+而真正区分这一轮的那句话被埋在下面。
+**代价如实记**：因此 `input` 不等于「实际发给模型的字节」；要查那个，看 `logFile`。
+
 ### 4.8 `collected`
 
 ```jsonc
@@ -376,6 +397,18 @@ dispatch 时输入文件还没写完 → 先 `state:"pending"` 且 `ref:null`，
 - `returnedChars` 是**实际内联返回的字符数**。`returnMode:"ref"` 时可以是 `0`，
   **不等于正文的 `chars`**。
 - **同一轮重复 result/wait 只记第一次 collection。**
+
+⚠️ **`settling` 期到达的收口必须暂存，不许丢。**
+合同要求 `collected !== null ⟹ state === "settled"`，但那说的是**快照里**的样子，
+不是"晚于我们自己写完才算数"。真实时序恰恰相反：结算时正文可能还在宽限期里
+（OMP 要等最后一条 `message_update`，最多 2s），而调用方的 `wait` 早就返回、
+正文早就交到它手上了。丢掉这一条 ⇒ **一次已经取走的交付被记成「从未被取走」**，
+页面挂出"未取结果"的假警报——而那个标记的全部价值就在于它不说假话。
+**收口是外部事实；不该因为我们自己的写还在途就当它没发生过。**
+
+⚠️ **两条绕过 `buildSessionResult` 的 wait 路径不带溯源**（会话被并发关掉的 gone 分支、
+`result()` 抛错的 base fallback），所以它们不产生 `collected`，页面上表现为
+「已结算、从未取走」。**这不是假警报**：那两条路上调用方确实没拿到正文。
 
 ---
 
