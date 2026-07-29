@@ -41,7 +41,7 @@ html = html.replace("<script>\n/* ===", `<script type="module">
 /* ⚠️ 这是 module：DOM 已就绪才执行，所以顶部直接取元素是安全的。 */
 import {
   statusKind, permKind, contextLevel, isUncollected, shortName,
-  OUTCOME_LABEL, BODY_LABEL,
+  adaptSnapshot, refsOf, BODY_PLACEHOLDER,
 } from "./reconcile.mjs";
 
 /* ===`);
@@ -56,52 +56,30 @@ const endOfScript = html.indexOf("</script>");
 const sectionBody = (i) => html.slice(marks[i].end, i + 1 < marks.length ? marks[i + 1].start : endOfScript);
 const mk = (n, title, body) => `/* ${"=".repeat(60)}\n   ${n}. ${title}\n   ${"=".repeat(60)} */\n${body}`;
 
-const NEW_2 = mk(2, "数据层：wire 快照 → 展示模型（合同见同目录 STATE.md）", `
-/* ⚠️ **页面不改写快照。** 快照是 writer 的产物、\`contract-invariants.mjs\` 验的就是它；
-      页面在这里做的是**另建一份展示模型**，两者并存、互不覆盖。
-      viewer 一旦就地改写快照，页面吃的就不再是"那份快照"，中间那道缝正是漂移的产地。 */
+const NEW_2 = mk(2, "数据层：正文取回与缓存（适配层在 reconcile.mjs，可单测）", `
+/* ⚠️ **适配层不在这里，在 \`reconcile.mjs\`。**
+      它内联在页面里的时候藏过一个正好说明问题的 bug：正文是异步从 \`/file\` 取的，
+      取回来只触发了"重画 DOM"，而 DOM 是从**已构造好的展示模型**画的——
+      那个模型里 \`input.text\` 早在构造时就被烘成了占位符「正在读取原文…」。
+      于是缓存填上了、页面也重画了，**正文永远出不来**。
+      这类 bug 在页面里查不出来：没有任何东西能单独喂它一份"缓存从空到满"的输入。
 
-var SESSIONS = [];                 /* 展示模型，由 applyState() 整体重建 */
+   ⚠️ **页面不改写快照。** 快照是 writer 的产物、\`contract-invariants.mjs\` 验的就是它；
+      这里做的是**另建一份展示模型**，两者并存、互不覆盖。 */
+
+var SESSIONS = [];                 /* 展示模型，由 rebuild() 整体重建 */
 var SNAP = null;                   /* 最近一份快照原文（只读） */
 var RUN = { runId:null, vizDir:null, degraded:false, recordingErrors:[], gone:false,
             readFailure:false, startedAt:null };
 var PROGRESS = new Map();          /* vizTurnId -> §5 sidecar */
-var BODY = new Map();              /* ref -> {text} | {pending:true} | {tamper:true} | {error} */
+var BODY = new Map();              /* ref -> {text}|{pending}|{tamper}|{error} */
 
-var ENGINE = {
-  omp:    { name:"Oh My Pi",     eb:"OM" },
-  codex:  { name:"Codex",        eb:"CX" },
-  claude: { name:"Claude Code",  eb:"CC" },
-  cursor: { name:"Cursor Agent", eb:"CU" },
-  kimi:   { name:"Kimi Code",    eb:"KM" },
-};
-
-function hhmmss(iso){
-  if(!iso) return "--:--:--";
-  var d=new Date(iso); if(isNaN(d)) return "--:--:--";
-  var p=function(x){return String(x).padStart(2,"0");};
-  return p(d.getHours())+":"+p(d.getMinutes())+":"+p(d.getSeconds());
-}
-function secsSince(iso){
-  if(!iso) return 0;
-  var t=Date.parse(iso); if(!isFinite(t)) return 0;
-  return Math.max(0, Math.round((Date.now()-t)/1000));
-}
-function mb(bytes){
-  if(!isFinite(bytes)) return "?";
-  if(bytes >= 1048576) return (bytes/1048576).toFixed(1)+" MB";
-  if(bytes >= 1024) return Math.round(bytes/1024)+" KB";
-  return bytes+" B";
-}
-
-/* ---- 正文按需取，并**当场对证** ---- */
-/* ⚠️ 服务端会用**实际发出去的字节**实时算一遍 SHA-256 放在 X-Viz-Sha256 里；
-      这里拿它和快照里 writer 记下的指纹比。不一致 = 文件在落盘之后被改过 ——
-      这时候**绝不能照常展示**，否则页面等于替一份被篡改的内容背书。 */
-function bodyOf(ref, expectSha){
-  if(!ref) return { text:"" };
-  var hit = BODY.get(ref);
-  if(hit) return hit;
+/* ---- 正文按需取，并**当场对证** ----
+   服务端用**实际发出去的字节**实时算一遍 SHA-256 放在 X-Viz-Sha256 里；
+   这里拿它和快照里 writer 记下的指纹比。不一致 = 文件在落盘之后被改过 ——
+   这时**绝不能照常展示**，否则页面等于替一份被篡改的内容背书。 */
+function fetchBody(ref, expectSha){
+  if(!ref || BODY.has(ref)) return;
   BODY.set(ref, { pending:true });
   fetch("/file?ref="+encodeURIComponent(ref)).then(function(r){
     if(!r.ok) throw new Error("HTTP "+r.status);
@@ -109,116 +87,35 @@ function bodyOf(ref, expectSha){
     var truncated = r.headers.get("X-Viz-Truncated") === "1";
     var fullBytes = Number(r.headers.get("X-Viz-Full-Bytes") || 0);
     return r.text().then(function(text){
-      if(expectSha && got && !truncated && got !== expectSha){
-        BODY.set(ref, { tamper:true, expected:expectSha, actual:got });
-      }else{
-        BODY.set(ref, { text:text, truncated:truncated, fullBytes:fullBytes });
-      }
+      if(expectSha && got && !truncated && got !== expectSha) BODY.set(ref, { tamper:true });
+      else BODY.set(ref, { text:text, truncated:truncated, fullBytes:fullBytes });
     });
   }).catch(function(e){
-    BODY.set(ref, { error:String(e && e.message || e) });
-  }).then(function(){ scheduleRender(); });
-  return BODY.get(ref);
+    BODY.set(ref, { error:String((e && e.message) || e) });
+  }).then(function(){
+    /* ⚠️ **必须重建模型，不能只重画 DOM。** 占位符是烘在模型里的字符串，
+          光重画只会把同一个占位符再画一遍——那正是原来那个 bug。 */
+    rebuild();
+  });
 }
 
-var PLACEHOLDER = "（正在读取原文…）";
-function textFrom(b){
-  if(!b) return "";
-  if(b.pending) return PLACEHOLDER;
-  if(b.tamper)  return "⚠️ 这份文件在落盘之后被改动过（指纹对不上），已拒绝展示。";
-  if(b.error)   return "⚠️ 读取失败：" + b.error;
-  return b.text || "";
-}
-function isUsable(b){ return !!(b && !b.pending && !b.tamper && !b.error); }
-
-/* ---- 一轮 ---- */
-function adaptTurn(s, t){
-  /* run gone 时把仍是 dispatched 的轮次**合成**为 abandoned（STATE.md §9）。
-     快照永远发不出终态——run.status 只有一档，终态是传输层的一帧。 */
-  var synthesized = RUN.gone && t.state === "dispatched";
-  var running = t.state === "dispatched" && !synthesized;
-  var result = running ? "running" : (synthesized ? "abandoned" : t.outcome);
-  var body = running ? "none" : (synthesized ? "none" : t.bodyKind);
-
-  var inB = bodyOf(t.input.ref, t.input.sha256);
-  var o = {
-    n: t.turnNo,
-    result: result,
-    body: body,
-    from: hhmmss(t.dispatchedAt),
-    to: t.settledAt ? hhmmss(t.settledAt) : null,
-    dur: Math.round((t.durationMs || 0) / 1000),
-    elapsed: running ? secsSince(t.dispatchedAt) : 0,
-    /* 「未取结果」——UIREQ §2 场景 3，这套系统里最常见的一类事故。 */
-    unfetched: isUncollected(t) && !synthesized,
-    error: t.error || null,
-    __vizTurnId: t.vizTurnId,
-    __pending: false,
-    input: {
-      chars: t.input.chars || 0,
-      text: textFrom(inB),
-      truncated: t.input.truncated
-        ? { orig: mb(t.input.originalBytes), saved: mb(t.input.bytes) } : null,
-    },
-  };
-  if(!isUsable(inB)) o.__pending = true;
-
-  if(running){
-    /* §5 的四条前提：只有仍是 dispatched、且 sidecar 的 vizTurnId 对得上才合并。
-       快照一旦标 settled，迟到的 sidecar **永远无法让它回退**。 */
-    var p = PROGRESS.get(t.vizTurnId);
-    var ok = p && p.vizTurnId === t.vizTurnId;
-    o.live = {
-      chars: ok ? (p.charCount || 0) : 0,
-      draft: (ok ? p.generationCount : t.generationCount) || 1,
-      preview: ok ? (p.tail || "") : "",
-      age: ok ? secsSince(p.updatedAt) : 0,
-      bump: ok && LAST_DRAFT.get(t.vizTurnId) != null && LAST_DRAFT.get(t.vizTurnId) !== p.generationCount,
-    };
-    if(ok) LAST_DRAFT.set(t.vizTurnId, p.generationCount);
-  } else if(body !== "none"){
-    var ob = bodyOf(t.output.ref, t.output.sha256);
-    o.output = { chars: t.output.chars || 0, md: textFrom(ob) };
-    if(ob && ob.truncated){
-      o.output.capped = {
-        shown: mb((o.output.md || "").length),
-        total: mb(ob.fullBytes),
-        path: (RUN.vizDir ? RUN.vizDir + "\\\\" : "") + String(t.output.ref).replace(/\\//g, "\\\\"),
-      };
-    }
-    if(!isUsable(ob)) o.__pending = true;
-  } else {
-    o.output = { chars: 0, md: "" };
-  }
-  return o;
-}
 var LAST_DRAFT = new Map();
-
-/* ---- 一个会话 ---- */
-function adaptSession(s){
-  var eng = ENGINE[s.agent] || { name: s.agent || "未知", eb: "??" };
-  var turns = (s.turns || []).map(function(t){ return adaptTurn(s, t); });
-  /* ⚠️ 存活**只看 status + health**，绝不看 backendPid：cursor / kimi 在两轮之间
-        不占任何进程，但会话完全健康、随时可以继续。 */
-  var kind = statusKind(s);
-  return {
-    id: s.sessionId,
-    alias: s.name || null,
-    engine: s.agent, engineName: eng.name, eb: eng.eb,
-    model: s.model || null,
-    effort: s.effort || null,
-    perm: permKind(s),
-    state: s.status, health: s.health,
-    /* ⚠️ null 是**未知**，不是 0。显示成 0 会让人以为"很空闲、很安全"——是反的。 */
-    ctx: (s.contextUsage && isFinite(s.contextUsage.tokens)) ? s.contextUsage.tokens : null,
-    cwd: s.cwd || "",
-    createdAt: hhmmss(s.createdAt),
-    lastActive: kind === "run" ? 0 : secsSince(s.updatedAt),
-    incomplete: RUN.degraded,
-    startupError: s.openFailed ? s.openFailed.error : null,
-    logFile: s.logFile || null,
-    turns: turns,
-  };
+function rebuild(){
+  if(!SNAP) return;
+  SESSIONS = adaptSnapshot(SNAP, { progress:PROGRESS, bodyCache:BODY,
+                                   runGone:RUN.gone, vizDir:RUN.vizDir });
+  /* 「第 N 稿」的脉冲提示：稿次变了才闪一下。
+     ⚠️ 这是**纯展示层的瞬态**（跟"上一帧"比出来的），不属于快照，
+     所以留在页面这边，不进 adaptSnapshot——那是个纯函数，不该有记忆。 */
+  SESSIONS.forEach(function(s){
+    s.turns.forEach(function(t){
+      if(!t.live) return;
+      var prev = LAST_DRAFT.get(t.vizTurnId);
+      t.live.bump = (prev != null && prev !== t.live.draft);
+      LAST_DRAFT.set(t.vizTurnId, t.live.draft);
+    });
+  });
+  scheduleRender();
 }
 
 function applyState(snap){
@@ -226,14 +123,14 @@ function applyState(snap){
   RUN.degraded = !!(snap.run && snap.run.degraded);
   RUN.recordingErrors = (snap.run && snap.run.recordingErrors) || [];
   RUN.startedAt = snap.run && snap.run.startedAt;
-  SESSIONS = (snap.sessions || []).map(adaptSession);
+  refsOf(snap).forEach(function(x){ fetchBody(x.ref, x.sha256); });
   /* 已结算的轮次立刻忘掉 sidecar——留着它只会让迟到的内容有机会回来。 */
   var alive = new Set();
   (snap.sessions || []).forEach(function(s){
     (s.turns || []).forEach(function(t){ if(t.state === "dispatched") alive.add(t.vizTurnId); });
   });
   for(var k of Array.from(PROGRESS.keys())) if(!alive.has(k)) PROGRESS.delete(k);
-  scheduleRender();
+  rebuild();
 }
 `);
 
@@ -388,7 +285,7 @@ out = out.replace(
   Array.prototype.forEach.call(elDetail.querySelectorAll("[data-copy]"), function(el){
     var n = el.getAttribute("data-copy").split("|")[1];
     var t = s.turns.filter(function(x){ return String(x.n) === n; })[0];
-    if(t && t.__pending){ el.disabled = true; el.title = "原文尚未读取完成"; }
+    if(t && t.pending){ el.disabled = true; el.title = "原文尚未读取完成"; }
   });`);
 
 if (/UI\.proto/.test(out)) throw new Error("仍残留 UI.proto 引用：" + (out.match(/.*UI\.proto.*/g) || []).join(" | "));

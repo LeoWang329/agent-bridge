@@ -1002,6 +1002,79 @@ async function runTransportTests() {
   });
 }
 
+// ── 第五组：适配层的正文缓存（这一组是被一个真 bug 逼出来的） ─────────────────
+//
+// 正文是异步从 /file 取的。**取回来必须重建模型，不能只重画 DOM**——
+// 占位符是烘在展示模型里的字符串，光重画只会把同一个占位符再画一遍。
+// 这个 bug 在页面里查不出来：没有任何东西能单独喂它一份「缓存从空到满」的输入。
+// 适配层从 index.html 搬进 reconcile.mjs 之后，它就只是两次纯函数调用的差。
+async function runAdapterBodyTests() {
+  const { adaptSnapshot, refsOf, BODY_PLACEHOLDER } = await import('./reconcile.mjs');
+  const IN_REF = 'turns/codex-a-b/t1.in.md';
+  const OUT_REF = 'turns/codex-a-b/t1.out.md';
+  const snap = {
+    schemaVersion: 1, runId: 'mcp-x', generation: 1, updatedAt: '2026-07-29T00:00:00.000Z',
+    run: { pid: 1, bridgeVersion: 't', startedAt: '2026-07-29T00:00:00.000Z',
+           status: 'running', degraded: false, recordingErrors: [] },
+    sessions: [{
+      sessionId: 'codex-a-b', name: null, agent: 'codex', model: null, effort: null,
+      access: 'read', cwd: 'D:\\x', returnMode: 'full', logFile: null,
+      appendSystemPrompt: null, backendPid: null, status: 'idle', health: 'healthy',
+      isStreaming: false, contextUsage: null,
+      createdAt: '2026-07-29T00:00:00.000Z', updatedAt: '2026-07-29T00:00:00.000Z',
+      openFailed: null, closed: null,
+      turns: [{
+        turnNo: 1, vizTurnId: 'vt-1', backendTurnId: null, backendTurnCount: null,
+        state: 'settled', boundary: 'turn_start_ack',
+        attemptedAt: '2026-07-29T00:00:00.000Z', dispatchedAt: '2026-07-29T00:00:00.000Z',
+        settledAt: '2026-07-29T00:00:10.000Z', firstBackendEventAt: null,
+        source: 'send_message', blocking: false, hasSchema: false,
+        input: { state: 'ready', ref: IN_REF, sha256: 'a'.repeat(64),
+                 chars: 4, bytes: 12, truncated: false, originalBytes: 12, error: null },
+        output: { state: 'ready', ref: OUT_REF, sha256: 'b'.repeat(64),
+                  chars: 4, bytes: 12, previewBytes: null, previewSha256: null, error: null },
+        outcome: 'completed', bodyKind: 'final', generationCount: 1,
+        collected: null, error: null, durationMs: 10000,
+      }],
+    }],
+  };
+
+  const refs = refsOf(snap);
+  assertCase('refsOf 找出输入与输出两个 ref', refs.length === 2, JSON.stringify(refs.map(r => r.ref)));
+  assertCase('refsOf 带上了用于对证的 sha256', refs.every(r => /^[0-9a-f]{64}$/.test(r.sha256)));
+
+  // ① 缓存为空 → 占位符
+  const t0 = adaptSnapshot(snap, { bodyCache: new Map() })[0].turns[0];
+  assertCase('缓存为空时是占位符',
+    t0.input.text === BODY_PLACEHOLDER && t0.output.md === BODY_PLACEHOLDER,
+    JSON.stringify({ i: t0.input.text, o: t0.output.md }));
+  assertCase('缓存为空时标记 pending（页面据此禁用复制，不许把占位符当原文交出去）', t0.pending === true);
+
+  // ② 缓存填上 → **同一份快照必须产出不同的模型**。
+  //    这一条就是那个 bug 的判别式：只重画 DOM、不重建模型的实现在这里过不去。
+  const cache = new Map([[IN_REF, { text: '问题原文' }], [OUT_REF, { text: '回答正文' }]]);
+  const t1 = adaptSnapshot(snap, { bodyCache: cache })[0].turns[0];
+  assertCase('★ 缓存填上后同一份快照产出真正文（不再是占位符）',
+    t1.input.text === '问题原文' && t1.output.md === '回答正文',
+    JSON.stringify({ i: t1.input.text, o: t1.output.md }));
+  assertCase('缓存填上后不再 pending', t1.pending === false);
+
+  // ③ 指纹对不上 → **绝不照常展示**（否则页面等于替一份被篡改的内容背书）
+  const tampered = new Map([[IN_REF, { text: '问题原文' }], [OUT_REF, { tamper: true }]]);
+  const t2 = adaptSnapshot(snap, { bodyCache: tampered })[0].turns[0];
+  assertCase('★ 指纹对不上时拒绝展示内容并说明原因',
+    /被改动过/.test(t2.output.md) && t2.output.md.indexOf('回答正文') < 0, t2.output.md);
+
+  // ④ 读失败 → 说清是「读不到」，不是「没有」
+  const t3 = adaptSnapshot(snap, { bodyCache: new Map([[OUT_REF, { error: 'HTTP 500' }]]) })[0].turns[0];
+  assertCase('读失败时如实说读失败（区别于「这轮没有输出」）', /读取失败/.test(t3.output.md), t3.output.md);
+
+  // ⑤ 纯函数：同输入必得同输出（它不该有记忆——瞬态属于页面层）
+  const a = adaptSnapshot(snap, { bodyCache: cache, now: 1 });
+  const b = adaptSnapshot(snap, { bodyCache: cache, now: 1 });
+  assertCase('adaptSnapshot 是纯函数（同输入同输出）', JSON.stringify(a) === JSON.stringify(b));
+}
+
 async function main() {
   await runSection('第一组：冻结样例与双槽选择', async () => {
     await runFrozenCorpusTests();
@@ -1010,6 +1083,7 @@ async function main() {
   await runSection('第二组：reconcile DOM shim 自动负对照', runDomShimTests);
   await runSection('第三组：展示映射', runDisplayMappingTests);
   await runSection('第四组：真实 serve.mjs 传输层', runTransportTests);
+  await runSection('第五组：适配层的正文缓存', runAdapterBodyTests);
 }
 
 try {

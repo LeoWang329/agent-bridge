@@ -106,7 +106,170 @@ export function shortName(s) {
   return second > 0 ? `${id.slice(0, second)}…${id.slice(-4)}` : id;
 }
 
-// ── 快照 → 展示模型 ─────────────────────────────────────────────────────────
+// ── 快照 → 页面展示模型（**适配层**） ───────────────────────────────────────
+
+/**
+ * ⚠️ **这一层必须住在这里，不能内联进 `index.html`。**
+ *
+ * 它内联在页面里的时候藏过一个正好说明问题的 bug：正文是异步从 `/file` 取的，
+ * 取回来只触发了「重画 DOM」，而 DOM 是**从已构造好的展示模型**画的——
+ * 那个模型里 `input.text` 早在构造时就被烘成了字符串占位符「正在读取原文…」。
+ * 于是缓存填上了、页面也重画了，**正文永远出不来**。
+ *
+ * 这类 bug 在页面里查不出来，因为没有任何东西能单独喂它一份"缓存从空到满"的输入。
+ * 搬到这里之后就是一个纯函数：给两次不同的 `bodyCache`，断言两次输出不同。
+ */
+export const BODY_PLACEHOLDER = "（正在读取原文…）";
+
+const ENGINE = {
+  omp: { name: "Oh My Pi", eb: "OM" },
+  codex: { name: "Codex", eb: "CX" },
+  claude: { name: "Claude Code", eb: "CC" },
+  cursor: { name: "Cursor Agent", eb: "CU" },
+  kimi: { name: "Kimi Code", eb: "KM" },
+};
+
+function hhmmss(iso, now) {
+  if (!iso) return "--:--:--";
+  const d = new Date(iso);
+  if (isNaN(d)) return "--:--:--";
+  const p = x => String(x).padStart(2, "0");
+  void now;
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+function secsSince(iso, now) {
+  if (!iso) return 0;
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return 0;
+  return Math.max(0, Math.round(((now ?? Date.now()) - t) / 1000));
+}
+function mb(bytes) {
+  if (!Number.isFinite(bytes)) return "?";
+  if (bytes >= 1048576) return `${(bytes / 1048576).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${bytes} B`;
+}
+
+/**
+ * 一份正文缓存条目 → 页面要显示的字符串。
+ * 四种状态各有各的说法，**不许混成一句**：没取 / 取回来了 / 指纹对不上 / 取失败。
+ */
+export function bodyText(entry) {
+  if (!entry) return BODY_PLACEHOLDER;
+  if (entry.pending) return BODY_PLACEHOLDER;
+  // ⚠️ 指纹对不上时**绝不照常展示**——那等于替一份被篡改的内容背书。
+  if (entry.tamper) return "⚠️ 这份文件在落盘之后被改动过（指纹对不上），已拒绝展示。";
+  if (entry.error) return `⚠️ 读取失败：${entry.error}`;
+  return entry.text || "";
+}
+export function bodyUsable(entry) { return !!(entry && !entry.pending && !entry.tamper && !entry.error); }
+
+/**
+ * 快照 → 页面展示模型。**纯函数**：同样的输入必得同样的输出。
+ *
+ * @param {object} snapshot   §4 的快照，**原样**（不得改写它）
+ * @param {object} ctx
+ *   - `progress`: Map<vizTurnId, sidecar>
+ *   - `bodyCache`: Map<ref, entry>   ← 换一份就得到不同的模型，这正是它可测的原因
+ *   - `runGone`: boolean
+ *   - `vizDir`: string | null
+ *   - `now`: number（可注入，便于测试）
+ */
+export function adaptSnapshot(snapshot, ctx = {}) {
+  const { progress = new Map(), bodyCache = new Map(), runGone = false, vizDir = null, now = Date.now() } = ctx;
+  return (snapshot?.sessions || []).map(s => adaptSession(s, { progress, bodyCache, runGone, vizDir, now }));
+}
+
+function adaptSession(s, c) {
+  const eng = ENGINE[s.agent] || { name: s.agent || "未知", eb: "??" };
+  const kind = statusKind(s);
+  return {
+    id: s.sessionId,
+    alias: s.name || null,
+    engine: s.agent, engineName: eng.name, eb: eng.eb,
+    model: s.model || null,
+    effort: s.effort || null,
+    perm: permKind(s),
+    state: s.status, health: s.health,
+    // ⚠️ null 是**未知**，不是 0。显示成 0 会让人以为"很空闲、很安全"——是反的。
+    ctx: (s.contextUsage && Number.isFinite(s.contextUsage.tokens)) ? s.contextUsage.tokens : null,
+    cwd: s.cwd || "",
+    createdAt: hhmmss(s.createdAt, c.now),
+    lastActive: kind === "run" ? 0 : secsSince(s.updatedAt, c.now),
+    startupError: s.openFailed ? s.openFailed.error : null,
+    logFile: s.logFile || null,
+    turns: (s.turns || []).map(t => adaptTurn(t, c)),
+  };
+}
+
+function adaptTurn(t, c) {
+  // run gone 时把仍是 dispatched 的轮次**合成**为 abandoned（STATE.md §9）。
+  // 快照永远发不出终态——`run.status` 只有一档，终态是传输层的一帧。
+  const synthesized = c.runGone && t.state === "dispatched";
+  const running = t.state === "dispatched" && !synthesized;
+  const result = running ? "running" : (synthesized ? "abandoned" : t.outcome);
+  const body = running || synthesized ? "none" : t.bodyKind;
+
+  const inEntry = t.input.ref ? c.bodyCache.get(t.input.ref) : { text: "" };
+  const o = {
+    n: t.turnNo,
+    result, body,
+    from: hhmmss(t.dispatchedAt, c.now),
+    to: t.settledAt ? hhmmss(t.settledAt, c.now) : null,
+    dur: Math.round((t.durationMs || 0) / 1000),
+    elapsed: running ? secsSince(t.dispatchedAt, c.now) : 0,
+    unfetched: isUncollected(t) && !synthesized,
+    error: t.error || null,
+    vizTurnId: t.vizTurnId,
+    pending: t.input.ref ? !bodyUsable(inEntry) : false,
+    input: {
+      chars: t.input.chars || 0,
+      text: t.input.ref ? bodyText(inEntry) : "",
+      truncated: t.input.truncated
+        ? { orig: mb(t.input.originalBytes), saved: mb(t.input.bytes) } : null,
+    },
+  };
+
+  if (running) {
+    // §5 的四条前提：只有仍是 dispatched、且 sidecar 的 vizTurnId 对得上才合并。
+    const p = c.progress.get(t.vizTurnId);
+    const okp = p && p.vizTurnId === t.vizTurnId;
+    o.live = {
+      chars: okp ? (p.charCount || 0) : 0,
+      draft: (okp ? p.generationCount : t.generationCount) || 1,
+      preview: okp ? (p.tail || "") : "",
+      age: okp ? secsSince(p.updatedAt, c.now) : 0,
+    };
+  } else if (body !== "none") {
+    const outEntry = c.bodyCache.get(t.output.ref);
+    o.output = { chars: t.output.chars || 0, md: bodyText(outEntry) };
+    if (outEntry && outEntry.truncated) {
+      o.output.capped = {
+        shown: mb((o.output.md || "").length),
+        total: mb(outEntry.fullBytes),
+        path: (c.vizDir ? `${c.vizDir}\\` : "") + String(t.output.ref).replace(/\//g, "\\"),
+      };
+    }
+    if (!bodyUsable(outEntry)) o.pending = true;
+  } else {
+    o.output = { chars: 0, md: "" };
+  }
+  return o;
+}
+
+/** 这份快照要取哪些正文（页面据此发 `/file` 请求）。 */
+export function refsOf(snapshot) {
+  const out = [];
+  for (const s of snapshot?.sessions || []) {
+    for (const t of s.turns || []) {
+      if (t.input?.ref) out.push({ ref: t.input.ref, sha256: t.input.sha256 });
+      if (t.output?.ref) out.push({ ref: t.output.ref, sha256: t.output.sha256 });
+    }
+  }
+  return out;
+}
+
+// ── 快照 → 内部视图（左栏排序/筛选用） ──────────────────────────────────────
 
 /**
  * @param {object} snapshot  §4 的快照，**原样**（viewer 不得改写它）
