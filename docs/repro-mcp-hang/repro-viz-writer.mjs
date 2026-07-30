@@ -5,6 +5,7 @@
 //
 // 跑法:node docs/repro-mcp-hang/repro-viz-writer.mjs
 
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -1153,6 +1154,23 @@ const { checkVizDir: checkDirT } = await import(`file://${INVARIANTS}`);
       JSON.stringify({ o: t1.outcome, k: t1.bodyKind, s: t1.output.state }));
     ok("R-T4 两轮都被结算了(终态不能只收一半)",
       t1.state === "settled" && t2.state === "settled");
+    // ⚠️ **只断言 partial/ready/failed 这三个元数据是不够的。** 把交上来的正文换成任意
+    //    固定内容,照样能得到自洽的 sha、`partial+ready+failed`、零校验违规 —— 于是观测台
+    //    存的是伪造内容而这一段全绿。**存对了没存对,只能靠读文件逐字节对证。**
+    const refAbs = path.join(rec.dir, t2.output.ref.split("/").join(path.sep));
+    const saved = fs.readFileSync(refAbs);
+    ok("R-T4 ★ 落盘的就是崩溃前那一截,逐字节相等(不是任何自洽的替代品)",
+      saved.toString("utf8") === "崩之前它说到这儿",
+      JSON.stringify(saved.toString("utf8").slice(0, 60)));
+    ok("R-T4 指纹与字节数都对得上(残件也必须是可对证的残件)",
+      crypto.createHash("sha256").update(saved).digest("hex") === t2.output.sha256
+        && saved.length === t2.output.bytes,
+      JSON.stringify({ bytes: t2.output.bytes, file: saved.length }));
+    ok("R-T4 ★ 崩溃原因保留在轮次上(页面要能说出「为什么只有半截」)",
+      t2.error === "backend died" && t1.error === "backend died",
+      JSON.stringify({ e1: t1.error, e2: t2.error }));
+    ok("R-T4 没拿到正文的那一轮确实没有文件(ref 为 null,不许悬空)",
+      t1.output.ref === null, JSON.stringify(t1.output));
     const v = checkDirT(rec.dir);
     ok("R-T4 ★ 终态目录通过独立校验器", v.violations.length === 0, JSON.stringify(v.violations));
     rec.cleanup();
@@ -1188,6 +1206,72 @@ const { checkVizDir: checkDirT } = await import(`file://${INVARIANTS}`);
       t.outcome === "aborted" && t.bodyKind === "partial",
       JSON.stringify({ o: t.outcome, k: t.bodyKind }));
     ok("R-T6 正文本身不丢(降的是标签,不是内容)", t.output.state === "ready");
+    rec.cleanup();
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+sect("S1-U 复审第 3 轮:两个说不清的轮次 + 后端进程死掉");
+
+// 这一节钉住的路径:同一个 OMP 会话连续两次 ACK 超时(留下两个 `ambiguous`),
+// 紧接着后端进程退出。仅凭 sessionId 无法知道哪个终结事件属于哪个 prompt,
+// 所以两个都必须转 `unresolved` 并点亮 degraded。
+//
+// **漏掉这一步的后果不是"少一条数据"**:`ambiguous` 是不对外公开的内部态,
+// 于是页面上出现一个失败会话、里面一个轮次都没有,两次委托凭空消失,
+// 而 degraded 不亮 —— 页面连「本次记录不完整」都不会说。**丢数据还骗人。**
+// 原先这段逻辑在三处各写一遍,`markSessionTerminal` 那处整段漏掉了。
+{
+  await withTmp(async () => {
+    const rec = createVizRun({ bridgeVersion: "t", env: on() });
+    rec.sessionOpened({ sessionId: "s1", agent: "omp", access: "read", cwd: "D:\\repo" });
+
+    // 两次 ACK 超时 ⇒ 两个 ambiguous(桥侧对应 `ambiguous()`,证据不足以说"已派发")
+    const a1 = rec.attempt({ sessionId: "s1", input: "第一问" });
+    rec.ambiguous(a1, "ack_timeout");
+    const a2 = rec.attempt({ sessionId: "s1", input: "第二问" });
+    rec.ambiguous(a2, "ack_timeout");
+
+    rec.markSessionTerminal("s1", { outcome: "failed", error: "OMP RPC exited." });
+    await settleIo(rec);
+
+    const snap = latest(rec.dir);
+    const sess = snap.sessions.find(s => s.sessionId === "s1");
+    // ⚠️ 「有没有留在账上」**不能靠 `turns` 为空来判**:`ambiguous` 本来就不对外公开,
+    //    所以那条断言修没修都是绿的(我第一版就这么写的,变异测试当场证伪)。
+    //    真判据是 ledger 的 attempts 表里还有没有它们 —— 那正是三处写法不一致的地方:
+    //    只改状态不 delete,表会随长时间运行一直涨、过期 id 还能解析。
+    ok("R-U1 ★ 两个说不清的 attempt 真的从账上销掉了(不是只改了个状态)",
+      !rec._ledger.attempts.has(a1) && !rec._ledger.attempts.has(a2),
+      JSON.stringify({ a1: rec._ledger.attempts.has(a1), a2: rec._ledger.attempts.has(a2) }));
+    ok("R-U1 它们也没作为轮次公开(内部态不该露出去)",
+      (sess.turns || []).length === 0, JSON.stringify(sess.turns));
+    ok("R-U1 ★ 页面必须被告知「本次记录不完整」—— degraded 亮 + 原因码在册",
+      snap.run.degraded === true && (snap.run.recordingErrors || []).includes("write_failed"),
+      JSON.stringify({ degraded: snap.run.degraded, errs: snap.run.recordingErrors }));
+    const v = checkDirT(rec.dir);
+    ok("R-U1 这个形态也通过独立校验器", v.violations.length === 0, JSON.stringify(v.violations));
+    rec.cleanup();
+  });
+
+  // 反向:**只有一个** ambiguous 时不许一起销毁 —— 那一个是能被认领的。
+  // 没有这一条,上面那条可以靠"见到 ambiguous 就全销毁"作弊通过。
+  await withTmp(async () => {
+    const rec = createVizRun({ bridgeVersion: "t", env: on() });
+    rec.sessionOpened({ sessionId: "s1", agent: "omp", access: "read", cwd: "D:\\repo" });
+    const a = rec.attempt({ sessionId: "s1", input: "唯一一问" });
+    rec.ambiguous(a, "ack_timeout");
+    rec.markSessionTerminal("s1", { outcome: "failed", error: "OMP RPC exited." });
+    await settleIo(rec);
+
+    const snap = latest(rec.dir);
+    const t = turnsOf(snap, "s1")[0];
+    ok("R-U2 ★ 单个 ambiguous 被认领成一个真实轮次,而不是被一起销毁",
+      !!t && t.boundary === "terminal_adopted", JSON.stringify({ n: turnsOf(snap, "s1").length, b: t?.boundary }));
+    ok("R-U2 它按后端死亡如实收成 failed", t?.outcome === "failed" && t?.state === "settled",
+      JSON.stringify({ o: t?.outcome, s: t?.state }));
+    ok("R-U2 这一条路上 degraded 不该亮(没有任何说不清的东西)",
+      snap.run.degraded === false, JSON.stringify({ degraded: snap.run.degraded }));
     rec.cleanup();
   });
 }

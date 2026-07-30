@@ -43,12 +43,26 @@ fs.mkdirSync(STATE, { recursive: true });
 fs.mkdirSync(TMP, { recursive: true });
 
 let srv = null, viewer = null;
+let KEEP_BOX_ON_FAIL = false;
+
+// 这份 e2e 一共该跑多少条断言。**写死它,不是形式主义。**
+// 少跑一条最常见的形态是「前提没成立 ⇒ 整段被 `if` 跳过」——那时 fail 仍是 0、
+// 退出码仍是 0,一条本该守住的判据静静消失,而看日志的人只会看到一片绿。
+// 这个数就是那种消失的唯一报警器;有意增删断言时同步改它。
+const EXPECTED_ASSERTIONS = 28;
+
 function finish(code) {
   for (const p of [viewer, srv]) { try { p?.kill("SIGKILL"); } catch {} }
+  const total = pass + fail;
+  if (total !== EXPECTED_ASSERTIONS) {
+    fail += 1;
+    console.log(`\n  [FAIL] 断言条数 ${total} ≠ 预期 ${EXPECTED_ASSERTIONS} —— 有断言被跳过了(前提不成立时被 if 吞掉),别把这当成绿`);
+  }
   console.log(`\n========================================================`);
   console.log(`  e2e-viz: ${pass} passed, ${fail} failed`);
   console.log(`========================================================\n`);
-  try { fs.rmSync(BOX, { recursive: true, force: true }); } catch {}
+  if (fail && KEEP_BOX_ON_FAIL) console.log(`  失败现场已保留(含桥日志):${BOX}\n`);
+  else { try { fs.rmSync(BOX, { recursive: true, force: true }); } catch {} }
   process.exit(code ?? (fail ? 1 : 0));
 }
 
@@ -132,40 +146,68 @@ ok("E1 真后端返回了正文", typeof text === "string" && text.length > 0, S
 //    两者必须当场分开:混在一起,一次欠费会被读成"观测台坏了"而去改代码;
 //    反过来,一个真 bug 也可能被当成"今天额度不够"放过去。判据是后端自己报的错文。
 //    命中环境类中断 ⇒ 用一个专门的退出码停下,并说清"恢复后重跑即可",**不改任何断言的判定**。
+//
+// ⚠️ **错文得从真有它的地方取。** 第一版从 `wait` 的返回里读 `lastTurnError` / `error` ——
+//    那两个字段根本不存在:`wait` 故意不带 `session` 摘要(见 waitSessions 的 `extra` 注释,
+//    是为了上下文卫生),于是正则永远只看得到 `status`,整个分流是**死代码**。
+//    (它不会把产品缺陷误放成环境事件 —— 因为它什么也看不到。但那不叫安全,叫没实现。)
+//    真有错文的地方有两处,都要读:`status` 工具返回的 `session.lastError`(桥的权威字段),
+//    以及观测台自己记下的 `turn.error`(结算时从后端异常抄下来的原话)。
 const ENV_INTERRUPT = /credit|quota|rate.?limit|usage.?limit|billing|insufficient|payment|too many requests|\b402\b|\b429\b|overloaded|capacity/i;
-const backendErr = [res0?.lastTurnError, res0?.error, res0?.status].filter(Boolean).join(" | ");
-if (res0 && res0.status !== "idle" && ENV_INTERRUPT.test(backendErr)) {
-  console.log(`\n  [HALT] 后端被外部原因打断(账号/额度/限流),不是产品缺陷:${backendErr}`);
-  console.log(`  [HALT] 恢复后重跑 node docs/repro-mcp-hang/e2e-viz.mjs 即可;本次不判定产品。`);
-  finish(3);
-}
+const st0 = await call("agent_bridge_status", { session_id: sid });
+const bridgeLastError = st0?.session?.lastError ?? st0?.lastError ?? null;
 await sleep(1200);   // 让 writer 的合并槽落盘
 
 sect("E2 落盘的字节 = 后端真给的字节");
 
 const snap = snapshot(dir);
 const turn = snap?.sessions?.find(s => s.sessionId === sid)?.turns?.[0];
-// ⚠️ 详情里必须带上 `error` 和桥自己那份状态。**一条只说"不等于 completed"的红断言,
+const turnOk = turn?.state === "settled" && turn?.outcome === "completed";
+
+// 环境/产品的分流放在这里,因为到这一步两份错文都到手了(桥的 lastError + 观测记的 turn.error)。
+const backendErr = [bridgeLastError, turn?.error, res0?.status].filter(Boolean).join(" | ");
+if (!turnOk && ENV_INTERRUPT.test(backendErr)) {
+  console.log(`\n  [HALT] 后端被外部原因打断(账号/额度/限流),不是产品缺陷:${backendErr}`);
+  console.log(`  [HALT] 恢复后重跑 node docs/repro-mcp-hang/e2e-viz.mjs 即可;本次不判定产品。`);
+  finish(3);
+}
+
+// ⚠️ 详情里必须带上 `error` 和桥自己那份 lastError。**一条只说"不等于 completed"的红断言,
 //    等于让下一个人从零开始查** —— 这一条第一次变红时就是这样:只知道 outcome=failed,
 //    既不知道后端报了什么,也无从判断是产品坏了还是账号断了。
-ok("E2 轮次已结算", turn?.state === "settled" && turn?.outcome === "completed",
-  JSON.stringify({
-    s: turn?.state, o: turn?.outcome, err: turn?.error,
-    bridgeStatus: res0?.status, bridgeErr: res0?.lastTurnError ?? res0?.error ?? null,
-  }));
-// 这一条红了就把桥自己那份日志的尾巴打出来 —— **后端的原话就在里面**。
-// 真后端会间歇性给出非 success 的收场(`error_during_execution` 之类),
-// 而"重跑就绿了"不是结论。要么当场定性成环境事件、要么定性成产品缺陷,
-// 靠的就是这段原文;拿不到原文,下一次出现还是只能耸肩。
-if (!(turn?.state === "settled" && turn?.outcome === "completed")) {
+ok("E2 轮次已结算", turnOk,
+  JSON.stringify({ s: turn?.state, o: turn?.outcome, err: turn?.error, bridgeLastError }));
+// 这一条红了就把桥自己那份日志里的**终态/错误行**捞出来 —— 后端的原话就在里面。
+// ⚠️ 不能只 tail 尾部若干行、再按字符截断:claude 的终态是一条很长的 JSON,
+//    错误字段可能落在截断之后;错误行后面还可能跟着若干行别的东西把它顶出窗口。
+//    所以按内容捞(type=result / 带 error 字段的行),并**保留失败现场目录**——
+//    删掉现场等于把唯一的原件销毁,下一次出现还是只能耸肩。
+if (!turnOk) {
   const lf = snap?.sessions?.find(s => s.sessionId === sid)?.logFile;
   console.log(`  [DIAG] logFile=${lf}`);
+  KEEP_BOX_ON_FAIL = true;
   try {
     const lines = fs.readFileSync(lf, "utf8").split(/\r?\n/).filter(Boolean);
-    for (const l of lines.slice(-12)) console.log(`  [DIAG] ${l.slice(0, 600)}`);
+    const interesting = lines.filter(l => /"type"\s*:\s*"result"|"subtype"|is_error|error/i.test(l));
+    const picked = (interesting.length ? interesting : lines).slice(-6);
+    for (const l of picked) console.log(`  [DIAG] ${l}`);   // 不截断:原件不许再被裁一次
+    if (!interesting.length) console.log(`  [DIAG] (日志里没有 result/error 行,以上是尾部 6 行)`);
   } catch (e) { console.log(`  [DIAG] 读不到日志:${e.message}`); }
 }
-ok("E2 边界档与后端相符", typeof turn?.boundary === "string" && turn.boundary.length > 0, String(turn?.boundary));
+// ⚠️ 原先这条只检查"是个非空字符串",却叫「与后端相符」——**名不副实的断言比没有更坏**:
+//    把 claude 的 boundary 换成任意另一个合法枚举它照样绿(独立校验器也只管枚举合法)。
+//    证据档是**按后端分**的(STATE.md §4.6),所以期望值也必须按后端写死。
+//    这张表与 repro-viz-bridge 的 V6~V9 是同一份口径,改一处就得改另一处。
+const EXPECTED_BOUNDARY = {
+  omp: ["rpc_ack"],
+  codex: ["turn_start_ack", "turn_started_notification"],
+  claude: ["pipe_enqueued"],
+  cursor: ["os_spawned"],
+  kimi: ["os_spawned"],
+};
+const wantBoundary = EXPECTED_BOUNDARY[AGENT] ?? [];
+ok(`E2 ★ 边界档是 ${AGENT} 该有的那一档(${wantBoundary.join(" / ") || "未登记的后端"})`,
+  wantBoundary.includes(turn?.boundary), `实得 ${String(turn?.boundary)}`);
 
 const outAbs = turn?.output?.ref ? path.join(dir, turn.output.ref.split("/").join(path.sep)) : null;
 const outBuf = outAbs && fs.existsSync(outAbs) ? fs.readFileSync(outAbs) : null;
@@ -183,11 +225,17 @@ if (outBuf) {
     /[^\x00-\x7F]/.test(outBuf.toString("utf8")), outBuf.toString("utf8").slice(0, 60));
 }
 
+// ⚠️ **这三条不能包在「ref 存在才考」的 if 里。** 输入没落盘是一个**合法**快照形态
+//    (`missing` + `write_failed` + degraded),独立校验器会照样放行 —— 于是把输入写坏之后,
+//    这段整体被跳过、fail 仍是 0、退出码仍是 0,而观测台其实已经丢了 prompt。
+//    「问题原文丢了」正是这块表最不能出的错,判据必须无条件执行。
 const inAbs = turn?.input?.ref ? path.join(dir, turn.input.ref.split("/").join(path.sep)) : null;
-if (inAbs && fs.existsSync(inAbs)) {
-  ok("E2 ★ 输入存的是**原始 message**(不是拼好前缀的 argv)",
-    fs.readFileSync(inAbs, "utf8") === ASK, JSON.stringify(fs.readFileSync(inAbs, "utf8").slice(0, 100)));
-}
+ok("E2 ★ 输入必须落盘(prompt 是这块表最不能丢的东西)",
+  turn?.input?.state === "ready" && !!inAbs, JSON.stringify(turn?.input));
+ok("E2 输入文件真的在盘上(ref 不许悬空)", !!inAbs && fs.existsSync(inAbs), String(inAbs));
+ok("E2 ★ 输入存的是**原始 message**(不是拼好前缀的 argv)",
+  (() => { try { return fs.readFileSync(inAbs, "utf8") === ASK; } catch { return false; } })(),
+  (() => { try { return JSON.stringify(fs.readFileSync(inAbs, "utf8").slice(0, 100)); } catch (e) { return e.message; } })());
 ok("E2 collected 记下了这次交付", turn?.collected?.via === "wait", JSON.stringify(turn?.collected));
 
 sect("E3 独立校验器判真数据");

@@ -1084,6 +1084,62 @@ async function runSlotRobustnessTests() {
       await stopServe(service.child);
     }
   });
+
+  // ③ **run 真的没了 ⇒ 必须发 run-gone。** 原先只考了它的反面(「暂时读不到」不许冒充 run-gone),
+  //    正面从来没人考 —— 于是把 serve 里那条广播删掉,没有任何断言会红,
+  //    而页面会在 run 结束之后一直挂着「仍在运行」的旧态,等一个永远不会来的下一帧。
+  //    触发方式就是真实场景本身:桥干净退出时会把整个目录删掉(里面是全量委托明文)。
+  await withTempVizDir(async (vizDir) => {
+    await createTransportFixture(vizDir);
+    const service = await startServe(vizDir);
+    try {
+      // 判别式必须在**同一条连接**上做:新连接靠 replayFor 补发,测不出"当场广播"这件事。
+      const watching = collectSse(service.baseUrl, 2600);
+      await delay(600);
+      await rm(vizDir, { recursive: true, force: true });   // ← run 没了
+      const seen = await watching;
+      const controls = seen.frames.filter((f) => f.event === 'control');
+      assertCase(
+        '★ 目录消失(桥干净退出)⇒ 向已连接的客户端广播 run-gone',
+        controls.some((f) => f.data?.kind === 'run-gone'),
+        seen.frames.map((f) => `${f.event}:${f.data?.generation ?? f.data?.kind ?? ''}`).join(','),
+      );
+      // 这两件事不是一回事:run-gone 是终态(记录没了),history-read-failure 是可重试的读取故障。
+      // 反过来发就会让页面把一份还在的记录当成已清除。
+      assertCase(
+        'run 没了的时候不许说成「暂时读不到」',
+        !controls.some((f) => f.data?.kind === 'history-read-failure'),
+        controls.map((f) => JSON.stringify(f.data)).join(','),
+      );
+    } finally {
+      await stopServe(service.child);
+    }
+  });
+
+
+  // ④ **悬空 ref:快照说有正文,盘上却没有那个文件。**
+  //    这是 §4.9 蕴含式 4(ref 非 null ⟹ 该文件存在且可读)的负例,而它**只在目录层可观察** ——
+  //    冻结样例走的是纯对象校验,`materializeRefs` 还会自动把引用的文件都造出来,
+  //    所以那条规则从来没被任何用例真正考过:把 `checkReadableRef` 整段删掉,全绿。
+  //    这条规则守的是页面上最难查的一种错:卡片说「有产出、这是它的指纹」,点开却什么都没有。
+  await withTempVizDir(async (vizDir) => {
+    const fixture = await createTransportFixture(vizDir);
+    const before = checkVizDir(vizDir);
+    assertCase(
+      '悬空 ref 用例的前提:动手之前这个目录是干净的',
+      before.violations.length === 0,
+      JSON.stringify(before.violations),
+    );
+    // 只删文件,快照一个字不改 —— 于是 ref/sha256/bytes 全都还在,唯一的差别是文件没了。
+    await rm(fixture.outputPath, { force: true });
+    const after = checkVizDir(vizDir);
+    assertCase(
+      '★ 快照说有正文而文件不在 ⇒ 独立校验器必须判违规(不许有悬空 ref)',
+      after.violations.some((v) => /不存在或不可读/.test(v)),
+      JSON.stringify(after.violations),
+    );
+  });
+
 }
 
 // ── 第五组：适配层的正文缓存（这一组是被一个真 bug 逼出来的） ─────────────────

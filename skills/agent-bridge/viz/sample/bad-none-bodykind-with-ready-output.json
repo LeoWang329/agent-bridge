@@ -1,0 +1,94 @@
+{
+  "schemaVersion": 1,
+  "runId": "mcp-3f9a2c7e",
+  "generation": 23,
+  "updatedAt": "2026-07-29T02:18:22.415Z",
+  "run": {
+    "pid": 1234,
+    "bridgeVersion": "0.10.0",
+    "startedAt": "2026-07-29T02:11:04.221Z",
+    "status": "running",
+    "degraded": false,
+    "recordingErrors": []
+  },
+  "sessions": [
+    {
+      "sessionId": "omp-p2k9d4-c17f83",
+      "name": null,
+      "agent": "omp",
+      "model": "deepseek-v3.2-exp",
+      "effort": "medium",
+      "access": "write",
+      "cwd": "D:\\cc\\agent-bridge",
+      "returnMode": "full",
+      "logFile": "C:\\Temp\\ab\\omp-p2k9d4-c17f83.log",
+      "appendSystemPrompt": {
+        "file": "D:\\cc\\agent-bridge\\roles\\architect.md",
+        "bytes": 3096,
+        "injectionMode": "system"
+      },
+      "backendPid": 9032,
+      "status": "idle",
+      "health": "healthy",
+      "isStreaming": false,
+      "contextUsage": {
+        "tokens": 208114,
+        "live": true,
+        "isCompacting": true,
+        "autoCompactionEnabled": false
+      },
+      "createdAt": "2026-07-29T02:15:01.774Z",
+      "updatedAt": "2026-07-29T02:18:22.390Z",
+      "openFailed": null,
+      "closed": null,
+      "turns": [
+        {
+          "turnNo": 1,
+          "vizTurnId": "vt-a17c3e92",
+          "backendTurnId": "omp-turn-7f31c9a0",
+          "backendTurnCount": 1,
+          "state": "settled",
+          "boundary": "rpc_ack",
+          "attemptedAt": "2026-07-29T02:15:02.180Z",
+          "dispatchedAt": "2026-07-29T02:15:02.441Z",
+          "settledAt": "2026-07-29T02:18:22.109Z",
+          "firstBackendEventAt": "2026-07-29T02:15:03.006Z",
+          "source": "send_message",
+          "blocking": false,
+          "hasSchema": true,
+          "input": {
+            "state": "ready",
+            "ref": "turns/omp-p2k9d4-c17f83/t1.in.md",
+            "sha256": "a17c3e924bd085f16e29c7b4038da51e9f4b6c27d1e80a5372bc9f46e0538ad1",
+            "chars": 986,
+            "bytes": 2704,
+            "truncated": false,
+            "originalBytes": 2704,
+            "error": null
+          },
+          "output": {
+            "state": "ready",
+            "ref": "turns/omp-p2k9d4-c17f83/t1.out.md",
+            "sha256": "c48f0b172e6a9d35801fc7b6d94e2a085b7c31ef60a2d894137be5c09ad4f612",
+            "chars": 2143,
+            "bytes": 6218,
+            "previewBytes": null,
+            "previewSha256": null,
+            "error": null
+          },
+          "outcome": "completed",
+          "bodyKind": "none",
+          "generationCount": 3,
+          "collected": {
+            "at": "2026-07-29T02:18:22.377Z",
+            "via": "result",
+            "returnedChars": 2143,
+            "truncated": false
+          },
+          "error": "调用方在 02:18:21 发起 abort_turn；OMP 回收已产出的 partial transcript（2143 code unit）后终止本轮，结论不完整。",
+          "durationMs": 199668
+        }
+      ]
+    }
+  ]
+}

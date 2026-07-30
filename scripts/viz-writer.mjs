@@ -830,17 +830,34 @@ class VizRecorder {
    *    这个 `agent_end` 属于哪个 prompt。一律转 `unresolved` + degraded，
    *    **不许永远挂在 ledger 上**。
    */
+  /**
+   * 同一 session 有多个 `ambiguous` 时的**唯一**处置:全转 `unresolved` + 点亮 degraded。
+   *
+   * ⚠️ 抽出来不是为了少写几行。这段逻辑原先在三个地方各写一遍(`adoptByTerminal`、
+   *    `finalizeSession`、`markSessionTerminal`),**第三处直接漏了整段** ——
+   *    于是「连续两次 ACK 超时后后端进程退出」这条路上,两个 attempt 既不被认领、
+   *    也不被销毁、也不点 degraded。而 `ambiguous` 是不对外公开的内部态,
+   *    结果就是**页面上出现一个失败会话、里面一个轮次都没有**,两次委托凭空消失,
+   *    且页面连「本次记录不完整」都不会说。**丢数据还骗人,是这套东西最不该有的收场。**
+   *    另外那两处写法也不一致(一处从 attempts 表里 delete、一处只改状态),
+   *    只改状态会让 ledger 的 attempts 表随长时间运行一直涨、且过期 id 仍能解析。
+   *    现在只有一个地方可漏。
+   */
+  #dissolveAmbiguous(s) {
+    if (!s) return;
+    for (const a of s.attempts) {
+      if (a.state === "ambiguous") { a.state = "unresolved"; this.#ledger.attempts.delete(a.id); }
+    }
+    s.attempts = s.attempts.filter(a => a.state !== "unresolved");
+    this.#noteRecordingError("write_failed");   // 记录不完整:有轮次永远说不清
+    this.#markDirty();
+  }
+
   adoptByTerminal(sessionId) {
     return this.#safe(() => {
       const { attempt, tooMany } = this.#ledger.claimableAmbiguous(sessionId);
       if (tooMany) {
-        const s = this.#ledger.session(sessionId);
-        for (const a of s.attempts) {
-          if (a.state === "ambiguous") { a.state = "unresolved"; this.#ledger.attempts.delete(a.id); }
-        }
-        s.attempts = s.attempts.filter(a => a.state !== "unresolved");
-        this.#noteRecordingError("write_failed");   // 记录不完整:有轮次永远说不清
-        this.#markDirty();
+        this.#dissolveAmbiguous(this.#ledger.session(sessionId));
         return null;
       }
       if (!attempt) return null;
@@ -919,8 +936,12 @@ class VizRecorder {
       const s = this.#ledger.session(sessionId);
       if (!s) return;
       this.rpcDrainSession(sessionId, error || outcome);
-      const { attempt: amb } = this.#ledger.claimableAmbiguous(sessionId);
+      // ⚠️ `tooMany` 必须一起处理,不能只取 `attempt`。漏掉它,「连续两次 ACK 超时
+      //    → 后端进程退出」这条路上的两个 attempt 会永远挂在 ledger 上、
+      //    一个都不出现在页面上、degraded 也不亮(见 `#dissolveAmbiguous` 的说明)。
+      const { attempt: amb, tooMany } = this.#ledger.claimableAmbiguous(sessionId);
       if (amb) this.dispatch(amb.id, { boundary: "terminal_adopted" });
+      if (tooMany) this.#dissolveAmbiguous(s);
       // ⚠️ **正文只归当前那一轮**（`activeAttemptId`）。后端崩掉时调用方手上那截流式正文
       //    属于正在跑的那个 attempt；一视同仁地写给每个 dispatched 轮次，就是把一轮的产出
       //    复制到另一轮头上——**比丢掉更糟**：丢掉是缺数据，复制是假数据。
@@ -1254,11 +1275,7 @@ class VizRecorder {
       // 单个可认领的 ambiguous：先 adopt 再收成 abandoned。
       const { attempt: amb, tooMany } = this.#ledger.claimableAmbiguous(sessionId);
       if (amb) this.dispatch(amb.id, { boundary: "terminal_adopted" });
-      if (tooMany) {
-        for (const a of s.attempts) if (a.state === "ambiguous") a.state = "unresolved";
-        s.attempts = s.attempts.filter(a => a.state !== "unresolved");
-        this.#noteRecordingError("write_failed");
-      }
+      if (tooMany) this.#dissolveAmbiguous(s);
       for (const a of s.turns) {
         // `settling` 的复用原 settlement Promise，不重复收口。
         if (a.state === "dispatched") this.settleOnce(a.id, { outcome: "abandoned", body: null, bodyKind: "none" });

@@ -118,7 +118,7 @@ process.stdin.on("data", d => {
           ? slowsettleStreaming
           : (MODE === "multiturn" || MODE === "multiturn-fast")
           ? multiturnStreaming
-          : !(MODE === "okturn" || MODE === "okturn-exit" || MODE === "errturn" || MODE === "echoturn" || MODE === "reaskturn" || WRITE_MODES.includes(MODE) || MODE === "ctxturn" || MODE === "logstress" || MODE === "badline" || MODE === "toolturns" || MODE === "agentenderr");
+          : !(MODE === "okturn" || MODE === "okturn-exit" || MODE === "errturn" || MODE === "echoturn" || MODE === "reaskturn" || WRITE_MODES.includes(MODE) || MODE === "ctxturn" || MODE === "logstress" || MODE === "badline" || MODE === "toolturns" || MODE === "agentenderr" || MODE === "hugeturn");
         const data = { isStreaming, queuedMessageCount: 0, sessionId: "fake", messageCount: 1 };
         // ctx* modes: real omp reports current-context occupancy in get_state.data (contextUsage sub-object
         // + isCompacting/autoCompactionEnabled siblings — see the probe dump). The bridge normalizes this to
@@ -263,6 +263,26 @@ process.stdin.on("data", d => {
             say({ type: "turn_end", message: { stopReason: "error", errorMessage: "fake-omp: simulated turn error" } });
             say({ type: "agent_end" });
           }, 60);
+        } else if (MODE === "hugeturn") {
+          // 一轮吐出**超过桥的 `MAX_TEXT`(40 万字符)**的正文。
+          // 用来考「保尾截断后的残件不得自称 final」:桥的 `clampText` 砍的是**开头**,
+          // 所以 HEADMARK 必须消失、TAILMARK 必须在、长度恰好等于 MAX_TEXT。
+          // 分段吐是故意的:真 OMP 就是逐 delta 流,一次性吐完考不到累加路径。
+          say({ type: "agent_start" });
+          const HUGE_TOTAL = 410000;
+          const HEAD = "HEADMARK", TAIL = "TAILMARK";
+          const filler = "x".repeat(50000);
+          say({ type: "message_update", message: { type: "text_delta", delta: HEAD } });
+          let emitted = HEAD.length;
+          while (emitted + filler.length + TAIL.length <= HUGE_TOTAL) {
+            say({ type: "message_update", message: { type: "text_delta", delta: filler } });
+            emitted += filler.length;
+          }
+          const pad = HUGE_TOTAL - emitted - TAIL.length;
+          if (pad > 0) say({ type: "message_update", message: { type: "text_delta", delta: "y".repeat(pad) } });
+          say({ type: "message_update", message: { type: "text_delta", delta: TAIL } });
+          say({ type: "turn_end" });
+          say({ type: "agent_end" });
         } else if (MODE === "partialslow") {
           // 中途**已经有部分文本**的慢 turn。slowturn 在终态之前一个 delta 都不吐,mid-result 的
           // textRef 会是 null,考不到"running 时 textRef 指向的是片段"这件事。

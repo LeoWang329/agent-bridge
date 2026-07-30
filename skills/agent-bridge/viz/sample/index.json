@@ -150,6 +150,36 @@
       "why": "钉 §4.1 封闭枚举：recordingErrors 只允许 queue_full / queue_item_too_large / write_failed / snapshot_write_failed。混进自创的 \"disk_full\" 会让页面的原因码→文案映射落空，且封闭枚举一旦被当成开放集合，去重与 16 条上限的语义也随之松掉。本轮真实的观测失败（write_failed）与三处连带都已正确写好，定位点唯一。",
       "expectValid": false,
       "violates": "§4.1：recordingErrors 是封闭枚举，\"disk_full\" 不在四个原因码之内"
+    },
+    {
+      "name": "aborted-none-abort-before-any-text",
+      "why": "钉 §4.9 矩阵 aborted×none ✅ —— 一次「还没吐出任何字就被打断」的轮次:调用方 abort 得早,后端一个 token 都没产出。此时 output 必须是 missing + ref/sha 全 null,而 error 仍要说清是被谁打断的;不许为了凑出正文而写空文件(空文件会让页面显示「有产出、内容为空」,那是另一件事)。",
+      "expectValid": true,
+      "violates": null
+    },
+    {
+      "name": "abandoned-partial-closed-mid-stream",
+      "why": "钉 §4.9 矩阵 abandoned×partial ✅ —— 会话在轮次流到一半时被关掉(close_session),已经写出来的那截保留、只能标 partial。abandoned 与 aborted 的区别是「谁结束的」:前者是会话被关、这一轮从中间截断,后者是这一轮被显式打断;两者都不配 final。同时钉 closed 对象非空这条路径(桥主动关 ⇒ 产出随之销毁,所以 collected 必须是 null)。",
+      "expectValid": true,
+      "violates": null
+    },
+    {
+      "name": "bad-aborted-with-final-body",
+      "why": "钉 §4.9 矩阵的 ❌ 格:aborted 永远不能配 final。**这一格原先没有任何样例** —— 从校验器的禁止集合里单独删掉 aborted,没有一条样例会红,而它对应的真实事故是「用户中断的一轮被标成最终答复」(第 2 轮复审在四个 #settleTurn 上抓到过这个形状)。",
+      "expectValid": false,
+      "violates": "§4.9 outcome×bodyKind:aborted × final"
+    },
+    {
+      "name": "bad-abandoned-with-final-body",
+      "why": "钉 §4.9 矩阵的 ❌ 格:abandoned 永远不能配 final。同样原先无样例覆盖。真实事故形状是「会话被关时把半截产出收成 final」——`finalizeSession` 就在这条路上。",
+      "expectValid": false,
+      "violates": "§4.9 outcome×bodyKind:abandoned × final"
+    },
+    {
+      "name": "bad-none-bodykind-with-ready-output",
+      "why": "钉 §4.9 蕴含式 2 的**反向**:bodyKind=none ⟺ output.state=missing 且 ref=null。原先只有正向负例(final 配 missing),反向这半边没人守 —— 于是「明明落了盘却标成没有正文」能过检,页面会藏起一份已经存在的产出。",
+      "expectValid": false,
+      "violates": "§4.9 蕴含式 2:bodyKind=none 却 output.state=ready 且 ref 非空"
     }
   ]
 }

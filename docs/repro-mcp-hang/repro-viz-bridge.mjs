@@ -238,7 +238,7 @@ ok("V4 ★ 正常退出把整个 viz 目录删掉(里面是全量委托明文)",
 // 通用台架:起一个独立的桥进程(自带 TMPDIR/STATE 隔离)、开一个会话、跑一轮、把
 // 快照交回来。V5~V9 五段各要一个不同后端的真桥进程,**照抄五遍 MCP 客户端就等于
 // 维护一张会漏的清单**——本仓在"每处都记得改"上已经栽过好几次,不再重来一次。
-async function bridgeRun({ tag, env, agent, openArgs = {}, message = "问一句", waitMs = 25000 }) {
+async function bridgeRun({ tag, env, agent, openArgs = {}, message = "问一句", waitMs = 25000, abortAfterMs = null }) {
   const tmp = path.join(BOX, `tmp-${tag}`);
   const state = path.join(BOX, `state-${tag}`);
   fs.mkdirSync(tmp, { recursive: true });
@@ -311,6 +311,14 @@ async function bridgeRun({ tag, env, agent, openArgs = {}, message = "问一句"
   if (!rsid) { await sleep(400); return { dir: rdir, sid: null, openError, call: rcall, pick, stop, ...pick() }; }
 
   await rcall("agent_bridge_send_message", { session_id: rsid, message });
+  // `abortAfterMs`:不等它跑完,过一会儿就打断 —— 用来考「被打断的一轮怎么记」。
+  // 这条路上桥对外报的是 aborted,所以观测台也必须记 aborted,不能记 completed。
+  if (abortAfterMs != null) {
+    await sleep(abortAfterMs);
+    await rcall("agent_bridge_abort", { session_id: rsid }, 20000);
+    await sleep(1200);   // 等 abort 的收场事件走完 + writer 落盘
+    return { dir: rdir, sid: rsid, openError: null, call: rcall, pick, stop, ...pick() };
+  }
   await rcall("agent_bridge_wait", { session_ids: [rsid], mode: "all", timeout_ms: waitMs });
   await sleep(600);
   return { dir: rdir, sid: rsid, openError: null, call: rcall, pick, stop, ...pick() };
@@ -478,6 +486,115 @@ class KimiStub {
       await r.stop();
     }
   }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+sect("V10 被打断的一轮:桥报 aborted,观测台不许记成 completed");
+
+// ⚠️ 这一段补的是第 2 轮那个修复**自己没有桥级测试**的缺口。
+//    四个 `#settleTurn` 现在按 `status` 优先映射 outcome —— 但 V6~V9 全是成功轮、
+//    真 e2e 也不 abort,于是把那四处退回 `err ? "failed" : "completed"`,所有测试仍然全绿,
+//    而用户中断会重新被记成 `completed + final`(「这是最终答复」)。**改对了却没人守着,等于没改。**
+//    用户主动 abort 走的是 `#settleTurn(null, "aborted")` —— err 为空,只看 err 必然记错。
+if (process.platform !== "win32") {
+  console.log("  [SKIP] V10 用 cursor 假后端(Windows-only),本平台跳过");
+} else {
+  const root = path.join(BOX, "cursor-install-abort");
+  const ver = path.join(root, "versions", "2026.07.09-deadbeef");
+  fs.mkdirSync(ver, { recursive: true });
+  const nodeTarget = path.join(ver, "node.exe");
+  try { fs.linkSync(process.execPath, nodeTarget); } catch { fs.copyFileSync(process.execPath, nodeTarget); }
+  fs.copyFileSync(path.join(HERE, "fake-cursor-index.js"), path.join(ver, "index.js"));
+
+  // `abort` 模式:先吐一段 assistant 正文,然后挂住不给 result、不退出 ⇒ 必须靠 abort 树杀。
+  // 于是这一轮**有正文**,正好考「aborted × partial」这一格(有正文时不许是 final,也不许是 none)。
+  const r = await bridgeRun({
+    tag: "cursor-abort", agent: "cursor",
+    env: { CURSOR_AGENT_BIN: root, FAKE_CURSOR_MODE: "abort" },
+    abortAfterMs: 2500,
+  });
+  ok("V10 cursor 会话开起来了", !!r.sid, String(r.openError).slice(0, 200));
+  ok("V10 ★ 被打断的一轮 outcome=aborted(不是 completed,也不是 failed)",
+    r.turn?.outcome === "aborted", JSON.stringify({ o: r.turn?.outcome, k: r.turn?.bodyKind }));
+  ok("V10 ★ 已经吐出来的那段正文留下了,且只能标 partial(§4.9:final 只配 completed)",
+    r.turn?.bodyKind === "partial" && r.turn?.output?.state === "ready",
+    JSON.stringify({ k: r.turn?.bodyKind, s: r.turn?.output?.state }));
+  ok("V10 轮次确实结算了(被打断 ≠ 永远挂着)", r.turn?.state === "settled", String(r.turn?.state));
+  const v10 = checkVizDir(r.dir);
+  ok("V10 ★ 中断形态的目录通过独立校验器", v10.violations.length === 0, JSON.stringify(v10.violations));
+  await r.stop();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+sect("V11 超过 MAX_TEXT 的答复:保尾残件不许自称最终答复");
+
+// ⚠️ 同上,这也是第 2 轮改动**从未被执行过**的分支(`vizBodyKind` 的截断判据)。
+//    把那一行改成"completed 一律 final",产品就会拿一份被砍掉开头的 40 万字残件
+//    宣称「这就是最终答复」并附上 sha256 —— 而 S1-T 用的是自写的 8 字符阈值、
+//    假 claude 的 bigresult 只有 5000 字、真 e2e 要的是三行短答案,**三处都碰不到这个分支**。
+//    这里走 OMP,顺带把「正文晚交 ⇒ 标签也晚判」那条新合同一起考到(OMP 的 bodyKind 是函数)。
+{
+  const r = await bridgeRun({
+    tag: "huge", agent: "omp",
+    env: { OMP_BIN: FAKE, FAKE_OMP_MODE: "hugeturn" },
+    waitMs: 30000,
+  });
+  ok("V11 会话开起来了 + 轮次结算", !!r.sid && r.turn?.state === "settled",
+    JSON.stringify({ sid: !!r.sid, st: r.turn?.state }));
+  ok("V11 ★ 撞上截断上限的答复被如实标成 partial,而不是 final",
+    r.turn?.outcome === "completed" && r.turn?.bodyKind === "partial",
+    JSON.stringify({ o: r.turn?.outcome, k: r.turn?.bodyKind, chars: r.turn?.output?.chars }));
+
+  const abs = r.turn?.output?.ref ? path.join(r.dir, r.turn.output.ref.split("/").join(path.sep)) : null;
+  const body = abs && fs.existsSync(abs) ? fs.readFileSync(abs, "utf8") : null;
+  ok("V11 正文落盘了", typeof body === "string" && body.length > 0, String(abs));
+  if (typeof body === "string") {
+    // 桥的 clampText **砍开头保结尾**。所以:开头的标记必须没了,结尾的标记必须在。
+    // 这两条一起才说明"存下来的是尾段",少任何一条都可能被别的实现蒙对。
+    ok("V11 ★ 砍掉的是开头(HEADMARK 不在了)", !body.includes("HEADMARK"), `前 20 字:${body.slice(0, 20)}`);
+    ok("V11 ★ 留下的是结尾(TAILMARK 在)", body.endsWith("TAILMARK"), `后 20 字:${body.slice(-20)}`);
+    ok("V11 长度恰好等于桥的上限 400000(clampText 超限时正好留 max 个字符)",
+      body.length === 400000, `实得 ${body.length}`);
+    ok("V11 快照记的字符数与文件一致", r.turn?.output?.chars === body.length,
+      JSON.stringify({ snap: r.turn?.output?.chars, file: body.length }));
+    ok("V11 ★ 指纹对得上(残件也必须是可对证的残件)",
+      crypto.createHash("sha256").update(Buffer.from(body, "utf8")).digest("hex") === r.turn?.output?.sha256);
+  }
+  const v11 = checkVizDir(r.dir);
+  ok("V11 ★ 超长形态的目录通过独立校验器", v11.violations.length === 0, JSON.stringify(v11.violations));
+  await r.stop();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+sect("V12 后端自己退出:也是 status=closed,但 `closed` 对象必须留空");
+
+// ⚠️ STATE.md §4.2 专门为此列了一张表:两种 `closed` 靠 `closed` 对象区分,**不是靠 status**。
+//    桥主动关 ⇒ 产出已随之销毁;后端自己退出(`process_close`,含 code 0)⇒ 会话仍在、
+//    `result()` 照样取得回。原先只考了前者(V4),于是「在状态钩子里误挂 `sessionClosed()`」
+//    这个改动不会让任何测试变红 —— 而它会把一批**还救得回来**的产出说成已销毁。
+{
+  const r = await bridgeRun({
+    tag: "selfexit", agent: "omp",
+    env: { OMP_BIN: FAKE, FAKE_OMP_MODE: "okturn-exit" },
+    waitMs: 20000,
+  });
+  ok("V12 轮次正常结算并留下正文",
+    r.turn?.outcome === "completed" && r.turn?.output?.state === "ready",
+    JSON.stringify({ o: r.turn?.outcome, s: r.turn?.output?.state }));
+
+  await sleep(900);   // 等后端自己退出 + process_close 走完
+  const after = r.pick();
+  ok("V12 后端退出后 status 变成 closed", after.session?.status === "closed", String(after.session?.status));
+  ok("V12 ★ 但 `closed` 对象必须仍是 null —— 这是「还救得回来」与「已销毁」的唯一分界",
+    after.session?.closed === null, JSON.stringify(after.session?.closed));
+  // 最硬的判据:真去取一次。取得回来,才说明那句"还救得回来"不是纸面承诺。
+  const got = await r.call("agent_bridge_result", { session_id: r.sid }, 15000);
+  ok("V12 ★ 会话仍在,产出真能取回(不是只有字段好看)",
+    typeof got?.text === "string" && got.text.includes("OKTURN_EXIT_ANSWER"),
+    JSON.stringify(got?.text ?? got).slice(0, 160));
+  const v12 = checkVizDir(r.dir);
+  ok("V12 ★ 该形态的目录通过独立校验器", v12.violations.length === 0, JSON.stringify(v12.violations));
+  await r.stop();
 }
 
 finish();
