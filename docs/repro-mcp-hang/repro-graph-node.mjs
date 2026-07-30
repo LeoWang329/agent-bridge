@@ -963,6 +963,44 @@ async function t14_review_round1() {
       between.length === 2 && between.every((n) => n === 0), JSON.stringify(between));
   }
 
+  // ── R16:抛在**开跑之前**的那条路,也得把「在跑」标记摘掉 ────────────────────
+  // 坏在哪:`settleTurn` 那次退出走不到"脏树复查/建工作树/分支名"这些抛在开跑前的路径。
+  //        对话的回调完全可以 catch 掉那个错、接着跑嵌套节点 —— 那时对话早闲着了却还挂在
+  //        集合里,嵌套节点被误判成并发过、白丢桥 stderr 那份证据。
+  // (第 3 轮复审点名的非阻塞项;修在 liveTurn 的 finally 里,和执行闸同一个生命周期。)
+  {
+    // ⚠️ 要的是**轮内**那次脏树复查(它排在 markStderrWindow 之后),不是入场那次 ——
+    //    入场那次在 prepareRun 里、回调压根还没跑,catch 不到(第一版就瞄错了)。
+    //    所以:先给一棵干净的临时仓库,再**在回调里**把它弄脏,然后才开第一轮。
+    const repo = path.join(RUN_ROOT, "t16-repo");
+    fs.mkdirSync(repo, { recursive: true });
+    const g = (args) => spawnSync("git", args, { cwd: repo, encoding: "utf8", windowsHide: true });
+    g(["init", "-q", "-b", "main"]);
+    g(["config", "user.name", "t16"]); g(["config", "user.email", "t16@local"]);
+    fs.writeFileSync(path.join(repo, "tracked.txt"), "原样\n");
+    fs.writeFileSync(path.join(repo, ".gitignore"), ".graph/\n");
+    g(["add", "-A"]); g(["commit", "-qm", "init"]);
+
+    const outDir = path.join(repo, ".graph", "run");
+    let sizeAfterCatch = null, caught = null, ranCallback = false;
+    await withBridge(async (b) => b.conversation(
+      { id: "cw", agent: "omp", cwd: repo, outDir, access: "write" },
+      async (turn) => {
+        ranCallback = true;
+        // 入场时是干净的,这里把跟踪文件改掉 ⇒ 轮内复查会拦下这一轮(抛在开跑之前)。
+        fs.writeFileSync(path.join(repo, "tracked.txt"), "被改脏了\n");
+        try { await turn({ key: "t1", prompt: "AAA", timeoutMs: 30000 }); }
+        catch (e) { caught = e; }
+        sizeAfterCatch = b._activeNodes.size;
+      },
+    ).catch((e) => { caught = caught || e; }), { env: { ...BASE_ENV, FAKE_OMP_MODE: "echoturn" } });
+    ok("R16 前提:回调跑到了,而且轮内脏树复查确实拦下了这一轮(抛在开跑之前)",
+      ranCallback && caught instanceof UsageError,
+      `回调=${ranCallback} ${caught?.constructor?.name}: ${String(caught?.message).slice(0, 120)}`);
+    ok("R16 ★ 回调 catch 之后「在跑」集合是干净的(否则轮间的嵌套节点会被算成并发)",
+      sizeAfterCatch === 0, String(sizeAfterCatch));
+  }
+
   // ── R3:上次连回执都没写下来时,残留产物照样要留档 ──────────────────────────
   // 坏在哪:归档整段包在「回执存在」里。上次在写回执前就被杀掉、只留下 .md/.scene 的话,
   //        retryFailed 会直接跳过归档、把 canonical 路径覆盖掉 —— 最需要留档的场合反而不留。
@@ -1105,10 +1143,13 @@ async function t14_review_round1() {
     ok("R10 ★ 剔除只针对自己的话,后端真说的那句照样认得出(不能一并把证据削光)",
       withOwn.failureKind === "backend_crash" && /ECONNRESET/.test(String(withOwn.failureEvidence)),
       JSON.stringify(withOwn));
-    ok("R10 太短的行不剔除(否则会把正常错文一起削掉)",
-      classifyFailure({ status: "backend_failed", error: "quota exceeded",
-                        ownTexts: ["quota"] }).failureKind === "quota",
-      JSON.stringify(classifyFailure({ status: "backend_failed", error: "quota exceeded", ownTexts: ["quota"] })));
+    // 我们只提了 `quota` 这一个词、**没构成任何一条判据**,那就不算"我们也说过" ——
+    // 否则任何提到额度、限流、登录的任务正文都会把分类整体废掉。
+    // (这条原先叫「太短的行不剔除」,那是按行剔除时代的说法;机制换了,名字也得跟着换,
+    //  留着一个名不副实的断言,下一个人会照着它去理解一套已经不存在的逻辑。)
+    const oneWord = classifyFailure({ status: "backend_failed", error: "quota exceeded", ownTexts: ["quota"] });
+    ok("R10 只提了个别词、没凑成判据的,不算我们说过(否则分类会被整体废掉)",
+      oneWord.failureKind === "quota", JSON.stringify(oneWord));
   }
 
   // 上面四条考的是**纯函数**。但「`settleTurn` 到底有没有把自己发出去的话传下去」是根**接线**,
@@ -1167,6 +1208,95 @@ async function t14_review_round1() {
       clean.failureKind === "quota", JSON.stringify(clean));
   }
 
+  // ── R15:归一规则必须和判据自己的等价规则**同一套** ────────────────────────
+  // 坏在哪:判据里写的是 `quota[_ ]?exceeded` —— 它**自己**就把空格和下划线当同一个东西。
+  //        第一版只归一了大小写,于是「我们说 quota exceeded、日志回显 quota_exceeded」
+  //        比对不上、照样误判成 quota。判据认为等价的写法,比对也必须认为等价。
+  // (第 3 轮复审点名的阻塞项。少对齐一维就是一个漏洞,所以这里把三档判据各考一遍。)
+  {
+    const CASES = [
+      ["quota", "quota exceeded", "quota_exceeded"],
+      ["quota", "insufficient quota", "insufficient_quota"],
+      ["rate_limited", "rate limit", "rate_limit"],
+      ["auth", "invalid api key", "invalid_api_key"],
+    ];
+    for (const [kind, spoken, echoed] of CASES) {
+      const r = classifyFailure({ status: "backend_failed",
+        stderrTail: `log: ${echoed} 是回显`, ownTexts: [`请检查 ${spoken} 这个分支对不对。`] });
+      ok(`R15 ★ 我们说「${spoken}」、日志回显「${echoed}」时不许判成 ${kind}`,
+        r.failureKind !== kind, JSON.stringify(r));
+    }
+    // 反方向也要成立:我们用下划线写、日志用空格回显。
+    const rev = classifyFailure({ status: "backend_failed",
+      stderrTail: "log: quota exceeded", ownTexts: ["请检查 quota_exceeded 这个分支。"] });
+    ok("R15 ★ 反方向同样挡住(我们写下划线、它回空格)",
+      rev.failureKind !== "quota", JSON.stringify(rev));
+    // 换行/多空格也是同一个词 —— 日志换行常把一句话折断。
+    const wrapped = classifyFailure({ status: "backend_failed",
+      stderrTail: "log: quota\n   exceeded", ownTexts: ["请检查 quota exceeded 分支。"] });
+    ok("R15 ★ 折行和多空格也算同一个词(日志经常把一句话折断)",
+      wrapped.failureKind !== "quota", JSON.stringify(wrapped));
+    // 仍然不许误伤:我们真的没说过的时候要照常判出来。
+    const still = classifyFailure({ status: "backend_failed",
+      stderrTail: "backend: insufficient_quota", ownTexts: ["跟额度无关的一句话,够长"] });
+    ok("R15 这道闸没有把判据变钝(没说过的照常判)",
+      still.failureKind === "quota", JSON.stringify(still));
+  }
+
+  // ── R17:判据的**可选组**变体 —— 这批是「按归一表比对」那条路根本追不上的 ────────
+  // 为什么单列一节:这个地方我改过三版,前两版都错在同一处 —— 去追判据的等价写法。
+  //   v1 按行剔除自己的话   → 挡不住大小写、转义
+  //   v2 比对命中的词 + 大小写归一 → 挡不住 `quota[_ ]?exceeded` 的下划线
+  //   v3 再补空格/下划线归一 → 仍挡不住**可选组**:`额度(已)?用尽`、`token (has )?expired`、
+  //      `exit(ed)? with code`、`process (tree )?(died|gone)`、`slow ?down`(写 slowdown 回 slow down)
+  // v4 改成"拿同一条判据去扫我们自己的话",于是判据认为等价的一切写法天然覆盖。
+  // 下面每一条**在 v3 下都会漏**,是这次换根的真凭据。
+  {
+    const CASES = [
+      ["quota",         "额度用尽了吗",              "错误:额度已用尽"],
+      ["auth",          "token expired 要怎么处理",   "错误:token has expired"],
+      ["backend_crash", "exit with code 该怎么读",    "错误:exited with code 3"],
+      ["backend_crash", "process died 之后呢",        "错误:process tree died"],
+      ["rate_limited",  "slowdown 这个词怎么翻",      "错误:please slow down"],
+      ["rate_limited",  "concurrency limit 怎么设",   "错误:concurrent limit reached"],
+    ];
+    for (const [kind, spoken, echoed] of CASES) {
+      const r = classifyFailure({ status: "backend_failed", stderrTail: echoed, ownTexts: [spoken] });
+      ok(`R17 ★ 我们说「${spoken}」、它回「${echoed}」时不许判成 ${kind}(可选组变体,归一表追不上)`,
+        r.failureKind !== kind, JSON.stringify(r));
+    }
+    // 反面:同一批判据在我们没提过的时候必须照常判,否则这道闸就是把分类整体废了。
+    const ctrl = [
+      ["quota", "错误:额度已用尽"],
+      ["auth", "错误:token has expired"],
+      ["backend_crash", "错误:exited with code 3"],
+      ["rate_limited", "错误:please slow down"],
+    ];
+    for (const [kind, echoed] of ctrl) {
+      const r = classifyFailure({ status: "backend_failed", stderrTail: echoed,
+                                 ownTexts: ["一句完全无关的任务正文,长度够用"] });
+      ok(`R17 对照:我们没提过时「${echoed}」照常判成 ${kind}`,
+        r.failureKind === kind, JSON.stringify(r));
+    }
+    // ⚠️ 判据自己的拼写 bug,是写上面那批用例时撞出来的:原先写成 `concurrent(cy)? limit`,
+    //    它匹配 `concurrent limit` 和 `concurrentcy limit`(拼错那个),
+    //    **匹配不到英文里正常的 `concurrency limit`** —— 于是真后端报
+    //    "concurrency limit exceeded" 压根判不出 rate_limited。两种拼法都得认。
+    for (const spell of ["concurrent limit reached", "concurrency limit reached"]) {
+      const r = classifyFailure({ status: "backend_failed", stderrTail: `错误:${spell}`,
+                                 ownTexts: ["一句无关的正文,长度够用"] });
+      ok(`R17 ★ 「${spell}」要判成 rate_limited(括号放错一个字母就漏掉正常拼法)`,
+        r.failureKind === "rate_limited", JSON.stringify(r));
+    }
+
+    // ⚠️ 这里**刻意不写**「同一份输入连判两次结果一致」那条断言。
+    //    我写过,变异验出来它永远不会红:判据表里现在没有任何一条带 `g`/`y` 标志,
+    //    复用正则对象与否观测不出差别。**一个永远不会红的断言就是假绿**,
+    //    留着比没有更坏 —— 下一个人会以为那条防御被覆盖了。
+    //    实现里那次 `new RegExp(...)` 是给"以后有人给判据加 g 标志"留的,
+    //    等真加了、这条断言才有意义,到时候再写。
+  }
+
   // ── R12:列不出目录 ≠ 目录里没东西 ────────────────────────────────────────
   // 坏在哪:`readdirSync` 失败时返回 false,等于把"看不见"当成"确定没有",
   //        紧接着这一次就把 <id>.md 覆盖掉 —— 正好重演要修的那条数据丢失路径。
@@ -1193,6 +1323,15 @@ async function t14_review_round1() {
     ok("R12 ★ 归档时列不出目录也要停下,绝不「当成空的、宣称归档成功」",
       threwArc instanceof UsageError && /没有覆盖任何东西/.test(String(threwArc.message)),
       `${threwArc?.constructor?.name}: ${String(threwArc?.message).slice(0, 160)}`);
+    // 它现在是导出的(测试要直接调),于是**多了一个入口** —— 入口多了就不能只信上游校验。
+    // 只挡点号是不够的:`..`、路径分隔符一样会让"按前缀改名"伤到别处。(第 3 轮复审点名)
+    for (const badId of ["a.b", "..", "a/b", "a\\b", "*", ""]) {
+      let t = null;
+      try { archiveFailedRun(RUN_ROOT, badId, "backend_failed"); } catch (e) { t = e; }
+      ok(`R12 ★ 归档拒绝不合规的 id ${JSON.stringify(badId)}(它会按前缀改名文件)`,
+        t instanceof UsageError && /不合规|不变量/.test(String(t.message)),
+        `${t?.constructor?.name}: ${String(t?.message).slice(0, 100)}`);
+    }
   }
 
   // ── R13:降级之后不许再顶着后端那档旧分类 ──────────────────────────────────
@@ -1234,6 +1373,31 @@ async function t14_review_round1() {
     reconcileOutcome(fine, "ok");
     ok("R13 ok 的回执上两个字段一律清成 null",
       fine.receipt.failureKind === null && fine.receipt.failureEvidence === null);
+
+    // ── 对话节点那一支(第 3 轮复审点名的第二个阻塞项)──
+    // 顶层分类是从轮记录**投影**上来的,投影时不记 kindForStatus 的话,下面那道降级闸
+    // 永远不触发(`settleTurn` 那次记账只对单轮节点生效)——于是对话节点照样长出
+    // `status:"unknown"` + `failureKind:"quota"`,正是本函数声称修掉的组合。
+    const conv = {
+      receipt: {
+        kind: "conversation", status: "backend_failed", failureKind: null, failureEvidence: null,
+        turns: [{ key: "t1", status: "ok" },
+                { key: "t2", status: "backend_failed", failureKind: "quota", failureEvidence: "余额不足" }],
+        error: null, diagnostics: [],
+      },
+    };
+    reconcileOutcome(conv, "backend_failed");
+    ok("R13 对话节点:顶层分类从「最坏那一轮」投影上来(否则失败的对话永远顶着 null)",
+      conv.receipt.failureKind === "quota" && /第 t2 轮/.test(String(conv.receipt.failureEvidence)),
+      JSON.stringify({ k: conv.receipt.failureKind, e: conv.receipt.failureEvidence }));
+    // 然后模拟"回执写盘失败" —— 顶层被压成 unknown,再对一次账。
+    conv.receipt.status = "unknown";
+    conv.receipt.error = "回执写入失败(EISDIR)";
+    reconcileOutcome(conv, "backend_failed");
+    ok("R13 ★★ 对话节点降级后也不许顶着 quota(投影时没记 kindForStatus 就会漏掉这一支)",
+      conv.receipt.failureKind === "internal", String(conv.receipt.failureKind));
+    ok("R13 ★ 对话节点降级后同样要把原判定折进证据",
+      /quota/.test(String(conv.receipt.failureEvidence)), String(conv.receipt.failureEvidence).slice(0, 200));
   }
 
   // 上面考的是函数本身。**「settleTurn 到底有没有记下这个分类是针对哪个结局做的」是根接线** ——

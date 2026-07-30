@@ -1987,10 +1987,15 @@ function ownedEntries(entries, id) {
 }
 
 export function archiveFailedRun(nodesDir, id, prevStatus) {
-  // 「按前缀认归属」只有在 id 里没有点号时才成立(见 normalizeSpec 里那条不变量)。
-  // 这里再挡一道:这个函数会**改名别人的文件**,靠调用链上游的校验没被绕过,代价太大。
-  if (id.includes(".")) {
-    throw new UsageError(`内部不变量被破坏:id "${id}" 含点号,按前缀归档会误伤同前缀的其他环节`);
+  // 「按前缀认归属」只有在 id 合规时才成立(见 normalizeSpec 里那条不变量)。
+  // 这里**校验完整的 id 不变量**,不只挑点号:这个函数会**按前缀改名别人的文件**,
+  // 而它现在还被测试直接调用(export),等于多了一个入口 —— 入口多了,就不能只信上游。
+  // (第 3 轮复审点名:只查点号 = 把 `..`、路径分隔符、通配符这些都放进来了。)
+  if (typeof id !== "string" || !/^[A-Za-z0-9_-]+$/.test(id)) {
+    throw new UsageError(
+      `内部不变量被破坏:id ${JSON.stringify(id)} 不合规(只允许字母数字和 _ -)。` +
+      `按前缀归档会改名文件,不能拿一个可能含点号/路径分隔符的 id 去做。`,
+    );
   }
   const prefix = `${id}.`;
   const archived = /^f\d+\./;    // 相对 prefix 之后的那一段
@@ -2282,7 +2287,12 @@ export const FAILURE_KINDS = Object.freeze([
 const FAILURE_PATTERNS = [
   ["quota", /insufficient[_ ]?quota|quota[_ ]?exceeded|exceeded your current quota|payment[_ ]?required|billing|余额不足|额度(已)?(用尽|耗尽|不足)|欠费|\b402\b|credit balance|out of credits|no credits/i],
   ["auth", /unauthorized|invalid[_ ]?api[_ ]?key|authentication[_ ]?(failed|error)|not (logged in|authenticated)|token (has )?expired|please (run )?.{0,12}login|\b401\b|\b403\b|未登录|登录(已)?(过期|失效)/i],
-  ["rate_limited", /rate[_ ]?limit|too many requests|\b429\b|overloaded|server is busy|capacity|slow ?down|concurrent(cy)? limit|请求过于频繁|限流/i],
+  // ⚠️ `concurren(t|cy)` 的括号位置是要紧的:原先写成 `concurrent(cy)? limit`,
+  //    它匹配的是 `concurrent limit` 和 `concurrentcy limit`(拼错的那个),
+  //    **匹配不到英文里正常的 `concurrency limit`** —— concurrent 结尾是 t,
+  //    concurrency 是 concurren + cy。于是真后端报 "concurrency limit exceeded"
+  //    压根判不出 rate_limited。(写"我们说过同一个词"的用例时撞出来的。)
+  ["rate_limited", /rate[_ ]?limit|too many requests|\b429\b|overloaded|server is busy|capacity|slow ?down|concurren(t|cy) limit|请求过于频繁|限流/i],
   ["backend_crash", /\bEPIPE\b|\bECONNRESET\b|\bECONNREFUSED\b|\bENOENT\b|broken pipe|exited (before|without)|exit(ed)? with code|killed|segmentation fault|panic|process (tree )?(died|gone)|起不来/i],
 ];
 
@@ -2371,7 +2381,40 @@ function nodeStderrTail(run) {
  */
 function ownTextHaystack(ownTexts) {
   if (!Array.isArray(ownTexts) || !ownTexts.length) return "";
-  return ownTexts.filter((s) => typeof s === "string").join("\n").toLowerCase();
+  return ownTexts.filter((s) => typeof s === "string").join("\n");
+}
+
+/**
+ * 「做这次判定的那条判据,是不是**也在我们自己的话上**命中了?」
+ *
+ * ⚠️ 这里**刻意不做任何归一**,而是拿**同一条正则**去扫我们自己的正文 ——
+ *    这是这个地方的第三版写法,前两版都错在同一个地方:去追判据的等价写法。
+ *      v1 按行把自己的话从证据里抹掉 → 挡不住大小写、挡不住转义;
+ *      v2 比对命中的那一小段 + 大小写归一 → 挡不住 `quota[_ ]?exceeded` 的下划线变体;
+ *      v3 再补一条空格/下划线归一 → 仍然挡不住表里另外几种等价写法:
+ *         `额度(已)?(用尽|耗尽|不足)`(可选字符)、`token (has )?expired`、
+ *         `exit(ed)? with code`、`process (tree )?(died|gone)`、`concurren(t|cy) limit`、
+ *         `slow ?down`(我们写 slowdown、它回 slow down,折叠空格反而对不上)。
+ *    **那张清单是追不完的** —— 每次给判据加一种写法,归一表就得跟着补一条,而漏了不报错。
+ *
+ *    所以换个问法:判定是**这条判据**做出来的,那就问**这条判据**在我们自己的话上灵不灵。
+ *    判据认为等价的一切写法,天然都被覆盖(它就是那个等价关系本身),不需要任何归一表。
+ *
+ * 代价说清楚:这比"比对具体那个词"更保守 —— 我们说 `quota exceeded`、后端真吐 `402`,
+ * 两句都被同一条判据命中,于是也会被判成"分不清"。那种时候证据里会原样写清看见了什么,
+ * 由人来看。**宁可少判一次,也不能把一次本可重试的失败误判成"去充值"。**
+ *
+ * 仍然盖不到的一角:后端把我们的话**翻译**了(我们说中文、它回英文),那已经不是同一个词,
+ * 任何基于文本的判据都区分不了。不在这里假装处理了。
+ */
+function ownTextTrips(re, own) {
+  if (!own) return false;
+  // ⚠️ 必须**新建一个 RegExp**:判据里有 `g`/`y` 标志的话,复用同一个对象会带着
+  //    `lastIndex` 走,同一份文本时灵时不灵 —— 一个只在特定调用顺序下才出现的假阴性。
+  //    老实说:**这一条没有测试覆盖,现在也覆盖不了** —— 判据表里眼下没有一条带 g/y,
+  //    复用与否观测不出差别(变异验过,改回 `re.test(own)` 照样全绿)。
+  //    它是给"以后有人给判据加 g 标志"留的门闸,不是在修一个此刻能观测到的 bug。
+  return new RegExp(re.source, re.flags.replace(/[gy]/g, "")).test(own);
 }
 
 export function classifyFailure({ status, error, stderrTail, sceneDir, ownTexts } = {}) {
@@ -2408,11 +2451,11 @@ export function classifyFailure({ status, error, stderrTail, sceneDir, ownTexts 
     for (const [where, text] of sources) {
       const m = re.exec(text);
       if (!m) continue;
-      // ⚠️ **命中的那个词,我们自己是不是也说过?** 说过就分不清了 ——
-      //    现场是双向的,后端会把我们的话原样回显进去(还可能换大小写、加转义)。
-      //    比对**命中的那一小段本身**,而不是去逐行剔除原文:剔除挡不住大小写和转义,
-      //    这一比对挡得住(它不依赖回显时逐字保留,只依赖那个词还是那个词)。
-      if (own && own.includes(m[0].toLowerCase())) {
+      // ⚠️ **这条判据在我们自己的话上也命中了吗?** 命中了就分不清 ——
+      //    现场是双向的,后端会把我们发的话回显进去(可能换大小写、换分隔符、加转义)。
+      //    问"判据在我们的话上灵不灵",而不是"命中的那个词我们说没说过":
+      //    后者要靠一张追不完的归一表(见 ownTextTrips 上面那段)。
+      if (ownTextTrips(re, own)) {
         muted.push(`${where} 命中 ${JSON.stringify(m[0])}`);
         continue;
       }
@@ -2461,6 +2504,11 @@ export function reconcileOutcome(run, turnStatus) {
     if (culprit) {
       receipt.failureKind = culprit.failureKind;
       receipt.failureEvidence = `第 ${culprit.key ?? "?"} 轮:${culprit.failureEvidence}`;
+      // ⚠️ **记下这个分类对应的是哪个结局。** 少了这一句,对话节点就绕过了下面那道降级闸:
+      //    `settleTurn` 那次记账只对单轮节点生效(`rec === run.receipt`),对话轮不进那一支,
+      //    于是 `kindForStatus` 一直是 undefined、降级判据永不触发 ——
+      //    对话节点照样长出 `status:"unknown"` + `failureKind:"quota"`,正是本函数要修的那个组合。
+      run.kindForStatus = receipt.status;
     }
   }
 
@@ -3534,6 +3582,11 @@ async function liveTurn(run, t) {
     // 那正是"复审发生在两轮之间"这个头号用法。(`runNode` 是另一种 lease:持到写完回执,
     // 因为它的 close/finalize 都排在轮之后,提前放会让活会话数越过 maxConcurrent。)
     if (run.gateHeld) { run.bridge._gate.release(); run.gateHeld = false; }
+    // 「此刻在跑」也**按轮放**,理由和执行闸一模一样,而且必须放在 `finally` 里:
+    // `settleTurn` 那次退出走不到**抛在开跑之前**的路径(脏树复查、建工作树、分支名)。
+    // 对话的回调完全可以 catch 掉那个错、接着跑嵌套节点 —— 那时这段对话早就闲着了,
+    // 却还挂在集合里,于是嵌套节点被误判成"并发过"、白丢桥 stderr 那份证据。
+    run.bridge?._activeNodes?.delete(run);
   }
   // 毒化:这一轮之后会话不能再用了 ⇒ 整段封口(判据在工具里,不靠回调自觉)
   if (rec.sessionReusable !== true && run.poisonedAfter === null) run.poisonedAfter = t.key;
