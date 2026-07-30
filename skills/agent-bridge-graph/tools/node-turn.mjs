@@ -13,8 +13,11 @@
 //     [--role-file D:/prompts/reviewer.md]   # 角色设定(注入为 system 追加)
 //     [--require-keys findings,summary]      # 弱检查:输出必须是 JSON 且含这些顶层键
 //     [--schema-file D:/schema.json]         # 强制格式,**仅 codex**
+//     [--scope-file D:/scope.json]           # 范围界定 {include,exclude,outOfBounds},拼进提问末尾
 //     [--no-reask]                           # 不合格时不打回重说(默认打回一次)
 //     [--force] [--reuse-if-same]            # 幂等闸的两种解法
+//     [--retry-failed]                       # 上次**没成功**才重跑:旧产物挪到 <id>.f<n>.* 留档
+//                                            #   (--force 是**销毁**旧产物,这个是**留档**。要重试选这个)
 //     [--write]                              # 改代码档:**恒定跑在自己的 git worktree 里**
 //     [--base-ref HEAD] [--allow-dirty-base] # 仅 --write:基线,与"主树脏了也照跑"
 //     [--json]                               # stdout 只吐回执 JSON(给脚本吃)
@@ -30,7 +33,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { withBridge, runNode, UsageError, STATUS_EXIT } from "./node-core.mjs";
 
-const BOOLEAN_FLAGS = new Set(["no-reask", "force", "reuse-if-same", "write", "allow-dirty-base", "json", "help"]);
+const BOOLEAN_FLAGS = new Set(["no-reask", "force", "reuse-if-same", "retry-failed", "write", "allow-dirty-base", "json", "help"]);
 
 function die(msg, code = 5) {
   process.stderr.write(`[node-turn] ${msg}\n`);
@@ -54,8 +57,9 @@ function parseArgs(argv) {
 const USAGE = `用法:node node-turn.mjs --id <名> --agent <omp|codex|claude|cursor|kimi> --cwd <目录> \\
   (--prompt <文本> | --prompt-file <文件>) --timeout-ms <毫秒> --out-dir <目录> [可选项]
 
-可选:--model --effort --role-file --require-keys a,b --schema-file <文件>
+可选:--model --effort --role-file --require-keys a,b --schema-file <文件> --scope-file <文件>
       --no-reask --force --reuse-if-same --json
+      --retry-failed    # 上次没成功才重跑,旧产物挪到 <id>.f<n>.* 留档(--force 是销毁,这个是留档)
       --write [--base-ref HEAD] [--allow-dirty-base]   # 改代码档(自动用 git worktree 隔离)
 
 退出码:0 成功 / 1 崩了 / 2 格式不合格 / 3 后端挂 / 4 超时 / 5 用法错 / 6 未知状态(已保留现场)`;
@@ -78,6 +82,7 @@ async function main() {
     reask: args["no-reask"] ? 0 : 1,
     force: Boolean(args.force),
     reuseIfSame: Boolean(args["reuse-if-same"]),
+    retryFailed: Boolean(args["retry-failed"]),
   };
 
   // `access` 只在明确 --write 时才设。**不能无条件写 `access: args.write ? "write" : "read"`** ——
@@ -102,6 +107,14 @@ async function main() {
     try { spec.schema = JSON.parse(fs.readFileSync(p, "utf8")); }
     catch (e) { die(`schema-file 不是合法 JSON:${e.message}`); }
   }
+  // 键名拼错(includes / out_of_bounds …)由 node-core 的 normalizeScope 当场拒绝 —— 这里**不要**
+  // 自己再挑一遍键:两处判据一旦分头维护就会漂,而"静默忽略拼错的键"正是这个开关要修掉的那个坑。
+  if (args["scope-file"]) {
+    const p = path.resolve(args["scope-file"]);
+    if (!fs.existsSync(p)) die(`scope-file 不存在:${p}`);
+    try { spec.scope = JSON.parse(fs.readFileSync(p, "utf8")); }
+    catch (e) { die(`scope-file 不是合法 JSON:${e.message}`); }
+  }
 
   const receipt = await withBridge((bridge) => runNode(bridge, spec));
 
@@ -117,7 +130,12 @@ async function main() {
     process.stdout.write(line + "\n");
     if (receipt.artifactPath) process.stdout.write(`  结果: ${receipt.artifactPath}\n`);
     if (receipt.scene?.dir) process.stdout.write(`  现场: ${receipt.scene.dir}\n`);
+    if (receipt.retriedFrom) {
+      process.stdout.write(`  上次(${receipt.retriedFrom.prevStatus})已留档: ${receipt.retriedFrom.archivedPrefix}*\n`);
+    }
     if (receipt.error) process.stdout.write(`  错误: ${receipt.error}\n`);
+    // 失败时把判定单独打一行:光看 error 原文,人分不出"重试没用"(quota/auth)和"该重试"(rate_limited)。
+    if (receipt.failureKind) process.stdout.write(`  判定: ${receipt.failureKind}${receipt.failureEvidence ? `(凭据: ${receipt.failureEvidence})` : ""}\n`);
     for (const d of receipt.diagnostics) process.stdout.write(`  诊断: ${d}\n`);
   }
 

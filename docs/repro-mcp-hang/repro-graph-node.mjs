@@ -30,7 +30,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { withBridge, startBridge, runNode, UsageError } from "../../skills/agent-bridge-graph/tools/node-core.mjs";
+import { withBridge, startBridge, runNode, UsageError, FAILURE_KINDS } from "../../skills/agent-bridge-graph/tools/node-core.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, "../..");
@@ -598,6 +598,243 @@ async function t10_no_residue() {
   ok("pid 记录已被回收(没有孤儿记录堆积)", leftover.length === 0, `残留记录:${leftover.join(", ")}`);
 }
 
+// ── T13:实跑缺陷清单(DEFECTS-agent-bridge-graph-observed-2026-07-29)的收口 ──
+//
+// 这一节钉住四条"用出来的"缺陷的修法。判据都是**改坏实现就会红**,
+// 不是"跑起来没报错"(那一类断言在本仓已经被证伪过好几次)。
+async function t13_defect_fixes() {
+  console.log("\n[T13] 实跑缺陷清单的收口:runAll / failureKind / retryFailed / scope");
+
+  // ── D4+D8:并行部分成果不许丢 ────────────────────────────────────────────
+  // 形状:三个节点并行,其中一个 id 撞锁(派发阶段抛)。
+  // 用 Promise.all 时那一抛会让整体 reject、另外两个已跑完的产出全丢;
+  // runAll 必须三个结局都给回来。
+  {
+    const outDir = path.join(RUN_ROOT, "t13-runall");
+    const nodesDir = path.join(outDir, "nodes");
+    fs.mkdirSync(nodesDir, { recursive: true });
+    // 预先占住 p2 的锁 —— 这正是"派发阶段抛 UsageError"的真实形状(id 撞了)
+    fs.writeFileSync(path.join(nodesDir, "p2.lock"), "someone-else\n");
+
+    const rs = await withBridge(async (bridge) =>
+      bridge.runAll([1, 2, 3].map((i) => ({
+        id: `p${i}`, agent: "omp", cwd: REPO, prompt: `RUNALL_${i}`,
+        timeoutMs: 30000, outDir,
+      }))), { env: { ...BASE_ENV, FAKE_OMP_MODE: "echoturn" } });
+
+    ok("D4 runAll 返回的数组与 specs 同序等长(按下标取是安全的)",
+      Array.isArray(rs) && rs.length === 3 && rs[0].id === "p1" && rs[1].id === "p2" && rs[2].id === "p3",
+      JSON.stringify(rs.map((r) => r?.id)));
+    ok("D4 ★ 撞锁那个环节没有把其余环节的产出一起带走",
+      rs[0].status === "ok" && rs[2].status === "ok",
+      rs.map((r) => `${r.id}:${r.status}`).join(" "));
+    ok("D4 ★ 派发阶段抛出的归一成 unknown + dispatchError(不伪装成后端失败)",
+      rs[1].status === "unknown" && typeof rs[1].dispatchError === "string"
+        && /锁文件已存在/.test(rs[1].dispatchError) && rs[1].failureKind === "internal",
+      JSON.stringify({ s: rs[1].status, d: rs[1].dispatchError?.slice(0, 80), k: rs[1].failureKind }));
+    ok("D4 成功的那两个产出真的落盘了(不是只有个 status 好看)",
+      [rs[0], rs[2]].every((r) => r.artifactPath && fs.existsSync(r.artifactPath)
+        && fs.readFileSync(r.artifactPath, "utf8").includes("RUNALL_")),
+      JSON.stringify([rs[0].artifactPath, rs[2].artifactPath]));
+  }
+
+  // 用法错必须在派发**任何**环节之前抛 —— 那时没有产出可丢,而拼错的字段
+  // 也不该伪装成"某个环节失败了"混过去。
+  {
+    const outDir = path.join(RUN_ROOT, "t13-runall-usage");
+    let threw = null, ranAnything = false;
+    await withBridge(async (bridge) => {
+      try {
+        await bridge.runAll([
+          { id: "good", agent: "omp", cwd: REPO, prompt: "x", timeoutMs: 30000, outDir },
+          { id: "bad", agent: "omp", cwd: REPO, prompt: "x", timeoutMs: 30000, outDir, reask: 7 },
+        ]);
+      } catch (e) { threw = e; }
+      ranAnything = fs.existsSync(path.join(outDir, "nodes", "good.receipt.json"));
+    }, { env: { ...BASE_ENV, FAKE_OMP_MODE: "echoturn" } });
+    ok("D4 ★ 用法错在派发之前就抛(UsageError,且点名是第几个 spec)",
+      threw instanceof UsageError && /第 1 个 spec/.test(threw.message), String(threw?.message).slice(0, 140));
+    ok("D4 ★ 而且**一个环节都没跑**(否则就是先花钱再报错)", ranAnything === false);
+  }
+
+  // ── D2:failureKind ──────────────────────────────────────────────────────
+  // 真跑一个后端失败的节点,看回执上有没有分档 + 可审计的证据。
+  {
+    const outDir = path.join(RUN_ROOT, "t13-kind");
+    // 用「后端起不来」造 backend_failed(照 T4 的做法)。
+    // ⚠️ **不能用 `errturn`** —— 那是"收场了但错了",桥回报的是 unknown,不是 backend_failed。
+    //    第一版就写错了,测试当场变红:挑桩子要看它到底产出什么状态。
+    const r = await withBridge(async (bridge) =>
+      bridge.runNode({ id: "boom", agent: "omp", cwd: REPO, prompt: "x", timeoutMs: 30000, outDir }),
+      { env: { ...BASE_ENV, OMP_BIN: path.join(HERE, "definitely-not-a-real-binary-xyz") } });
+    ok("D2 后端失败的节点如实是 backend_failed", r.status === "backend_failed", r.status);
+    ok("D2 ★ 回执上有 failureKind,且落在封闭枚举里",
+      typeof r.failureKind === "string" && FAILURE_KINDS.includes(r.failureKind),
+      JSON.stringify({ k: r.failureKind }));
+    ok("D2 ★ 有可审计的证据(说清凭哪一段判的,不是给个不容置疑的标签)",
+      typeof r.failureEvidence === "string" && r.failureEvidence.length > 0,
+      String(r.failureEvidence).slice(0, 120));
+  }
+  // ok 的节点上这两个字段必须恒为 null —— "有字段但恒 null" 比 "成功回执上压根没这个键" 好:
+  // 调用方不必写 `?.`,也不会把 undefined 当成"没失败"。
+  {
+    const outDir = path.join(RUN_ROOT, "t13-kind-ok");
+    const r = await withBridge(async (bridge) =>
+      bridge.runNode({ id: "fine", agent: "omp", cwd: REPO, prompt: "x", timeoutMs: 30000, outDir }),
+      { env: { ...BASE_ENV, FAKE_OMP_MODE: "okturn" } });
+    ok("D2 成功的节点上 failureKind / failureEvidence 恒为 null(字段在,值是 null)",
+      r.status === "ok" && r.failureKind === null && r.failureEvidence === null,
+      JSON.stringify({ s: r.status, k: r.failureKind, e: r.failureEvidence }));
+  }
+
+  // ── D3:原地重试不破坏路径契约 ──────────────────────────────────────────
+  {
+    const outDir = path.join(RUN_ROOT, "t13-retry");
+    const nodesDir = path.join(outDir, "nodes");
+    // 第一次:让它失败
+    const bad = await withBridge(async (bridge) =>
+      bridge.runNode({ id: "flaky", agent: "omp", cwd: REPO, prompt: "SAME_PROMPT", timeoutMs: 30000, outDir }),
+      { env: { ...BASE_ENV, OMP_BIN: path.join(HERE, "definitely-not-a-real-binary-xyz") } });
+    ok("D3 第一次确实失败了(否则这段考不到重试)", bad.status === "backend_failed", bad.status);
+
+    // 第二次:同一个 id、同一份 spec,retryFailed 原地重试
+    const good = await withBridge(async (bridge) =>
+      bridge.runNode({ id: "flaky", agent: "omp", cwd: REPO, prompt: "SAME_PROMPT", timeoutMs: 30000,
+                       outDir, retryFailed: true }),
+      { env: { ...BASE_ENV, FAKE_OMP_MODE: "echoturn" } });
+    ok("D3 重试这次成功了", good.status === "ok", good.status);
+    ok("D3 ★ 产物路径**没变**(下游按 nodes/<id>.md 读仍然读得到最新那次)",
+      good.artifactPath === path.join(nodesDir, "flaky.md") && fs.existsSync(good.artifactPath)
+        && fs.readFileSync(good.artifactPath, "utf8").includes("SAME_PROMPT"),
+      good.artifactPath);
+    ok("D3 ★ 上一次失败的现场留成了审计原件(f1 前缀),没被销毁",
+      fs.existsSync(path.join(nodesDir, "flaky.f1.receipt.json"))
+        && fs.existsSync(path.join(nodesDir, "flaky.f1.scene")),
+      fs.readdirSync(nodesDir).join(", "));
+    ok("D3 ★ 归档件里那张回执就是上次失败那张(不是随便挪了个文件)",
+      JSON.parse(fs.readFileSync(path.join(nodesDir, "flaky.f1.receipt.json"), "utf8")).status === "backend_failed");
+    ok("D3 新回执里记了它是重试来的、上次什么结局",
+      good.retriedFrom?.n === 1 && good.retriedFrom?.prevStatus === "backend_failed"
+        && good.retriedFrom?.archivedPrefix === "flaky.f1.",
+      JSON.stringify(good.retriedFrom));
+    ok("D3 锁文件没被当成产物一起归档(它是我们此刻攥着的)",
+      !fs.existsSync(path.join(nodesDir, "flaky.f1.lock")));
+
+    // ⚠️ 这里**不能**接着上面那次成功往下考"f2":重试成功之后,磁盘上那张回执是 ok,
+    //    `retryFailed` 按约定当没这个开关(好的不许悄悄重跑),于是既不归档也不重试 ——
+    //    第一版就是这么写的,harness 当场被 UsageError 打断。要考归档号递增,
+    //    就得**连续两次都失败**,所以另起一个 id。
+    const outDir2 = path.join(RUN_ROOT, "t13-retry-twice");
+    const nodesDir2 = path.join(outDir2, "nodes");
+    const twice = [];
+    for (let i = 0; i < 3; i++) {
+      twice.push(await withBridge(async (bridge) =>
+        bridge.runNode({ id: "always", agent: "omp", cwd: REPO, prompt: "P", timeoutMs: 30000,
+                         outDir: outDir2, ...(i > 0 ? { retryFailed: true } : {}) }),
+        { env: { ...BASE_ENV, OMP_BIN: path.join(HERE, "definitely-not-a-real-binary-xyz") } }));
+    }
+    ok("D3 前提:三次全都失败了(否则考不到归档号递增)",
+      twice.every((r) => r.status === "backend_failed"), twice.map((r) => r.status).join(" "));
+    ok("D3 ★ 归档号逐次递增(f1 然后 f2),f1 没被套进 f2 里(审计原件不许被覆盖)",
+      twice[1].retriedFrom?.n === 1 && twice[2].retriedFrom?.n === 2
+        && fs.existsSync(path.join(nodesDir2, "always.f1.receipt.json"))
+        && fs.existsSync(path.join(nodesDir2, "always.f2.receipt.json"))
+        && !fs.existsSync(path.join(nodesDir2, "always.f2.f1.receipt.json")),
+      fs.readdirSync(nodesDir2).join(", "));
+  }
+
+  // 上一次是 ok 时,retryFailed 必须**当没这个开关** —— 绝不能把好结果悄悄重跑掉。
+  {
+    const outDir = path.join(RUN_ROOT, "t13-retry-ok");
+    const spec = { id: "done", agent: "omp", cwd: REPO, prompt: "KEEP_ME", timeoutMs: 30000, outDir };
+    const first = await withBridge(async (bridge) => bridge.runNode(spec),
+      { env: { ...BASE_ENV, FAKE_OMP_MODE: "echoturn" } });
+    ok("D3 前提:第一次是 ok", first.status === "ok", first.status);
+    const second = await withBridge(async (bridge) =>
+      bridge.runNode({ ...spec, retryFailed: true, reuseIfSame: true }),
+      { env: { ...BASE_ENV, OMP_BIN: path.join(HERE, "definitely-not-a-real-binary-xyz") } });   // ← 真跑必然失败,所以"它是 ok"就证明走的是复用
+    ok("D3 ★ 上次是 ok 时 retryFailed 不生效,走复用(好的复用、坏的重试)",
+      second.status === "ok" && second.reused === true,
+      JSON.stringify({ s: second.status, reused: second.reused }));
+    ok("D3 ★ 没有产生 f1 归档(什么都没被挪动)",
+      !fs.existsSync(path.join(outDir, "nodes", "done.f1.receipt.json")),
+      fs.readdirSync(path.join(outDir, "nodes")).join(", "));
+  }
+
+  // ── D7:scope 拼进冻结正文 + 进指纹 ──────────────────────────────────────
+  {
+    const outDir = path.join(RUN_ROOT, "t13-scope");
+    // echoturn 会把收到的 prompt 回显 —— 于是"范围段真的发出去了"可以逐字节验证
+    const r = await withBridge(async (bridge) =>
+      bridge.runNode({ id: "scoped", agent: "omp", cwd: REPO, prompt: "TASK_BODY", timeoutMs: 30000, outDir,
+                       scope: { include: ["ONLY_THIS_FILE"], outOfBounds: ["NO_TRESPASS"] } }),
+      { env: { ...BASE_ENV, FAKE_OMP_MODE: "echoturn" } });
+    ok("D7 带 scope 的节点正常跑完", r.status === "ok", r.status);
+    const body = fs.readFileSync(r.artifactPath, "utf8");
+    ok("D7 ★ 范围段**真的发给了后端**(回显里既有任务正文也有范围)",
+      body.includes("TASK_BODY") && body.includes("ONLY_THIS_FILE") && body.includes("NO_TRESPASS"),
+      body.slice(0, 200));
+    // 改范围 = 换任务单:同 id + reuseIfSame 必须被复用闸拒掉,而不是静默复用旧结果
+    let rejected = null;
+    await withBridge(async (bridge) => {
+      try {
+        await bridge.runNode({ id: "scoped", agent: "omp", cwd: REPO, prompt: "TASK_BODY", timeoutMs: 30000,
+                               outDir, reuseIfSame: true, scope: { include: ["A_DIFFERENT_FILE"] } });
+      } catch (e) { rejected = e; }
+    }, { env: { ...BASE_ENV, FAKE_OMP_MODE: "echoturn" } });
+    ok("D7 ★ 改了 scope 之后旧回执复用不了(否则会把上一版范围的结果当成这一版)",
+      rejected instanceof UsageError && /任务单变了/.test(rejected.message),
+      String(rejected?.message).slice(0, 140));
+  }
+
+  // ── 命令行入口也得有这两个开关 ────────────────────────────────────────────
+  // 为什么单独考:CLI 早就有**销毁式**的 `--force`,却没有**留档式**的重试 ——
+  // 只给危险的不给安全的,人就只能用危险那个。光在 JS 那层修完,CLI 用户照样撞 D3。
+  {
+    const outDir = path.join(RUN_ROOT, "t13-cli");
+    const nodesDir = path.join(outDir, "nodes");
+    const base = ["--id", "c1", "--agent", "omp", "--cwd", REPO, "--prompt", "CLI_BODY",
+                  "--timeout-ms", "30000", "--out-dir", outDir];
+
+    const bad = await runCli(base, { OMP_BIN: path.join(HERE, "definitely-not-a-real-binary-xyz") });
+    ok("CLI 前提:这一次确实失败了", bad.code === 3, `exit=${bad.code}`);
+    ok("D2 ★ 人读的那份输出里有判定一行(光看 error 原文分不出该不该重试)",
+      /判定: (quota|auth|rate_limited|backend_crash|protocol|internal|unknown)/.test(bad.out),
+      bad.out.slice(-300));
+
+    const retry = await runCli([...base, "--retry-failed"], { FAKE_OMP_MODE: "echoturn" });
+    ok("D3 ★ --retry-failed 真的通到了内核(退出码 0)", retry.code === 0, `exit=${retry.code}\n${retry.err.slice(-300)}`);
+    ok("D3 ★ CLI 重试同样留档不销毁(f1 在,canonical 路径给了新的这次)",
+      fs.existsSync(path.join(nodesDir, "c1.f1.receipt.json"))
+        && fs.readFileSync(path.join(nodesDir, "c1.md"), "utf8").includes("CLI_BODY"),
+      fs.readdirSync(nodesDir).join(", "));
+    ok("D3 ★ 留档位置打给了人看(不然他不知道上次的现场去哪了)",
+      /上次\(backend_failed\)已留档: c1\.f1\./.test(retry.out), retry.out.slice(-300));
+
+    const scopePath = path.join(RUN_ROOT, "t13-cli-scope.json");
+    fs.writeFileSync(scopePath, JSON.stringify({ include: ["CLI_ONLY_THIS"], outOfBounds: ["CLI_NO_TRESPASS"] }));
+    const outDir2 = path.join(RUN_ROOT, "t13-cli-scope");
+    const scoped = await runCli(
+      ["--id", "c2", "--agent", "omp", "--cwd", REPO, "--prompt", "CLI_BODY2", "--timeout-ms", "30000",
+       "--out-dir", outDir2, "--scope-file", scopePath], { FAKE_OMP_MODE: "echoturn" });
+    ok("D7 ★ --scope-file 真的通到了内核(退出码 0)", scoped.code === 0, `exit=${scoped.code}\n${scoped.err.slice(-300)}`);
+    const cliBody = fs.readFileSync(path.join(outDir2, "nodes", "c2.md"), "utf8");
+    ok("D7 ★ CLI 传的范围段也真的发了出去",
+      cliBody.includes("CLI_BODY2") && cliBody.includes("CLI_ONLY_THIS") && cliBody.includes("CLI_NO_TRESPASS"),
+      cliBody.slice(0, 200));
+
+    // 拼错的键必须当场炸。CLI 这一层**没有**自己抄一份键名清单,考的就是它确实转交给了
+    // normalizeScope —— 两处分头维护判据,迟早漂成"JS 拒绝、CLI 静默忽略"。
+    const typoPath = path.join(RUN_ROOT, "t13-cli-scope-typo.json");
+    fs.writeFileSync(typoPath, JSON.stringify({ includes: ["oops"] }));
+    const typo = await runCli(
+      ["--id", "c3", "--agent", "omp", "--cwd", REPO, "--prompt", "X", "--timeout-ms", "30000",
+       "--out-dir", path.join(RUN_ROOT, "t13-cli-typo"), "--scope-file", typoPath], { FAKE_OMP_MODE: "echoturn" });
+    ok("D7 ★ CLI 传了拼错的 scope 键也当场拒绝(退出码 5),不是静默忽略",
+      typo.code === 5 && /includes/.test(typo.err), `exit=${typo.code} ${typo.err.slice(-200)}`);
+  }
+}
+
 async function main() {
   console.log(`[harness] 运行目录 ${RUN_ROOT}`);
   console.log(`[harness] 假后端 ${FAKE_OMP}`);
@@ -615,6 +852,7 @@ async function main() {
   await t9_total_budget();
   await t11_backend_multiturn();
   await t12_attempts();
+  await t13_defect_fixes();
   await sleep(1500); // 给最后一批收尾动作一点时间,再做残留总检
   await t10_no_residue();
 

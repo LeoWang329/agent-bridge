@@ -13,6 +13,7 @@ import { withBridge, runNode, normalizeSpec, UsageError, STATUS_EXIT } from "./n
 | `withBridge(fn, opts?)` | 起**一个**私有桥进程 → 跑你的编排 → **收尾一定会跑**(异常路径也跑;能安全回收的都收干净,唯一的例外见下方收尾说明)。日常用这个 |
 | `startBridge(opts?)` | 手动起桥(**你自己负责 `close()`**)。除非有特殊生命周期需求,否则用 `withBridge` |
 | `bridge.runNode(spec)` | 跑一个环节,返回回执。等价于 `runNode(bridge, spec)` |
+| `bridge.runAll(specs)` | **并行跑一批,全部跑完、逐个给结局、绝不提前 reject**。并行收口一律用它,别直接 `Promise.all`(见下) |
 | `bridge.conversation(spec, fn)` | 跑**一段多轮对话**(有记忆),返回回执。见下 |
 | `bridge.doctor()` | 后端体检(只查版本号,不验登录) |
 | `bridge.callTool(name, args, timeoutMs?)` | 逃生舱:直接调任意 `agent_bridge_*` MCP 工具 |
@@ -21,7 +22,32 @@ import { withBridge, runNode, normalizeSpec, UsageError, STATUS_EXIT } from "./n
 | `UsageError` | 用法错的类型(与「环节失败」区分:后者进回执不抛) |
 | `STATUS_EXIT` | `status` → 退出码的映射表,**也是对话顶层结局的严重度序** |
 
-`opts`:`{ bridgePath?, env?, initTimeoutMs?, onStderr?, maxConcurrent?, maxConversations? }`。
+`opts`:`{ bridgePath?, env?, initTimeoutMs?, onStderr?, maxConcurrent?, maxConversations?, viz?, vizPort?, outDir? }`。
+
+### `bridge.runAll(specs)` —— 并行收口
+
+```js
+const rs = await bridge.runAll(FILES.map((f, i) => ({ id: `audit-${i}`, agent: "codex", cwd, outDir,
+                                                      prompt: `审计 ${f}`, timeoutMs: 600000 })));
+// rs 与 FILES 同序等长,每个都是一张回执
+```
+
+**为什么不用 `Promise.all`**:`runNode` 不为环节失败抛异常,所以 `Promise.all` 通常"看起来没事" ——
+**那是巧合,不是设计**。只要有任何一处抛(你自己的分诊 `throw`、组合纪律第 6 条要求的「停下报告」、
+或者一个 id 撞了锁),第一个抛出就让整个 `all` reject,而**其余环节仍在后台跑**,
+直到 `withBridge` 收尾才被回收 —— 它们的产出写完没写完、写到哪了,你一无所知。
+一个跑了四十分钟的复审就这么没了。
+
+`runAll` 的契约:
+
+- 返回数组与 `specs` **同序等长**(按下标取是安全的)。
+- 每个元素都是回执;`status` 仍然只有那五档,**不新增第六档**。
+- **用法错在派发任何环节之前就抛** —— 所有 spec 先过一遍 `normalizeSpec`,那时一个环节都还没跑,
+  抛出去不丢任何东西;而一个拼错的字段也不会伪装成"某个环节失败了"混过去。
+- 派发之后再抛的(锁撞了、内部异常)不中断别人:归一成 `status:"unknown"` + `dispatchError`
+  + `failureKind:"internal"`。`unknown` 的含义正是「已停下、保留现场、别自动重跑」。
+
+并发仍由 `maxConcurrent` 管(默认 4),超限自动排队 —— **这里没有第二个旋钮**。
 
 ### `bridge.conversation(spec, fn)`
 
@@ -94,16 +120,68 @@ const receipt = await bridge.conversation(
 | `schema` | | 强制输出格式,**仅 codex**;传给别人当场报错 |
 | `outputShape` | | 弱检查,如 `{ requiredKeys: ["findings"] }`——只查能否 parse + 顶层键在不在 |
 | `reask` | | `0` 或 `1`(默认 1):格式不合格时打回重说几次。**全系统唯一的 retry** |
-| `force` | | 覆盖已存在的回执;write 环节还会覆盖同名分支/残留 worktree |
+| `force` | | 覆盖已存在的回执;write 环节还会覆盖同名分支/残留 worktree。**丢弃上次的现场** |
 | `reuseIfSame` | | 回执已存在且**指纹一致**就复用;指纹变了报错 |
+| `retryFailed` | | **原地重试**:上次**没成功**时,把它的全部产物挪到 `<id>.f<n>.*` 留档,canonical 路径让给这一次。上次是 `ok` 时**当没这个开关**(交给 `reuseIfSame` 决定)。与 `force` 冲突;`access:"write"` 不支持(见下) |
+| `scope` | | 范围界定:`{ include?, exclude?, outOfBounds? }`,三个字符串数组。工具拼成结构化一段**追加在 prompt 末尾**。进指纹(改范围 = 换任务单)。键拼错当场拒绝 |
+
+#### `retryFailed` —— 重试而不破坏路径契约
+
+失败回执不可复用,于是原先重跑只有两条路:`force`(覆盖并**丢掉现场**)或者换一个 id。
+换 id 之后产出落在 `nodes/<id>-r1.md`,而下游引用的是 `nodes/<id>.md` ——
+**组合纪律第 3 条「结果靠文件路径传」被重试本身破坏了**。图一大、下游靠路径读上游产出时,
+这次重试会静默读到一个不存在的文件。
+
+`retryFailed:true` 让路径契约不变:`<id>.md` 永远是最新那次的产出,上一次的全部产物
+(`.md` / `.receipt.json` / `.scene/` / `.a<n>.md` / 对话的 `.t-*`)整套挪到 `<id>.f<n>.` 前缀下,
+新回执里记 `retriedFrom: { n, prevStatus, archivedPrefix, files }`。
+
+- 与 `reuseIfSame` **可以同传**,而且这正是断点续跑要的语义:**好的复用、坏的重试**。
+- ⚠️ **`access:"write"` 不支持,会当场报错。** 失败的 write 环节会把 worktree 与分支
+  **原样保留**(里面可能有还没人看过的改动),原地重试就得先动它们 —— 那个决定必须由人做。
+  处置:自己看一眼 `git -C <worktree> status`,确认可丢弃后用 `force`,或换新 id。
+
+#### `scope` —— 范围界定别再堆字符串
+
+给复审者划范围(「只审这五份」「这几类不在范围内」「别重新讨论已定的取舍」)在实践中能占
+prompt 的一多半,而且每轮都要重写。它是**这个用法的固有部分**,不是某人的偏好,所以给了位置:
+
+```js
+bridge.runNode({ id: "review", agent: "codex", cwd, outDir, timeoutMs: 900000,
+  prompt: "复审这次改动,报能指到行号的问题。",
+  scope: {
+    include: ["scripts/viz-writer.mjs", "skills/**/contract-invariants.mjs"],
+    exclude: ["已合入的历史提交", "页面样式"],
+    outOfBounds: ["已定的取舍不要重新讨论", "越界的发现一条都不要写"],
+  },
+});
+```
+
+**不做范围校验器** —— 判一条发现有没有越界要理解语义,那是模型的活,不是字符串匹配能干的。
+工具只保证:形状对(键拼错就拒)、拼进**冻结的正文**(所以它同时进指纹、进归档原件、进依赖扫描)。
 
 ### `withBridge` / `startBridge` 的选项
 
 | 选项 | 默认 | 说明 |
 |---|---|---|
 | `maxConcurrent` | `4` | 同时在跑的环节上限。**超限的 `runNode` 自动排队**(不报错、不用改写法),别自己再搓限流。计时**从拿到闸之后**才起算,排队不算进 `timeoutMs` |
+| `maxConversations` | 同 `maxConcurrent` | **跨轮活着的对话**上限(与执行闸是两把闸;真实上限是两者之和) |
+| `viz` | `false` | **给这次运行开观测台**:建归档 scope + fork 一个只读 viewer,地址在 `bridge.vizUrl`,也打到 stderr。**起不来就 fail-fast**(不静默降级) |
+| `vizPort` | 随机 | 观测台端口。想要固定地址时传 |
+| `outDir` | — | 归档根目录。**开 `viz` 时必须给**,而且要与各环节 spec 里的 `outDir` 一致(不一致当场报错) |
 | `env` | — | 附加环境变量(传给桥进程) |
 | `bridgePath` | 自动定位 | 桥脚本路径 |
+
+⚠️ **`viz` 是运行时开关,不能事后补。** 一次 `withBridge` 起来时没开,这次运行就没有归档,
+**retrofit 不了** —— 想看就在起的时候开:
+
+```js
+await withBridge(async (bridge) => { … }, { viz: true, outDir });   // ← 给自己这次 run 开
+//  [viz] 观测台 http://127.0.0.1:53211/  (graph 9f1d…)
+```
+
+(`viz/serve.mjs` 那条 `VIZ_OUT_DIR=…` 的命令是**单独看一份已有归档**用的,比如仓里那份样例;
+它不会让一个正在跑、但没开 `viz` 的 run 变得可看。)
 
 ### 回执(runNode 的返回值)
 
@@ -113,6 +191,15 @@ const receipt = await bridge.conversation(
   "id": "audit-auth", "specHash": "9f2c…",     // 输入指纹:防止把上一版任务的结果当成这一版
   "agent": "codex", "model": null, "effort": null,
   "status": "ok",                               // ok|contract_error|backend_failed|timeout|unknown
+  // **`status` 说"怎么收场",`failureKind` 说"为什么"** —— 而"为什么"决定处置:
+  // 要人去充值(quota)、该退避重试(rate_limited)、要重新登录(auth)、还是别再动它。
+  // ok 时恒为 null。封闭枚举:quota|rate_limited|auth|backend_crash|protocol|internal|unknown
+  "failureKind": null,
+  // 凭什么这么判(在哪份证据里命中了什么 + 上下文)。⚠️ 这是**按错文做的启发式**,
+  // 不是协议级保证 —— 桥与五个后端都没有机读的失败码。所以它给的是**可复核的判断**,
+  // 不是不容置疑的标签;拿不准就自己看 `failureEvidence` 指的那段。
+  "failureEvidence": null,
+  "retriedFrom": null,                          // retryFailed 命中才有:{n, prevStatus, archivedPrefix, files}
   "artifactPath": "<outDir>/nodes/audit-auth.md",
   "charCount": 1234, "byteCount": 1400,
   "contextUsage": { "tokens": 51234 },          // cursor/kimi 恒 null(是"未知",不是 0)
@@ -250,12 +337,17 @@ diff 里——跑测试产生的 `coverage/`、临时文件、它自己写的 `.
 node node-turn.mjs --id <名> --agent <后端> --cwd <目录> \
   (--prompt <文本> | --prompt-file <文件>) --timeout-ms <毫秒> --out-dir <目录> \
   [--model X] [--effort xhigh] [--role-file F] \
-  [--require-keys a,b] [--schema-file F] \
-  [--no-reask] [--force] [--reuse-if-same] [--json]
+  [--require-keys a,b] [--schema-file F] [--scope-file F] \
+  [--no-reask] [--force] [--reuse-if-same] [--retry-failed] [--json]
 ```
 
 `--require-keys a,b` 等价于 `outputShape.requiredKeys`;`--no-reask` 等价于 `reask: 0`;
+`--scope-file F` 读一份 `{include,exclude,outOfBounds}` 的 JSON(键拼错当场退 5,判据与 JS 那边同一处);
 `--json` 让 stdout 只吐回执 JSON(给脚本吃)。
+
+**`--force` 与 `--retry-failed` 别选错**:前者**销毁**旧产物,后者把它们挪到 `<id>.f<n>.*` **留档**。
+想重跑一个失败的环节,要的几乎总是 `--retry-failed` —— 现场是查清「为什么失败」的唯一凭据。
+人读的那份输出里,失败时多一行 `判定: <failureKind>`,重试时多一行「上次已留档: `<id>.f<n>.`」。
 
 **退出码**(描述**这一个环节**的结局):
 

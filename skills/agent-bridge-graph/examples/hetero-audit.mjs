@@ -7,7 +7,7 @@
 // 看不看它,这段脚本照跑;关掉浏览器也不影响任何环节。
 //
 // 这段脚本本身就是"graph 工程"该长的样子:
-//   · 扇出/等齐  = Promise.all(JS 自带,不用我们发明)
+//   · 扇出/等齐  = bridge.runAll(**不是** Promise.all —— 后者一抛就丢掉其余环节的产出)
 //   · 过滤/分支  = filter / if(普通代码,一次 AI 都没叫)
 //   · 判断       = 才叫 bridge.runNode(...)
 //   · 中间结果   = 活在 JS 变量和磁盘里,**主 agent 只看见最后 return 的那点东西**
@@ -86,8 +86,10 @@ const result = await withBridge(async (bridge) => {
 
   // --- 扇出:每家一个角度,同时跑
   console.log(`[fan-out] ${AGENTS.length} 家并发审计 ${TARGET}`);
-  const audits = await Promise.all(AGENTS.map((agent, i) =>
-    bridge.runNode({
+  // ⚠️ 用 runAll 而不是 Promise.all:任何一处抛(分诊 throw / id 撞锁)都会让 Promise.all
+  //    整体 reject,而其余几家**仍在后台跑** —— 它们跑了十几分钟的产出就这么没了。
+  const audits = await bridge.runAll(AGENTS.map((agent, i) =>
+    ({
       id: `audit-${agent}`,
       agent,
       cwd: TARGET,

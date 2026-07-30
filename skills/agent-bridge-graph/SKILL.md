@@ -57,9 +57,9 @@ node tools/node-turn.mjs --id audit-auth --agent codex --cwd D:/repo \
 import { withBridge } from "<本目录>/tools/node-core.mjs";
 
 const out = await withBridge(async (bridge) => {
-  const rs = await Promise.all(FILES.map((f, i) =>          // 扇出
-    bridge.runNode({ id: `audit-${i}`, agent: "codex", cwd, outDir,
-                     prompt: `审计 ${f}`, timeoutMs: 600000 })));
+  const rs = await bridge.runAll(FILES.map((f, i) =>        // 扇出:**用 runAll,别用 Promise.all**
+    ({ id: `audit-${i}`, agent: "codex", cwd, outDir,
+       prompt: `审计 ${f}`, timeoutMs: 600000 })));
 
   const ok = rs.filter(r => r.status === "ok");             // 过滤:普通代码,不叫 AI
   if (ok.length < 2) return { halt: "挂太多,先查环境" };     // 分支:普通 if
@@ -141,17 +141,23 @@ await bridge.conversation(
 前两条**代码已经替你保证**(写错当场报错),其余靠你:
 
 1. ✅ **一次并行不超过 `maxConcurrent`(默认 4)** —— 已是机制:超限的 `runNode` **自动排队**,
-   不报错也不用你改写法(照写 `Promise.all` 就行),**别自己再搓一层限流**。
+   不报错也不用你改写法,**别自己再搓一层限流**。
    要调:`withBridge(fn, { maxConcurrent: 2 })`。为什么是 4:不是机器扛不住,是怕挤垮主 agent 自己那条桥连接。
-2. ✅ **`timeoutMs` 必填,且是总上限** —— 「wait 必传超时」这条纪律由代码保证,不再靠人记。
-3. **循环一定要写死最大轮数 + 一个收敛条件**。不然没人叫停就一直烧钱。
-4. **不需要判断的活用代码,别叫 AI**:合并、去重、排序、计票、按条件路由。
-5. **结果靠文件路径传**,别把正文贴进下一个提问(大家在同一个 `cwd`,让它自己读)。
-6. **汇总/评审/挑刺的环节一定换引擎**——自己评自己没意义。
-7. **遇到没预料到的情况就停下报告**,别写"看不懂就再跑一遍"的重试。
+2. ⚠️ **并行收口一律用 `bridge.runAll(specs)`,别直接 `Promise.all`。**
+   `runNode` 不为环节失败抛异常,所以 `Promise.all` 通常"看起来没事"——**那是巧合,不是设计**。
+   只要有任何一处抛(你自己的分诊 `throw`、下面第 8 条要求的「停下报告」、或者一个 id 撞了锁),
+   第一个抛出就让整个 `all` reject,而**其余环节仍在后台跑**,直到 `withBridge` 收尾才被回收 ——
+   它们的产出写完没写完、写到哪了,你一无所知。**一个跑了四十分钟的复审就这么没了。**
+   `runAll` 的语义写死为「全部跑完、逐个给结局、绝不提前 reject」;用法错在派发任何环节**之前**就抛。
+3. ✅ **`timeoutMs` 必填,且是总上限** —— 「wait 必传超时」这条纪律由代码保证,不再靠人记。
+4. **循环一定要写死最大轮数 + 一个收敛条件**。不然没人叫停就一直烧钱。
+5. **不需要判断的活用代码,别叫 AI**:合并、去重、排序、计票、按条件路由。
+6. **结果靠文件路径传**,别把正文贴进下一个提问(大家在同一个 `cwd`,让它自己读)。
+7. **汇总/评审/挑刺的环节一定换引擎**——自己评自己没意义。
+8. **遇到没预料到的情况就停下报告**,别写"看不懂就再跑一遍"的重试。
    尤其 **`unknown` 不是"一种失败"**,是"不知道后端干没干"——重跑可能让同一件事做两遍,停下等人。
-8. **委托 agent 改了文件,主 agent 仍要自己 `git diff` + 跑测试再报告**,不盲信。
-9. ⚠️ **`runNode` 之间没有记忆**(`conversation` 才有)—— 每个 `runNode` 都是「开会话 → 发一条 →
+9. **委托 agent 改了文件,主 agent 仍要自己 `git diff` + 跑测试再报告**,不盲信。
+10. ⚠️ **`runNode` 之间没有记忆**(`conversation` 才有)—— 每个 `runNode` 都是「开会话 → 发一条 →
    关会话」,下一个节点是**全新上下文**(节点内唯一的多轮是 `reask`,且只为格式不合格)。
    这不是疏漏:回执的 `specHash` 承诺「同样的输入 → 同样的执行」,节点要是能记住上一轮,结果就
    取决于**看不见的会话状态**,指纹当场变成谎言。
@@ -234,6 +240,19 @@ bridge.runNode({ id: "implement", agent: "claude", cwd: REPO, outDir,
   diagnostics 会说明,**代码已经安全地在分支上**,只是目录残留需要你自己
   `git worktree remove --force <path>`。
 
+### 要「真独立的第二实现」时:用隔离 `cwd` + 时序,别只靠嘴说
+
+想要两份**互不参照**的实现/判断(独立第二实现、盲审、交叉核对),光在 prompt 里写
+「别看另一份」是不够的 —— 只要它们在同一个 `cwd`,对方的文件就在手边,而且
+**cursor 连会话都不隔离**(见下面那条)。工具本身就支撑更硬的做法,`cwd` 是**每个环节独立**的:
+
+- **隔离 `cwd`**:给每个环节一个只放它该看的东西的目录(或 worktree),对方的产物**不在那儿**。
+- **靠时序**:让被参照的那份**此刻还不存在** —— 先派两个环节各自产出,再派第三个去比。
+  「看不到」由事实保证,不由自觉保证。
+
+这两条是实践里量过有效的形状(session-viz 那次的独立第二实现就是这么排的),
+写在这里是因为它**不是**某个人的偏好:一旦"独立"只靠提示词维持,它就迟早不成立。
+
 ## 五个后端的脾气(排任务单前先看)
 
 | 后端 | 能力边界 | 派活前先确认 |
@@ -257,6 +276,30 @@ bridge.runNode({ id: "implement", agent: "claude", cwd: REPO, outDir,
 - **`schema` 只有 codex 能用**,传给别人会被当场拒绝;其余四家用 `outputShape`(工具做弱检查:
   能不能 parse + 顶层必需键在不在)。**弱检查不是完整校验**,别指望它给出 codex 那种保证。
 - 开跑前先 `bridge.doctor()`;但 doctor **只查版本号**,过了也可能起不来(不验登录)。
+
+### 「我要机读输出,但这个活儿该给 claude/omp 干」
+
+这个组合的后果**不是**"弱一点的校验",而是:**弱检查 + 赌一次 reask**。上面两条各自都写了,
+但组合起来只有两种处置,没有第三种:
+
+| 你的取舍 | 怎么做 |
+|---|---|
+| 机读输出比"谁来干"更重要 | **改派 codex**(只有它能强制格式),把任务改写成 codex 也干得了的样子 |
+| 这个活儿非它不可 | 接受 `outputShape` 弱检查 + **可能白跑一轮**;把解析失败当**正常分支**写进编排(`status:"contract_error"` ⇒ `failureKind:"protocol"`),别当意外 |
+
+「弱检查不是完整校验」说的是**强度**;上面这张表说的是**该怎么办** —— 拿不准就选第一行。
+
+### ⚠️ `reask` 的代价与节点时长成正比
+
+`reask` 默认 `1`,格式不合格就打回重说一次。它是全系统唯一的 retry,但**它的代价是一个乘数**:
+对一个 `timeoutMs: 900000`(15 分钟)的节点,一次 reask 就是**再花 15 分钟**。
+
+实测过的形态:一个 claude 节点第一次输出不合格被打回,第二次才过 —— 这一轮总耗时 1092 秒里
+相当一部分是那次重说。所以:
+
+- **`timeoutMs` 超过 ~10 分钟的节点,排任务单时就把 reask 的时间算进去**(最坏 2×)。
+- 只想要"一次机会、失败就走别的路"就显式 `reask: 0`,把重试策略放到编排层(那里你能换引擎、
+  能改提示、能先看一眼 `failureEvidence`),而不是原地再赌一次一模一样的 15 分钟。
 
 ## 产物长什么样
 
@@ -309,6 +352,12 @@ await withBridge(async (b) => { … }, { viz: true, outDir });
 
 **它只是一块屏幕**:没有暂停、重跑、改参数、合分支 —— 一个操作按钮都没有。看不看它,运行照跑。
 
+⚠️ **`viz` 是起桥时的开关,不能事后补。** 一次 `withBridge` 起来时没传 `{ viz: true }`,
+这次运行就没有归档 —— 跑到一半再想看,**retrofit 不了**,只能等下一次起的时候开。
+所以:**任何你可能想看的运行,起的时候就把它打开**(代价只是一个本地只读页面 + 一份归档)。
+下面那条 `VIZ_OUT_DIR=…` 的命令是**单独打开一份已有归档**用的(比如仓里那份样例),
+它**不会**让一个正在跑、但没开 `viz` 的 run 变得可看 —— 这两件事别混。
+
 几条会影响你怎么用它的口径:
 
 - **一个 `withBridge` = 一个 graph = 一个页面。** 同一个 `outDir` 跑第二个 `withBridge`,
@@ -331,11 +380,15 @@ await withBridge(async (b) => { … }, { viz: true, outDir });
 (响亮地拒而不是静默降级是刻意的:v1 没有 `attempts[]`,拿它当"支持新 UI 的回执"用,
  页面上逐次尝试那一段只会是空白。)
 
-离线看一眼它长什么样(不起桥、不花钱):
+**单独打开一份已有归档**(不起桥、不花钱)—— 换成你自己那次运行的 `outDir` 也一样:
 
 ```sh
+# 仓里那份样例:
 VIZ_OUT_DIR=skills/agent-bridge-graph/viz/sample VIZ_GRAPH_ID=gr-sample-main VIZ_PORT=8080 \
   node skills/agent-bridge-graph/viz/serve.mjs
+
+# 自己跑过的某次(前提:那次**开了** viz,否则目录里没有归档):
+VIZ_OUT_DIR=<你的 outDir> VIZ_PORT=8080 node skills/agent-bridge-graph/viz/serve.mjs
 ```
 
 事件流的合同全文在 `skills/agent-bridge-graph/EVENTS.md`(**对外接口文档**,页面照它写)。

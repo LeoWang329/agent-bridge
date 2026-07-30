@@ -104,6 +104,13 @@ const nowIso = () => new Date().toISOString();
  *  (撞 id → 先分辨是不是有人在跑;workspace-setup → 去看残留),猜错就把人指到错的地方。
  *  ⚠️ **只补第一个**:内层已经标过的不覆盖 —— 同关同义的两个抛点共用一个 phase 是对的,
  *  但外层的粗粒度标签不许盖掉内层的精确标签。 */
+/** `taggedPhase` 的同步版。归档是纯 rename,没有 await 可言,但**出错时同样要带 phase 标** ——
+ *  少了它,上层就分不清这个 UsageError 来自归档还是来自复用闸。 */
+function taggedPhaseSync(phase, fn) {
+  try { return fn(); }
+  catch (e) { throw Object.assign(e, { phase: e.phase ?? phase }); }
+}
+
 async function taggedPhase(phase, fn) {
   try { return await fn(); }
   catch (e) { if (e instanceof UsageError && !e.phase) e.phase = phase; throw e; }
@@ -317,13 +324,33 @@ export function normalizeSpec(raw, { kind = "node" } = {}) {
   }
 
   // 严格布尔:`Boolean("false")` 是 true —— 从命令行/配置文件流过来的字符串会把开关**反着**打开
-  for (const k of ["force", "reuseIfSame"]) {
+  for (const k of ["force", "reuseIfSame", "retryFailed"]) {
     if (s[k] === undefined || s[k] === null) { s[k] = false; continue; }
     if (typeof s[k] !== "boolean") throw new UsageError(`${k} 必须是布尔值(true/false),拿到 ${typeof s[k]}:${JSON.stringify(s[k])}`);
   }
   // 两个语义相反(一个"无条件重跑"一个"能复用就复用"),同传说明调用方没想清楚 → 当场拒绝,
   // 不靠隐式优先级替人做决定。
   if (s.force && s.reuseIfSame) throw new UsageError("force 与 reuseIfSame 语义冲突,不能同时设置");
+  // `force` 是"覆盖并丢弃上次的现场",`retryFailed` 是"把上次的现场留成审计原件再重跑" ——
+  // 一个丢一个留,同传也是没想清楚。
+  if (s.force && s.retryFailed) throw new UsageError("force 与 retryFailed 语义冲突(一个丢弃现场、一个保留现场),不能同时设置");
+  // ⚠️ **write 档不给原地重试。** 失败的 write 环节会把 worktree 与分支**原样保留**
+  //    (见 finalizeWorktree 的 preserve:说不清的岔子什么都不删)。原地重试要么撞上
+  //    "分支已存在"、要么就得去删那棵被刻意保留下来的工作树 —— 而那里面可能有
+  //    没人看过的改动。**静默删掉别人保留的分支,是这个仓库明确记过的危险动作**,
+  //    不能为了少敲一行命令去冒这个险。
+  if (s.retryFailed && s.access === "write") {
+    throw new UsageError(
+      "retryFailed 不支持 access:\"write\" 环节。\n" +
+      "  失败的 write 环节会原样保留 worktree 与分支(里面可能有还没人看过的改动),\n" +
+      "  原地重试就得先动它们 —— 那个决定必须由人做。\n" +
+      "  处置:先自己看一眼(git -C <worktree> status && git log --oneline),\n" +
+      "        确认可以丢弃后用 force:true 重跑,或者换一个新 id。",
+    );
+  }
+
+  // 范围界定。**必须早于 computeSpecHash** —— 它会被拼进冻结的正文里。
+  s.scope = normalizeScope(s.scope);
 
   // A 档拓扑:调用方声明的依赖。**系统既不校验也不执行** —— 执行路径上没有任何代码读它。
   s.declaredDeps = normalizeDeps(s.deps);
@@ -424,10 +451,80 @@ export function inferDeps(text, selfId) {
  *  ⚠️ 为什么不"把文件复制一份快照再发那个路径":桥要求 `message_file` **必须在会话 cwd 里面**。
  *  read 档的 cwd 就是用户的工作区(往里写盘直接破了只读的承诺),write 档的 cwd 是 worktree
  *  (写进去会混进这次的 diff)。两边都不能写 —— 所以正确的做法是**根本不发路径,发字节**。 */
+/** `scope` 的三个键。**封闭清单** —— 多一个键就当场拒绝。
+ *  理由:`includes:`(多个 s)这种笔误如果被静默忽略,你会以为范围界定生效了,
+ *  而实际上一句都没发出去 —— 然后为无效发现付一整轮的钱和时间。 */
+const SCOPE_KEYS = Object.freeze(["include", "exclude", "outOfBounds"]);
+
+const SCOPE_HEADINGS = Object.freeze({
+  include: "只看这些(范围之内)",
+  exclude: "这些不在范围内",
+  outOfBounds: "越界的一律不要写进结论",
+});
+
+/**
+ * 把 `scope` 规范化。**不做"范围校验器"** —— 判一条发现有没有越界需要理解语义,
+ * 那是模型的活,不是字符串匹配能干的。这里只负责:形状对不对、拼成结构化的一段。
+ */
+function normalizeScope(raw) {
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new UsageError(`scope 必须是对象 { include?, exclude?, outOfBounds? },拿到:${JSON.stringify(raw)}`);
+  }
+  const unknown = Object.keys(raw).filter((k) => !SCOPE_KEYS.includes(k));
+  if (unknown.length) {
+    throw new UsageError(`scope 有不认识的键:${unknown.join(", ")}(只允许 ${SCOPE_KEYS.join(" / ")})`);
+  }
+  const out = {};
+  for (const k of SCOPE_KEYS) {
+    if (raw[k] === undefined || raw[k] === null) continue;
+    if (!Array.isArray(raw[k])) throw new UsageError(`scope.${k} 必须是字符串数组,拿到 ${typeof raw[k]}`);
+    const items = raw[k].map((v, i) => {
+      if (typeof v !== "string" || v.trim() === "") {
+        throw new UsageError(`scope.${k}[${i}] 必须是非空字符串,拿到:${JSON.stringify(v)}`);
+      }
+      return v.trim();
+    });
+    if (items.length) out[k] = items;
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+/**
+ * 渲染成追加在 prompt **末尾**的一段。
+ *
+ * ⚠️ **拼进 promptBody 本身,而不是另立一个指纹字段。** 这样三件事自动成立:
+ *    ①它进了 specHash(改范围 = 换任务单,旧回执不该被复用);
+ *    ②归档里那份输入原件**就是真派发出去的字节**(否则事件在描述一份从未被派发过的输入);
+ *    ③`inferDeps` 扫得到里面的路径 —— `include` 里的文件本来就是这个环节的依赖。
+ *
+ * 放末尾而不是开头:范围是**约束**,正文才是任务。约束压在任务前面,
+ * 长 prompt 里模型容易把"别做什么"当成主题。
+ */
+function renderScope(scope) {
+  if (!scope) return "";
+  const lines = ["", "---", "", "## 本次的范围(由编排给定,不是建议)", ""];
+  for (const k of SCOPE_KEYS) {
+    if (!scope[k]) continue;
+    lines.push(`**${SCOPE_HEADINGS[k]}**`);
+    for (const item of scope[k]) lines.push(`- ${item}`);
+    lines.push("");
+  }
+  lines.push("范围之外的东西**一句都不要写** —— 越界的发现要另花一轮去甄别,而那一轮是白花的。");
+  lines.push("");
+  return lines.join("\n");
+}
+
 function freezePromptBody(o, what) {
-  if (!o.promptFile) return o.prompt;
-  try { return fs.readFileSync(o.promptFile, "utf8"); }
-  catch (e) { throw new UsageError(`读 ${what} 失败:${e.message}`); }
+  let body;
+  if (!o.promptFile) body = o.prompt;
+  else {
+    try { body = fs.readFileSync(o.promptFile, "utf8"); }
+    catch (e) { throw new UsageError(`读 ${what} 失败:${e.message}`); }
+  }
+  // 范围段在**这里**拼进去 —— 也就是"冻结正文"的那一刻。见 renderScope 的说明:
+  // 它必须同时进指纹、进归档原件、进依赖扫描,拼在这里三件事一次都成立。
+  return o.scope ? `${body}${renderScope(o.scope)}` : body;
 }
 
 /** 输入指纹:决定「这张旧回执记的,是不是当前这份任务单的结果」。
@@ -630,6 +727,8 @@ export async function startBridge(opts = {}) {
     _scopeGate: scopeGate,
     doctor: (timeoutMs = RPC_TIMEOUT_MS) => callTool("agent_bridge_doctor", {}, timeoutMs),
     runNode: (spec) => runNode(bridge, spec),
+    // 并行收口的**唯一**推荐写法(见 runAll 的说明:Promise.all 在这里是错的形状)。
+    runAll: (specs) => runAll(bridge, specs),
     conversation: (spec, fn) => conversation(bridge, spec, fn),
     async close() {
       if (state.closed) return;
@@ -1570,6 +1669,12 @@ export async function prepareRun(bridge, rawSpec, { kind = "node", hold = null }
     agent: spec.agent, model: spec.model ?? null, effort: spec.effort ?? null,
     status: "unknown", artifactPath: null, charCount: null, byteCount: null,
     contextUsage: null, reaskCount: 0, durationMs: null,
+    // 失败为什么(封闭枚举)+ 凭什么这么判。ok 时恒为 null —— **有字段但恒 null**
+    // 比"成功回执上压根没这个键"好:调用方不必写 `?.`,也不会把 undefined 当成"没失败"。
+    failureKind: null, failureEvidence: null,
+    // 这一次是不是"原地重试"出来的,上一次是什么结局、审计原件在哪个前缀下。
+    // 留在**回执里**而不是只留在磁盘上:回执是这个环节唯一的对外记录。
+    retriedFrom: null,
     startedAt: run.startedAt, endedAt: null, diagnostics: [], error: null, scene: null,
     sessionId: null, abortConfirmed: null, closeConfirmed: null, artifactSha256: null,
     // v2:**每次尝试各自一条**。第一次的产出不再被第二次覆盖(见 attemptArtifactPathFor)。
@@ -1675,7 +1780,26 @@ export async function prepareRun(bridge, rawSpec, { kind = "node", hold = null }
 
     // --- 幂等闸
     if (fs.existsSync(receiptPath) && !spec.force) {
-      reused = await taggedPhase("reuse-check", () => checkReuse(run));
+      // `retryFailed`:上一次**没成功**才归档重跑;上一次是 ok 就当没这个开关,
+      // 交给既有闸门(reuseIfSame 决定复用还是响亮报错)。
+      // 这样 `{ reuseIfSame:true, retryFailed:true }` 正好是断点续跑要的语义:
+      // **好的复用、坏的重试**,而"好的"绝不会被悄悄重跑掉。
+      let prevStatus;
+      if (spec.retryFailed) {
+        try { prevStatus = JSON.parse(fs.readFileSync(receiptPath, "utf8"))?.status; }
+        catch { prevStatus = undefined; }   // 读不出来/不是合法 JSON
+      }
+      // 回执坏掉(读不出来)也算"没成功":它同样不能当这一次的结果,而归档不销毁任何东西。
+      if (spec.retryFailed && prevStatus !== "ok") {
+        run.retriedFrom = taggedPhaseSync("retry-archive", () =>
+          archiveFailedRun(nodesDir, spec.id, prevStatus ?? "(回执读不出来)"));
+        // ⚠️ **在这里写进回执,不能在回执构造处写。** 回执是在幂等闸**之前**就建好的
+        //    (它要先存在,后面几关才有地方记 diagnostics),那时 `retriedFrom` 还不存在 ——
+        //    写在那儿就永远是 null。测试逮到过这一条。
+        run.receipt.retriedFrom = run.retriedFrom;
+      } else {
+        reused = await taggedPhase("reuse-check", () => checkReuse(run));
+      }
     }
   } catch (e) {
     await releaseRun(run);
@@ -1795,6 +1919,55 @@ async function assertAttemptsIntact(run, turnKey, attempts, reask, bail) {
       throw bail(`第 ${a.n} 次尝试的审计原件内容与回执记录的不一致(可能被改过):${want}`);
     }
   }
+}
+
+/**
+ * 把**上一次失败**的全部产物挪到 `<id>.f<n>.*`,腾出 canonical 路径给这一次重试。
+ *
+ * 为什么要有这条路:失败回执不可复用,于是原先重跑只有两条路 —— `force`(覆盖并**丢掉现场**)
+ * 或者换一个 id。换 id 之后产出落在 `nodes/<id>-r1.md`,而下游代码引用的是 `nodes/<id>.md`;
+ * 而 skill 自己的组合纪律第 3 条正是「结果靠文件路径传」——**重试恰好把那个路径改掉了**。
+ * 图一大、下游节点靠路径读上游产出时,这次重试就会静默读到一个不存在的文件。
+ * 这条路让**路径契约不变**(重试后 `<id>.md` 仍然是最新那次的产出),现场也没丢。
+ *
+ * ⚠️ **按前缀搬,不维护后缀清单。** 一个环节的产物有 `.md`/`.receipt.json`/`.scene/`/
+ *    `.a<n>.md`/`.diff`/对话的 `.t-<key>.*` —— 列一张"要搬哪些"的清单,下次新增一种产物
+ *    就会漏掉它(这个仓库在"维护一张会漏的清单"上已经栽过好几次)。所以规则是:
+ *    `<id>.` 开头的**一律**搬,只排除两样 —— 我们此刻正攥着的 `<id>.lock`,
+ *    以及**已经归档过的** `<id>.f<m>.*`(否则第二次重试会把第一次的审计原件套进去)。
+ */
+function archiveFailedRun(nodesDir, id, prevStatus) {
+  const prefix = `${id}.`;
+  const archived = /^f\d+\./;    // 相对 prefix 之后的那一段
+  let entries;
+  try { entries = fs.readdirSync(nodesDir); } catch { entries = []; }
+  const mine = entries.filter((n) => n.startsWith(prefix) && n !== `${id}.lock`);
+  // 下一个可用的 <n>:**扫已存在的归档号取最大 + 1**,不从 1 开始试 ——
+  // 中间某个号被人手工删掉时,从 1 试会把新的一次塞进那个空档,顺序就乱了。
+  let maxN = 0;
+  for (const n of mine) {
+    const m = /^f(\d+)\./.exec(n.slice(prefix.length));
+    if (m) maxN = Math.max(maxN, Number(m[1]));
+  }
+  const nextN = maxN + 1;
+  const moved = [];
+  for (const name of mine) {
+    const rest = name.slice(prefix.length);
+    if (archived.test(rest)) continue;         // 已经是归档件,别再套一层
+    const dest = `${prefix}f${nextN}.${rest}`;
+    try {
+      fs.renameSync(path.join(nodesDir, name), path.join(nodesDir, dest));
+      moved.push(dest);
+    } catch (e) {
+      // 搬不动就**停下**,绝不"那就直接覆盖吧" —— 那正是 force 的语义,而调用方要的不是它。
+      throw new UsageError(
+        `retryFailed:把上次失败的产物归档到 ${dest} 时失败(${e.message})。\n` +
+        `  已经搬走的:${moved.join(", ") || "(无)"}\n` +
+        `  没有覆盖任何东西 —— 请人工处理 ${path.join(nodesDir, name)} 之后再重试。`,
+      );
+    }
+  }
+  return { n: nextN, prevStatus: prevStatus ?? null, archivedPrefix: `${prefix}f${nextN}.`, files: moved };
 }
 
 /** 幂等闸:上一张回执还能不能当成这一次的结果。
@@ -1973,6 +2146,90 @@ async function checkReuse(run) {
   return { ...prev, reused: true };
 }
 
+/**
+ * `failureKind` 的封闭枚举。**`status` 说的是"这一轮怎么收场",这个说的是"为什么"** ——
+ * 而"为什么"决定了处置:要人去充值,还是退避重试,还是别再动它。
+ */
+export const FAILURE_KINDS = Object.freeze([
+  "quota",         // 额度/余额耗尽、payment required —— **重试毫无意义,要人去充值**
+  "rate_limited",  // 429 / overloaded / 并发上限 —— 该退避重试
+  "auth",          // 未登录、token 过期、403 —— 要人去重新登录
+  "backend_crash", // 后端进程崩了/管道断了/起不来
+  "protocol",      // 收场了但形状不对(schema/outputShape 不合格、解析不了)
+  "internal",      // 本工具自己的派发/收尾阶段炸了(不是后端的错)
+  "unknown",       // 有证据但对不上任何一档,或压根没有证据
+]);
+
+// 判据表。**顺序有意义**:先判"重试没用"的,再判"该重试"的 ——
+// 判错的方向很贵:把欠费当成瞬时错,就是在余额为零时把钱包按着继续刷。
+const FAILURE_PATTERNS = [
+  ["quota", /insufficient[_ ]?quota|quota[_ ]?exceeded|exceeded your current quota|payment[_ ]?required|billing|余额不足|额度(已)?(用尽|耗尽|不足)|欠费|\b402\b|credit balance|out of credits|no credits/i],
+  ["auth", /unauthorized|invalid[_ ]?api[_ ]?key|authentication[_ ]?(failed|error)|not (logged in|authenticated)|token (has )?expired|please (run )?.{0,12}login|\b401\b|\b403\b|未登录|登录(已)?(过期|失效)/i],
+  ["rate_limited", /rate[_ ]?limit|too many requests|\b429\b|overloaded|server is busy|capacity|slow ?down|concurrent(cy)? limit|请求过于频繁|限流/i],
+  ["backend_crash", /\bEPIPE\b|\bECONNRESET\b|\bECONNREFUSED\b|\bENOENT\b|broken pipe|exited (before|without)|exit(ed)? with code|killed|segmentation fault|panic|process (tree )?(died|gone)|起不来/i],
+];
+
+/** 分类时读多少证据。**必须有界** —— session.log 可以很大,而错误行总在尾部。 */
+const FAILURE_EVIDENCE_TAIL_BYTES = 64 * 1024;
+
+/**
+ * 从"最接近后端的那点证据"里判失败类型。
+ *
+ * ⚠️ **这是按错文做的启发式判定,不是协议级保证。** 桥与五个后端都没有机读的失败码,
+ *    所以真相只存在于后端吐出来的那句话里。把它做成工具的一部分,换来的是三件事:
+ *    ①**只做一次**(原先每个编排脚本各抄一遍同样的 markers 表);
+ *    ②**可审计**(`failureEvidence` 说清凭哪一段判的,不是给你一个不容置疑的标签);
+ *    ③**可回归**(判据在仓里,换个措辞漏判了能被测试抓住,而不是散在各人脚本里烂掉)。
+ *    分类是**事实**,只有桥和后端看得见,调用方是最没资格猜的那个 ——
+ *    但处置(继续/换引擎/停)仍然归调用方,这一条没变。
+ *
+ * 证据按"离后端多近"取:先 `error`(桥明确回报的那句)、再桥自己的 stderr,
+ * 都不匹配才去读现场 `session.log` 的**尾部**(有界)。
+ */
+export function classifyFailure({ status, error, stderrTail, sceneDir } = {}) {
+  if (status === "ok") return { failureKind: null, failureEvidence: null };
+  if (status === "contract_error") {
+    // 这一档不用猜:它的定义就是"收场了但形状不对"。
+    return { failureKind: "protocol", failureEvidence: "status=contract_error(输出形状不合格)" };
+  }
+
+  const sources = [];
+  if (typeof error === "string" && error) sources.push(["error", error]);
+  if (typeof stderrTail === "string" && stderrTail) sources.push(["bridge-stderr", stderrTail]);
+  if (sceneDir) {
+    for (const name of ["session.log", "answer.txt"]) {
+      const p = path.join(sceneDir, name);
+      const st = statSafe(p);
+      if (!st || !st.isFile() || st.size === 0) continue;
+      try {
+        const start = Math.max(0, st.size - FAILURE_EVIDENCE_TAIL_BYTES);
+        const fd = fs.openSync(p, "r");
+        try {
+          const len = st.size - start;
+          const buf = Buffer.allocUnsafe(len);
+          fs.readSync(fd, buf, 0, len, start);
+          sources.push([`${name}${start > 0 ? "(尾部)" : ""}`, buf.toString("utf8")]);
+        } finally { fs.closeSync(fd); }
+      } catch { /* 读不到就少一份证据,不影响判定,更不许因此抛 */ }
+    }
+  }
+
+  for (const [kind, re] of FAILURE_PATTERNS) {
+    for (const [where, text] of sources) {
+      const m = re.exec(text);
+      if (!m) continue;
+      // 证据要能让人复核:说清在哪儿、命中了什么、上下文长什么样。
+      const at = Math.max(0, m.index - 60);
+      const ctx = text.slice(at, m.index + m[0].length + 60).replace(/\s+/g, " ").trim();
+      return { failureKind: kind, failureEvidence: `${where}:命中 ${JSON.stringify(m[0])} —— …${ctx}…` };
+    }
+  }
+  return {
+    failureKind: "unknown",
+    failureEvidence: sources.length ? `看过 ${sources.map(([w]) => w).join("/")},没有命中任何一档判据` : "没有可用证据",
+  };
+}
+
 /** 结束**这一轮**:定状态 +(非 ok 时)立刻冻结现场。
  *
  *  ⚠️ 它**不关会话、不收工作区、不写回执** —— 那三件是**环节级**的,归 `finalizeRun`。
@@ -1984,6 +2241,18 @@ async function settleTurn(run, status, extra = {}) {
   rec.status = status;
   if (status !== "ok") await run.saveScene(extra._sceneTag || status, rec, run.sceneDirFor(run.currentKey));
   delete rec._sceneTag;
+  // ⚠️ **排在 saveScene 之后**:分类要读现场里的 session.log 尾部,而那份现场是上一行才冻出来的。
+  //    排到前面去,拿到的证据就只有 `error` 那一句 —— 恰好把后端说得最清楚的那段漏掉。
+  {
+    const cls = classifyFailure({
+      status,
+      error: rec.error,
+      stderrTail: run.bridge?.stderrTail,
+      sceneDir: status === "ok" ? null : run.sceneDirFor(run.currentKey),
+    });
+    rec.failureKind = cls.failureKind;
+    rec.failureEvidence = cls.failureEvidence;
+  }
   // 这一轮之后这个会话还能不能接着用。**由工具判,不靠回调自觉** ——
   // 破了这条的后果是两个 turn 在同一会话里并发,远超"回调写得不好"。
   // ⚠️ 只给对话加:`runNode` 的回执**不许多出新字段**,那是既有调用方与 reuseIfSame 的合同。
@@ -3181,6 +3450,69 @@ async function conversationBody(bridge, rawSpec, fn) {
   } finally {
     await releaseRun(run);
   }
+}
+
+/**
+ * **并行跑一批环节:全部跑完、逐个给结局、绝不提前 reject。**
+ *
+ * 为什么这是一个原语而不是"文档里教你写 allSettled":
+ * `Promise.all` 是所有人的自然写法,而它在这里是**错的形状** —— 只要有任何一处抛
+ * (你自己的分诊逻辑 throw、纪律第 6 条要求的"停下报告"、或者一个 id 撞了锁),
+ * 第一个抛出就让整个 all reject,而其余节点**仍在后台跑**,直到 withBridge 收尾才被回收。
+ * 它们的产出有没有写完、写到哪了,调用方一无所知。一个跑了四十分钟的复审就这么没了。
+ * `runNode` 不为环节失败抛异常,所以照写 `Promise.all` 通常"看起来没事" ——
+ * **那是巧合,不是设计**。要靠读源码确认异常契约才敢用的写法,不该是默认写法。
+ *
+ * 契约:
+ *   · 返回的数组与 `specs` **同序等长**(调用方按下标取,这一点不许变)。
+ *   · 每个元素都是一张回执;`status` 仍然只有那五档,**不新增第六档**。
+ *   · **用法错在派发任何节点之前就抛。** 所有 spec 先过一遍规范化 ——
+ *     那时一个节点都还没跑,抛出去不丢任何东西,而一个拼错的字段也不会
+ *     伪装成"某个节点失败了"混过去。
+ *   · 派发之后再抛出来的(锁撞了、内部异常)不再中断别人:归一成一张
+ *     `status:"unknown"` + `dispatchError` 的回执。unknown 的含义正是
+ *     「已停下、保留现场、别自动重跑」,这时该做的恰好就是这个;而 `dispatchError`
+ *     让"这不是后端的错"一眼可辨,不必去猜。
+ *
+ * 并发仍由 `maxConcurrent` 管(默认 4),超限自动排队 —— 这里**不再加第二个旋钮**。
+ */
+export async function runAll(bridge, specs) {
+  if (!Array.isArray(specs)) {
+    throw new UsageError(`runAll 要一个数组,拿到:${JSON.stringify(specs)}`);
+  }
+  // ⚠️ 先把**每一个** spec 都规范化一遍,再派发任何一个。
+  //    normalizeSpec 是同步纯函数,只查形状不落盘 —— 所以这一遍是免费的,
+  //    而它把"拼错字段"这类错挡在了"已经有节点在跑"之前。
+  //    (真正的落盘校验仍在各自的 prepareRun 里,这里不重复也不替代。)
+  specs.forEach((raw, i) => {
+    try { normalizeSpec(raw, { kind: "node" }); }
+    catch (e) {
+      throw new UsageError(`runAll 的第 ${i} 个 spec 不合法(id=${JSON.stringify(raw?.id)}):${e.message}`);
+    }
+  });
+
+  const settled = await Promise.allSettled(specs.map((spec) => runNode(bridge, spec)));
+  return settled.map((r, i) => {
+    if (r.status === "fulfilled") return r.value;
+    const e = r.reason;
+    const id = specs[i]?.id ?? `#${i}`;
+    return {
+      receiptVersion: RECEIPT_VERSION,
+      id, specHash: null,
+      agent: specs[i]?.agent ?? null, model: specs[i]?.model ?? null, effort: specs[i]?.effort ?? null,
+      status: "unknown",
+      // 这不是后端给的结局,是派发/收尾自己炸了。分开写,免得被当成"后端失败"去重试。
+      dispatchError: e instanceof Error ? `${e.name}: ${e.message}` : String(e),
+      failureKind: "internal", failureEvidence: null,
+      artifactPath: null, charCount: null, byteCount: null, artifactSha256: null,
+      contextUsage: null, reaskCount: 0, durationMs: null,
+      startedAt: null, endedAt: nowIso(),
+      diagnostics: [`runAll:第 ${i} 个环节在派发/收尾阶段抛出,已归一成 unknown 而不中断其余环节`],
+      error: e instanceof Error ? e.message : String(e),
+      scene: null, sessionId: null, abortConfirmed: null, closeConfirmed: null,
+      attempts: [], access: specs[i]?.access ?? "read", workspace: null,
+    };
+  });
 }
 
 /** status → node-turn 的退出码。脚本用法用不到这个(直接看 receipt.status)。 */

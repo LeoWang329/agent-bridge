@@ -39,8 +39,9 @@ if (PROBES.some((p) => p.agent === SYNTH_AGENT)) {
 
 const result = await withBridge(async (bridge) => {
   // 第 1 波:扇出。**每一波都从头声明整张图** —— 已完成的靠指纹复用,不会重跑。
-  // 照写 Promise.all 就行:超过 maxConcurrent(默认 4)的会自动排队。
-  const probes = await Promise.all(PROBES.map((p) => bridge.runNode({
+  // 并行收口用 runAll(**别用 Promise.all**:一处抛就丢掉其余环节已跑完的产出)。
+  // 超过 maxConcurrent(默认 4)的会自动排队,不用自己搓限流。
+  const probes = await bridge.runAll(PROBES.map((p) => ({
     ...p, cwd: CWD, outDir: OUT_DIR, access: "read", timeoutMs: TIMEOUT_MS,
     reuseIfSame: true, // ← 分波的关键:第 2 波跑到这里是本地秒判,不发模型请求
   })));
