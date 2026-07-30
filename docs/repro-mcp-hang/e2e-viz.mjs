@@ -124,16 +124,47 @@ if (!sid) finish(1);
 const ASK = "请只输出下面三行，不要任何解释、不要代码块：\n第一行：观测台\n第二行：café — 汉字\n第三行：done";
 await call("agent_bridge_send_message", { session_id: sid, message: ASK });
 const waited = await call("agent_bridge_wait", { session_ids: [sid], mode: "all", timeout_ms: 240000 });
-const text = waited?.results?.[0]?.text ?? null;
+const res0 = waited?.results?.[0] ?? null;
+const text = res0?.text ?? null;
 ok("E1 真后端返回了正文", typeof text === "string" && text.length > 0, String(text).slice(0, 120));
+
+// ⚠️ **真后端会因为账号/额度这类外部原因中断,那不是产品缺陷。**
+//    两者必须当场分开:混在一起,一次欠费会被读成"观测台坏了"而去改代码;
+//    反过来,一个真 bug 也可能被当成"今天额度不够"放过去。判据是后端自己报的错文。
+//    命中环境类中断 ⇒ 用一个专门的退出码停下,并说清"恢复后重跑即可",**不改任何断言的判定**。
+const ENV_INTERRUPT = /credit|quota|rate.?limit|usage.?limit|billing|insufficient|payment|too many requests|\b402\b|\b429\b|overloaded|capacity/i;
+const backendErr = [res0?.lastTurnError, res0?.error, res0?.status].filter(Boolean).join(" | ");
+if (res0 && res0.status !== "idle" && ENV_INTERRUPT.test(backendErr)) {
+  console.log(`\n  [HALT] 后端被外部原因打断(账号/额度/限流),不是产品缺陷:${backendErr}`);
+  console.log(`  [HALT] 恢复后重跑 node docs/repro-mcp-hang/e2e-viz.mjs 即可;本次不判定产品。`);
+  finish(3);
+}
 await sleep(1200);   // 让 writer 的合并槽落盘
 
 sect("E2 落盘的字节 = 后端真给的字节");
 
 const snap = snapshot(dir);
 const turn = snap?.sessions?.find(s => s.sessionId === sid)?.turns?.[0];
+// ⚠️ 详情里必须带上 `error` 和桥自己那份状态。**一条只说"不等于 completed"的红断言,
+//    等于让下一个人从零开始查** —— 这一条第一次变红时就是这样:只知道 outcome=failed,
+//    既不知道后端报了什么,也无从判断是产品坏了还是账号断了。
 ok("E2 轮次已结算", turn?.state === "settled" && turn?.outcome === "completed",
-  JSON.stringify({ s: turn?.state, o: turn?.outcome }));
+  JSON.stringify({
+    s: turn?.state, o: turn?.outcome, err: turn?.error,
+    bridgeStatus: res0?.status, bridgeErr: res0?.lastTurnError ?? res0?.error ?? null,
+  }));
+// 这一条红了就把桥自己那份日志的尾巴打出来 —— **后端的原话就在里面**。
+// 真后端会间歇性给出非 success 的收场(`error_during_execution` 之类),
+// 而"重跑就绿了"不是结论。要么当场定性成环境事件、要么定性成产品缺陷,
+// 靠的就是这段原文;拿不到原文,下一次出现还是只能耸肩。
+if (!(turn?.state === "settled" && turn?.outcome === "completed")) {
+  const lf = snap?.sessions?.find(s => s.sessionId === sid)?.logFile;
+  console.log(`  [DIAG] logFile=${lf}`);
+  try {
+    const lines = fs.readFileSync(lf, "utf8").split(/\r?\n/).filter(Boolean);
+    for (const l of lines.slice(-12)) console.log(`  [DIAG] ${l.slice(0, 600)}`);
+  } catch (e) { console.log(`  [DIAG] 读不到日志:${e.message}`); }
+}
 ok("E2 边界档与后端相符", typeof turn?.boundary === "string" && turn.boundary.length > 0, String(turn?.boundary));
 
 const outAbs = turn?.output?.ref ? path.join(dir, turn.output.ref.split("/").join(path.sep)) : null;
