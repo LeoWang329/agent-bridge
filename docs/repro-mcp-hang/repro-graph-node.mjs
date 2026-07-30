@@ -30,7 +30,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { withBridge, startBridge, runNode, UsageError, FAILURE_KINDS } from "../../skills/agent-bridge-graph/tools/node-core.mjs";
+import { withBridge, startBridge, runNode, UsageError, FAILURE_KINDS, classifyFailure, stderrWindow } from "../../skills/agent-bridge-graph/tools/node-core.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, "../..");
@@ -613,17 +613,20 @@ async function t13_defect_fixes() {
     const outDir = path.join(RUN_ROOT, "t13-runall");
     const nodesDir = path.join(outDir, "nodes");
     fs.mkdirSync(nodesDir, { recursive: true });
-    // 预先占住 p2 的锁 —— 这正是"派发阶段抛 UsageError"的真实形状(id 撞了)
-    fs.writeFileSync(path.join(nodesDir, "p2.lock"), "someone-else\n");
+    // ⚠️ id 刻意**不按字典序**排(zulu / alpha / mike)。原先用 p1/p2/p3,输入本身就有序,
+    //    于是"内部拿 id 排个序再返回"这种坏实现照样能让同序断言变绿 —— 复审点名的假绿之一。
+    const IDS = ["zulu", "alpha", "mike"];
+    // 预先占住中间那个的锁 —— 这正是"派发阶段抛 UsageError"的真实形状(id 撞了)
+    fs.writeFileSync(path.join(nodesDir, "alpha.lock"), "someone-else\n");
 
     const rs = await withBridge(async (bridge) =>
-      bridge.runAll([1, 2, 3].map((i) => ({
-        id: `p${i}`, agent: "omp", cwd: REPO, prompt: `RUNALL_${i}`,
+      bridge.runAll(IDS.map((id, i) => ({
+        id, agent: "omp", cwd: REPO, prompt: `RUNALL_${i}`,
         timeoutMs: 30000, outDir,
       }))), { env: { ...BASE_ENV, FAKE_OMP_MODE: "echoturn" } });
 
-    ok("D4 runAll 返回的数组与 specs 同序等长(按下标取是安全的)",
-      Array.isArray(rs) && rs.length === 3 && rs[0].id === "p1" && rs[1].id === "p2" && rs[2].id === "p3",
+    ok("D4 ★ runAll 与 specs 同序等长(按下标取是安全的;id 故意非字典序,排序过就露馅)",
+      Array.isArray(rs) && rs.length === 3 && rs.every((r, i) => r?.id === IDS[i]),
       JSON.stringify(rs.map((r) => r?.id)));
     ok("D4 ★ 撞锁那个环节没有把其余环节的产出一起带走",
       rs[0].status === "ok" && rs[2].status === "ok",
@@ -650,11 +653,17 @@ async function t13_defect_fixes() {
           { id: "bad", agent: "omp", cwd: REPO, prompt: "x", timeoutMs: 30000, outDir, reask: 7 },
         ]);
       } catch (e) { threw = e; }
-      ranAnything = fs.existsSync(path.join(outDir, "nodes", "good.receipt.json"));
+      // ⚠️ 判据不能只看"回执落没落盘" —— 先启动后端、随后才发现第二个 spec 非法时,
+      //    回执本来就还没写,那条断言照样绿(复审点名的假绿)。改看**磁盘上有没有任何痕迹**:
+      //    预检若真在派发之前,连 nodes/ 目录都不该被建出来。
+      ranAnything = fs.existsSync(path.join(outDir, "nodes"))
+        && fs.readdirSync(path.join(outDir, "nodes")).length > 0;
     }, { env: { ...BASE_ENV, FAKE_OMP_MODE: "echoturn" } });
     ok("D4 ★ 用法错在派发之前就抛(UsageError,且点名是第几个 spec)",
       threw instanceof UsageError && /第 1 个 spec/.test(threw.message), String(threw?.message).slice(0, 140));
-    ok("D4 ★ 而且**一个环节都没跑**(否则就是先花钱再报错)", ranAnything === false);
+    ok("D4 ★ 而且**一个环节都没跑**(连 nodes/ 里一个文件都没建 —— 否则就是先花钱再报错)",
+      ranAnything === false,
+      fs.existsSync(path.join(outDir, "nodes")) ? fs.readdirSync(path.join(outDir, "nodes")).join(", ") : "(无 nodes/)");
   }
 
   // ── D2:failureKind ──────────────────────────────────────────────────────
@@ -696,6 +705,14 @@ async function t13_defect_fixes() {
       bridge.runNode({ id: "flaky", agent: "omp", cwd: REPO, prompt: "SAME_PROMPT", timeoutMs: 30000, outDir }),
       { env: { ...BASE_ENV, OMP_BIN: path.join(HERE, "definitely-not-a-real-binary-xyz") } });
     ok("D3 第一次确实失败了(否则这段考不到重试)", bad.status === "backend_failed", bad.status);
+    // 归档前把原件的**字节**留一份:后面要验"归档件就是它",而不是"归档件也是一张失败回执"。
+    const firstReceiptBytes = fs.readFileSync(path.join(nodesDir, "flaky.receipt.json"), "utf8");
+    // ⚠️ 故意塞一个**工具不认识的后缀**。不塞的话,这个夹具留下的恰好只有 `.receipt.json`
+    //    和 `.scene` 两样 —— 于是「只搬这两种」的坏实现照样能让下面那条"一样不落"变绿
+    //    (第一版就是这样,变异跑出来才发现它是被别处的报错顺带带红的,自己并没有抓到)。
+    //    「不维护后缀清单」这条设计,只有拿清单外的东西去考才算考到。
+    fs.writeFileSync(path.join(nodesDir, "flaky.zz-unknown-kind.txt"), "某种以后才会有的产物\n");
+    const beforeFiles = fs.readdirSync(nodesDir).filter((n) => n.startsWith("flaky.") && n !== "flaky.lock");
 
     // 第二次:同一个 id、同一份 spec,retryFailed 原地重试
     const good = await withBridge(async (bridge) =>
@@ -711,8 +728,27 @@ async function t13_defect_fixes() {
       fs.existsSync(path.join(nodesDir, "flaky.f1.receipt.json"))
         && fs.existsSync(path.join(nodesDir, "flaky.f1.scene")),
       fs.readdirSync(nodesDir).join(", "));
-    ok("D3 ★ 归档件里那张回执就是上次失败那张(不是随便挪了个文件)",
-      JSON.parse(fs.readFileSync(path.join(nodesDir, "flaky.f1.receipt.json"), "utf8")).status === "backend_failed");
+    // ⚠️ 这一条针对复审点名的假绿:「只搬 .receipt.json 和 .scene」的坏实现,原先照样全绿。
+    //    判据改成**上一次留下的每一样都必须搬走**,而不是点名检查其中两样 ——
+    //    点名检查等于又维护了一张会漏的清单,正是 archiveFailedRun 刻意不做的那件事。
+    // ⚠️ 判据不能写成"原名必须消失":新的这一次会**合法地重新写出同名回执**,那样断言恒红。
+    //    准确的说法是两条:①每一样都得有 f1 副本;②还留在原名下的必须是**新内容** ——
+    //    第二条同时挡住"复制而不是移动"(复制的话两处字节一模一样)。
+    const archivedName = (n) => `flaky.f1.${n.slice("flaky.".length)}`;
+    const sameBytes = (a, b) => {
+      try {
+        if (!fs.statSync(a).isFile() || !fs.statSync(b).isFile()) return false;
+        return fs.readFileSync(a).equals(fs.readFileSync(b));
+      } catch { return false; }
+    };
+    ok("D3 ★ 上一次留下的产物**一样不落**全搬进了 f1,且没有一样是被复制过去的",
+      beforeFiles.length >= 2
+        && beforeFiles.every((n) => fs.existsSync(path.join(nodesDir, archivedName(n))))
+        && !beforeFiles.some((n) => sameBytes(path.join(nodesDir, n), path.join(nodesDir, archivedName(n)))),
+      `上次留下 ${beforeFiles.join(", ")};现在 ${fs.readdirSync(nodesDir).join(", ")}`);
+    ok("D3 ★ 归档件里那张回执**逐字节**就是上次那张(只比 status 的话,随便挪张失败回执都能蒙混)",
+      fs.readFileSync(path.join(nodesDir, "flaky.f1.receipt.json"), "utf8") === firstReceiptBytes,
+      `归档件 ${fs.readFileSync(path.join(nodesDir, "flaky.f1.receipt.json"), "utf8").length} 字 vs 原件 ${firstReceiptBytes.length} 字`);
     ok("D3 新回执里记了它是重试来的、上次什么结局",
       good.retriedFrom?.n === 1 && good.retriedFrom?.prevStatus === "backend_failed"
         && good.retriedFrom?.archivedPrefix === "flaky.f1.",
@@ -767,13 +803,15 @@ async function t13_defect_fixes() {
     // echoturn 会把收到的 prompt 回显 —— 于是"范围段真的发出去了"可以逐字节验证
     const r = await withBridge(async (bridge) =>
       bridge.runNode({ id: "scoped", agent: "omp", cwd: REPO, prompt: "TASK_BODY", timeoutMs: 30000, outDir,
-                       scope: { include: ["ONLY_THIS_FILE"], outOfBounds: ["NO_TRESPASS"] } }),
+                       scope: { include: ["ONLY_THIS_FILE"], exclude: ["SKIP_THIS_ONE"],
+                                outOfBounds: ["NO_TRESPASS"] } }),
       { env: { ...BASE_ENV, FAKE_OMP_MODE: "echoturn" } });
     ok("D7 带 scope 的节点正常跑完", r.status === "ok", r.status);
     const body = fs.readFileSync(r.artifactPath, "utf8");
-    ok("D7 ★ 范围段**真的发给了后端**(回显里既有任务正文也有范围)",
-      body.includes("TASK_BODY") && body.includes("ONLY_THIS_FILE") && body.includes("NO_TRESPASS"),
-      body.slice(0, 200));
+    ok("D7 ★ 范围段**真的发给了后端**(三个键一个都不许少 —— 丢掉 exclude 也算实现坏了)",
+      body.includes("TASK_BODY") && body.includes("ONLY_THIS_FILE")
+        && body.includes("SKIP_THIS_ONE") && body.includes("NO_TRESPASS"),
+      body.slice(0, 300));
     // 改范围 = 换任务单:同 id + reuseIfSame 必须被复用闸拒掉,而不是静默复用旧结果
     let rejected = null;
     await withBridge(async (bridge) => {
@@ -835,6 +873,298 @@ async function t13_defect_fixes() {
   }
 }
 
+/**
+ * T14 —— 第 1 轮复审揪出来的七条。
+ *
+ * 这一节全是「上一版看着对、其实有洞」的东西,所以每条都写清**坏在哪**,
+ * 而不是只写"应该怎样":读的人得能看出这条断言在防谁。
+ */
+async function t14_review_round1() {
+  console.log("\n[T14] 第 1 轮复审的收口:归属歧义 / 证据串台 / 无回执残留 / 降级对账 / 形状一致");
+
+  // ── R1:id 里的点号会让「按前缀认归属」失效 ────────────────────────────────
+  // 坏在哪:id 允许点号时,重试 `a` 会把 `a.b` 的产物一起搬走 —— 连 `a.b.lock` 都偷走,
+  //        那把锁一没,另一个进程就能同时再跑一遍 `a.b`。
+  {
+    const outDir = path.join(RUN_ROOT, "t14-id");
+    let threw = null;
+    await withBridge(async (bridge) => {
+      try { await bridge.runNode({ id: "a.b", agent: "omp", cwd: REPO, prompt: "x", timeoutMs: 30000, outDir }); }
+      catch (e) { threw = e; }
+    }, { env: { ...BASE_ENV, FAKE_OMP_MODE: "echoturn" } });
+    ok("R1 ★ 含点号的 id 当场拒绝(点号是产物名的分隔符,留着它前缀归属就不成立)",
+      threw instanceof UsageError && /点号/.test(threw.message), String(threw?.message).slice(0, 140));
+    ok("R1 拒绝发生在开会话之前(没白花钱)",
+      !fs.existsSync(path.join(outDir, "nodes", "a.b.receipt.json")));
+  }
+
+  // ── R2:失败分类不许拿别人的 stderr 当证据 ────────────────────────────────
+  // 坏在哪:桥的 stderr 尾巴是**整座桥共用一份**。前一个环节吐过 "billing account disabled",
+  //        后一个环节撞上别的错,就会被判成 quota —— 于是去查账单,而不是重试。
+  // 桥 stderr 没法在真跑里按需注入(那是桥进程自己的流),所以这里考**纯函数 + 分类**的组合:
+  // 复现复审给的那个场景 —— 尾巴里躺着上一个环节的欠费错文,本环节撞的是 429。
+  {
+    const POLLUTION = "ERROR your billing account is disabled, payment required\n";
+    const MINE = "ERROR HTTP 429 too many requests, please retry later\n";
+    const tail = POLLUTION + MINE;
+
+    const win = stderrWindow({ tail, totalChars: tail.length, mark: POLLUTION.length, exclusive: true });
+    ok("R2 ★ 窗口只切出本轮开跑之后的那一段(上一个环节的字节留在窗口外)",
+      win === MINE, JSON.stringify(win));
+    ok("R2 ★ 于是分类判成 rate_limited(该等一会儿重试),不是 quota(去查账单、永久放弃)",
+      classifyFailure({ status: "backend_failed", error: "", stderrTail: win }).failureKind === "rate_limited",
+      JSON.stringify(classifyFailure({ status: "backend_failed", error: "", stderrTail: win })));
+    // 反证:不划窗口就是复审复现出来的那个错判 —— 证明这条断言确实在防这件事。
+    ok("R2 (反证)不划窗口时确实会被判成 quota —— 这就是被修掉的那个错",
+      classifyFailure({ status: "backend_failed", error: "", stderrTail: tail }).failureKind === "quota",
+      JSON.stringify(classifyFailure({ status: "backend_failed", error: "", stderrTail: tail })));
+    ok("R2 ★ 并发过就完全不采信桥 stderr(四个环节交织在一条流里,谁的哪一行流本身没说)",
+      stderrWindow({ tail, totalChars: tail.length, mark: 0, exclusive: false }) === null);
+    ok("R2 本轮期间桥一个字都没吐时,老实返回 null 而不是把旧字节当新的",
+      stderrWindow({ tail, totalChars: tail.length, mark: tail.length, exclusive: true }) === null);
+    ok("R2 新吐的比尾巴还长时整条尾巴都算本轮的(尾巴会滑走,不能按长度反推)",
+      stderrWindow({ tail, totalChars: 99999, mark: 0, exclusive: true }) === tail);
+  }
+
+  // 真跑一遍,坐实「跑完的环节会从在跑集合里摘掉」—— 漏了这一步集合只增不减,
+  // 后面每个环节都会被判成并发过,于是永远拿不到桥 stderr 那份证据(静默退化)。
+  {
+    const outDir = path.join(RUN_ROOT, "t14-active");
+    let sizes = [];
+    await withBridge(async (bridge) => {
+      for (const id of ["s1", "s2", "s3"]) {
+        await bridge.runNode({ id, agent: "omp", cwd: REPO, prompt: "x", timeoutMs: 30000, outDir });
+        sizes.push(bridge._activeNodes.size);
+      }
+    }, { env: { ...BASE_ENV, FAKE_OMP_MODE: "echoturn" } });
+    ok("R2 ★ 串行跑完三个环节后,「在跑」集合是空的(不摘干净就会静默退化成永不采信)",
+      sizes.every((n) => n === 0), JSON.stringify(sizes));
+  }
+
+  // ── R3:上次连回执都没写下来时,残留产物照样要留档 ──────────────────────────
+  // 坏在哪:归档整段包在「回执存在」里。上次在写回执前就被杀掉、只留下 .md/.scene 的话,
+  //        retryFailed 会直接跳过归档、把 canonical 路径覆盖掉 —— 最需要留档的场合反而不留。
+  {
+    const outDir = path.join(RUN_ROOT, "t14-orphan");
+    const nodesDir = path.join(outDir, "nodes");
+    fs.mkdirSync(nodesDir, { recursive: true });
+    // 手造「上次崩在写回执之前」的现场:有产出、有现场目录,**唯独没有回执**。
+    fs.writeFileSync(path.join(nodesDir, "orphan.md"), "上一次的产出,没人给它写回执\n");
+    fs.mkdirSync(path.join(nodesDir, "orphan.scene"), { recursive: true });
+    fs.writeFileSync(path.join(nodesDir, "orphan.scene", "session.log"), "上一次的现场\n");
+
+    const r = await withBridge(async (bridge) =>
+      bridge.runNode({ id: "orphan", agent: "omp", cwd: REPO, prompt: "NEW_RUN", timeoutMs: 30000,
+                       outDir, retryFailed: true }),
+      { env: { ...BASE_ENV, FAKE_OMP_MODE: "echoturn" } });
+    ok("R3 这一次跑通了", r.status === "ok", r.status);
+    ok("R3 ★ 没有回执的残留产物也被留档了(f1 里既有 .md 也有现场)",
+      fs.existsSync(path.join(nodesDir, "orphan.f1.md"))
+        && fs.existsSync(path.join(nodesDir, "orphan.f1.scene", "session.log")),
+      fs.readdirSync(nodesDir).join(", "));
+    ok("R3 ★ 上一次的正文没有被这一次覆盖掉(留档件里还是原话)",
+      fs.readFileSync(path.join(nodesDir, "orphan.f1.md"), "utf8").includes("没人给它写回执"),
+      fs.readFileSync(path.join(nodesDir, "orphan.f1.md"), "utf8").slice(0, 80));
+    ok("R3 canonical 路径给了这一次",
+      fs.readFileSync(path.join(nodesDir, "orphan.md"), "utf8").includes("NEW_RUN"));
+    ok("R3 回执里记了它是从「没留下回执」那次重试来的",
+      r.retriedFrom?.n === 1 && /没留下回执/.test(String(r.retriedFrom?.prevStatus)),
+      JSON.stringify(r.retriedFrom));
+  }
+
+  // ── R4:归档中途搬不动,已搬走的必须还原 ──────────────────────────────────
+  // 坏在哪:逐项 rename、中途抛且不回滚 —— 回执已进 f1、剩下的还在 canonical,
+  //        下一次重试要么看不见回执(跳过归档直接覆盖),要么把剩下的塞进 f2,
+  //        **同一次失败的现场被拆成两个号**。
+  {
+    const outDir = path.join(RUN_ROOT, "t14-rollback");
+    const nodesDir = path.join(outDir, "nodes");
+    fs.mkdirSync(nodesDir, { recursive: true });
+    fs.writeFileSync(path.join(nodesDir, "stuck.md"), "产出\n");
+    fs.writeFileSync(path.join(nodesDir, "stuck.receipt.json"),
+      JSON.stringify({ id: "stuck", status: "backend_failed" }) + "\n");
+    // 怎么才能真的挡住 rename:**开着句柄的普通文件在这台机器上照样能改名**
+    // (第一版就是这么写的,于是回滚分支根本没被走到 —— 一条没考到却看着像通过的断言)。
+    // Windows 上改不动的是「里面有打开文件的目录」,而 `.scene/` 恰好是目录、
+    // readdir 里又排在 `.md`/`.receipt.json` 后面:前两件先搬走、它失败,正是"半截归档"那一刻。
+    fs.mkdirSync(path.join(nodesDir, "stuck.scene"), { recursive: true });
+    const blockerPath = path.join(nodesDir, "stuck.scene", "session.log");
+    fs.writeFileSync(blockerPath, "被占着\n");
+    const held = fs.openSync(blockerPath, "r+");
+    let threw = null;
+    try {
+      await withBridge(async (bridge) => {
+        try {
+          await bridge.runNode({ id: "stuck", agent: "omp", cwd: REPO, prompt: "x", timeoutMs: 30000,
+                                 outDir, retryFailed: true });
+        } catch (e) { threw = e; }
+      }, { env: { ...BASE_ENV, FAKE_OMP_MODE: "echoturn" } });
+    } finally { try { fs.closeSync(held); } catch {} }
+
+    const after = fs.readdirSync(nodesDir);
+    if (threw) {
+      ok("R4 ★ 搬不动就停下,而且已经搬走的都还原了(现场没被拆成两半)",
+        !after.some((n) => n.startsWith("stuck.f1.")) && after.includes("stuck.receipt.json")
+          && after.includes("stuck.md"),
+        after.join(", "));
+      ok("R4 报错说清了没覆盖任何东西、以及该去处理谁",
+        /没有覆盖任何东西/.test(String(threw.message)) && /stuck\.scene/.test(String(threw.message)),
+        String(threw.message).slice(0, 300));
+    } else {
+      // 这台机器上占着句柄也能 rename(不同文件系统语义不同)——那就退而验"要么全搬要么全没搬"。
+      const f1 = after.filter((n) => n.startsWith("stuck.f1."));
+      ok("R4 ★ 这台机器允许占用中改名,那就必须整批搬完(不许留半截)",
+        f1.length === 3, `f1 里有 ${f1.join(", ")};全部 ${after.join(", ")}`);
+      ok("R4 ⚠️ 本机 rename 没被占用阻挡,**回滚分支这一轮没考到**(是没考到,不是通过了)", true);
+    }
+  }
+
+  // ── R5:顶层降级成 unknown 时,failureKind 必须跟着走 ────────────────────────
+  // 坏在哪:分类在轮级做,之后 write 收尾/收尾异常/回执写失败都会把 status 压成 unknown,
+  //        却不动 failureKind —— 下游按分类分派时拿到 null,只能当"没失败"或者当场炸。
+  {
+    const outDir = path.join(RUN_ROOT, "t14-downgrade");
+    const nodesDir = path.join(outDir, "nodes");
+    fs.mkdirSync(nodesDir, { recursive: true });
+    // 让回执**写不下去**:把 <id>.receipt.json 这个名字先占成目录。
+    // ⚠️ 必须带 `force` —— 否则幂等闸看见"回执已存在"就先炸了,压根走不到写盘那一步
+    //    (第一版忘了这点,harness 当场被 UsageError 打断)。
+    fs.mkdirSync(path.join(nodesDir, "cantwrite.receipt.json"), { recursive: true });
+    const r = await withBridge(async (bridge) =>
+      bridge.runNode({ id: "cantwrite", agent: "omp", cwd: REPO, prompt: "x", timeoutMs: 30000,
+                       outDir, force: true }),
+      { env: { ...BASE_ENV, FAKE_OMP_MODE: "echoturn" } });
+    ok("R5 前提:回执写不下去,顶层被降级成 unknown", r.status === "unknown", r.status);
+    ok("R5 ★ 降级之后 failureKind 不许还是 null(有字段却拿不到结论是最难查的形状)",
+      FAILURE_KINDS.includes(r.failureKind), JSON.stringify({ k: r.failureKind }));
+    ok("R5 ★ 而且老实标成 internal —— 这是本工具没能收场,不是后端的错(混进 backend_crash 会诱导重试本地 bug)",
+      r.failureKind === "internal", String(r.failureKind));
+    ok("R5 证据说清了是收尾阶段定的",
+      /收尾/.test(String(r.failureEvidence)), String(r.failureEvidence).slice(0, 160));
+  }
+
+  // ── R6:CLI 拼错的开关不许静默丢弃 ────────────────────────────────────────
+  // 坏在哪:parseArgs 放行任意 --xxx。`--scope-fiel x.json` 被悄悄丢掉,环节照跑照花钱,
+  //        人以为范围约束生效了 —— 和 scope 里 `includes` 拼错是同一个坑。
+  {
+    const outDir = path.join(RUN_ROOT, "t14-cli-typo");
+    const base = ["--id", "t", "--agent", "omp", "--cwd", REPO, "--prompt", "x",
+                  "--timeout-ms", "30000", "--out-dir", outDir];
+    const r = await runCli([...base, "--scope-fiel", "nope.json"], { FAKE_OMP_MODE: "echoturn" });
+    ok("R6 ★ 拼错的开关当场拒绝(退出码 5),不是解析了没人用",
+      r.code === 5 && /不认识的开关 --scope-fiel/.test(r.err), `exit=${r.code} ${r.err.slice(-200)}`);
+    ok("R6 还提示了正确写法(拼错时人最需要的就是这一句)",
+      /--scope-file/.test(r.err), r.err.slice(-200));
+    ok("R6 ★ 而且一个字都没跑(拒绝在派发之前)",
+      !fs.existsSync(path.join(outDir, "nodes", "t.receipt.json")));
+    // 反面:正常开关不许被这道闸误伤。
+    const good = await runCli(base, { FAKE_OMP_MODE: "echoturn" });
+    ok("R6 正常开关不受影响(这道闸没有误伤)", good.code === 0, `exit=${good.code} ${good.err.slice(-200)}`);
+  }
+
+  // ── R10:判定不许命中**我们自己发出去的话** ────────────────────────────────
+  // 坏在哪:现场的 session.log 是双向的,后端把我们的 prompt 原样回显进去。真 e2e 里实测到
+  //        一次:prompt 写了「预期起不来」,分类就凭这四个字判成 backend_crash。
+  //        真正危险的是任务正文里出现「配额」「欠费」—— 会被判成 quota,而 quota 的处置是
+  //        别再重试、去充值:一次本可自愈的失败被永久放弃,人还去查一笔没问题的账。
+  {
+    const PROMPT = "请审计计费模块:配额耗尽时会不会重复扣款,以及 quota exceeded 的分支。\n第二行凑够长度。";
+    const LOG = `> {"type":"user","content":"${PROMPT.split("\n")[0]}"}\n`
+              + `< {"type":"result","subtype":"error","message":"ECONNRESET while reading"}\n`;
+    const withOwn = classifyFailure({ status: "backend_failed", error: "", sceneDir: null,
+                                      stderrTail: LOG, ownTexts: [PROMPT] });
+    ok("R10 ★ 任务正文里的「配额 / quota」不会让失败被判成 quota(否则本可重试的活儿被永久放弃)",
+      withOwn.failureKind !== "quota", JSON.stringify(withOwn));
+    // 反证:不剔除就会判成 quota —— 证明这条断言确实在防这件事。
+    const without = classifyFailure({ status: "backend_failed", error: "", sceneDir: null,
+                                      stderrTail: LOG });
+    ok("R10 (反证)不剔除自己说过的话时确实会判成 quota —— 这就是被修掉的那个错",
+      without.failureKind === "quota", JSON.stringify(without));
+    ok("R10 ★ 剔除只针对自己的话,后端真说的那句照样认得出(不能一并把证据削光)",
+      withOwn.failureKind === "backend_crash" && /ECONNRESET/.test(String(withOwn.failureEvidence)),
+      JSON.stringify(withOwn));
+    ok("R10 太短的行不剔除(否则会把正常错文一起削掉)",
+      classifyFailure({ status: "backend_failed", error: "quota exceeded",
+                        ownTexts: ["quota"] }).failureKind === "quota",
+      JSON.stringify(classifyFailure({ status: "backend_failed", error: "quota exceeded", ownTexts: ["quota"] })));
+  }
+
+  // 上面四条考的是**纯函数**。但「`settleTurn` 到底有没有把自己发出去的话传下去」是根**接线**,
+  // 纯函数测不到 —— 变异实测过:把 `ownTexts` 置空,上面四条照样全绿。
+  // 所以这里走一遍真流程:假后端出错时**把收到的原话抄进错误消息**(真后端常这么干)。
+  {
+    const outDir = path.join(RUN_ROOT, "t14-ownwire");
+    const r = await withBridge(async (bridge) =>
+      bridge.runNode({ id: "wire", agent: "omp", cwd: REPO, timeoutMs: 30000, outDir,
+        prompt: "请审计计费模块:配额耗尽会不会重复扣款,重点看 quota exceeded 那个分支。" }),
+      { env: { ...BASE_ENV, FAKE_OMP_MODE: "errecho" } });
+    // 前提要坐实在**分类真正会去读的那份证据**上 —— 是现场的 session.log / status.json,
+    // 不是回执的 `error`(那句是桥自己的话)。第一版查错了字段,前提当场变红。
+    const sceneText = r.scene?.dir
+      ? fs.readdirSync(r.scene.dir).map((f) => fs.readFileSync(path.join(r.scene.dir, f), "utf8")).join("\n")
+      : "";
+    ok("R10 前提:这一轮失败了,而且现场里确实回显了我们的原话",
+      r.status !== "ok" && /quota exceeded/.test(sceneText),
+      `${r.status} / 现场 ${sceneText.length} 字`);
+    ok("R10 ★★ 整条接线:真跑一遍,任务正文里的 quota 字样也不会让它被判成 quota",
+      r.failureKind !== "quota",
+      `判成 ${r.failureKind};凭据:${String(r.failureEvidence).slice(0, 200)}`);
+  }
+
+  // ── R9:归档的归属判定要跟文件系统同一套大小写规则 ──────────────────────────
+  // 坏在哪(仅 Windows):文件名大小写不敏感,而 startsWith 敏感。id 写 `Foo`、磁盘上是
+  //        `foo.receipt.json` 时,existsSync 认为"有旧回执"(于是走归档分支),
+  //        readdir 过滤却一个都匹配不上 —— 什么都没搬,紧接着新的一次把 foo.* 覆盖掉。
+  if (IS_WIN) {
+    const outDir = path.join(RUN_ROOT, "t14-case");
+    const nodesDir = path.join(outDir, "nodes");
+    fs.mkdirSync(nodesDir, { recursive: true });
+    // 磁盘上是小写,任务单里写大写。
+    fs.writeFileSync(path.join(nodesDir, "casey.md"), "上一次的产出\n");
+    fs.writeFileSync(path.join(nodesDir, "casey.receipt.json"),
+      JSON.stringify({ id: "casey", status: "backend_failed" }) + "\n");
+    const r = await withBridge(async (bridge) =>
+      bridge.runNode({ id: "Casey", agent: "omp", cwd: REPO, prompt: "NEWER", timeoutMs: 30000,
+                       outDir, retryFailed: true }),
+      { env: { ...BASE_ENV, FAKE_OMP_MODE: "echoturn" } });
+    ok("R9 这一次跑通了", r.status === "ok", `${r.status} ${r.error ?? ""}`);
+    const names = fs.readdirSync(nodesDir);
+    ok("R9 ★ 大小写不同也认得出是同一个环节的产物,老老实实归了档",
+      names.some((n) => /^casey\.f1\.md$/i.test(n)), names.join(", "));
+    ok("R9 ★ 上一次的正文没有被无声覆盖掉",
+      names.filter((n) => /^casey\.f1\.md$/i.test(n))
+        .every((n) => fs.readFileSync(path.join(nodesDir, n), "utf8").includes("上一次的产出")),
+      names.join(", "));
+    ok("R9 回执也记了这是重试来的(而不是当成一次全新的首跑)",
+      r.retriedFrom?.n === 1, JSON.stringify(r.retriedFrom));
+  }
+
+  // ── R7:runAll 的合成回执必须和真回执**同形** ──────────────────────────────
+  // 坏在哪:合成那张是手抄的字段清单,漏了 retriedFrom / inferredDeps /
+  //        inferredDepsTruncated / turnDurationMs,"每个元素都是一张回执"这句话不成立。
+  {
+    const outDir = path.join(RUN_ROOT, "t14-shape");
+    const nodesDir = path.join(outDir, "nodes");
+    fs.mkdirSync(nodesDir, { recursive: true });
+    fs.writeFileSync(path.join(nodesDir, "locked.lock"), "someone-else\n");
+    const rs = await withBridge(async (bridge) =>
+      bridge.runAll([
+        { id: "real", agent: "omp", cwd: REPO, prompt: "x", timeoutMs: 30000, outDir },
+        { id: "locked", agent: "omp", cwd: REPO, prompt: "x", timeoutMs: 30000, outDir },
+      ]), { env: { ...BASE_ENV, FAKE_OMP_MODE: "echoturn" } });
+    const [real, synth] = rs;
+    ok("R7 前提:一真一合成", real.status === "ok" && synth.status === "unknown",
+      `${real.status} / ${synth.status}`);
+    const missing = Object.keys(real).filter((k) => !(k in synth));
+    ok("R7 ★ 合成回执的键**一个不少**(下游按字段消费时不会拿到 undefined)",
+      missing.length === 0, `缺:${missing.join(", ")}`);
+    ok("R7 ★ internal 也要给证据(处置是「去看本地代码」,人得知道凭什么这么判)",
+      synth.failureKind === "internal" && typeof synth.failureEvidence === "string"
+        && synth.failureEvidence.length > 0,
+      JSON.stringify({ k: synth.failureKind, e: synth.failureEvidence }));
+  }
+}
+
 async function main() {
   console.log(`[harness] 运行目录 ${RUN_ROOT}`);
   console.log(`[harness] 假后端 ${FAKE_OMP}`);
@@ -853,6 +1183,7 @@ async function main() {
   await t11_backend_multiturn();
   await t12_attempts();
   await t13_defect_fixes();
+  await t14_review_round1();
   await sleep(1500); // 给最后一批收尾动作一点时间,再做残留总检
   await t10_no_residue();
 

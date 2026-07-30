@@ -118,7 +118,7 @@ process.stdin.on("data", d => {
           ? slowsettleStreaming
           : (MODE === "multiturn" || MODE === "multiturn-fast")
           ? multiturnStreaming
-          : !(MODE === "okturn" || MODE === "okturn-exit" || MODE === "errturn" || MODE === "echoturn" || MODE === "reaskturn" || WRITE_MODES.includes(MODE) || MODE === "ctxturn" || MODE === "logstress" || MODE === "badline" || MODE === "toolturns" || MODE === "agentenderr" || MODE === "hugeturn");
+          : !(MODE === "okturn" || MODE === "okturn-exit" || MODE === "errturn" || MODE === "errecho" || MODE === "echoturn" || MODE === "reaskturn" || WRITE_MODES.includes(MODE) || MODE === "ctxturn" || MODE === "logstress" || MODE === "badline" || MODE === "toolturns" || MODE === "agentenderr" || MODE === "hugeturn");
         const data = { isStreaming, queuedMessageCount: 0, sessionId: "fake", messageCount: 1 };
         // ctx* modes: real omp reports current-context occupancy in get_state.data (contextUsage sub-object
         // + isCompacting/autoCompactionEnabled siblings — see the probe dump). The bridge normalizes this to
@@ -261,6 +261,18 @@ process.stdin.on("data", d => {
           say({ type: "agent_start" });
           setTimeout(() => {
             say({ type: "turn_end", message: { stopReason: "error", errorMessage: "fake-omp: simulated turn error" } });
+            say({ type: "agent_end" });
+          }, 60);
+        } else if (MODE === "errecho") {
+          // 出错,**并且把收到的原话抄进错误消息里** —— 真后端常这么干(报错时引用惹事的那段输入)。
+          // 用来考「失败分类不许命中我们自己说过的话」的**整条接线**:
+          // 光测 classifyFailure 这个纯函数是不够的,`settleTurn` 有没有真的把自己发出去的话
+          // 传下去,只有走一遍真流程才看得出来(变异实测:不测这一段,把 ownTexts 置空照样全绿)。
+          say({ type: "agent_start" });
+          const quoted = String(msg.message ?? "").slice(0, 2000);
+          setTimeout(() => {
+            say({ type: "turn_end", message: { stopReason: "error",
+                  errorMessage: `fake-omp: 这一轮失败了,原始请求是:${quoted}` } });
             say({ type: "agent_end" });
           }, 60);
         } else if (MODE === "hugeturn") {

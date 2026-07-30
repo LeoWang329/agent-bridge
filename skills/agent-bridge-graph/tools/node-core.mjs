@@ -224,8 +224,16 @@ export function normalizeSpec(raw, { kind = "node" } = {}) {
     if (s[k] === undefined || s[k] === null || s[k] === "") throw new UsageError(`任务单缺必填字段:${k}`);
     requireString(s[k], k);
   }
-  if (!/^[A-Za-z0-9._-]+$/.test(s.id)) {
-    throw new UsageError(`id 只能用字母数字和 . _ -(拿来做文件名):${s.id}`);
+  // ⚠️ **点号不许出现在 id 里,这是一条不变量,不是风格洁癖。**
+  // 所有产物都平铺在同一个 nodes/ 目录里,靠 `<id>.` 前缀认归属(归档、清理都靠它)。
+  // 一旦 id 自己带点,`a` 和 `a.b` 的产物就分不开了:重试 `a` 会把 `a.b.md` 搬成 `a.f1.b.md`,
+  // 连 `a.b.lock` 都一起偷走 —— 那把锁一没,另一个进程就能同时再跑一遍 `a.b`。
+  // 「按前缀认归属」要成立,前提就是 id 里没有分隔符。把前提写死在入口,比在归档处打补丁可靠。
+  if (!/^[A-Za-z0-9_-]+$/.test(s.id)) {
+    const why = s.id.includes(".")
+      ? "(点号是产物名的分隔符,id 里不能有 —— 否则 `a` 与 `a.b` 的产物分不开)"
+      : "(拿来做文件名)";
+    throw new UsageError(`id 只能用字母数字和 _ -${why}:${s.id}`);
   }
   if (!["omp", "codex", "claude", "cursor", "kimi"].includes(s.agent)) {
     throw new UsageError(`agent 必须是 omp|codex|claude|cursor|kimi,拿到:${s.agent}`);
@@ -585,6 +593,9 @@ export async function startBridge(opts = {}) {
 
   const state = {
     child, exited: null, stderrTail: "", waiters: new Map(),
+    // 桥 stderr **从开机到现在**一共吐了多少字符。尾巴只留末 4000 字、会滑走,
+    // 所以"这一轮开跑之后新吐的是哪一段"没法用 tail.length 算,只能靠这个只增不减的水位。
+    stderrChars: 0,
     nextId: 1, closed: false, lateResponses: 0, activeNodes: new Set(),
   };
 
@@ -617,8 +628,10 @@ export async function startBridge(opts = {}) {
   // stdin 的异步 EPIPE 必须变成 waiter 的 reject,不能冒泡成进程级未捕获异常
   child.stdin.on("error", (e) => failAllWaiters(new TransportError(`向桥写入失败:${e.message}`)));
   child.stderr.on("data", (d) => {
-    state.stderrTail = (state.stderrTail + d.toString()).slice(-4000);
-    if (opts.onStderr) opts.onStderr(d.toString());
+    const s = d.toString();
+    state.stderrChars += s.length;
+    state.stderrTail = (state.stderrTail + s).slice(-4000);
+    if (opts.onStderr) opts.onStderr(s);
   });
 
   let buf = "";
@@ -717,6 +730,7 @@ export async function startBridge(opts = {}) {
   const bridge = {
     callTool,
     get stderrTail() { return state.stderrTail; },
+    get stderrChars() { return state.stderrChars; },
     get exited() { return state.exited; },
     get lateResponses() { return state.lateResponses; },
     get pid() { return child.pid; },
@@ -1663,26 +1677,11 @@ export async function prepareRun(bridge, rawSpec, { kind = "node", hold = null }
     throw Object.assign(new UsageError(`无法创建环节锁文件 ${lockPath}:${e.message}`), { phase: "lock" });
   }
 
-  run.receipt = {
-    receiptVersion: RECEIPT_VERSION,
-    id: spec.id, specHash: spec.specHash,
-    agent: spec.agent, model: spec.model ?? null, effort: spec.effort ?? null,
-    status: "unknown", artifactPath: null, charCount: null, byteCount: null,
-    contextUsage: null, reaskCount: 0, durationMs: null,
-    // 失败为什么(封闭枚举)+ 凭什么这么判。ok 时恒为 null —— **有字段但恒 null**
-    // 比"成功回执上压根没这个键"好:调用方不必写 `?.`,也不会把 undefined 当成"没失败"。
-    failureKind: null, failureEvidence: null,
-    // 这一次是不是"原地重试"出来的,上一次是什么结局、审计原件在哪个前缀下。
-    // 留在**回执里**而不是只留在磁盘上:回执是这个环节唯一的对外记录。
-    retriedFrom: null,
-    startedAt: run.startedAt, endedAt: null, diagnostics: [], error: null, scene: null,
-    sessionId: null, abortConfirmed: null, closeConfirmed: null, artifactSha256: null,
-    // v2:**每次尝试各自一条**。第一次的产出不再被第二次覆盖(见 attemptArtifactPathFor)。
-    attempts: [],
-    // read 环节恒为 null;write 环节在入场时填 worktree 信息,收尾时被 finalizeWorktree 的结果填满
-    // (branch / baseCommit / headCommit / filesChanged / diffPath / committed / removed)。
-    access: spec.access, workspace: null,
-  };
+  run.receipt = blankReceipt({
+    id: spec.id, specHash: spec.specHash, agent: spec.agent,
+    model: spec.model ?? null, effort: spec.effort ?? null,
+    access: spec.access, startedAt: run.startedAt,
+  });
   if (isConv) {
     run.receipt.kind = "conversation";
     run.receipt.turns = [];
@@ -1690,7 +1689,8 @@ export async function prepareRun(bridge, rawSpec, { kind = "node", hold = null }
     // 逐轮才有的那几样在对话的**顶层回执**上没有意义 —— 留着就是一排恒为 null 的字段,
     // 而"没有消费者的字段"这个坑本仓踩过好几次。它们全在 turns[] 里各归各轮。
     for (const k of ["artifactPath", "charCount", "byteCount", "artifactSha256",
-                     "reaskCount", "contextUsage", "abortConfirmed", "scene", "attempts"]) {
+                     "reaskCount", "contextUsage", "abortConfirmed", "scene", "attempts",
+                     "inferredDeps", "inferredDepsTruncated", "turnDurationMs"]) {
       delete run.receipt[k];
     }
   } else {
@@ -1800,6 +1800,14 @@ export async function prepareRun(bridge, rawSpec, { kind = "node", hold = null }
       } else {
         reused = await taggedPhase("reuse-check", () => checkReuse(run));
       }
+    } else if (spec.retryFailed && !spec.force && hasOrphanArtifacts(nodesDir, spec.id)) {
+      // **没有回执、却留着产物** —— 上一次在写回执之前就断了(进程被杀、回执原子写失败、
+      // 断电)。原先归档整段都包在"回执存在"里面,于是这一支直接跳过归档,
+      // 新的一次把 `<id>.md` 覆盖掉、`.scene/` 和新回执混在一起 ——
+      // 正好是 D3 要修的那件事,只不过发生在最需要留档的场合:**上次连回执都没来得及写**。
+      run.retriedFrom = taggedPhaseSync("retry-archive", () =>
+        archiveFailedRun(nodesDir, spec.id, "(上次没留下回执)"));
+      run.receipt.retriedFrom = run.retriedFrom;
     }
   } catch (e) {
     await releaseRun(run);
@@ -1936,12 +1944,46 @@ async function assertAttemptsIntact(run, turnKey, attempts, reask, bail) {
  *    `<id>.` 开头的**一律**搬,只排除两样 —— 我们此刻正攥着的 `<id>.lock`,
  *    以及**已经归档过的** `<id>.f<m>.*`(否则第二次重试会把第一次的审计原件套进去)。
  */
+/**
+ * 没有回执,但这个 id 还留着别的产物吗?
+ *
+ * 判据与 `archiveFailedRun` 的搬运规则**必须是同一条**(`<id>.` 开头,排除此刻攥着的锁和
+ * 已归档件),否则会出现"这里说没有残留、那里却搬走了东西"的漂移。
+ * 这也是为什么两处都不去维护一张后缀清单。
+ */
+function hasOrphanArtifacts(nodesDir, id) {
+  let entries;
+  try { entries = fs.readdirSync(nodesDir); } catch { return false; }
+  return ownedEntries(entries, id).some((n) => !/^f\d+\./.test(n.slice(id.length + 1)));
+}
+
+/**
+ * 这些文件名里,哪些属于环节 `id`(排除此刻攥着的锁)。
+ *
+ * ⚠️ **大小写要跟文件系统同一套规则。** Windows 上文件名大小写不敏感,而 `startsWith` 敏感:
+ * id 写作 `Foo`、磁盘上是 `foo.receipt.json` 时,`fs.existsSync("Foo.receipt.json")` **为真**
+ * (于是走进归档分支),这里却一个都匹配不上 —— 归档列表为空、什么都没搬,
+ * 紧接着新的一次把 `foo.*` **覆盖掉**。现场就这么无声销毁了。
+ * 决定"这两个名字是不是同一个文件"的是文件系统,那判归属就得用它那套规则。
+ */
+function ownedEntries(entries, id) {
+  const fold = (s) => (IS_WINDOWS ? s.toLowerCase() : s);
+  const prefix = fold(`${id}.`);
+  const lock = fold(`${id}.lock`);
+  return entries.filter((n) => fold(n).startsWith(prefix) && fold(n) !== lock);
+}
+
 function archiveFailedRun(nodesDir, id, prevStatus) {
+  // 「按前缀认归属」只有在 id 里没有点号时才成立(见 normalizeSpec 里那条不变量)。
+  // 这里再挡一道:这个函数会**改名别人的文件**,靠调用链上游的校验没被绕过,代价太大。
+  if (id.includes(".")) {
+    throw new UsageError(`内部不变量被破坏:id "${id}" 含点号,按前缀归档会误伤同前缀的其他环节`);
+  }
   const prefix = `${id}.`;
   const archived = /^f\d+\./;    // 相对 prefix 之后的那一段
   let entries;
   try { entries = fs.readdirSync(nodesDir); } catch { entries = []; }
-  const mine = entries.filter((n) => n.startsWith(prefix) && n !== `${id}.lock`);
+  const mine = ownedEntries(entries, id);
   // 下一个可用的 <n>:**扫已存在的归档号取最大 + 1**,不从 1 开始试 ——
   // 中间某个号被人手工删掉时,从 1 试会把新的一次塞进那个空档,顺序就乱了。
   let maxN = 0;
@@ -1954,20 +1996,39 @@ function archiveFailedRun(nodesDir, id, prevStatus) {
   for (const name of mine) {
     const rest = name.slice(prefix.length);
     if (archived.test(rest)) continue;         // 已经是归档件,别再套一层
-    const dest = `${prefix}f${nextN}.${rest}`;
+    // 前缀取**磁盘上那份**的大小写(`name.slice(0, …)`),不是任务单里写的那份 ——
+    // 两者在 Windows 上可能不同,用任务单的会让回执里报的文件名跟磁盘上的不一样。
+    // ⚠️ 老实说:这一条**没有测试覆盖,也覆盖不了** —— Windows 上两种拼法指向同一个文件,
+    //    从文件系统看不出区别(变异验过,改回去照样全绿);而大小写敏感的系统上压根不会有分歧。
+    //    留着它只是为了"报出去的名字就是磁盘上那个",不是修一个能观测到的 bug。
+    const dest = `${name.slice(0, prefix.length)}f${nextN}.${rest}`;
     try {
       fs.renameSync(path.join(nodesDir, name), path.join(nodesDir, dest));
-      moved.push(dest);
+      moved.push([name, dest]);
     } catch (e) {
       // 搬不动就**停下**,绝不"那就直接覆盖吧" —— 那正是 force 的语义,而调用方要的不是它。
+      //
+      // ⚠️ 但"停下"之前必须**把已经搬走的搬回来**。半截归档比不归档更坏:
+      //    回执要是已经进了 f1、剩下的还在 canonical,下一次 retryFailed 会看不到回执
+      //    (于是跳过归档、直接覆盖),或者把剩下的塞进 f2 —— **同一次失败的现场被拆成两个号**,
+      //    而审计原件的全部价值就在于"这一次失败的东西都在一起"。
+      const rollbackFailed = [];
+      for (const [from, to] of moved.reverse()) {
+        try { fs.renameSync(path.join(nodesDir, to), path.join(nodesDir, from)); }
+        catch (e2) { rollbackFailed.push(`${to} → ${from}(${e2.message})`); }
+      }
       throw new UsageError(
         `retryFailed:把上次失败的产物归档到 ${dest} 时失败(${e.message})。\n` +
-        `  已经搬走的:${moved.join(", ") || "(无)"}\n` +
-        `  没有覆盖任何东西 —— 请人工处理 ${path.join(nodesDir, name)} 之后再重试。`,
+        (rollbackFailed.length
+          ? `  ⚠️ 已搬走的没能全部还原,现场被拆散了,需要人工归位:\n    ${rollbackFailed.join("\n    ")}\n`
+          : `  已搬走的${moved.length ? ` ${moved.length} 项` : ""}都还原了,现场保持原样。\n`) +
+        `  没有覆盖任何东西 —— 请人工处理 ${path.join(nodesDir, name)} 之后再重试` +
+        `(常见原因:有进程还占着这个文件)。`,
       );
     }
   }
-  return { n: nextN, prevStatus: prevStatus ?? null, archivedPrefix: `${prefix}f${nextN}.`, files: moved };
+  return { n: nextN, prevStatus: prevStatus ?? null, archivedPrefix: `${prefix}f${nextN}.`,
+           files: moved.map(([, to]) => to) };
 }
 
 /** 幂等闸:上一张回执还能不能当成这一次的结果。
@@ -2147,6 +2208,40 @@ async function checkReuse(run) {
 }
 
 /**
+ * 一张**空白回执**。所有回执都从这里出生 —— 包括 `runAll` 在派发阶段炸掉时合成的那张。
+ *
+ * ⚠️ **不要在别处手抄一份字段清单。** 抄出来的那份一定会漂:原先 `runAll` 的合成回执就漏了
+ * `retriedFrom` / `inferredDeps` / `inferredDepsTruncated` / `turnDurationMs`,
+ * 于是"每个元素都是一张回执"这句承诺不成立,严格按字段消费的下游会拿到 `undefined`。
+ * 新增字段只加在这里,两条路径自动同步 —— 这正是本仓反复吃亏的那种清单。
+ */
+function blankReceipt({ id, specHash = null, agent = null, model = null, effort = null,
+                        access = "read", startedAt = null } = {}) {
+  return {
+    receiptVersion: RECEIPT_VERSION,
+    id, specHash, agent, model, effort,
+    status: "unknown", artifactPath: null, charCount: null, byteCount: null,
+    contextUsage: null, reaskCount: 0, durationMs: null, turnDurationMs: null,
+    // 失败为什么(封闭枚举)+ 凭什么这么判。ok 时恒为 null —— **有字段但恒 null**
+    // 比"成功回执上压根没这个键"好:调用方不必写 `?.`,也不会把 undefined 当成"没失败"。
+    failureKind: null, failureEvidence: null,
+    // 派发/收尾自己炸了时才有(runAll)。恒有此键,理由同上。
+    dispatchError: null,
+    // 这一次是不是"原地重试"出来的,上一次是什么结局、审计原件在哪个前缀下。
+    // 留在**回执里**而不是只留在磁盘上:回执是这个环节唯一的对外记录。
+    retriedFrom: null,
+    inferredDeps: [], inferredDepsTruncated: false,
+    startedAt, endedAt: null, diagnostics: [], error: null, scene: null,
+    sessionId: null, abortConfirmed: null, closeConfirmed: null, artifactSha256: null,
+    // v2:**每次尝试各自一条**。第一次的产出不再被第二次覆盖(见 attemptArtifactPathFor)。
+    attempts: [],
+    // read 环节恒为 null;write 环节在入场时填 worktree 信息,收尾时被 finalizeWorktree 的结果填满
+    // (branch / baseCommit / headCommit / filesChanged / diffPath / committed / removed)。
+    access, workspace: null,
+  };
+}
+
+/**
  * `failureKind` 的封闭枚举。**`status` 说的是"这一轮怎么收场",这个说的是"为什么"** ——
  * 而"为什么"决定了处置:要人去充值,还是退避重试,还是别再动它。
  */
@@ -2186,7 +2281,80 @@ const FAILURE_EVIDENCE_TAIL_BYTES = 64 * 1024;
  * 证据按"离后端多近"取:先 `error`(桥明确回报的那句)、再桥自己的 stderr,
  * 都不匹配才去读现场 `session.log` 的**尾部**(有界)。
  */
-export function classifyFailure({ status, error, stderrTail, sceneDir } = {}) {
+/**
+ * 本轮开跑那一刻,记下桥 stderr 的水位;并记下**这一轮期间是不是只有它一个环节在跑**。
+ *
+ * 为什么要有「独占」这个概念:桥 stderr 是一条流,四个环节并行时它们的错文交织在一起,
+ * **谁的哪一行,流本身没有告诉我们**。这种时候唯一诚实的做法是不拿它当证据 ——
+ * 猜错的代价(把别人的欠费错安到我头上、于是永久放弃一个本可重试的环节)远大于
+ * 少一份证据(还有本环节自己的 error 原文和现场 session.log 可用)。
+ */
+function markStderrWindow(bridge, run) {
+  run.stderrMark = bridge?.stderrChars ?? 0;
+  run.stderrExclusive = true;
+  const active = bridge?._activeNodes;
+  if (!active) return;
+  active.add(run);
+  // ⚠️ 只往 false 抹,**永不抹回 true**:并发过就是并发过,后来别人跑完了也洗不掉
+  //    ——它吐的那些字节还在尾巴里躺着。
+  if (active.size > 1) for (const r of active) r.stderrExclusive = false;
+}
+
+/**
+ * 从共用的 stderr 尾巴里,切出**属于某一轮**的那一段。纯函数,**导出只为可测** ——
+ * 这段逻辑判错的后果(把别人的欠费错安到我头上)很贵,而它又恰恰最难在真跑里造出来。
+ *
+ * @param tail       当前尾巴(末 N 字,会滑走)
+ * @param totalChars 桥从开机到现在一共吐了多少字符(只增不减)
+ * @param mark       本轮开跑那一刻的 totalChars
+ * @param exclusive  本轮期间是不是只有它一个环节在跑
+ * @returns 属于本轮的那一段;拿不出可信的一段就返回 null(= 没有这份证据)
+ */
+export function stderrWindow({ tail, totalChars, mark, exclusive } = {}) {
+  if (!exclusive) return null;                       // 并发过 ⇒ 分不清谁的哪一行 ⇒ 不采信
+  if (typeof tail !== "string" || !tail) return null;
+  const fresh = (totalChars ?? 0) - (mark ?? 0);
+  if (fresh <= 0) return null;                       // 本轮期间桥一个字都没吐
+  // 新吐的比尾巴还长时,整条尾巴都是本轮之后的。
+  return fresh >= tail.length ? tail : tail.slice(-fresh);
+}
+
+/** 这一轮**自己**那段桥 stderr。 */
+function nodeStderrTail(run) {
+  return stderrWindow({
+    tail: run?.bridge?.stderrTail,
+    totalChars: run?.bridge?.stderrChars,
+    mark: run?.stderrMark,
+    exclusive: run?.stderrExclusive,
+  });
+}
+
+/**
+ * 把**我们自己发出去的话**从待检文本里抹掉,抹之前先按行拆。
+ *
+ * 为什么要有这一步:现场的 `session.log` 是**双向**的,后端会把我们发的 prompt 原样回显进去。
+ * 不抹掉,判据就会命中我们自己的措辞 —— 真 e2e 实测到过:prompt 里写了「预期起不来」,
+ * 分类就凭这四个字判成 `backend_crash`。真正危险的是任务正文里出现「配额」「欠费」这类词:
+ * 一个失败的环节会被判成 `quota`,而 `quota` 的处置是**别再重试、去充值** ——
+ * 一次本可自愈的失败被永久放弃,而且人还会去查一笔根本没问题的账。
+ *
+ * 按**行**抹而不是整段抹:发出去的正文进了 JSON 之后换行会变成 `\n` 转义,整段比对必然对不上;
+ * 而单行文本通常是逐字保留的。太短的行(<8 字)不抹 —— 抹掉它们会连正常错文一起削掉。
+ */
+function stripOwnText(text, ownTexts) {
+  if (!Array.isArray(ownTexts) || !ownTexts.length) return text;
+  // 去重 + 长的先抹(短行往往是长行的一部分),并给条数收一个界:
+  // 每一行都要在 64 KB 的证据上扫一遍,不收界的话一份几千行的任务正文能把分类拖成秒级。
+  const lines = [...new Set(ownTexts.filter((s) => typeof s === "string").flatMap((s) => s.split(/\r?\n/))
+    .map((s) => s.trim()).filter((s) => s.length >= 8))]
+    .sort((a, b) => b.length - a.length)
+    .slice(0, 500);
+  let out = text;
+  for (const s of lines) out = out.split(s).join(" ");   // 换成空格,别拼出原本不相邻的两段文字
+  return out;
+}
+
+export function classifyFailure({ status, error, stderrTail, sceneDir, ownTexts } = {}) {
   if (status === "ok") return { failureKind: null, failureEvidence: null };
   if (status === "contract_error") {
     // 这一档不用猜:它的定义就是"收场了但形状不对"。
@@ -2215,7 +2383,9 @@ export function classifyFailure({ status, error, stderrTail, sceneDir } = {}) {
   }
 
   for (const [kind, re] of FAILURE_PATTERNS) {
-    for (const [where, text] of sources) {
+    for (const [where, raw] of sources) {
+      // 先把自己说过的话剔掉再匹配 —— 判定只该由**后端说的话**决定。
+      const text = stripOwnText(raw, ownTexts);
       const m = re.exec(text);
       if (!m) continue;
       // 证据要能让人复核:说清在哪儿、命中了什么、上下文长什么样。
@@ -2228,6 +2398,46 @@ export function classifyFailure({ status, error, stderrTail, sceneDir } = {}) {
     failureKind: "unknown",
     failureEvidence: sources.length ? `看过 ${sources.map(([w]) => w).join("/")},没有命中任何一档判据` : "没有可用证据",
   };
+}
+
+/**
+ * 回执写盘**之前**,把「结局」和「为什么」对齐成同一个结论。
+ *
+ * 为什么需要这一步:分类发生在 `settleTurn`(轮级),而**顶层结局在那之后还会被改** ——
+ * write 交付物确认不了、收尾抛异常、回执写不下去,三条路都会把 status 压成 `unknown`。
+ * 那三处只改了 status,于是回执长成 `status:"unknown"` + `failureKind:null`:
+ * 下游按分类分派时拿到 null,只能当"没失败"或者当场炸掉。
+ *
+ * 这里**不重新猜后端的错**(那一轮的窗口早就过去了),只保证两件事:
+ * ①非 ok 一定有一个分类;②分类是收尾自己造成的时候,老老实实标 `internal` ——
+ * 那不是后端的错,把它混进 `backend_crash` 会诱导人去重试一个本地 bug。
+ */
+function reconcileOutcome(run, turnStatus) {
+  const { receipt } = run;
+  if (receipt.status === "ok") { receipt.failureKind = null; receipt.failureEvidence = null; return; }
+
+  // 对话节点:顶层结局取自"最坏的那一轮",那么"为什么"也该来自同一轮。
+  // 不补这一步的话,**失败的对话节点回执永远顶着 failureKind:null** ——
+  // 分类落在轮记录上,而顶层回执压根没人给它填过。
+  if (!receipt.failureKind && Array.isArray(receipt.turns)) {
+    const culprit = receipt.turns.find((t) => t?.status === receipt.status && t?.failureKind);
+    if (culprit) {
+      receipt.failureKind = culprit.failureKind;
+      receipt.failureEvidence = `第 ${culprit.key ?? "?"} 轮:${culprit.failureEvidence}`;
+    }
+  }
+
+  if (!receipt.failureKind) {
+    receipt.failureKind = "internal";
+    receipt.failureEvidence =
+      `收尾阶段把结局定为 ${receipt.status}(轮结局=${turnStatus ?? "?"}) —— 不是后端的错,` +
+      `是本工具没能确认收场;${String(receipt.error || "").slice(0, 200)}`;
+  } else if (turnStatus && turnStatus !== receipt.status) {
+    // 分类当初是针对轮结局做的,顶层后来被降级了 —— 证据里必须说清这件事,
+    // 否则人会拿着一个"针对别的结局"的判定去处置。
+    receipt.failureEvidence =
+      `[判定针对轮结局 ${turnStatus},顶层已降级为 ${receipt.status}] ${receipt.failureEvidence}`;
+  }
 }
 
 /** 结束**这一轮**:定状态 +(非 ok 时)立刻冻结现场。
@@ -2247,8 +2457,9 @@ async function settleTurn(run, status, extra = {}) {
     const cls = classifyFailure({
       status,
       error: rec.error,
-      stderrTail: run.bridge?.stderrTail,
+      stderrTail: nodeStderrTail(run),
       sceneDir: status === "ok" ? null : run.sceneDirFor(run.currentKey),
+      ownTexts: run.ownTexts,
     });
     rec.failureKind = cls.failureKind;
     rec.failureEvidence = cls.failureEvidence;
@@ -2393,6 +2604,10 @@ export async function runTurn(run, t) {
   await bridge._gate.acquire();
   run.gateHeld = true;
   run.startClock(t.timeoutMs); // 预算从**真正开跑**这一刻起算,不含排队时间
+  // 给失败分类划出**这一轮自己的** stderr 窗口。桥的 stderr 是一条**所有环节共用**的流:
+  // 不划窗口就会拿前一个环节的错文给这一个定性 —— 上一个环节吐过 "billing account disabled",
+  // 这一个撞上 429,就会被判成 quota(于是去查账单,而不是等一会儿重试)。
+  markStderrWindow(bridge, run);
   // 「**这一轮**拿到执行名额、开始烧预算」。⚠️ 不是「这个节点第一次开跑」——
   // 每一轮各自排队、各自起钟,所以一个节点有几轮就有几条。
   if (run.viz) await run.viz.turnGateAcquired(t, monoNow() - queuedFrom);
@@ -2518,6 +2733,13 @@ export async function runTurn(run, t) {
         settled: false, t0: monoNow(),
       };
       receipt.attempts.push(liveAttempt);
+      // ⚠️ 留一份**我们自己发出去的原文**,只给失败分类用(在内存里,不进回执)。
+      //    现场的 `session.log` 是**双向**的:后端会把我们发的话原样回显进去。
+      //    不把自己说过的话剔掉,判据就会命中**我们自己的措辞** —— 真 e2e 里实测到一次:
+      //    prompt 里写了「预期起不来」,分类就凭这四个字判成 backend_crash。
+      //    真正危险的是反过来:谁的任务正文里出现「配额」「欠费」,一个失败的环节就会被判成
+      //    quota,而 quota 的处置是**别再重试、去充值** —— 一次本可自愈的失败被永久放弃。
+      (run.ownTexts ??= []).push(msgArgs.message);
       // 先把输入归档、再发引用它的事件 —— 顺序反了页面会读到 404 并当成"文件丢了"。
       if (run.viz) await run.viz.attemptStarted(t, liveAttempt, msgArgs.message);
 
@@ -2801,6 +3023,7 @@ export async function finalizeRun(run, { callbackError = null, callbackThrew = f
   receipt.endedAt = nowIso();
   // ⚠️ 用**环节**的起点(首轮起钟那一刻),不是最后一轮的 t0 —— 多轮时后者只算得出最后一轮的耗时。
   receipt.durationMs = Math.round(monoNow() - (run.nodeT0 ?? run.t0));
+  reconcileOutcome(run, turnStatus);
   try {
     writeAtomic(run.receiptPath, JSON.stringify(receipt, null, 2) + "\n");
   } catch (e) {
@@ -2808,6 +3031,9 @@ export async function finalizeRun(run, { callbackError = null, callbackThrew = f
     // 绝不能"退出 0 但没有回执"。
     receipt.status = "unknown";
     receipt.error = `回执写入失败(${e.message});原始结局=${turnStatus}${receipt.error ? `;${receipt.error}` : ""}`;
+    // 这一句降级发生在上面那次对账**之后**,所以必须再对一次 —— 否则调用方拿到的是
+    // `status:"unknown"` 配 `failureKind:null`,正是"有字段但拿不到结论"那种最难查的形状。
+    reconcileOutcome(run, turnStatus);
   }
   // ── viz:节点终态。**排在归档 receipt.json 写完之后**(见 viz.settled 里那一步)。
   if (run.viz) {
@@ -2997,6 +3223,9 @@ export async function releaseRun(run) {
   }
   if (run.gateHeld) { run.bridge._gate.release(); run.gateHeld = false; }
   if (run.scopeHeld) { run.bridge._scopeGate.release(); run.scopeHeld = false; }
+  // 从"此刻在跑的环节"里摘掉。**漏了这一步,集合就只增不减**,后面每个环节都会被判成
+  // "并发过"、于是永远拿不到桥 stderr 那份证据 —— 一个静默让分类越来越瞎的退化。
+  run.bridge?._activeNodes?.delete(run);
   if (run.active && run.activeKey) run.active.delete(run.activeKey);
   try { if (run.lockFd !== null) fs.closeSync(run.lockFd); } catch {}
   run.lockFd = null;
@@ -3495,23 +3724,23 @@ export async function runAll(bridge, specs) {
   return settled.map((r, i) => {
     if (r.status === "fulfilled") return r.value;
     const e = r.reason;
-    const id = specs[i]?.id ?? `#${i}`;
-    return {
-      receiptVersion: RECEIPT_VERSION,
-      id, specHash: null,
-      agent: specs[i]?.agent ?? null, model: specs[i]?.model ?? null, effort: specs[i]?.effort ?? null,
-      status: "unknown",
-      // 这不是后端给的结局,是派发/收尾自己炸了。分开写,免得被当成"后端失败"去重试。
-      dispatchError: e instanceof Error ? `${e.name}: ${e.message}` : String(e),
-      failureKind: "internal", failureEvidence: null,
-      artifactPath: null, charCount: null, byteCount: null, artifactSha256: null,
-      contextUsage: null, reaskCount: 0, durationMs: null,
-      startedAt: null, endedAt: nowIso(),
-      diagnostics: [`runAll:第 ${i} 个环节在派发/收尾阶段抛出,已归一成 unknown 而不中断其余环节`],
-      error: e instanceof Error ? e.message : String(e),
-      scene: null, sessionId: null, abortConfirmed: null, closeConfirmed: null,
-      attempts: [], access: specs[i]?.access ?? "read", workspace: null,
-    };
+    const detail = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+    // ⚠️ 从**同一个工厂**出生,不手抄字段清单 —— 抄的那份漂过一次(漏了四个字段),
+    //    于是"每个元素都是一张回执"这句话不成立。
+    const rec = blankReceipt({
+      id: specs[i]?.id ?? `#${i}`,
+      agent: specs[i]?.agent ?? null, model: specs[i]?.model ?? null,
+      effort: specs[i]?.effort ?? null, access: specs[i]?.access ?? "read",
+    });
+    rec.endedAt = nowIso();
+    // 这不是后端给的结局,是派发/收尾自己炸了。分开写,免得被当成"后端失败"去重试。
+    rec.dispatchError = detail;
+    rec.failureKind = "internal";
+    // 证据不能留空:`internal` 的处置是"去看本地代码",人得知道凭什么这么判。
+    rec.failureEvidence = `runAll 派发/收尾阶段抛出:${detail}`;
+    rec.error = e instanceof Error ? e.message : String(e);
+    rec.diagnostics.push(`runAll:第 ${i} 个环节在派发/收尾阶段抛出,已归一成 unknown 而不中断其余环节`);
+    return rec;
   });
 }
 

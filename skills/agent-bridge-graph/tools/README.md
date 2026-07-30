@@ -41,7 +41,9 @@ const rs = await bridge.runAll(FILES.map((f, i) => ({ id: `audit-${i}`, agent: "
 `runAll` 的契约:
 
 - 返回数组与 `specs` **同序等长**(按下标取是安全的)。
-- 每个元素都是回执;`status` 仍然只有那五档,**不新增第六档**。
+- 每个元素都是回执 —— **字段一个不少**,包括派发阶段炸出来的那张合成回执
+  (它和正常回执从同一个工厂出生,所以按字段消费不会拿到 `undefined`)。
+  `status` 仍然只有那五档,**不新增第六档**。
 - **用法错在派发任何环节之前就抛** —— 所有 spec 先过一遍 `normalizeSpec`,那时一个环节都还没跑,
   抛出去不丢任何东西;而一个拼错的字段也不会伪装成"某个环节失败了"混过去。
 - 派发之后再抛的(锁撞了、内部异常)不中断别人:归一成 `status:"unknown"` + `dispatchError`
@@ -105,7 +107,7 @@ const receipt = await bridge.conversation(
 
 | 字段 | 必填 | 说明 |
 |---|---|---|
-| `id` | ✅ | 环节编号,只能用 `[A-Za-z0-9._-]`(要拿来做文件名);同 `outDir` 内唯一 |
+| `id` | ✅ | 环节编号,只能用 `[A-Za-z0-9_-]`(要拿来做文件名);同 `outDir` 内唯一。**点号不行** —— 产物平铺在同一个目录里、靠 `<id>.` 前缀认归属,id 自己带点的话 `a` 和 `a.b` 的产物就分不开(重试 `a` 会搬走 `a.b` 的东西,连它的锁一起) |
 | `agent` | ✅ | `omp` / `codex` / `claude` / `cursor` / `kimi` |
 | `cwd` | ✅ | 委托 agent 的工作目录(绝对路径,必须存在) |
 | `outDir` | ✅ | 产出与回执落盘的目录 |
@@ -137,6 +139,13 @@ const receipt = await bridge.conversation(
 新回执里记 `retriedFrom: { n, prevStatus, archivedPrefix, files }`。
 
 - 与 `reuseIfSame` **可以同传**,而且这正是断点续跑要的语义:**好的复用、坏的重试**。
+- **上次连回执都没写下来也照样留档。** 进程被杀、断电、回执落盘本身失败 ——
+  这些场合磁盘上只剩 `.md` / `.scene/`,没有回执。它们同样会被挪进 `<id>.f<n>.`,
+  `retriedFrom.prevStatus` 记成 `(上次没留下回执)`。**恰恰是这种时候最需要现场**,
+  而没有回执并不代表没有现场。
+- **搬不动就整批还原。** 归档是逐个改名的,中途某一样被别的进程占着(Windows 上常见)
+  就会失败 —— 这时已经搬走的会**全部搬回原位**再报错。半截归档比不归档更坏:
+  同一次失败的现场会被拆进两个归档号,而审计原件的全部价值就是"这一次的东西都在一起"。
 - ⚠️ **`access:"write"` 不支持,会当场报错。** 失败的 write 环节会把 worktree 与分支
   **原样保留**(里面可能有还没人看过的改动),原地重试就得先动它们 —— 那个决定必须由人做。
   处置:自己看一眼 `git -C <worktree> status`,确认可丢弃后用 `force`,或换新 id。
@@ -200,6 +209,7 @@ await withBridge(async (bridge) => { … }, { viz: true, outDir });   // ← 给
   // 不是不容置疑的标签;拿不准就自己看 `failureEvidence` 指的那段。
   "failureEvidence": null,
   "retriedFrom": null,                          // retryFailed 命中才有:{n, prevStatus, archivedPrefix, files}
+  "dispatchError": null,                        // runAll 里派发/收尾自己抛了才有(见 runAll 那节)
   "artifactPath": "<outDir>/nodes/audit-auth.md",
   "charCount": 1234, "byteCount": 1400,
   "contextUsage": { "tokens": 51234 },          // cursor/kimi 恒 null(是"未知",不是 0)
@@ -344,6 +354,9 @@ node node-turn.mjs --id <名> --agent <后端> --cwd <目录> \
 `--require-keys a,b` 等价于 `outputShape.requiredKeys`;`--no-reask` 等价于 `reask: 0`;
 `--scope-file F` 读一份 `{include,exclude,outOfBounds}` 的 JSON(键拼错当场退 5,判据与 JS 那边同一处);
 `--json` 让 stdout 只吐回执 JSON(给脚本吃)。
+
+**不认识的开关会被当场拒绝(退出码 5),并提示正确写法** —— `--scope-fiel` 这种拼错不会被
+静默丢掉。静默忽略拼错的输入,代价是"你以为设了、其实没设",永远比响亮报错贵。
 
 **`--force` 与 `--retry-failed` 别选错**:前者**销毁**旧产物,后者把它们挪到 `<id>.f<n>.*` **留档**。
 想重跑一个失败的环节,要的几乎总是 `--retry-failed` —— 现场是查清「为什么失败」的唯一凭据。

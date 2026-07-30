@@ -34,6 +34,9 @@ import path from "node:path";
 import { withBridge, runNode, UsageError, STATUS_EXIT } from "./node-core.mjs";
 
 const BOOLEAN_FLAGS = new Set(["no-reask", "force", "reuse-if-same", "retry-failed", "write", "allow-dirty-base", "json", "help"]);
+// 带取值的开关。**必须和 BOOLEAN_FLAGS 一起构成"全部认识的开关"** —— 见 parseArgs 里为什么。
+const VALUE_FLAGS = new Set(["id", "agent", "cwd", "out-dir", "timeout-ms", "prompt", "prompt-file",
+  "model", "effort", "role-file", "require-keys", "schema-file", "scope-file", "base-ref"]);
 
 function die(msg, code = 5) {
   process.stderr.write(`[node-turn] ${msg}\n`);
@@ -46,6 +49,15 @@ function parseArgs(argv) {
     const a = argv[i];
     if (!a.startsWith("--")) { out._.push(a); continue; }
     const key = a.slice(2);
+    // ⚠️ **不认识的开关一律当场拒绝,绝不"解析了但没人消费"。**
+    // 原先这里放行任意 `--xxx`:`--scope-fiel x.json` 会被静默丢掉,环节照跑照花钱,
+    // 而人以为范围约束已经生效了 —— 和 scope 里 `includes` 拼错是同一个坑,
+    // 这次的新开关正好又踩了一遍。静默忽略拼错的输入,永远比响亮报错贵。
+    if (!BOOLEAN_FLAGS.has(key) && !VALUE_FLAGS.has(key)) {
+      const all = [...VALUE_FLAGS, ...BOOLEAN_FLAGS];
+      const near = all.filter((k) => k.startsWith(key.slice(0, 3)) || k.includes(key) || key.includes(k));
+      die(`不认识的开关 --${key}${near.length ? `,你是不是想写 ${near.map((k) => `--${k}`).join(" / ")}?` : ""}`);
+    }
     if (BOOLEAN_FLAGS.has(key)) { out[key] = true; continue; }
     const next = argv[i + 1];
     if (next === undefined || next.startsWith("--")) die(`--${key} 缺少取值`);

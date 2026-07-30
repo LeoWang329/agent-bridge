@@ -310,6 +310,9 @@ bridge.runNode({ id: "implement", agent: "claude", cwd: REPO, outDir,
 <out-dir>/nodes/<id>.scene/          ← 只有非正常收场才有:session.log / answer.txt / status.json
 <repo>/.graph/wt/<run>/<id>/         ← write 环节的隔离工作树(跑完即删,请 gitignore `.graph/`)
 
+⚠️ 一个环节的东西全靠 `<id>.` 前缀认归属(重试留档、清理都靠它),所以 **id 里不能有点号**
+   (只允许字母数字和 `_` `-`)。允许的话 `a` 和 `a.b` 的产物就分不开了。
+
 对话(conversation)多一层「轮」,产出与现场都按轮分开:
 <out-dir>/nodes/<id>.t-<key>.md      ← **每一轮**的完整产出
 <out-dir>/nodes/<id>.t-<key>.scene/  ← 那一轮的现场(只有非正常收场才有)
