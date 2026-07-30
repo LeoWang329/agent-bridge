@@ -46,16 +46,18 @@ const ok = (n, c, d = "") => { if (c) { pass++; console.log(`[PASS] ${n}`); } el
 const readArtifact = (r) =>
   r?.artifactPath && fs.existsSync(r.artifactPath) ? fs.readFileSync(r.artifactPath, "utf8") : "";
 
+// ⚠️ 体检**排在建临时目录之前**。反过来的话,后端不可用时那句 `process.exit(0)` 会跳过
+//    finally 的清理,于是每 SKIP 一次就在 temp 里留一个 graph-e2e-defects-* 目录,越攒越多。
+const doc = await withBridge((b) => b.doctor(), {});
+const docText = doc?._raw || JSON.stringify(doc);
+if (!new RegExp(`${AGENT}:\\s*ok`, "i").test(docText)) {
+  console.log(`>>> SKIP: 需要后端 ${AGENT} 可用`);
+  process.exit(0);
+}
+
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "graph-e2e-defects-"));
 let exitCode = 1;
 try {
-  // ── 0. 体检 ────────────────────────────────────────────────────────────────
-  const doc = await withBridge((b) => b.doctor(), {});
-  const docText = doc?._raw || JSON.stringify(doc);
-  if (!new RegExp(`${AGENT}:\\s*ok`, "i").test(docText)) {
-    console.log(`>>> SKIP: 需要后端 ${AGENT} 可用`);
-    process.exit(0);
-  }
 
   // 一个小工作区。scope 那节要引用**真实存在**的文件名,否则模型有理由说"我没看见这些文件"。
   const cwd = path.join(ROOT, "ws");

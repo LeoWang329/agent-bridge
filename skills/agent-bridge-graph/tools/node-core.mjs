@@ -1951,9 +1951,22 @@ async function assertAttemptsIntact(run, turnKey, attempts, reask, bail) {
  * 已归档件),否则会出现"这里说没有残留、那里却搬走了东西"的漂移。
  * 这也是为什么两处都不去维护一张后缀清单。
  */
-function hasOrphanArtifacts(nodesDir, id) {
+export function hasOrphanArtifacts(nodesDir, id) {
   let entries;
-  try { entries = fs.readdirSync(nodesDir); } catch { return false; }
+  try {
+    entries = fs.readdirSync(nodesDir);
+  } catch (e) {
+    // ⚠️ **列不出目录 ≠ 目录里没东西。** 原先这里 `catch { return false; }`,
+    //    等于把"看不见"当成"确定没有" —— 而紧接着这一次就会覆盖 `<id>.md`。
+    //    ACL 只给了写权限没给列权限、或者一次瞬时 I/O 错误,都会走到这里。
+    //    "分不清的时候唯一安全的答案是停下等人",这是本工具最要紧的一条纪律,不该在这儿破例。
+    if (e?.code === "ENOENT") return false;   // 目录压根不存在 —— 这才是真的没有残留
+    throw new UsageError(
+      `retryFailed:列不出 ${nodesDir}(${e.message}),无法判断上一次有没有留下产物。\n` +
+      `  **没有覆盖任何东西**就停下了 —— 看不见不等于没有,而这一次跑下去就会把它盖掉。\n` +
+      `  确认目录可读之后再重试。`,
+    );
+  }
   return ownedEntries(entries, id).some((n) => !/^f\d+\./.test(n.slice(id.length + 1)));
 }
 
@@ -1973,7 +1986,7 @@ function ownedEntries(entries, id) {
   return entries.filter((n) => fold(n).startsWith(prefix) && fold(n) !== lock);
 }
 
-function archiveFailedRun(nodesDir, id, prevStatus) {
+export function archiveFailedRun(nodesDir, id, prevStatus) {
   // 「按前缀认归属」只有在 id 里没有点号时才成立(见 normalizeSpec 里那条不变量)。
   // 这里再挡一道:这个函数会**改名别人的文件**,靠调用链上游的校验没被绕过,代价太大。
   if (id.includes(".")) {
@@ -1982,7 +1995,16 @@ function archiveFailedRun(nodesDir, id, prevStatus) {
   const prefix = `${id}.`;
   const archived = /^f\d+\./;    // 相对 prefix 之后的那一段
   let entries;
-  try { entries = fs.readdirSync(nodesDir); } catch { entries = []; }
+  try {
+    entries = fs.readdirSync(nodesDir);
+  } catch (e) {
+    // 同 `hasOrphanArtifacts`:列不出来就**停下**,绝不"当成空的、宣称归档成功" ——
+    // 那会让调用方以为现场留好了,然后这一次把它盖掉。
+    throw new UsageError(
+      `retryFailed:列不出 ${nodesDir}(${e.message}),没法把上一次的产物挪走。\n` +
+      `  **没有覆盖任何东西**就停下了。确认目录可读之后再重试。`,
+    );
+  }
   const mine = ownedEntries(entries, id);
   // 下一个可用的 <n>:**扫已存在的归档号取最大 + 1**,不从 1 开始试 ——
   // 中间某个号被人手工删掉时,从 1 试会把新的一次塞进那个空档,顺序就乱了。
@@ -2330,28 +2352,26 @@ function nodeStderrTail(run) {
 }
 
 /**
- * 把**我们自己发出去的话**从待检文本里抹掉,抹之前先按行拆。
+ * 把**我们自己发出去的话**拼成一份小写干草堆,给分类做"这句话我是不是也说过"的比对。
  *
- * 为什么要有这一步:现场的 `session.log` 是**双向**的,后端会把我们发的 prompt 原样回显进去。
- * 不抹掉,判据就会命中我们自己的措辞 —— 真 e2e 实测到过:prompt 里写了「预期起不来」,
+ * 为什么需要它:现场的 `session.log` 是**双向**的,后端会把我们发的 prompt 原样回显进去。
+ * 不管这件事,判据就会命中我们自己的措辞 —— 真 e2e 实测到过:prompt 里写了「预期起不来」,
  * 分类就凭这四个字判成 `backend_crash`。真正危险的是任务正文里出现「配额」「欠费」这类词:
  * 一个失败的环节会被判成 `quota`,而 `quota` 的处置是**别再重试、去充值** ——
- * 一次本可自愈的失败被永久放弃,而且人还会去查一笔根本没问题的账。
+ * 一次本可自愈的失败被永久放弃,人还会去查一笔根本没问题的账。
  *
- * 按**行**抹而不是整段抹:发出去的正文进了 JSON 之后换行会变成 `\n` 转义,整段比对必然对不上;
- * 而单行文本通常是逐字保留的。太短的行(<8 字)不抹 —— 抹掉它们会连正常错文一起削掉。
+ * ⚠️ 第一版是「按行把自己的话从证据里抹掉」,**换掉了** —— 那是在启发式上再打一层启发式,
+ *    三种情况都能绕过去:后端把回显改成大写、日志把引号转义、以及"输入和真错文恰好同一句"
+ *    (那一版会把真错文一起削掉)。现在改成比对**命中的那一小段本身**:
+ *    它不依赖回显时逐字保留,只依赖"那个词还是那个词",大小写和转义都挡得住。
+ *
+ * 仍然盖不到的一角:桥为 cursor / kimi 追加的只读策略前缀是**桥写的**,不在这份干草堆里。
+ * 那些是固定的策略措辞,不含判据词;真出现了会误判,但这一条只能等它真发生再说,
+ * 不在这里假装已经处理了。
  */
-function stripOwnText(text, ownTexts) {
-  if (!Array.isArray(ownTexts) || !ownTexts.length) return text;
-  // 去重 + 长的先抹(短行往往是长行的一部分),并给条数收一个界:
-  // 每一行都要在 64 KB 的证据上扫一遍,不收界的话一份几千行的任务正文能把分类拖成秒级。
-  const lines = [...new Set(ownTexts.filter((s) => typeof s === "string").flatMap((s) => s.split(/\r?\n/))
-    .map((s) => s.trim()).filter((s) => s.length >= 8))]
-    .sort((a, b) => b.length - a.length)
-    .slice(0, 500);
-  let out = text;
-  for (const s of lines) out = out.split(s).join(" ");   // 换成空格,别拼出原本不相邻的两段文字
-  return out;
+function ownTextHaystack(ownTexts) {
+  if (!Array.isArray(ownTexts) || !ownTexts.length) return "";
+  return ownTexts.filter((s) => typeof s === "string").join("\n").toLowerCase();
 }
 
 export function classifyFailure({ status, error, stderrTail, sceneDir, ownTexts } = {}) {
@@ -2382,17 +2402,34 @@ export function classifyFailure({ status, error, stderrTail, sceneDir, ownTexts 
     }
   }
 
+  const own = ownTextHaystack(ownTexts);
+  const muted = [];   // 命中了、但那句话我们自己也说过 ⇒ 分不清,不据此判定
   for (const [kind, re] of FAILURE_PATTERNS) {
-    for (const [where, raw] of sources) {
-      // 先把自己说过的话剔掉再匹配 —— 判定只该由**后端说的话**决定。
-      const text = stripOwnText(raw, ownTexts);
+    for (const [where, text] of sources) {
       const m = re.exec(text);
       if (!m) continue;
+      // ⚠️ **命中的那个词,我们自己是不是也说过?** 说过就分不清了 ——
+      //    现场是双向的,后端会把我们的话原样回显进去(还可能换大小写、加转义)。
+      //    比对**命中的那一小段本身**,而不是去逐行剔除原文:剔除挡不住大小写和转义,
+      //    这一比对挡得住(它不依赖回显时逐字保留,只依赖那个词还是那个词)。
+      if (own && own.includes(m[0].toLowerCase())) {
+        muted.push(`${where} 命中 ${JSON.stringify(m[0])}`);
+        continue;
+      }
       // 证据要能让人复核:说清在哪儿、命中了什么、上下文长什么样。
       const at = Math.max(0, m.index - 60);
       const ctx = text.slice(at, m.index + m[0].length + 60).replace(/\s+/g, " ").trim();
       return { failureKind: kind, failureEvidence: `${where}:命中 ${JSON.stringify(m[0])} —— …${ctx}…` };
     }
+  }
+  if (muted.length) {
+    // **这不是"没查到",是"查到了但说不清"** —— 必须原样告诉人,别让他以为什么都没有。
+    return {
+      failureKind: "unknown",
+      failureEvidence:
+        `${muted.join(";")} —— 但同样的话**我们自己发出去的正文里也有**,` +
+        `分不清是后端说的还是回显我们的,所以不据此判定。请自己看现场。`,
+    };
   }
   return {
     failureKind: "unknown",
@@ -2412,7 +2449,7 @@ export function classifyFailure({ status, error, stderrTail, sceneDir, ownTexts 
  * ①非 ok 一定有一个分类;②分类是收尾自己造成的时候,老老实实标 `internal` ——
  * 那不是后端的错,把它混进 `backend_crash` 会诱导人去重试一个本地 bug。
  */
-function reconcileOutcome(run, turnStatus) {
+export function reconcileOutcome(run, turnStatus) {
   const { receipt } = run;
   if (receipt.status === "ok") { receipt.failureKind = null; receipt.failureEvidence = null; return; }
 
@@ -2427,16 +2464,32 @@ function reconcileOutcome(run, turnStatus) {
     }
   }
 
+  // 顶层结局跟"当初做分类时的那个结局"不一样了 ⇒ **旧分类不再是这张回执的答案**。
+  //
+  // ⚠️ 原先这里只加一句证据前缀、把旧分类留着,于是会长出
+  //    `status:"unknown"` + `failureKind:"quota"` 这种回执:轮里确实撞了欠费,
+  //    但收尾没能确认收场。下游按 `quota` 分派 = 去充值,而真正该做的是**看本地收尾错误**。
+  //    "为什么"必须描述**这张回执为什么是现在这个结局**,不是"路上曾经发生过什么"。
+  //    路上那件事不丢:原分类和原证据整段折进 evidence 里。
+  if (run.kindForStatus !== undefined && run.kindForStatus !== receipt.status) {
+    const was = receipt.failureKind, wasWhy = receipt.failureEvidence;
+    receipt.failureKind = "internal";
+    receipt.failureEvidence =
+      `收尾把结局从 ${run.kindForStatus} 降级为 ${receipt.status} —— 不是后端的错,是本工具没能确认收场;` +
+      `${String(receipt.error || "").slice(0, 200)}` +
+      (was ? `。降级前那一轮的判定是 ${was}:${wasWhy}` : "");
+    // 记下"现在这个分类是针对哪个结局做的",于是第二次对账是**幂等**的
+    //(写盘失败会让本函数再跑一次;不记的话前缀会叠两遍)。
+    run.kindForStatus = receipt.status;
+    return;
+  }
+
   if (!receipt.failureKind) {
     receipt.failureKind = "internal";
     receipt.failureEvidence =
       `收尾阶段把结局定为 ${receipt.status}(轮结局=${turnStatus ?? "?"}) —— 不是后端的错,` +
       `是本工具没能确认收场;${String(receipt.error || "").slice(0, 200)}`;
-  } else if (turnStatus && turnStatus !== receipt.status) {
-    // 分类当初是针对轮结局做的,顶层后来被降级了 —— 证据里必须说清这件事,
-    // 否则人会拿着一个"针对别的结局"的判定去处置。
-    receipt.failureEvidence =
-      `[判定针对轮结局 ${turnStatus},顶层已降级为 ${receipt.status}] ${receipt.failureEvidence}`;
+    run.kindForStatus = receipt.status;
   }
 }
 
@@ -2463,7 +2516,17 @@ async function settleTurn(run, status, extra = {}) {
     });
     rec.failureKind = cls.failureKind;
     rec.failureEvidence = cls.failureEvidence;
+    // 记下这个分类是**针对哪个结局**做的。顶层后来被降级时,`reconcileOutcome` 靠它判断
+    // "旧分类还算不算数" —— 不记的话,一张 status:unknown 的回执会顶着后端那档 quota,
+    // 下游照着去充值,而真正该做的是看本地收尾错误。
+    if (rec === run.receipt) run.kindForStatus = status;
   }
+  // 这一轮结束了,从"此刻在跑的环节"里退出来。
+  // ⚠️ **必须在这里退,不能只等 `releaseRun`。** 对话节点的 `releaseRun` 要到整段结束才跑,
+  //    而轮与轮之间回调还会去跑**嵌套的 runNode** —— 那时对话本身早就闲着了,却仍占着集合,
+  //    于是嵌套节点被判成"并发过"、白白丢掉桥 stderr 那份证据。
+  //    集合语义是「此刻真的在跑」,那就该按轮进出;`releaseRun` 里那次删除留作兜底。
+  run.bridge?._activeNodes?.delete(run);
   // 这一轮之后这个会话还能不能接着用。**由工具判,不靠回调自觉** ——
   // 破了这条的后果是两个 turn 在同一会话里并发,远超"回调写得不好"。
   // ⚠️ 只给对话加:`runNode` 的回执**不许多出新字段**,那是既有调用方与 reuseIfSame 的合同。
@@ -2739,7 +2802,11 @@ export async function runTurn(run, t) {
       //    prompt 里写了「预期起不来」,分类就凭这四个字判成 backend_crash。
       //    真正危险的是反过来:谁的任务正文里出现「配额」「欠费」,一个失败的环节就会被判成
       //    quota,而 quota 的处置是**别再重试、去充值** —— 一次本可自愈的失败被永久放弃。
-      (run.ownTexts ??= []).push(msgArgs.message);
+      if (!run.ownTexts) {
+        // 角色设定也是**我们写的**,而且它同样会被后端回显。只加一次。
+        run.ownTexts = run.spec?.roleBody ? [run.spec.roleBody] : [];
+      }
+      run.ownTexts.push(msgArgs.message);
       // 先把输入归档、再发引用它的事件 —— 顺序反了页面会读到 404 并当成"文件丢了"。
       if (run.viz) await run.viz.attemptStarted(t, liveAttempt, msgArgs.message);
 

@@ -118,7 +118,7 @@ process.stdin.on("data", d => {
           ? slowsettleStreaming
           : (MODE === "multiturn" || MODE === "multiturn-fast")
           ? multiturnStreaming
-          : !(MODE === "okturn" || MODE === "okturn-exit" || MODE === "errturn" || MODE === "errecho" || MODE === "echoturn" || MODE === "reaskturn" || WRITE_MODES.includes(MODE) || MODE === "ctxturn" || MODE === "logstress" || MODE === "badline" || MODE === "toolturns" || MODE === "agentenderr" || MODE === "hugeturn");
+          : !(MODE === "okturn" || MODE === "okturn-exit" || MODE === "errturn" || MODE === "errecho" || MODE === "quotaturn" || MODE === "roleecho" || MODE === "echoturn" || MODE === "reaskturn" || WRITE_MODES.includes(MODE) || MODE === "ctxturn" || MODE === "logstress" || MODE === "badline" || MODE === "toolturns" || MODE === "agentenderr" || MODE === "hugeturn");
         const data = { isStreaming, queuedMessageCount: 0, sessionId: "fake", messageCount: 1 };
         // ctx* modes: real omp reports current-context occupancy in get_state.data (contextUsage sub-object
         // + isCompacting/autoCompactionEnabled siblings — see the probe dump). The bridge normalizes this to
@@ -261,6 +261,32 @@ process.stdin.on("data", d => {
           say({ type: "agent_start" });
           setTimeout(() => {
             say({ type: "turn_end", message: { stopReason: "error", errorMessage: "fake-omp: simulated turn error" } });
+            say({ type: "agent_end" });
+          }, 60);
+        } else if (MODE === "roleecho") {
+          // 把**角色设定**(--append-system-prompt 指到的那份)抄进错误消息里。
+          // 真后端把 system prompt 打进日志并不罕见,而角色设定同样是**我们写的字** ——
+          // 用来考"角色设定也算进「自己说过的话」"这根接线(不考的话,把它从集合里去掉照样全绿)。
+          say({ type: "agent_start" });
+          let roleText = "(没拿到角色文件)";
+          const flag = process.argv.find((a) => a.startsWith("--append-system-prompt"));
+          if (flag) {
+            const p = flag.includes("=") ? flag.slice(flag.indexOf("=") + 1)
+                                         : process.argv[process.argv.indexOf(flag) + 1];
+            try { roleText = fs.readFileSync(p, "utf8").slice(0, 1000); } catch { /* 拿不到就如实说 */ }
+          }
+          setTimeout(() => {
+            say({ type: "turn_end", message: { stopReason: "error",
+                  errorMessage: `fake-omp: 失败了。system prompt 是:${roleText}` } });
+            say({ type: "agent_end" });
+          }, 60);
+        } else if (MODE === "quotaturn") {
+          // 后端明确吐一句**欠费**错文(而且这句话我们自己没说过) —— 用来考
+          // 「轮里判成 quota、收尾又降级成 unknown」之后,顶层分类该归谁。
+          say({ type: "agent_start" });
+          setTimeout(() => {
+            say({ type: "turn_end", message: { stopReason: "error",
+                  errorMessage: "insufficient_quota: your credit balance is too low" } });
             say({ type: "agent_end" });
           }, 60);
         } else if (MODE === "errecho") {

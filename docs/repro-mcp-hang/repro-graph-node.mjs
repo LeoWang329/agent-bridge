@@ -30,7 +30,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { withBridge, startBridge, runNode, UsageError, FAILURE_KINDS, classifyFailure, stderrWindow } from "../../skills/agent-bridge-graph/tools/node-core.mjs";
+import { withBridge, startBridge, runNode, UsageError, FAILURE_KINDS, classifyFailure, stderrWindow,
+         hasOrphanArtifacts, reconcileOutcome, archiveFailedRun } from "../../skills/agent-bridge-graph/tools/node-core.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, "../..");
@@ -941,6 +942,27 @@ async function t14_review_round1() {
       sizes.every((n) => n === 0), JSON.stringify(sizes));
   }
 
+  // 对话节点必须**按轮**进出这个集合,不能整段占着。
+  // 坏在哪:`releaseRun` 要到整段对话结束才跑,而轮与轮之间回调还会去跑**嵌套的 runNode** ——
+  //        那时对话本身闲着,却仍占着集合,于是嵌套节点被判成"并发过"、白丢桥 stderr 那份证据。
+  // ⚠️ 只靠 `releaseRun` 那次删除的话,把按轮那次拿掉照样全绿(变异实测就是这么漏的),
+  //    所以这里在**轮与轮之间**直接看集合大小。
+  {
+    const outDir = path.join(RUN_ROOT, "t14-conv-active");
+    const between = [];
+    await withBridge(async (b) => b.conversation(
+      { id: "cv", agent: "omp", cwd: REPO, outDir },
+      async (turn) => {
+        await turn({ key: "t1", prompt: "AAA", timeoutMs: 30000 });
+        between.push(b._activeNodes.size);            // 这一刻对话闲着,集合该是空的
+        await turn({ key: "t2", prompt: "BBB", timeoutMs: 30000 });
+        between.push(b._activeNodes.size);
+      },
+    ), { env: { ...BASE_ENV, FAKE_OMP_MODE: "echoturn" } });
+    ok("R2 ★ 对话在轮与轮之间不占着「在跑」集合(否则轮间的嵌套节点会被误判成并发)",
+      between.length === 2 && between.every((n) => n === 0), JSON.stringify(between));
+  }
+
   // ── R3:上次连回执都没写下来时,残留产物照样要留档 ──────────────────────────
   // 坏在哪:归档整段包在「回执存在」里。上次在写回执前就被杀掉、只留下 .md/.scene 的话,
   //        retryFailed 会直接跳过归档、把 canonical 路径覆盖掉 —— 最需要留档的场合反而不留。
@@ -1111,6 +1133,150 @@ async function t14_review_round1() {
       `判成 ${r.failureKind};凭据:${String(r.failureEvidence).slice(0, 200)}`);
   }
 
+  // ── R11:第 2 轮复审点名的三种"绕过去"场景 ────────────────────────────────
+  // 第一版是「按行把自己的话从证据里抹掉」,这三种情况都能绕过:
+  //   ①后端把回显换成大写 → 抹不掉,而判据正则不分大小写 → 照样误判
+  //   ②日志把引号转义 → 原文行匹配不上 → 照样误判
+  //   ③输入和真错文恰好是同一句 → 真错文被一起削掉 → 该判的没判
+  // 现在改成比对**命中的那一小段本身**,前两种挡住了;第三种老实报"分不清",不瞎猜。
+  {
+    const OWN = "请检查计费:quota exceeded 这个分支对不对。";
+    const upper = classifyFailure({ status: "backend_failed",
+      stderrTail: 'echo> "QUOTA EXCEEDED" 是我们问的', ownTexts: [OWN] });
+    ok("R11 ★ 后端把回显改成大写也绕不过去(判据不分大小写,那比对也不能分)",
+      upper.failureKind !== "quota", JSON.stringify(upper));
+
+    const escaped = classifyFailure({ status: "backend_failed",
+      stderrTail: 'log: {\\"q\\":\\"quota exceeded\\"}', ownTexts: [OWN] });
+    ok("R11 ★ 日志把引号转义了也绕不过去(比对的是那个词,不是整行原文)",
+      escaped.failureKind !== "quota", JSON.stringify(escaped));
+
+    const both = classifyFailure({ status: "backend_failed",
+      stderrTail: "backend: quota exceeded", ownTexts: [OWN] });
+    ok("R11 ★ 输入和真错文撞在一句时,老实说「分不清」而不是瞎猜一个",
+      both.failureKind === "unknown" && /分不清/.test(String(both.failureEvidence)),
+      JSON.stringify(both));
+    ok("R11 ★ 而且要说清「看到了什么、为什么不据此判定」(不能让人以为什么都没查到)",
+      /命中/.test(String(both.failureEvidence)) && /我们自己发出去的正文里也有/.test(String(both.failureEvidence)),
+      String(both.failureEvidence).slice(0, 200));
+
+    // 我们没说过的词,照常判 —— 这道闸不许误伤。
+    const clean = classifyFailure({ status: "backend_failed",
+      stderrTail: "backend: quota exceeded", ownTexts: ["随便一句无关的话,长度够长"] });
+    ok("R11 我们没说过的词照常判(这道闸不许误伤)",
+      clean.failureKind === "quota", JSON.stringify(clean));
+  }
+
+  // ── R12:列不出目录 ≠ 目录里没东西 ────────────────────────────────────────
+  // 坏在哪:`readdirSync` 失败时返回 false,等于把"看不见"当成"确定没有",
+  //        紧接着这一次就把 <id>.md 覆盖掉 —— 正好重演要修的那条数据丢失路径。
+  // ⚠️ 这里直接考函数,不走整段 runNode:真实成因是「ACL 只给写不给列」,那个在测试里造不出来;
+  //    而想用"把 nodes 换成文件"去凑,`prepareRun` 更早的那次 mkdir 就先 EEXIST 了 ——
+  //    第一版就是这么写的,断言变红但**红的理由不对**(错误来自 mkdir,不是这道闸)。
+  //    两种成因走的是同一条 catch,所以直接喂它一个列不出来的路径就够了。
+  {
+    const notADir = path.join(RUN_ROOT, "t14-notadir");
+    fs.writeFileSync(notADir, "我不是目录\n");
+    let threw = null;
+    try { hasOrphanArtifacts(notADir, "blind"); } catch (e) { threw = e; }
+    ok("R12 ★ 列不出目录就抛,绝不当成「确定没有残留」返回 false",
+      threw instanceof UsageError, `拿到 ${threw?.constructor?.name}: ${threw?.message}`);
+    ok("R12 报错说清了没覆盖任何东西、看不见不等于没有",
+      /没有覆盖任何东西/.test(String(threw?.message)) && /无法判断/.test(String(threw?.message)),
+      String(threw?.message).slice(0, 200));
+    ok("R12 目录压根不存在才是真的没有残留(那一档要照常返回 false,不能一起抛)",
+      hasOrphanArtifacts(path.join(RUN_ROOT, "t14-never-existed"), "blind") === false);
+    // 归档那一处有**同一个坑**:原先 `catch { entries = [] }`,于是什么都没搬却宣称归档成功,
+    // 调用方以为现场留好了,紧接着就把它盖掉。两处必须同一条纪律。
+    let threwArc = null;
+    try { archiveFailedRun(notADir, "blind", "backend_failed"); } catch (e) { threwArc = e; }
+    ok("R12 ★ 归档时列不出目录也要停下,绝不「当成空的、宣称归档成功」",
+      threwArc instanceof UsageError && /没有覆盖任何东西/.test(String(threwArc.message)),
+      `${threwArc?.constructor?.name}: ${String(threwArc?.message).slice(0, 160)}`);
+  }
+
+  // ── R13:降级之后不许再顶着后端那档旧分类 ──────────────────────────────────
+  // 坏在哪:轮里撞了欠费(quota)、收尾又没能确认收场(unknown),原先只加一句证据前缀、
+  //        把 quota 留着 —— 下游照 quota 分派就是去充值,而真正该做的是看本地收尾错误。
+  // 同 R12:直接考这个函数。要在真流程里凑出「轮判成 quota、收尾又降级」得同时满足
+  // 「后端吐欠费」和「收尾失败」两个条件,假后端造不出来(它吐了欠费就已经收在 unknown 上了)。
+  // 与其拿一个凑不出来的夹具糊过去,不如直接把这个函数的语义钉死。
+  {
+    const mkRun = () => ({
+      kindForStatus: "backend_failed",
+      receipt: { status: "unknown", failureKind: "quota",
+                 failureEvidence: "session.log:命中 \"insufficient_quota\" —— …余额不足…",
+                 error: "回执写入失败(EISDIR)", diagnostics: [] },
+    });
+    const run = mkRun();
+    reconcileOutcome(run, "backend_failed");
+    ok("R13 ★ 降级之后不许还顶着后端那档 quota(下游照 quota 分派 = 去充值,而该做的是看本地收尾错误)",
+      run.receipt.failureKind === "internal", String(run.receipt.failureKind));
+    ok("R13 ★ 但轮里那档判定不许消失(要能查出来路上发生过什么)",
+      /quota/.test(String(run.receipt.failureEvidence)) && /insufficient_quota/.test(String(run.receipt.failureEvidence)),
+      String(run.receipt.failureEvidence).slice(0, 220));
+    // 写盘失败会让对账再跑一次 —— 第二次必须是空操作,不能把前缀叠两遍。
+    const before = run.receipt.failureEvidence;
+    reconcileOutcome(run, "backend_failed");
+    ok("R13 ★ 对账跑两次是幂等的(写盘失败会让它再跑一遍,叠两遍前缀就没法读了)",
+      run.receipt.failureEvidence === before
+        && (String(run.receipt.failureEvidence).match(/收尾把结局从/g) || []).length === 1,
+      String(run.receipt.failureEvidence).slice(0, 220));
+    // 结局没变过的时候不许乱动:轮里判的 quota 就是这张回执的答案。
+    const stable = { kindForStatus: "backend_failed",
+      receipt: { status: "backend_failed", failureKind: "quota", failureEvidence: "原判定", diagnostics: [] } };
+    reconcileOutcome(stable, "backend_failed");
+    ok("R13 结局没被降级过就别乱动(这道闸不许误伤正常的后端分类)",
+      stable.receipt.failureKind === "quota" && stable.receipt.failureEvidence === "原判定",
+      JSON.stringify(stable.receipt));
+    // ok 的回执必须被清干净。
+    const fine = { kindForStatus: "ok", receipt: { status: "ok", failureKind: "quota", failureEvidence: "x", diagnostics: [] } };
+    reconcileOutcome(fine, "ok");
+    ok("R13 ok 的回执上两个字段一律清成 null",
+      fine.receipt.failureKind === null && fine.receipt.failureEvidence === null);
+  }
+
+  // 上面考的是函数本身。**「settleTurn 到底有没有记下这个分类是针对哪个结局做的」是根接线** ——
+  // 不记的话降级判据永远不触发,而上面那些手搓 run 的断言照样全绿(变异实测过,就是这么漏的)。
+  // 真流程里凑法:先让这一轮收在 contract_error(分类 = protocol),再让回执写盘失败降级成 unknown。
+  {
+    const outDir = path.join(RUN_ROOT, "t14-kindwire");
+    const nodesDir = path.join(outDir, "nodes");
+    fs.mkdirSync(nodesDir, { recursive: true });
+    fs.mkdirSync(path.join(nodesDir, "kw.receipt.json"), { recursive: true });   // 写盘必失败
+    const r = await withBridge(async (bridge) =>
+      bridge.runNode({ id: "kw", agent: "omp", cwd: REPO, prompt: "x", timeoutMs: 30000, outDir,
+                       force: true, reask: 0, outputShape: { requiredKeys: ["never-gonna-be-there"] } }),
+      { env: { ...BASE_ENV, FAKE_OMP_MODE: "echoturn" } });
+    ok("R13 前提:轮里先判成 contract_error、随后写盘失败把顶层压成 unknown", r.status === "unknown", r.status);
+    ok("R13 ★★ 整条接线:降级之后分类改成 internal,不再顶着轮里那档 protocol",
+      r.failureKind === "internal", `${r.failureKind} / ${String(r.failureEvidence).slice(0, 160)}`);
+    ok("R13 ★ 轮里那档 protocol 折进证据里没丢",
+      /protocol/.test(String(r.failureEvidence)), String(r.failureEvidence).slice(0, 220));
+  }
+
+  // ── R14:角色设定也是「我们自己的话」 ─────────────────────────────────────
+  // 坏在哪:角色文件是**我们写的**,后端同样会把它回显进日志。不算进去的话,
+  //        一份写着「重点查配额相关的分支」的复审角色,能让任何失败都被判成 quota。
+  {
+    const roleFile = path.join(RUN_ROOT, "t14-role.md");
+    fs.writeFileSync(roleFile, "你是复审者。重点检查 quota exceeded 相关的分支有没有重复扣款。\n");
+    const outDir = path.join(RUN_ROOT, "t14-role");
+    const r = await withBridge(async (bridge) =>
+      bridge.runNode({ id: "role", agent: "omp", cwd: REPO, prompt: "开始吧。", timeoutMs: 30000,
+                       outDir, roleFile }),
+      { env: { ...BASE_ENV, FAKE_OMP_MODE: "roleecho" } });
+    const sceneText = r.scene?.dir
+      ? fs.readdirSync(r.scene.dir).map((f) => fs.readFileSync(path.join(r.scene.dir, f), "utf8")).join("\n")
+      : "";
+    ok("R14 前提:失败了,而且现场里回显了角色设定的原文",
+      r.status !== "ok" && /quota exceeded/.test(sceneText),
+      `${r.status} / 现场 ${sceneText.length} 字`);
+    ok("R14 ★ 角色设定里的词也不算后端说的(否则一份复审角色能让所有失败都变成 quota)",
+      r.failureKind !== "quota",
+      `判成 ${r.failureKind};凭据:${String(r.failureEvidence).slice(0, 200)}`);
+  }
+
   // ── R9:归档的归属判定要跟文件系统同一套大小写规则 ──────────────────────────
   // 坏在哪(仅 Windows):文件名大小写不敏感,而 startsWith 敏感。id 写 `Foo`、磁盘上是
   //        `foo.receipt.json` 时,existsSync 认为"有旧回执"(于是走归档分支),
@@ -1156,8 +1322,25 @@ async function t14_review_round1() {
     ok("R7 前提:一真一合成", real.status === "ok" && synth.status === "unknown",
       `${real.status} / ${synth.status}`);
     const missing = Object.keys(real).filter((k) => !(k in synth));
-    ok("R7 ★ 合成回执的键**一个不少**(下游按字段消费时不会拿到 undefined)",
+    ok("R7 合成回执的键覆盖了真回执的每一个",
       missing.length === 0, `缺:${missing.join(", ")}`);
+    // ⚠️ 上面那条**不是独立判据**:从 blankReceipt 里删掉一个两边共有的字段,两边一起没有,
+    //    它照样绿(复审点名)。所以这里写死一份**期望键清单** —— 工厂统一了形状,
+    //    就得有一份不来自工厂的东西去对它,否则测试只是在自己跟自己比。
+    const EXPECTED_KEYS = [
+      "receiptVersion", "id", "specHash", "agent", "model", "effort",
+      "status", "artifactPath", "charCount", "byteCount", "artifactSha256",
+      "contextUsage", "reaskCount", "durationMs", "turnDurationMs",
+      "failureKind", "failureEvidence", "dispatchError", "retriedFrom",
+      "inferredDeps", "inferredDepsTruncated",
+      "startedAt", "endedAt", "diagnostics", "error", "scene",
+      "sessionId", "abortConfirmed", "closeConfirmed", "attempts", "access", "workspace",
+    ];
+    for (const [label, rec] of [["真回执", real], ["合成回执", synth]]) {
+      const lack = EXPECTED_KEYS.filter((k) => !(k in rec));
+      ok(`R7 ★ ${label}含全部约定字段(清单写死在测试里,不从实现反推)`,
+        lack.length === 0, `缺:${lack.join(", ")}`);
+    }
     ok("R7 ★ internal 也要给证据(处置是「去看本地代码」,人得知道凭什么这么判)",
       synth.failureKind === "internal" && typeof synth.failureEvidence === "string"
         && synth.failureEvidence.length > 0,
