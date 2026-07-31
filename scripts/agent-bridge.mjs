@@ -71,9 +71,11 @@ function envByteCap(name, fallback, min) {
   return n;
 }
 
+// 0.11.0:委托会话观测台**默认开**(`AGENT_BRIDGE_VIZ=off` 关)。这是一处默认行为翻转 ——
+// 从此每个 MCP server 起来就把这次运行的全部委托原文写进临时目录。见 docs/ARCHITECTURE.md 的 v0.11.0 节。
 // 0.10.0:收口纪律加固。含两处破坏性变更 —— wait 的默认 mode(all→any,连带默认返回形状)与
 // close_session 的在途闸门(默认拒绝关未终态会话)。见 docs/ARCHITECTURE.md 的 v0.10.0 节。
-const BRIDGE_VERSION = "0.10.0";
+const BRIDGE_VERSION = "0.11.0";
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 // The INLINE clock: how long a wait:true send/open blocks before giving up. Read by all five backends'
 // send(). Timing out here is DESTRUCTIVE (see DEFAULT_JOIN_TIMEOUT_MS below for why that matters).
