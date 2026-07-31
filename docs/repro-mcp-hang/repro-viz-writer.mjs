@@ -123,9 +123,22 @@ sect("S1-A 零副作用与开关");
       r.status === 0 && [...globOf(box)].length === before.size, r.stderr?.slice(0, 200));
   });
 
+  // ⚠️ **2026-07-31 起默认开**（用户拍板，覆盖 07-27 的「默认关」）。
+  //    这一组四条一起考的是那张**不对称**的判定表：未设/空 → 开；on/1/true/yes → 开；
+  //    **其余任何值 → 关**。少考最后一条的话，把 `off` 打错成 `offf` 会静默变成"照录"，
+  //    而这个方向的代价是内容已经落了盘——不是"查不了"那么轻。
   await withTmp(async (box) => {
     const rec = createVizRun({ bridgeVersion: "test", env: {} });        // 开关未设
-    ok("A2 `AGENT_BRIDGE_VIZ` 未设 → disabled + tmpdir 零产出（这是默认路径）",
+    ok("A2 `AGENT_BRIDGE_VIZ` 未设 → **开** + 真建了目录（这是默认路径）",
+      rec.enabled === true
+      && fs.readdirSync(box).filter(n => n.startsWith(VIZ_DIR_PREFIX)).length === 1,
+      `enabled=${rec.enabled}`);
+    rec.cleanup();
+  });
+
+  await withTmp(async (box) => {
+    const rec = createVizRun({ bridgeVersion: "test", env: { AGENT_BRIDGE_VIZ: "off" } });
+    ok("A2 `=off` → disabled + tmpdir 零产出（连 mkdtemp 都不许调）",
       rec.enabled === false && rec.disabledReason === "off"
       && fs.readdirSync(box).filter(n => n.startsWith(VIZ_DIR_PREFIX)).length === 0);
     // disabled recorder 的每个方法都必须能安全地被调用
@@ -137,6 +150,20 @@ sect("S1-A 零副作用与开关");
     ok("A2 disabled recorder 全 no-op 且不抛", threw === null, String(threw));
   });
 
+  await withTmp(async (box) => {
+    // ★ 拼错的关闭值必须倒向**关**，不能因为"没认出来"就当成开。
+    const rec = createVizRun({ bridgeVersion: "test", env: { AGENT_BRIDGE_VIZ: "offf" } });
+    ok("A2 ★ 认不出来的值（`offf`）→ 倒向**关**（隐私开关拼错的两个方向代价不对称）",
+      rec.enabled === false && rec.disabledReason === "off"
+      && fs.readdirSync(box).filter(n => n.startsWith(VIZ_DIR_PREFIX)).length === 0);
+  });
+
+  await withTmp(async () => {
+    const rec = createVizRun({ bridgeVersion: "test", env: { AGENT_BRIDGE_VIZ: "YES" } });
+    ok("A2 `yes` 也认（大小写无关）", rec.enabled === true);
+    rec.cleanup();
+  });
+
   await withTmp(async () => {
     const rec = createVizRun({ bridgeVersion: "test", env: on() });
     ok("A3 新 run 的 runId 与目录对得上", rec.enabled && rec.runId.startsWith("mcp-"));
@@ -145,6 +172,27 @@ sect("S1-A 零副作用与开关");
       !("degraded" in meta) && meta.runId === rec.runId && Number.isSafeInteger(meta.pid),
       JSON.stringify(meta));
     ok("A3 owner 文件在", fs.existsSync(path.join(rec.dir, "owner")));
+    rec.cleanup();
+  });
+
+  await withTmp(async () => {
+    // ★ 出生就得有一份**可读的空快照**。
+    //   没有的话,viewer 分不出「还没开过会话」和「快照读不出来」(两个槽都不存在,
+    //   `readLatestState()` 一律返 null),于是刚开的服第一眼就报「暂时读不到记录」+
+    //   「以下为断连前的最后状态」——一个**假故障**,而且是默认开之后人人都会撞上的第一眼。
+    const rec = createVizRun({ bridgeVersion: "t", env: on() });
+    await settleIo(rec);                       // 走的是异步合并槽,不是构造函数里同步落盘
+    const snap = latest(rec.dir);
+    ok("A5 ★ 出生就有快照(没有的话 viewer 会把刚开的服报成故障)", snap !== null);
+    // ⚠️ 下面两条一律走可选链:上一条红了的时候 `snap` 是 null,
+    //    写成 `snap.sessions` 会当场抛异常把**整个套件**打断,
+    //    于是下次真的回归时看到的是一坨堆栈,而不是一条读得懂的红。
+    ok("A5 首份快照是**空的、但结构完整**(0 个会话 + run.status=running)",
+      Array.isArray(snap?.sessions) && snap.sessions.length === 0
+      && snap?.run?.status === "running" && snap?.runId === rec.runId,
+      JSON.stringify(snap).slice(0, 200));
+    ok("A5 首份快照落在 0 号槽、generation 从 1 起(发布屏障没被跳过)",
+      readSlot(rec.dir, 0)?.generation === 1 && readSlot(rec.dir, 1) === null);
     rec.cleanup();
   });
 

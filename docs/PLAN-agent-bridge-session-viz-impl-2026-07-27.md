@@ -22,7 +22,8 @@
 | turn 语义 | `turn:started`（宣称"后端已接受"） | **`turn:dispatched`** + `boundary` 证据 | 五后端里只有 OMP/Codex 有协议级确认；Claude 是裸 `stdin.write`、Cursor/Kimi 只是 OS spawn |
 | 结算 | 精确 hook + 1 Hz poller | **ledger 状态机 + `settleOnce()` + 退出 O(1) 封账** | 进程退出是同步 `close all → exit`，**没有下一拍**给 poller |
 
-**默认开关：`AGENT_BRIDGE_VIZ` 默认关，`=on` 显式开**（用户 2026-07-27 拍板，覆盖 DESIGN §10 的"默认开"）。
+**默认开关：~~`AGENT_BRIDGE_VIZ` 默认关，`=on` 显式开~~**（用户 2026-07-27 拍板，覆盖 DESIGN §10 的"默认开"）。
+⚠️ **2026-07-31 又翻回默认开**（`=off` 关）。理由与代价见 `STATE.md §7`（真理源），本文这两处只留历史。
 
 ---
 
@@ -492,7 +493,8 @@ JSON Schema + `validateState()`——**没有一个字禁止它们与 writer 同
 
 ## 8. 开关与隐私
 
-**`AGENT_BRIDGE_VIZ` 默认关，`=on` 显式开**（用户拍板，覆盖 DESIGN §10）。
+~~**`AGENT_BRIDGE_VIZ` 默认关，`=on` 显式开**~~（用户拍板，覆盖 DESIGN §10）。
+⚠️ **2026-07-31 翻回默认开、`=off` 关**——真理源是 `STATE.md §7`，下面这段只是当时的理由存档。
 
 理由：桥今天的诊断日志**刻意不落 prompt 全文**（`LOG_BODY_KEYS` elide），viz 会把它落盘——这让"本机磁盘上存在全部委托原文"从**不发生**变成**发生**。临时目录只解决持久化；run 存活期间 tmpdir 里就是一份全量明文，本机任何进程可读（tmpdir 无 ACL 收紧）。
 
@@ -524,7 +526,8 @@ JSON Schema + `validateState()`——**没有一个字禁止它们与 writer 同
   **没有 import 生产侧任何模块**（源码级检查，不是口头约定）
 - ownerless 60s 宽限**用可注入的 fake clock / 可配置测试宽限**，不真 sleep 60 秒
 - 三条退出路径各造一次，断言目录被删；SIGKILL 后 `cleanup` 能回收
-- `AGENT_BRIDGE_VIZ` 未设时 tmpdir 零产出（**这是默认路径**）
+- ~~`AGENT_BRIDGE_VIZ` 未设时 tmpdir 零产出（**这是默认路径**）~~
+  → 07-31 起改成：**未设时正常建目录（默认路径）；`=off` 及任何认不出的值才零产出**
 
 ### S2 —— 生命周期
 

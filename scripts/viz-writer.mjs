@@ -506,9 +506,21 @@ export function createVizRun({
   clock = null,
   onDiagnostic = null,
 } = {}) {
+  // **默认开**(2026-07-31 用户拍板,覆盖 2026-07-27 的「默认关」)。
+  // 理由是「要不要记」这个决定的**时点**:记录只在 run 存活期间存在,出事那次没开就永远查不了,
+  // 而默认关等于把这个决定推给一个**当时还没有信息**的人 —— 他要在什么都还没发生的时候
+  // 预判自己以后会不会需要它。默认开则把决定挪到有信息的一侧:知道这次要跑敏感内容,才去关。
+  //
+  // 判定规则**刻意不对称**(代价见 STATE.md §7:开着就等于「本机磁盘上存在全部委托原文」):
+  //   未设 / 空串        → 开(默认路径)
+  //   on / 1 / true / yes → 开
+  //   **其余任何值**      → 关
+  // 最后一条是关键:`off` 打错成 `offf`、`flase` 之类时,倒向**关**而不是开。
+  // 一个隐私开关拼错的两个方向代价不对称 —— 少记一次只是查不了,多记一次是内容已经落了盘。
   const flag = String(env.AGENT_BRIDGE_VIZ ?? "").trim().toLowerCase();
-  // **默认关。** 理由见 STATE.md §7:开着就等于"本机磁盘上存在全部委托原文"。
-  if (flag !== "on" && flag !== "1" && flag !== "true") return disabledRecorder("off");
+  if (flag !== "" && flag !== "on" && flag !== "1" && flag !== "true" && flag !== "yes") {
+    return disabledRecorder("off");
+  }
 
   const IO = io || defaultIo();
   const diag = (kind, err) => { try { onDiagnostic?.(kind, err); } catch {} };
@@ -558,6 +570,14 @@ class VizRecorder {
       this.#noteRecordingError(code);
       diag(code, err);
     });
+    // **出生就发一份空快照(0 个会话)。**
+    // 不发的话,「还没开过任何会话」与「快照写了但读不出来」在 viewer 眼里长得一模一样
+    // (两个槽都不存在 ⇒ `readLatestState()` 返 null ⇒ 报「暂时读不到记录」+「以下为断连前状态」)。
+    // 那是**刚开的服**最常见的样子,于是用户看到的第一眼就是一个假故障。
+    // 修在**写的这一侧**:让"没有快照"这个状态在实践中根本不存在,viewer 一个字不用改、
+    // STATE.md §6.2 那三种「看不到内容」的状态也不用加第四种。
+    // 走 `#markDirty` ⇒ 排进 SerialWriter 的合并槽,**异步**落盘 —— 启动路径不新增同步 IO。
+    this.#markDirty();
   }
 
   get dir() { return this.#dir; }

@@ -39,6 +39,26 @@ const TMP = path.join(BOX, "tmp");
 fs.mkdirSync(STATE, { recursive: true });
 fs.mkdirSync(TMP, { recursive: true });
 
+// ── 开服前先埋两个"上一次留下的"观测目录（考 V0 的孤儿回收） ────────────────
+//
+// 观测默认开之后,**每一次不干净的退出都会留下一份带全部委托原文的目录**。
+// 所以回收挂到了开服路径上(`serveMcp()` 里 `createVizRun()` 之前扫一遍)。
+// 这里埋一死一活:光考"死的被删掉"是没牙的——一个无脑 `rm -rf tmpdir/agent-bridge-viz-*`
+// 照样能全绿,而那会**删掉别的客户端正在用的 run**。活的那个必须留下来才算数。
+const PLANT_DEAD = path.join(TMP, "agent-bridge-viz-zzdead");
+const PLANT_LIVE = path.join(TMP, "agent-bridge-viz-zzlive");
+{
+  // 拿一个**确定已经死了**的 pid:spawnSync 返回时那个进程必然已退出。
+  const deadPid = spawnSync(process.execPath, ["-e", ""], { windowsHide: true }).pid;
+  fs.mkdirSync(PLANT_DEAD, { recursive: true });
+  fs.writeFileSync(path.join(PLANT_DEAD, "owner"),
+    JSON.stringify({ pid: deadPid, processStartedAt: new Date(0).toISOString() }));
+  fs.writeFileSync(path.join(PLANT_DEAD, "state.0.json"), '{"下面有正文":"删掉它才对"}');
+  fs.mkdirSync(PLANT_LIVE, { recursive: true });
+  fs.writeFileSync(path.join(PLANT_LIVE, "owner"),
+    JSON.stringify({ pid: process.pid, processStartedAt: new Date().toISOString() }));
+}
+
 const srv = spawn("node", [BRIDGE, "mcp"], {
   stdio: ["pipe", "pipe", "pipe"],
   windowsHide: true,
@@ -88,9 +108,13 @@ const call = async (name, args, ms = 30000) => {
   return parse(await waitResp(id, ms));
 };
 
-/** 找出这个桥进程建的 viz 目录。TMPDIR 已隔离,所以只可能有一个。 */
+/**
+ * 找出这个桥进程建的 viz 目录。TMPDIR 已隔离,所以只可能有一个。
+ * `zz` 前缀的是上面手埋的两个孤儿,不算桥自己建的。
+ */
 function vizDir() {
-  const hits = fs.readdirSync(TMP).filter(n => n.startsWith("agent-bridge-viz-"));
+  const hits = fs.readdirSync(TMP)
+    .filter(n => n.startsWith("agent-bridge-viz-") && !n.startsWith("agent-bridge-viz-zz"));
   return hits.length === 1 ? path.join(TMP, hits[0]) : null;
 }
 function snapshot(dir) {
@@ -113,6 +137,13 @@ function finish(code) {
 
 rpc({ jsonrpc: "2.0", id: nextId++, method: "initialize", params: {} });
 await sleep(500);
+
+sect("V0 开服时回收上一次留下的观测目录");
+
+ok("V0 ★ owner 已经死了的观测目录，开服时被扫掉（默认开之后每次脏退出都会留一份**带全文**的）",
+  !fs.existsSync(PLANT_DEAD), `还在: ${PLANT_DEAD}`);
+ok("V0 ★ owner 还活着的观测目录**不许动**（否则会删掉别的客户端正在用的 run）",
+  fs.existsSync(PLANT_LIVE), `被误删: ${PLANT_LIVE}`);
 
 sect("V1 观测目录与身份");
 

@@ -486,8 +486,9 @@ node skills/agent-bridge/viz/serve.mjs <viz-dir> [--port 7346]
 
 **`vizDir` 怎么到 viewer 手上**：桥把绝对路径放进 `agent_bridge_status`（列全部那个形态）与 `agent_bridge_open_session` 的返回值。主 agent 本来就是拿着 shell 起 viewer 的那个人。**不靠扫描。**
 
-**记录开关：~~默认开~~ → v5 更正为「默认关，`AGENT_BRIDGE_VIZ=on` 显式开」**，见 `PLAN §8`（用户 2026-07-27 拍板，覆盖本节）。
-理由是隐私：桥今天的诊断日志**刻意不落 prompt 全文**，viz 会把它落盘——这让"本机磁盘上存在全部委托原文"从**不发生**变成**发生**。
+**记录开关：默认开 → ~~v5 改为默认关~~ → 2026-07-31 又翻回「默认开，`AGENT_BRIDGE_VIZ=off` 关」**（用户拍板，真理源是 `STATE.md §7`）。
+07-27 改成默认关的理由是隐私，那条**至今成立**：桥的诊断日志**刻意不落 prompt 全文**，viz 会把它落盘——这让"本机磁盘上存在全部委托原文"从**不发生**变成**发生**。
+翻回来的理由是它没解决问题：记录只在 run 存活期间存在，**出事那次没开就永远查不了**，而默认关等于把"要不要记"推给一个**当时还没有信息**的人——他要在什么都没发生时预判以后会不会需要。默认开把决定挪到有信息的一侧（明知敏感才去关），并配了不对称判定（认不出的值一律当关）与开服时的孤儿目录回收。
 
 **体量上界**（不设 pruner，所以要能估）：
 - ⚠️ 输入侧**没有统一上限**——1 MiB 只约束 `message_file`（`:5141`），inline `message` / `initial_prompt` 不受它管。所以 viz 自设 `AGENT_BRIDGE_VIZ_INPUT_MAX_MB`（默认 4），超限截断并在文件尾标注。
@@ -558,7 +559,8 @@ node skills/agent-bridge/viz/serve.mjs <viz-dir> [--port 7346]
   断言 MCP 返回值、`outcome`、`status`、后端健康字段、退出码与 `VIZ=off` **逐字段一致**。
 - **进度不骗人**：造一次"`turn:settled` 先到、迟到的 progress 后到"，断言页面**不会**把已完成轮次打回"正在生成"；造一次 sidecar 写失败，断言页面标 degraded 而不是显示"卡住"。
 - **零消耗回归** `test-viz.mjs`：喂样例 transcript → 断言多轮分离、四档存活、`outcome`×`bodyKind` 各组合、未收口标注、空态、`run:gone` 态。
-- `AGENT_BRIDGE_VIZ=off` 后 `tmpdir` 里一个 `agent-bridge-viz-*` 都不产生。
+- `AGENT_BRIDGE_VIZ=off`（以及任何认不出的值）后 `tmpdir` 里一个 `agent-bridge-viz-*` 都不产生；
+  **未设时必须产生**（07-31 起那才是默认路径）。
 
 ---
 

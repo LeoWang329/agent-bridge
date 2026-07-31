@@ -6790,6 +6790,11 @@ function serveMcp() {
   // instead of one per tick.
   cleanupStalePidRecords().catch(() => {});
   reclaimStaleLogs(); // sweep run dirs left by servers that did not exit cleanly
+  // 同理扫掉别的 server 崩掉后留下的观测目录(判据只有「owner 的 pid 还活着吗」,自己的跳过)。
+  // ⚠️ 观测默认开之后这条才**必须**有:以前默认关,孤儿目录是罕见事,靠人手跑 `cleanup` 够了;
+  //    现在每一次不干净的退出都会留一份**带全部委托原文**的目录,没人扫就一直躺在 tmpdir 里。
+  //    放在 `createVizRun()` 之前,是为了不让本次自己刚建的目录进扫描范围(虽然它按 pid 也会跳过)。
+  try { vizCleanup(); } catch {}
   pruneExitJournal(); // cap the durable exit journal before this run appends to it
   // 观测台的**唯一**初始化点。
   // ⚠️ 只能在这里:`createVizRun()` 一被调用就 `mkdtempSync`,而 `doctor` / `cleanup` / `help` /
