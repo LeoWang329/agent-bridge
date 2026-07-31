@@ -457,9 +457,9 @@ body.run-ended .shell{display:none}
   </div>
 
   <div class="runmeta">
-    <span>本次运行 <b id="runElapsed">35分33秒</b></span>
+    <span>本次运行 <b id="runElapsed">--</b></span>
     <span class="sep">·</span>
-    <span id="runCount">7 个会话 · 2 进行中</span>
+    <span id="runCount">--</span>
   </div>
 
   <span class="deeplink mono" id="deeplink" title="刷新后按此链接恢复选中会话与展开的轮次">#/</span>
@@ -560,7 +560,7 @@ body.run-ended .shell{display:none}
 /* ⚠️ 这是 module：DOM 已就绪才执行，所以顶部直接取元素是安全的。 */
 import {
   statusKind, permKind, contextLevel, isUncollected, shortName,
-  adaptSnapshot, refsOf, BODY_PLACEHOLDER,
+  adaptSnapshot, refsOf, BODY_PLACEHOLDER, secsSince,
 } from "./reconcile.mjs";
 
 /* ============================================================

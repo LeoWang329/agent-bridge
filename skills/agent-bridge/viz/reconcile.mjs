@@ -137,7 +137,11 @@ function hhmmss(iso, now) {
   void now;
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
-function secsSince(iso, now) {
+/** ⚠️ **页面也要用它**(`updateHeader` 里算"这次 run 跑了多久")。
+ *  漏了 `export` 的后果不是少个工具函数,而是页面每秒抛一次 ReferenceError ——
+ *  连带把定时器里那句 `scheduleRender()` 一起带走,整个定时刷新就死了。
+ *  真浏览器一开就能看见,而在 vm 沙箱里跑渲染函数是照不出来的。 */
+export function secsSince(iso, now) {
   if (!iso) return 0;
   const t = Date.parse(iso);
   if (!Number.isFinite(t)) return 0;

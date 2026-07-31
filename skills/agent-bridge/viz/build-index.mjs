@@ -36,12 +36,29 @@ html = html.replace(/ data-od-id="[^"]*"/g, "");
 html = html.replace(/ data-od-id='\+[^+]*\+'/g, "");
 html = html.replace(/'\s*\+\s*esc\(slug\(s\)\)\s*\+\s*'/g, "");
 
+// ── 1b. 把设计稿里的**样例读数**换成中性占位 ─────────────────────────────────
+//
+// ⚠️ 设计稿在 `#runElapsed` / `#runCount` 里写着 `35分33秒`、`7 个会话 · 2 进行中`。
+//    它们本该在首帧被真实数据覆盖 —— 可一旦渲染那条路断了(模块没加载、某个函数抛了),
+//    覆盖就不会发生,而页面**照旧显示这两个看起来完全合理的数**。
+//    真事:`updateHeader()` 调了一个没 export 的 `secsSince`,于是每秒抛一次,
+//    页面就一直挂着"本次运行 35分33秒" —— 一个纯属虚构的时长,用户无从察觉。
+//
+//    这和本仓到处那条纪律是同一条:**不知道就如实说不知道,不能编一个看起来对的数。**
+//    中性占位让"渲染断了"长得像"渲染断了"。
+{
+  const before = html;
+  html = html.replace(/(<b id="runElapsed">)[^<]*(<\/b>)/, "$1--$2");
+  html = html.replace(/(<span id="runCount">)[^<]*(<\/span>)/, "$1--$2");
+  if (html === before) throw new Error("找不到 runElapsed / runCount 的样例读数，设计稿结构变了");
+}
+
 // ── 2. 转成 module（测试与页面共用 reconcile.mjs 的前提） ───────────────────
 html = html.replace("<script>\n/* ===", `<script type="module">
 /* ⚠️ 这是 module：DOM 已就绪才执行，所以顶部直接取元素是安全的。 */
 import {
   statusKind, permKind, contextLevel, isUncollected, shortName,
-  adaptSnapshot, refsOf, BODY_PLACEHOLDER,
+  adaptSnapshot, refsOf, BODY_PLACEHOLDER, secsSince,
 } from "./reconcile.mjs";
 
 /* ===`);
