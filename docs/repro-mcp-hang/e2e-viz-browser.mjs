@@ -508,6 +508,20 @@ console.log("\n[session] 专有");
   ok("session ★★ 每秒的定时刷新还活着(读数会自己走字;抛异常的话它整个死掉)",
     after !== before, `${before} → ${after}`);
 
+  // ⚠️ 还**没点任何卡片**时,右栏说的话必须跟左栏一致。
+  //    真跑一次抓到的:左栏列着 1 张卡片,右栏却写「还没有可查看的会话,主 agent 一旦把任务
+  //    派出去,左侧会出现会话卡片」——页面自己跟自己打架,用户能得出的唯一结论是"它坏了"。
+  //    根因是 `renderDetail()` 里 `if(!s)` 一个分支管两件事:「一个都没有」和「有但你没选」。
+  //    (和写的那一侧「没写过快照」被当成「读不出来」是同一类错。)
+  if (cards > 0) {
+    const idle = await page.evaluate(() => document.getElementById("detail")?.innerText || "");
+    ok("session ★★ 左栏有卡片时,右栏不许说「还没有可查看的会话」(两种空态不是一件事)",
+      !/还没有可查看的会话/.test(idle), JSON.stringify(idle.slice(0, 80)));
+    ok("session ★ 右栏空态改说「去左边选一个」,并报出真实会话数",
+      /选一个会话/.test(idle) && new RegExp(`已经有\\s*${cards}\\s*个会话`).test(idle),
+      JSON.stringify(idle.slice(0, 80)));
+  }
+
   if (cards > 0) {
     await page.locator(".scard").first().click();
     await page.waitForTimeout(1000);

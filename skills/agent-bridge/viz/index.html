@@ -877,7 +877,7 @@ function renderDetail(){
   var s=SESSIONS.filter(function(x){return x.id===UI.selected;})[0];
   if(!s){
     elDetail.innerHTML='<div class="empty"><div class="e-ic">'+ico('inbox')+'</div>'+
-      '<h2>还没有可查看的会话</h2><p>主 agent 一旦把任务派出去，左侧会出现会话卡片，选中即可在这里逐轮查看它问了什么、答了什么。</p></div>';
+      (SESSIONS.length?'<h2>左边选一个会话</h2><p>这次运行已经有 '+SESSIONS.length+' 个会话。点开左侧任意一张卡片，就能在这里逐轮查看它问了什么、答了什么。</p></div>':'<h2>还没有可查看的会话</h2><p>主 agent 一旦把任务派出去，左侧会出现会话卡片，选中即可在这里逐轮查看它问了什么、答了什么。</p></div>');
     return;
   }
   var k=statusOf(s), perm=PERM[s.perm];
