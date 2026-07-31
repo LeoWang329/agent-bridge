@@ -477,7 +477,7 @@ body.run-ended .shell{display:none}
 <div class="notice warn" id="connNotice" hidden>
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M1 1l22 22M16.7 16.7A6 6 0 0 0 12 8a6 6 0 0 0-2.7.6M5 12.5a10 10 0 0 1 2.3-2.3M2 8.8a15 15 0 0 1 4-2.6M12 20h.01"/></svg>
   <div>
-    <div><b>与本地服务的连接已断开，正在自动重连…</b>（第 <span id="retryN">2</span> 次尝试）</div>
+    <div><b>与本地服务的连接已断开，正在自动重连…</b>（第 <span id="retryN">--</span> 次尝试）</div>
     <div class="n-sub">以下内容为断连前的最后状态，不是最新的。这只是「暂时看不到」——记录本身仍在主 agent 手里。</div>
   </div>
 </div>
@@ -489,7 +489,7 @@ body.run-ended .shell{display:none}
     <div class="side-head">
       <div class="side-title">
         <span>会话</span>
-        <span class="count mono" id="listCount">7</span>
+        <span class="count mono" id="listCount">--</span>
         <button class="collapse" id="collapseBtn" title="折叠左栏">
           <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M15 6l-6 6 6 6"/></svg>
         </button>
@@ -499,9 +499,9 @@ body.run-ended .shell{display:none}
         <input id="search" type="search" placeholder="搜索会话名、引擎，或轮次正文…" autocomplete="off" />
       </div>
       <div class="filters" role="group" aria-label="会话筛选">
-        <button class="fchip" data-f="all" aria-pressed="true">全部 <span class="n" id="fAll">7</span></button>
-        <button class="fchip" data-f="running" aria-pressed="false">只看进行中 <span class="n" id="fRun">2</span></button>
-        <button class="fchip" data-f="problem" aria-pressed="false">只看有问题 <span class="n" id="fWarn">3</span></button>
+        <button class="fchip" data-f="all" aria-pressed="true">全部 <span class="n" id="fAll">--</span></button>
+        <button class="fchip" data-f="running" aria-pressed="false">只看进行中 <span class="n" id="fRun">--</span></button>
+        <button class="fchip" data-f="problem" aria-pressed="false">只看有问题 <span class="n" id="fWarn">--</span></button>
       </div>
     </div>
 

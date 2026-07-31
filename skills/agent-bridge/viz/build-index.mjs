@@ -46,11 +46,17 @@ html = html.replace(/'\s*\+\s*esc\(slug\(s\)\)\s*\+\s*'/g, "");
 //
 //    这和本仓到处那条纪律是同一条:**不知道就如实说不知道,不能编一个看起来对的数。**
 //    中性占位让"渲染断了"长得像"渲染断了"。
+// ⚠️ **一处都不能漏。** 第一版只换了 `runElapsed` / `runCount`,结果真跑一次打开页面,
+//    左栏赫然写着「会话 7 · 全部 7 · 只看进行中 2 · 只看有问题 3」,而顶部是「0 个会话」——
+//    页面同时给出两套互相矛盾的数字,后一套还配着"以下内容为断连前的最后状态"的横幅,
+//    等于**把编造的数字当成真实历史呈现**。`retryN` 同病:第一次尝试就写着"第 2 次尝试"。
 {
-  const before = html;
-  html = html.replace(/(<b id="runElapsed">)[^<]*(<\/b>)/, "$1--$2");
-  html = html.replace(/(<span id="runCount">)[^<]*(<\/span>)/, "$1--$2");
-  if (html === before) throw new Error("找不到 runElapsed / runCount 的样例读数，设计稿结构变了");
+  const SLOTS = ["runElapsed", "runCount", "listCount", "fAll", "fRun", "fWarn", "retryN"];
+  for (const id of SLOTS) {
+    const re = new RegExp(`(<(?:b|span)[^>]*\\bid="${id}"[^>]*>)[^<]*(</(?:b|span)>)`);
+    if (!re.test(html)) throw new Error(`找不到 #${id} 的样例读数，设计稿结构变了`);
+    html = html.replace(re, "$1--$2");
+  }
 }
 
 // ── 2. 转成 module（测试与页面共用 reconcile.mjs 的前提） ───────────────────
