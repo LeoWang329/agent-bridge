@@ -2776,7 +2776,7 @@ async function closeNotStartedTurn(run, t, e) {
   if (!run.viz || !t?.announced) return;
   await run.viz.turnSettled(t, {
     status: "not-started",
-    /* ⚠️ **不封口**(EVENTS.md §5.4 判定表):这一轮**一条消息都没发出去**,
+    /* ⚠️ **不封口**(docs/EVENTS-graph.md §5.4 判定表):这一轮**一条消息都没发出去**,
           会话(如果已经有)根本没被碰过,工具也确实允许回调换一个 key 再来一轮。
           写成 false 就是在 wire 上宣布"这段对话已经毒化" —— 而毒化的判据正是
           「第一个 sessionReusable === false 的轮」,页面会据此说"从这里之后都不能再聊了"。
@@ -3727,7 +3727,7 @@ async function liveTurn(run, t) {
     // **同一个 key** 再来一轮 —— 事件流里就出现两条 `node:turn{turnKey:"draft"}`,而第一条
     // 永远等不到自己的终态;页面按 key 建 map 会把前一条直接盖掉。
     // key 是这一轮的**身份**(也是产出文件名),用过就不能再用,哪怕那一轮没跑成。
-    // (EVENTS.md 复审 BLOCKER 1 顺着文档指回来的实现问题。)
+    // (docs/EVENTS-graph.md 复审 BLOCKER 1 顺着文档指回来的实现问题。)
     // ⚠️ **在释放执行闸之前**把这一轮闭合掉 —— 它有开头(`node:turn`)就必须有结尾。
     await closeNotStartedTurn(run, t, e);
     // 会话根本没开起来时,对话名额界的那个东西不存在 —— 还给别人,别让一段跑不起来的对话

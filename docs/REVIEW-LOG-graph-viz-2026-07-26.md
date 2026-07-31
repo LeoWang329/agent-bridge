@@ -1,6 +1,6 @@
 # agent-bridge-graph 可视化 —— 逐轮复审记录
 
-**这不是设计文档。** 现行合同在 `docs/DESIGN-graph-viz-2026-07-26.md`（以及施工时会从它析出的 `EVENTS.md`）。
+**这不是设计文档。** 现行合同在 `docs/DESIGN-graph-viz-2026-07-26.md`（以及施工时会从它析出的 `docs/EVENTS-graph.md`）。
 这里只回答一个问题：**每一条现行条款是被什么打出来的。**
 
 ⚠️ **本文件里的条款一律是历史快照，很多已经被后来的轮次推翻。要看现在怎么规定，看 DESIGN，不要引用这里。**
@@ -177,7 +177,7 @@
 |---|---|---|
 | **BLOCKER** | **控制消息仍会越过"已写盘、但 viewer 还没 tail 到"的正常事件**：v11 只排好了"已经进客户端缓冲的事件"与控制槽的顺序，可**控制走 IPC（立刻到）、事件靠 500ms 轮询（慢一拍）**，缓冲区**缓存不了 viewer 根本还没观察到的东西**。对 live 客户端**必现** | §3.1a：`recording-failed` 增加 **`lastGoodOffset`**，viewer 必须先把 transcript drain 到该偏移、把事件排进各客户端队列，**之后**才公开控制槽 |
 | **BLOCKER** | **复用节点在回执归档失败时会丢掉输入指纹**：复用命中**不发任何 attempt 事件**（源码在幂等闸后直接 return），而 `node:settled.attempts[]` 里**没有 `inputSha256`**——于是"原运行 viz-off + 本次复用 + 归档回执也失败"这条路上，UIREQ 要求显示的「仅保留指纹」**连指纹都拿不出来** | `attempts[]` 每项**恒带 `inputSha256`** + 一条判别验收 |
-| MAJOR | **"完整 schema 一个字段不少"这条不变式，缺一份完整的 schema**：它现在散在信封 / `AssetState` / 事件表 / `node:settled` 代码块 / 一条表外规则里；而且一批字段仍没有上限（`outDir`/`launcherCwd`/`cwd`/`path`/`branch`/`lastEvent`/`halt`） | §3.2：施工时先合成一份 **`EVENTS.md` 作为唯一规范**；补齐这批上限（路径类 512 B、`lastEvent` 白名单、`halt` 为 `string \| BoundedSummary`） |
+| MAJOR | **"完整 schema 一个字段不少"这条不变式，缺一份完整的 schema**：它现在散在信封 / `AssetState` / 事件表 / `node:settled` 代码块 / 一条表外规则里；而且一批字段仍没有上限（`outDir`/`launcherCwd`/`cwd`/`path`/`branch`/`lastEvent`/`halt`） | §3.2：施工时先合成一份 **`docs/EVENTS-graph.md` 作为唯一规范**；补齐这批上限（路径类 512 B、`lastEvent` 白名单、`halt` 为 `string \| BoundedSummary`） |
 | MAJOR | **"超限一律换 `boundedSummary`"会把结构字段变成对象**：`ref` 变成 `{name,code,head,…}`，页面拿它去拼链接——**当场违反那条不变式** | §3.2：只有显式声明为 `string \| BoundedSummary` 的**人类文本**字段才能降级；结构字段超限属于 recorder 失败，走 `recording-failed` |
 | MAJOR | **`failed → unavailable` 与 v11 刚修的 `no-output` 是同一个错，只修了一半**：源码存在"`copyBytes` 已成功、随后 `readFileSync` 失败"的窗口——**盘上确实有那份产出**，却被写成"没保住" | §3.1a 映射表：`failed` 允许 `present` **或** `unavailable` |
 | MAJOR | **`append()` 的"写调用完成"挡不住短写**：`writeSync` 与异步 `write` 都可能只写一部分；调一次就 resolve，会把**半行**判成"final 已确认"，而那半行在 viewer 眼里就是末尾半行 → **一次已确认的收场显示成被掐断** | §3.4① 第 6 步：四条合同（循环补齐 / 失败即 recorder 损坏 / resolve 点在底层回调 / **刻意不做 `fsync`**）+ 一条短写负对照 |
@@ -241,7 +241,7 @@
 
 **BLOCKER-3 不需要新增机制**：drain 的 resolve/reject 汇入同一条收尾路径，reject 先置 `historyReadFailure`，随后重算 `ownerEnded` 并起 grace。
 
-**施工顺序前三步**（已抄进 DESIGN §9）：①唯一规范 `EVENTS.md` + 校验 fixture；②记录基础层（graph 作用域 / 顺序 writer / 归档闭包 / 控制通道 + 故障注入测试）；③接进 `node-core.mjs`（`nodeSeq` / 插桩顺序 / promise 登记与 admission 封闭 / 收尾协议）。
+**施工顺序前三步**（已抄进 DESIGN §9）：①唯一规范 `docs/EVENTS-graph.md` + 校验 fixture；②记录基础层（graph 作用域 / 顺序 writer / 归档闭包 / 控制通道 + 故障注入测试）；③接进 `node-core.mjs`（`nodeSeq` / 插桩顺序 / promise 登记与 admission 封闭 / 收尾协议）。
 
 ### 这 13 轮里最贵的几条教训
 

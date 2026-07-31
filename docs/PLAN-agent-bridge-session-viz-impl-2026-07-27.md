@@ -23,7 +23,7 @@
 | 结算 | 精确 hook + 1 Hz poller | **ledger 状态机 + `settleOnce()` + 退出 O(1) 封账** | 进程退出是同步 `close all → exit`，**没有下一拍**给 poller |
 
 **默认开关：~~`AGENT_BRIDGE_VIZ` 默认关，`=on` 显式开~~**（用户 2026-07-27 拍板，覆盖 DESIGN §10 的"默认开"）。
-⚠️ **2026-07-31 又翻回默认开**（`=off` 关）。理由与代价见 `STATE.md §7`（真理源），本文这两处只留历史。
+⚠️ **2026-07-31 又翻回默认开**（`=off` 关）。理由与代价见 `docs/STATE-session-viz.md §7`（真理源），本文这两处只留历史。
 
 ---
 
@@ -274,7 +274,7 @@ r.session.lastTurn.id
 
 ---
 
-## 6. 快照 schema（`skills/agent-bridge/viz/STATE.md`，S1 同期落地）
+## 6. 快照 schema（`docs/STATE-session-viz.md`，S1 同期落地）
 
 ⚠️ **这是双槽改造引入的最大合同缺口**——PLAN 删掉了 DESIGN 的事件信封与事件表，必须给出等价的 state 结构，否则实现者要自己猜十来个决定。
 
@@ -442,7 +442,7 @@ r.session.lastTurn.id
 
 原文只有 `§9 S5` 一句「SSE 重连**只发当前态**」。**那句话下面躺着好几种互不兼容的实现，全都符合字面。**
 端点叫什么、帧怎么分、重连怎么办、两槽都读不出来时说什么——一个都没定。
-graph 那边把这些钉到了逐字节（`skills/agent-bridge-graph/EVENTS.md` 传输章 + `viz/serve.mjs`），**照那个粒度写进 `STATE.md`**：
+graph 那边把这些钉到了逐字节（`docs/EVENTS-graph.md` 传输章 + `viz/serve.mjs`），**照那个粒度写进 `docs/STATE-session-viz.md`**：
 
 | 要定死的 | 内容 |
 |---|---|
@@ -458,9 +458,9 @@ graph 那边把这些钉到了逐字节（`skills/agent-bridge-graph/EVENTS.md` 
 **不许冒充成 `run.degraded`**（那是"桥没记下来"，这是"viewer 读不到"，处置完全不同），
 也不许假装断连或 owner gone（那会让页面进入"已清除"终态，而记录其实还在）。
 
-### 6.5 `STATE.md` 是唯一真理源，校验器必须是**第二实现**（v5 新增）
+### 6.5 `docs/STATE-session-viz.md` 是唯一真理源，校验器必须是**第二实现**（v5 新增）
 
-原来 `§6` 把 schema 内嵌在 PLAN 里、又要求实现者"再生成一份 `STATE.md`"，`S2` 只要求交出
+原来 `§6` 把 schema 内嵌在 PLAN 里、又要求实现者"再生成一份 `docs/STATE-session-viz.md`"，`S2` 只要求交出
 JSON Schema + `validateState()`——**没有一个字禁止它们与 writer 同源**。
 
 ⚠️ **同一个人写规格、写生产者、再写校验器，校验器只能证明"生产者和它自己一致"。**
@@ -470,11 +470,11 @@ JSON Schema + `validateState()`——**没有一个字禁止它们与 writer 同
 
 **四条硬规则：**
 
-1. **`skills/agent-bridge/viz/STATE.md` 是唯一 wire 真理源。** PLAN §6 的 JSONC 只是它的草稿，
-   S1 落地后**以 `STATE.md` 为准**，两处不一致时改 PLAN，不改 `STATE.md`。
+1. **`docs/STATE-session-viz.md` 是唯一 wire 真理源。** PLAN §6 的 JSONC 只是它的草稿，
+   S1 落地后**以 `docs/STATE-session-viz.md` 为准**，两处不一致时改 PLAN，不改 `docs/STATE-session-viz.md`。
 2. 生产侧的 schema/有界化器 与 `skills/agent-bridge/viz/contract-invariants.mjs`
    **必须独立实现、互不 import**（包括不共用常量表与枚举字面量）。
-3. **冻结样例按 `STATE.md` 手工构造**，不是把 writer 的输出录下来当样例——
+3. **冻结样例按 `docs/STATE-session-viz.md` 手工构造**，不是把 writer 的输出录下来当样例——
    录出来的样例只会把 writer 当时的 bug 一起冻住。
 4. 独立不变量**同时**跑在冻结样例与**真实桥运行**产出的快照上。只跑前者证明不了生产路径。
 
@@ -494,7 +494,7 @@ JSON Schema + `validateState()`——**没有一个字禁止它们与 writer 同
 ## 8. 开关与隐私
 
 ~~**`AGENT_BRIDGE_VIZ` 默认关，`=on` 显式开**~~（用户拍板，覆盖 DESIGN §10）。
-⚠️ **2026-07-31 翻回默认开、`=off` 关**——真理源是 `STATE.md §7`，下面这段只是当时的理由存档。
+⚠️ **2026-07-31 翻回默认开、`=off` 关**——真理源是 `docs/STATE-session-viz.md §7`，下面这段只是当时的理由存档。
 
 理由：桥今天的诊断日志**刻意不落 prompt 全文**（`LOG_BODY_KEYS` elide），viz 会把它落盘——这让"本机磁盘上存在全部委托原文"从**不发生**变成**发生**。临时目录只解决持久化；run 存活期间 tmpdir 里就是一份全量明文，本机任何进程可读（tmpdir 无 ACL 收紧）。
 
@@ -506,9 +506,9 @@ JSON Schema + `validateState()`——**没有一个字禁止它们与 writer 同
 
 > S1 独立"上线"没有意义：没有页面它不是观测台，R1/R2 今天本来就能由 `agent_bridge_status` 大致回答。五期是**开发拆分与 merge 节奏**，不是发布节奏。
 
-### S1 —— writer 地基 + STATE.md + 隐私说明
+### S1 —— writer 地基 + docs/STATE-session-viz.md + 隐私说明
 
-`viz-writer.mjs`（双槽 + 串行 writer + coalesced dirty slot + 有界队列 + 开关 + error 300 字硬顶 + degraded）· `STATE.md`（§6 全文）· SKILL.md 隐私一节 · `vizCleanup()` 挂三处 · `cleanup` CLI 孤儿回收
+`viz-writer.mjs`（双槽 + 串行 writer + coalesced dirty slot + 有界队列 + 开关 + error 300 字硬顶 + degraded）· `docs/STATE-session-viz.md`（§6 全文）· SKILL.md 隐私一节 · `vizCleanup()` 挂三处 · `cleanup` CLI 孤儿回收
 
 **机器验收：**
 - import `viz-writer.mjs` 前后 **tmpdir 里 `agent-bridge-viz-*` 的集合相等**（证明零副作用）。⚠️ **只比这个 glob，不做整个 tmpdir 深比较**——机器上无关临时文件会让它假红，破坏自动化稳定性
@@ -522,7 +522,7 @@ JSON Schema + `validateState()`——**没有一个字禁止它们与 writer 同
 - 新 run `generation===1`
 - **v5 删掉**「指向已存在旧目录 → 拒绝初始化 + degraded」这条验收：那个状态结构上到不了（§3.2），
   留着它就是**一条只有测试构造得出来的绿灯**。改为断言 `createVizRun()` 的签名里**没有目录参数**
-- **v5 新增**：`STATE.md` 与 `contract-invariants.mjs` 落地（§6.5），断言 `contract-invariants.mjs`
+- **v5 新增**：`docs/STATE-session-viz.md` 与 `contract-invariants.mjs` 落地（§6.5），断言 `contract-invariants.mjs`
   **没有 import 生产侧任何模块**（源码级检查，不是口头约定）
 - ownerless 60s 宽限**用可注入的 fake clock / 可配置测试宽限**，不真 sleep 60 秒
 - 三条退出路径各造一次，断言目录被删；SIGKILL 后 `cleanup` 能回收

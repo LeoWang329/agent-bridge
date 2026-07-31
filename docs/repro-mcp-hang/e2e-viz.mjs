@@ -196,7 +196,7 @@ if (!turnOk) {
 }
 // ⚠️ 原先这条只检查"是个非空字符串",却叫「与后端相符」——**名不副实的断言比没有更坏**:
 //    把 claude 的 boundary 换成任意另一个合法枚举它照样绿(独立校验器也只管枚举合法)。
-//    证据档是**按后端分**的(STATE.md §4.6),所以期望值也必须按后端写死。
+//    证据档是**按后端分**的(docs/STATE-session-viz.md §4.6),所以期望值也必须按后端写死。
 //    这张表与 repro-viz-bridge 的 V6~V9 是同一份口径,改一处就得改另一处。
 const EXPECTED_BOUNDARY = {
   omp: ["rpc_ack"],

@@ -206,7 +206,7 @@ VIZ_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "agent-bridge-viz-"));
 
 > ⚠️ **这张表已被 `PLAN §3`/`§6` 的双槽快照取代**（`PLAN §0` 明写"数据面换双槽快照"）。
 > 留在这里只作**字段来源的说明**（每一项数据从桥的哪个位置取），
-> **不要拿它当 wire 合同** —— 合同是 `STATE.md`。尤其：`run:terminated` **不再是一条记录里的事件**，
+> **不要拿它当 wire 合同** —— 合同是 `docs/STATE-session-viz.md`。尤其：`run:terminated` **不再是一条记录里的事件**，
 > run 终态走传输层的 `control{kind:"run-gone"}`（`PLAN §6.4`）。
 
 | `event` | 关键 `payload` | 表达什么 |
@@ -486,7 +486,7 @@ node skills/agent-bridge/viz/serve.mjs <viz-dir> [--port 7346]
 
 **`vizDir` 怎么到 viewer 手上**：桥把绝对路径放进 `agent_bridge_status`（列全部那个形态）与 `agent_bridge_open_session` 的返回值。主 agent 本来就是拿着 shell 起 viewer 的那个人。**不靠扫描。**
 
-**记录开关：默认开 → ~~v5 改为默认关~~ → 2026-07-31 又翻回「默认开，`AGENT_BRIDGE_VIZ=off` 关」**（用户拍板，真理源是 `STATE.md §7`）。
+**记录开关：默认开 → ~~v5 改为默认关~~ → 2026-07-31 又翻回「默认开，`AGENT_BRIDGE_VIZ=off` 关」**（用户拍板，真理源是 `docs/STATE-session-viz.md §7`）。
 07-27 改成默认关的理由是隐私，那条**至今成立**：桥的诊断日志**刻意不落 prompt 全文**，viz 会把它落盘——这让"本机磁盘上存在全部委托原文"从**不发生**变成**发生**。
 翻回来的理由是它没解决问题：记录只在 run 存活期间存在，**出事那次没开就永远查不了**，而默认关等于把"要不要记"推给一个**当时还没有信息**的人——他要在什么都没发生时预判以后会不会需要。默认开把决定挪到有信息的一侧（明知敏感才去关），并配了不对称判定（认不出的值一律当关）与开服时的孤儿目录回收。
 
@@ -545,7 +545,7 @@ node skills/agent-bridge/viz/serve.mjs <viz-dir> [--port 7346]
 | 6 | 正文落盘：各后端 canonical 源（§6.2；Codex 三级 fallback；**OMP 宽限 + 无 RPC + `partial` 降级**）+ `bodyKind` 判定 + 同步抓串 → 队列写 → 才发事件 | 五后端 | 5 |
 | 7 | 进度 sidecar（400 字尾巴 + `generation` + `seq`，**覆盖写不用 rename**，结算后删除） | 五后端流式回调 | 4 |
 | 8 | `turn:collected`（§5.4 口径）+ `vizDir` 进 `status`/`open_session` 返回值 | `buildSessionResult` 调用方 + 两个工具 | 4 |
-| 9 | **`STATE.md`**（v5：唯一 wire 真理源，取代原来的 `EVENTS.md`，含传输章）+ **`contract-invariants.mjs`**（第二实现，不 import 生产端）+ `viz/serve.mjs`（**v5：基线换成 graph 那份**，§9）+ `viz/index.html` + `viz/sample/` + `test-viz.mjs` + SKILL.md 一节 | `skills/agent-bridge/` | 1-8 |
+| 9 | **`docs/STATE-session-viz.md`**（v5：唯一 wire 真理源，取代原来的 `EVENTS.md`，含传输章）+ **`contract-invariants.mjs`**（第二实现，不 import 生产端）+ `viz/serve.mjs`（**v5：基线换成 graph 那份**，§9）+ `viz/index.html` + `viz/sample/` + `test-viz.mjs` + SKILL.md 一节 | `skills/agent-bridge/` | 1-8 |
 
 **验收：**
 

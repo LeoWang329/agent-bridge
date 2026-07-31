@@ -1,7 +1,7 @@
 /**
  * graph 作用域 —— 一个 `withBridge` = 一个 graph = 一份 transcript = 一套不可变归档。
  *
- * 这个模块负责 EVENTS.md §1(落盘位置、谁写、归档布局)那一节的全部落地:
+ * 这个模块负责 docs/EVENTS-graph.md §1(落盘位置、谁写、归档布局)那一节的全部落地:
  *   · canonical outDir 绑定(§1.1)
  *   · `graphId` + transcript(`wx`)+ `nodeSeq` 分配
  *   · `nodes/.runs/<graphId>/<nodeSeq>-<id>/` 每节点一份**不可变**归档(§1.3)

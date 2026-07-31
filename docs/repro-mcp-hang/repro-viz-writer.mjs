@@ -16,7 +16,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "../..");
 const WRITER = path.join(ROOT, "scripts/viz-writer.mjs");
 const INVARIANTS = path.join(ROOT, "skills/agent-bridge/viz/contract-invariants.mjs");
-const STATE_MD = path.join(ROOT, "skills/agent-bridge/viz/STATE.md");
+const STATE_MD = path.join(ROOT, "docs/STATE-session-viz.md");
 
 let pass = 0, fail = 0;
 function ok(name, cond, detail = "") {
@@ -788,7 +788,7 @@ sect("S1-G 退出期与孤儿回收");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-sect("S1-H 独立第二实现（STATE.md §11）");
+sect("S1-H 独立第二实现（docs/STATE-session-viz.md §11）");
 
 {
   const src = fs.readFileSync(INVARIANTS, "utf8");
@@ -798,7 +798,7 @@ sect("S1-H 独立第二实现（STATE.md §11）");
     imports.length > 0 && imports.every(x => x.startsWith("node:")), JSON.stringify(imports));
   ok("H1 它也没有从主文件或 writer 取任何常量",
     !/viz-writer|agent-bridge\.mjs|from\s+["']\.\.?\//.test(src));
-  ok("H2 STATE.md 在，且是 wire 真理源", fs.existsSync(STATE_MD)
+  ok("H2 docs/STATE-session-viz.md 在，且是 wire 真理源", fs.existsSync(STATE_MD)
     && /唯一 *wire *真理源|唯一真理源/.test(fs.readFileSync(STATE_MD, "utf8")));
 }
 

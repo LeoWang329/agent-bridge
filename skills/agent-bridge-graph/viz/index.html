@@ -1357,7 +1357,7 @@ SCENES.push({
 
    ⚠️ **这是演示数据的构造,不是渲染器的兼容层。**
    它只跑在 SCENES 这一个静态数组上,不在渲染路径里。渲染器只认 turns ——
-   真实数据由 reducer 保证「每个节点都有 turns」(EVENTS.md §10.9 第 7 条:
+   真实数据由 reducer 保证「每个节点都有 turns」(docs/EVENTS-graph.md §10.9 第 7 条:
    不给单轮节点留没有 turn 的旧路径)。如果哪天 reducer 漏了 turns,
    页面上就该看到它漏了,而不是被这里补上。 */
 (function expandDemoTurns(){
@@ -1384,15 +1384,15 @@ SCENES.push({
 /* ============================================================
    2.5 归约器：事件流 → 页面 view-model
 
-   合同：`../EVENTS.md`（wire）· 翻译规则：`docs/MAPPING-viz-wire-to-viewmodel-2026-07-28.md`。
-   三者冲突时 EVENTS.md 定 wire，映射表定翻译，**页面的内部词表可以改、wire 不能**。
+   合同：`../docs/EVENTS-graph.md`（wire）· 翻译规则：`docs/MAPPING-viz-wire-to-viewmodel-2026-07-28.md`。
+   三者冲突时 docs/EVENTS-graph.md 定 wire，映射表定翻译，**页面的内部词表可以改、wire 不能**。
 
    这一段是**纯函数 + 一个累加器**，不碰 DOM、不发请求 —— 于是它能被零消耗回归直接喂事件、
    直接断言产出的 view-model（`test-viz.mjs`）。DOM 那一半在 §9。
    ============================================================ */
 
 /* 「拿不到」的 code 里，有一个是我们自己造的：记录说资产在、却没给可打开的位置。
-   ⚠️ 这种**不是** present —— 页面知道"东西在"却点不开，等于没有（EVENTS.md §3.1）。 */
+   ⚠️ 这种**不是** present —— 页面知道"东西在"却点不开，等于没有（docs/EVENTS-graph.md §3.1）。 */
 const REC_BROKEN_CODE = 'record-broken';
 
 /** wire 的 `AssetState` → 页面的 `a.s`。
@@ -1401,7 +1401,7 @@ function mapAsset(a, naWhy){
   if (a == null || typeof a !== 'object') return {s:'unlogged'};
   switch (a.state){
     case 'present':
-      /* ⚠️ `present` 的 `ref`/`sha256`/`byteCount` **三样恒有，一个都不能少**（EVENTS.md §3.1）。
+      /* ⚠️ `present` 的 `ref`/`sha256`/`byteCount` **三样恒有，一个都不能少**（docs/EVENTS-graph.md §3.1）。
             缺 ref → 页面知道"东西在"却点不开，等于没有；
             缺 sha256 / byteCount → **"页面上这份 = 磁盘上那份"的唯一对证手段没了** ——
             照样渲染成可打开的 have，就是在把一份无法验证的字节当成权威记录展示。
@@ -1430,7 +1430,7 @@ function mapScene(sc){
   if (sc.state === 'present'){
     const f = sc.files || {};
     return {sceneNone:false, scene:{
-      /* ⚠️ **键是逻辑名,不是磁盘上的文件名**(EVENTS.md §3.2)——合同刻意让两者不同。
+      /* ⚠️ **键是逻辑名,不是磁盘上的文件名**(docs/EVENTS-graph.md §3.2)——合同刻意让两者不同。
             读成 f['session.log'] 会**三样全部落空**,于是每一份真实存在的现场都被显示成
             「没有这一项的记录」。而它长得像一次正常的缺席,没人会去查。 */
       session: mapAsset(f.sessionLog), answer: mapAsset(f.answer), snapshot: mapAsset(f.status),
@@ -1450,7 +1450,7 @@ function mapScene(sc){
  * 可降级字段（`error` / `errorSummary` / `rejectedReason` / `reason`）→ 页面的有界摘要块。
  *
  * ⚠️ **这四个字段在 wire 上有两种形状**：≤2 KiB 时是**原样字符串**，超过才是 `BoundedSummary`
- * （EVENTS.md §3.3 第 4 条那道地板）。绝大多数错误走的是前一种。
+ * （docs/EVENTS-graph.md §3.3 第 4 条那道地板）。绝大多数错误走的是前一种。
  * 把字符串当对象读会得到一个 head/tail 全空、"省略了 0 字节"的摘要块 —— 那是**把正文弄丢**。
  */
 function mapBounded(b){
@@ -1686,7 +1686,7 @@ function applyControl(R, c){
       break;
     case 'owner-lost':
       /* **管道 EOF、owner 一句话没留下。** ⚠️ 与上面那条**必须分开存** ——
-         归并成一个"结束了"的布尔,第 2、3 档就共用同一句文案了,而 EVENTS.md §10.1 明令禁止:
+         归并成一个"结束了"的布尔,第 2、3 档就共用同一句文案了,而 docs/EVENTS-graph.md §10.1 明令禁止:
          「受控结束但记录损坏」与「记录损坏且 owner 也丢了」是两种处置完全不同的事。 */
       R.ctl.ownerLost = true;
       break;
@@ -1742,7 +1742,7 @@ function nodeStatusOf(R, n){
   /* ⚠️ 全局记录损坏**盖过**逐节点推断：这些节点很可能好好跑完了，只是没人记下来。
         把一次记录故障摊派成一堆节点事故，是这个页面能犯的最有误导性的错误之一。 */
   if (R.ctl.recordingFailed) return 'unlogged';
-  /* ⚠️ **历史没读全时,禁止据"缺了哪些事件"推断任何节点的状态**(EVENTS.md §10.1 末条)。
+  /* ⚠️ **历史没读全时,禁止据"缺了哪些事件"推断任何节点的状态**(docs/EVENTS-graph.md §10.1 末条)。
         出问题的是我们读历史这一侧 —— 那个节点很可能早就收场了,只是那几行没读回来。
         这里如实说"状态未知",而不是继续走 discovered/queued/running/abandoned。 */
   if (R.ctl.historyReadFailure) return 'unlogged';
@@ -1802,7 +1802,7 @@ function projectTurn(R, n, t, nodeStatus){
 /**
  * 把 `node:settled.turns[]` 里的一项(TurnSummary)投影成页面认的轮。
  *
- * ⚠️ **复用命中的节点一条 turn 事件都不发**(EVENTS.md §5.9),它那 N 轮的**全部信息
+ * ⚠️ **复用命中的节点一条 turn 事件都不发**(docs/EVENTS-graph.md §5.9),它那 N 轮的**全部信息
  * 只存在于这里**。只按实时 turn 事件建轮的话,一个复用节点会被补出
  * 「一条空的 main 轮 / queued / 没联系过 AI」—— 而回执上白纸黑字写着 ok、七千多字。
  * **页面直接和回执打架**,这是最难被发现的一类错:它看起来像一次正常的排队。
@@ -1917,7 +1917,7 @@ function writeOf(n, status){
   const s = n.settled;
   if (s){
     if (!('outcome' in s) || s.outcome === undefined) return null;     // read 节点
-    /* ⚠️ workspaceSummary **只在回执没归档成功时**才出现（EVENTS.md §5.8 的两级兜底）。
+    /* ⚠️ workspaceSummary **只在回执没归档成功时**才出现（docs/EVENTS-graph.md §5.8 的两级兜底）。
           回执在的时候这里是空对象 —— 分支、路径这些要去回执里读，不是"丢了"。
           ⚠️ 事件里**刻意没有** filesChanged（无上限）与 committed（交付结论只认 outcome）。
           所以这条路上给不出改动清单，页面必须说清"要看清单去回执"，不能默默显示成零项。 */
@@ -1941,7 +1941,7 @@ function writeOf(n, status){
       netEmpty: s.outcome === 'delivered' && !!s.diff && s.diff.state === 'present' && s.diff.byteCount === 0,
       inlineFallback: hasWs,
       reason: s.outcome === 'unknown' ? '提交或收尾步骤没有跑完，改动有没有落到分支上说不清。' : undefined,
-      /* ⚠️ **removed:false 的准确读法是「收尾时没有确认清理」**（EVENTS.md §5.8）：
+      /* ⚠️ **removed:false 的准确读法是「收尾时没有确认清理」**（docs/EVENTS-graph.md §5.8）：
             可能没删、也可能删了但没确认，**推不出「这个目录现在还在磁盘上」**。
             说"还在"会让人去核对一个可能不存在的目录；说"未确认"，人才知道去看一眼、
             也知道看不到并不代表出了错。 */
@@ -2004,7 +2004,7 @@ function buildScene(R){
     const n = R.nodes.get(seq);
     const status = nodeStatusOf(R, n);
     const turns = turnsOf(R, n, status);
-    /* ⚠️ 数据层**不给单轮节点留没有 turn 的旧路径**（EVENTS.md §10.9 第 7 条）；
+    /* ⚠️ 数据层**不给单轮节点留没有 turn 的旧路径**（docs/EVENTS-graph.md §10.9 第 7 条）；
           「一轮不显示外层控件」是渲染层的事。连一轮都没起过的节点给一条空轮。 */
     if (!turns.length){
       turns.push({key:'main', status: status==='rejected' ? 'not-started' : 'queued',
@@ -2067,7 +2067,7 @@ function buildScene(R){
       if (n.access === 'write' && lt && lt.started && !n.ws.created && !lt.attempts.size) o.phase = 'preparing_worktree';
       o.live = {tail: n.live ? n.live.tail : '', words, event: n.live && n.live.lastEvent ? n.live.lastEvent.type : (n.lastKind||'')};
     }
-    /* 派生量：只在这里算，**一条都不许补回 wire**（EVENTS.md §10.9 第 9 条）。 */
+    /* 派生量：只在这里算，**一条都不许补回 wire**（docs/EVENTS-graph.md §10.9 第 9 条）。 */
     const notStarted = n.turnOrder.filter(k => {
       const s = n.turns.get(k).settled; return s && s.status === 'not-started';
     });
@@ -2242,7 +2242,7 @@ function assetRow(name, a, openLabel){
       if (a.empty) b.push('<div class="a-why">这份 diff 是空文件——这次提交没有净改动。</div>');
       /* ⚠️ 归档区就在磁盘上，谁都能改。取回来的字节与事件里记的指纹对不上时**必须说** ——
             静默显示等于让人拿一份被改过的字节当证据。合同也明确要求不许因此判 4xx/5xx：
-            文件确实在、也确实读到了，拒绝服务只会让人以为文件丢了（EVENTS.md §11）。 */
+            文件确实在、也确实读到了，拒绝服务只会让人以为文件丢了（docs/EVENTS-graph.md §11）。 */
       if (a.verify === 'mismatch') b.push('<div class="a-why" data-warn="1"><b>这不是事件记录的那一份（文件已被改动）。</b>'+
         '记录里的指纹是 <code>'+esc(String(a.sha256||'').slice(0,16))+'…</code>，'+
         '刚取回来的是 <code>'+esc(String(a.gotSha||'').slice(0,16))+'…</code>。下面显示的是**磁盘上现在这一份**。</div>');
@@ -2694,7 +2694,7 @@ function statusBlock(n){
     const r = REJECT[n.rejected.kind] || {
       t:'被本地挡下了（原因码：'+n.rejected.kind+'）',
       d:'这个原因码不在本页已知的六档里 —— 可能是工具比页面新。',
-      todo:['拿这个原因码去查工具那边的 EVENTS.md。','下面那段是当时抛出来的原文。'],
+      todo:['拿这个原因码去查工具那边的 docs/EVENTS-graph.md。','下面那段是当时抛出来的原文。'],
     };
     o.push(box('reject', ICO.ban, '被拒绝 · '+r.t,
       '<p style="margin:0">'+esc(r.d)+'</p>'+
@@ -3302,7 +3302,7 @@ addEventListener('resize', () => { if (VIEW==='graph' && SC.key==='scale') fitZo
    §2.5 那一半是纯的（喂事件、出 view-model），这一半负责三件脏活：
    连上去、把 `ref` 换成正文、把两者接到已有的渲染器上。
 
-   ⚠️ **页面只读**：不提供暂停、重跑、改参数、合分支（EVENTS.md §10.9 第 4 条）。
+   ⚠️ **页面只读**：不提供暂停、重跑、改参数、合分支（docs/EVENTS-graph.md §10.9 第 4 条）。
    ============================================================ */
 
 /** 有没有一个服务端在后面。静态打开这份 HTML 时它是 false —— 那时页面就是演示台。 */
@@ -3335,7 +3335,7 @@ function wantFile(ref){
       if (!r.ok) { rec.state = 'error'; rec.why = 'HTTP ' + r.status; return null; }
       /* 归档区**理论上**不可变，但它就在磁盘上，谁都能改。服务端把它读到的那一份的指纹
          放在这个响应头里，页面拿它和事件里记的对一次 —— 这是"页面上这份 = 事件记录的那份"
-         唯一的对证手段（EVENTS.md §11）。⚠️ 不比 Content-Length：合同明说那两个数**允许**对不上。 */
+         唯一的对证手段（docs/EVENTS-graph.md §11）。⚠️ 不比 Content-Length：合同明说那两个数**允许**对不上。 */
       rec.gotSha = r.headers.get('X-Graph-Sha256') || null;
       return r.text();
     })

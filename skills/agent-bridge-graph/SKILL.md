@@ -424,8 +424,6 @@ VIZ_OUT_DIR=skills/agent-bridge-graph/viz/sample VIZ_GRAPH_ID=gr-sample-main VIZ
 VIZ_OUT_DIR=<你的 outDir> VIZ_PORT=8080 node skills/agent-bridge-graph/viz/serve.mjs
 ```
 
-事件流的合同全文在 `skills/agent-bridge-graph/EVENTS.md`(**对外接口文档**,页面照它写)。
-
 ## 这一版明确不做
 
 不做通用流程引擎(plan/DAG 格式、依赖解析、调度器)·
@@ -447,43 +445,3 @@ VIZ_OUT_DIR=<你的 outDir> VIZ_PORT=8080 node skills/agent-bridge-graph/viz/ser
 
 二期做的话形态大致是:脚本 append 一条"待决"事件并阻塞,主 agent 看到后回写答案文件,脚本继续。
 在那之前——**别在脚本里写等人输入的逻辑**(会一直挂到超时),把它拆成两波。
-
-回归测试(假后端,零消耗,推送前必过):
-
-```sh
-node docs/repro-mcp-hang/repro-graph-node.mjs        # 环节生命周期 / 失败三档 / 幂等 / 零残留
-node docs/repro-mcp-hang/repro-graph-worktree.mjs    # write 隔离 / 基线闸 / 复用闸 / 并发闸
-node docs/repro-mcp-hang/repro-viz-events.mjs        # 事件 writer:schema / 有界化 / 半行安全
-node docs/repro-mcp-hang/repro-viz-graph.mjs         # graph 作用域与归档写入器
-node docs/repro-mcp-hang/repro-graph-conversation.mjs # 多轮对话:轮的生命周期 / 会话毒化 / 记忆边界
-node docs/repro-mcp-hang/repro-graph-viz.mjs         # viz 开着时的事件流 / SSE / /file 四道闸
-node skills/agent-bridge-graph/viz/test-viz.mjs      # 页面这一侧:事件流 → 页面上写了什么
-```
-
-⚠️ 上面两条**都**会跑 `viz/contract-invariants.mjs` —— 合同里那些**跨字段的等式**
-(「这两处 sha256 必须相等」「这个字段只在那个字段不是 present 时才许出现」)。
-它**刻意不 import `tools/viz-events.mjs`**:schema 只管单个字段的形状,
-拿写方的 schema 去验写方造的事件,验的只是"我和我自己一致"。
-`repro-graph-viz` 用它验**每一次真跑出来的 transcript**,`test-viz` 用它验**冻结样例** ——
-写方与样例任何一侧漂离合同,当场变红。
-
-**真浏览器** e2e(零消耗,但要 playwright;改了页面之后跑一次):
-
-```sh
-npm i playwright && npx playwright install chromium         # 装在哪个目录都行
-PLAYWRIGHT_DIR=<那个目录> node docs/repro-mcp-hang/e2e-viz-browser.mjs
-```
-
-它同时考 **graph 观测台**和**委托会话观测台**,只问「只有真浏览器答得上来」的问题,
-不重复 `test-viz` 已经守住的内容断言。为什么非要它:`test-viz` 是在 **vm 沙箱**里跑页面脚本、
-断言吐出来的 HTML 字符串 —— 没有排版引擎、没有命中测试、没有焦点、也没有真的 JS 运行时。
-两个真事都是它照不出来的:**推断边"可点开看依据"实测命中率只有 8%**(线宽 1.4px 又是虚线,
-命中区就是那条线本身);**会话观测台调了一个没 export 的函数,每秒抛一次 ReferenceError,
-连带把定时刷新整个弄死**。两处的 HTML 字符串都挑不出毛病,一路全绿。
-装不上 playwright 时它**如实跳过并退 0**,所以不进推送前的闸。
-
-真后端 e2e(**真花钱**,改了归档布局 / 事件形状 / 页面读法之后跑一次):
-
-```sh
-node docs/repro-mcp-hang/e2e-graph-viz.mjs           # 真跑 → 观测台上看到的就是磁盘上那份
-```

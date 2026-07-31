@@ -143,7 +143,7 @@ function newestTime(v, acc = { t: -Infinity }) {
 }
 
 /**
- * 会话观测台的样例是**一份快照 JSON**,得按 STATE.md §1 的布局摆成一个可服务的 VIZ_DIR。
+ * 会话观测台的样例是**一份快照 JSON**,得按 docs/STATE-session-viz.md §1 的布局摆成一个可服务的 VIZ_DIR。
  *
  * 三处夹具讲究,每一处都是被红灯逼出来的:
  *  ① **pid 用本进程自己的** —— `ownerAlive()` 拿它 `process.kill(pid, 0)`。写死 pid 的话页面

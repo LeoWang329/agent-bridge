@@ -1,5 +1,5 @@
 /**
- * `EVENTS.md` 里那些**跨字段的等式** —— schema 管不到的那一类合同。
+ * `docs/EVENTS-graph.md` 里那些**跨字段的等式** —— schema 管不到的那一类合同。
  *
  * `tools/viz-events.mjs` 的 schema 只管**单个字段的形状**(是不是 hex64、超没超 512 字节)。
  * 它管不了「这两处的 sha256 必须相等」「这个字段只在那个字段不是 present 时才许出现」——
@@ -13,7 +13,7 @@
  *   - `viz/test-viz.mjs`     —— 验**冻结样例**(消费侧的地基:样例歪了,后面每条断言都在验假合同)
  *   - `docs/repro-mcp-hang/repro-graph-viz.mjs` —— 验**真跑出来的 transcript**(生产侧有没有漂)
  *
- * 条目对应 EVENTS.md:§1.3(四条"可验的断言")、§3.1(present 三样恒有)、§3.2(现场是容器、
+ * 条目对应 docs/EVENTS-graph.md:§1.3(四条"可验的断言")、§3.1(present 三样恒有)、§3.2(现场是容器、
  * 键是逻辑名)、§5.8(两级兜底的出现条件 + workspaceSummary 字段封闭)。
  */
 

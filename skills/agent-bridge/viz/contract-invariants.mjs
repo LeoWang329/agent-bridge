@@ -1,5 +1,5 @@
 /**
- * 这是 wire 合同的第二实现：它只把 STATE.md 的散文约束重新表达为可执行检查，
+ * 这是 wire 合同的第二实现：它只把 docs/STATE-session-viz.md 的散文约束重新表达为可执行检查，
  * 不读取生产者源码、不复用生产侧常量，也不在模块加载时触碰文件系统。
  * 这种刻意的独立性用于暴露生产者与合同之间的漂移，而不是证明一套代码与自己一致。
  */
@@ -628,7 +628,7 @@ function validateTurn(turn, session, label, vizContext, seenVizTurnIds, observed
 
   // terminal_adopted 代表终结事件晚到认领，时间倒序就不符合这段因果关系。
   //
-  // ⚠️ 判据是 `>=` 而不是 `>`（STATE.md §4.6）。要挡的是「实现把 dispatchedAt 直接抄成
+  // ⚠️ 判据是 `>=` 而不是 `>`（docs/STATE-session-viz.md §4.6）。要挡的是「实现把 dispatchedAt 直接抄成
   //    attemptedAt、抹平中间那段歧义期」，但**严格大于要求的是毫秒时钟分辨率**——
   //    本地极快的后端、hermetic 假后端都可能在同一毫秒里走完「尝试 → 终结事件 → 认领」。
   //    合同不该要求实现保证不了的事，否则这里就是一颗随机红的雷。

@@ -7,10 +7,10 @@
 ## 0. 这份文件解决什么
 
 页面（`skills/agent-bridge-graph/viz/index.html`）由 UI 设计师照 `docs/UI-REQUIREMENTS-graph-viz-2026-07-26.md` 产出，
-事件流合同是 `skills/agent-bridge-graph/EVENTS.md`。**两者不是同一套词表**，reducer 夹在中间。
+事件流合同是 `docs/EVENTS-graph.md`。**两者不是同一套词表**，reducer 夹在中间。
 
 **这份文件规定 reducer 怎么翻译，不规定页面长什么样，也不规定事件里有什么。**
-三者冲突时：EVENTS.md 定 wire、UIREQ 定语义要求、本文件定翻译。**页面的内部词表可以改，wire 不能。**
+三者冲突时：docs/EVENTS-graph.md 定 wire、UIREQ 定语义要求、本文件定翻译。**页面的内部词表可以改，wire 不能。**
 
 ### 0.1 交付物存档
 
@@ -30,7 +30,7 @@
 **根因不是设计师做错了。** UIREQ 是 2026-07-26 交出去的，`conversation()` / 轮这一层是 **2026-07-28** 才落地的
 （`docs/DESIGN-graph-conversation-2026-07-28.md`）。**页面照着一份 conversation 之前的合同实现，完全正确。**
 
-| | EVENTS.md（wire） | 页面（view-model 现状） |
+| | docs/EVENTS-graph.md（wire） | 页面（view-model 现状） |
 |---|---|---|
 | 层级 | 节点 ⊃ **轮** ⊃ 尝试 | 节点 ⊃ 尝试 |
 | `scene` 挂在哪 | **轮上**（`node:turn-settled.scene`；`node:settled` **没有**这个槽） | 节点上（`n.scene`） |
@@ -49,12 +49,12 @@
 所以 `attemptsBlock()` 的分段控件是**数组驱动、段数无上限**的，套第二层是加一层不是重写。三条改动：
 
 1. **加一层轮的分段控件**，外层选轮、内层选尝试；单轮节点**不显示外层控件**（与单次尝试不显示内层控件同一规则）。
-   ⚠️ 但**数据结构上单轮节点也必须有 `turns:[{key:"main",…}]`**——EVENTS.md §10.9 第 7 条明写「不给单轮节点留没有 turn 的旧路径」，
+   ⚠️ 但**数据结构上单轮节点也必须有 `turns:[{key:"main",…}]`**——docs/EVENTS-graph.md §10.9 第 7 条明写「不给单轮节点留没有 turn 的旧路径」，
    **两套解析迟早只有一套被改**。「单轮不显示外层控件」是**渲染层**的事，不是数据层。
 2. **`scene` 从节点级挪到轮级**：`sceneBlock(n)` → `sceneBlock(turn)`。一段对话可能有多份现场（§3.2）。
 3. **`attempts` 从 `n.attempts` 挪到 `n.turns[i].attempts`**。
 
-### 1.2 顺带要实现的派生量（EVENTS.md §10.8，**页面自己算，事件里没有**）
+### 1.2 顺带要实现的派生量（docs/EVENTS-graph.md §10.8，**页面自己算，事件里没有**）
 
 | 想显示的 | 怎么算 |
 |---|---|
@@ -205,14 +205,14 @@ worktree、分支、锁、已复制的 attempt 产出**都还在**，缺的只�
 
 ## 6. `AssetState` → 页面 `assetRow` 的 `a.s`
 
-wire 是三态判别联合（§3.1）；页面有六态——**多出来的三态正是 EVENTS.md 规定由 viewer 派生的那三种**，映射干净：
+wire 是三态判别联合（§3.1）；页面有六态——**多出来的三态正是 docs/EVENTS-graph.md 规定由 viewer 派生的那三种**，映射干净：
 
 | 页面 `a.s` | 来源 |
 |---|---|
 | `have` | wire `present`（`ref`/`sha256`/`byteCount` **三样恒有**） |
 | `na` | wire `not-applicable` |
 | `unavailable` | wire `unavailable`（`code` 恒有） |
-| `pending` | **派生**：产生它的那条事件还没出现，而节点仍在跑。⚠️ EVENTS.md §3.1 明写 `pending` **不进 wire**——「那条事件还没出现」本身就是这个意思 |
+| `pending` | **派生**：产生它的那条事件还没出现，而节点仍在跑。⚠️ docs/EVENTS-graph.md §3.1 明写 `pending` **不进 wire**——「那条事件还没出现」本身就是这个意思 |
 | `unlogged` | **派生**：`recording-failed` 发生在该资产的生产事件**之前**，这一项**根本没有 AssetState** |
 | `gone` | **派生**：记录时 `present`，现在按 ref 取不回来（`/file` 404）。⚠️ 与「本来就没有」是两件事 |
 
@@ -236,7 +236,7 @@ wire 是三态判别联合（§3.1）；页面有六态——**多出来的三�
 
 #### 🔴 缺口：字面量 `unknown` 与「没见过的 code」目前共用同一句文案
 
-EVENTS.md §3.1 对消费方的要求是**五条**：原样显示 + 不得崩 + 不得降级成 `not-applicable` + 不得归到已知原因上 +
+docs/EVENTS-graph.md §3.1 对消费方的要求是**五条**：原样显示 + 不得崩 + 不得降级成 `not-applicable` + 不得归到已知原因上 +
 **不得先偷偷改写成 `unknown` 再显示——字面量 `unknown` 与"没见过的 code"必须有不同的文案**。
 
 页面 `assetRow()` 的前四条**都做对了**（`known ? … : '原因码不在已知清单里…'`，且 `<code>` 原样显示）。

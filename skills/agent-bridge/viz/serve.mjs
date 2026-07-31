@@ -1,12 +1,12 @@
 /**
  * 委托会话史观测台 —— viewer 侧。
  *
- * **合同在同目录的 `STATE.md`。** 本文件只做三件事：
+ * **合同在仓库的 `docs/STATE-session-viz.md`。** 本文件只做三件事：
  *   ① 按 §2 的双槽协议挑出最新合法快照，**原样透传**给页面
  *   ② 轮询活跃轮次的 sidecar，作为独立的 `progress` 帧发出去
  *   ③ 按 §6.3 的判据把归档文件安全地发出去
  *
- * ⚠️ **viewer 是搬运工，不是第二个 writer**（STATE.md §6）：`state` 帧是槽文件的
+ * ⚠️ **viewer 是搬运工，不是第二个 writer**（docs/STATE-session-viz.md §6）：`state` 帧是槽文件的
  *    字节原样透传，不重新序列化、不补字段、不把 sidecar 合进去。
  *
  * 起法：`VIZ_DIR=<目录> node serve.mjs [port]`
@@ -22,7 +22,7 @@ import {
 } from "../../../scripts/viz-http.mjs";
 
 /**
- * 起法（**两种都认**，STATE.md §1.2）：
+ * 起法（**两种都认**，docs/STATE-session-viz.md §1.2）：
  *   VIZ_DIR=<目录> node serve.mjs [端口]
  *   node serve.mjs <目录> [端口]
  *
@@ -135,7 +135,7 @@ function looksLikeSnapshot(p) {
 /**
  * 读一个槽。返回 `{ raw, parsed }` 或 `null`。
  *
- * **合法槽四条**（STATE.md §2.1）——缺一不可，且**「generation 更高但 runId 不符者不得胜出」**：
+ * **合法槽四条**（docs/STATE-session-viz.md §2.1）——缺一不可，且**「generation 更高但 runId 不符者不得胜出」**：
  * 上一个 run 被 SIGKILL 留下的槽 generation 可能远大于新 run，
  * 只按 generation 排序会让页面显示上一个 run 的内容。
  */
@@ -154,7 +154,7 @@ async function readSlot(i) {
 }
 
 /**
- * ⚠️ **两槽 generation 相等 ⇒ 双方都不可信**（STATE.md §2.1）。
+ * ⚠️ **两槽 generation 相等 ⇒ 双方都不可信**（docs/STATE-session-viz.md §2.1）。
  *
  * 健康的 run 里到不了这个状态：写成功才推进代次并换槽，两槽必然差 1 以上。
  * 真出现就说明有东西在这个目录里乱写。静默择一（原来的 `>=` 就是静默择一）
@@ -179,7 +179,7 @@ function frame(event, dataStr) { return `event: ${event}\ndata: ${dataStr}\n\n`;
 /**
  * 一个客户端。
  *
- * **背压**（STATE.md §6）：每客户端只保留**一份可合并的最新 `state`**，
+ * **背压**（docs/STATE-session-viz.md §6）：每客户端只保留**一份可合并的最新 `state`**，
  * 新的直接盖掉旧的、**不排队堆积**；progress 同理按 vizTurnId 合并。
  * 控制帧不合并（它们各说一件事，丢一个就丢了一个语义）。
  */
@@ -264,7 +264,7 @@ async function pump(c) {
 // ── 控制态 ──────────────────────────────────────────────────────────────────
 
 /**
- * 三种「看不到内容」必须严格区分（STATE.md §6.2）。混成一句话，页面就会做错事。
+ * 三种「看不到内容」必须严格区分（docs/STATE-session-viz.md §6.2）。混成一句话，页面就会做错事。
  *   - `run-gone`             ← owner 死了 / 目录没了：记录**已经没有了**
  *   - `history-read-failure` ← owner 还活着但两槽都读不出来：**我暂时读不到**
  *   - 断连                    ← 传输层的事，页面自己重连
@@ -348,7 +348,7 @@ async function pollState() {
   lastGeneration = slot.parsed.generation;
   lastStateRaw = slot.raw;
 
-  // 重算还要不要轮询哪些 sidecar：**只有快照里仍是 dispatched 的轮次**（STATE.md §5 前提 2）。
+  // 重算还要不要轮询哪些 sidecar：**只有快照里仍是 dispatched 的轮次**（docs/STATE-session-viz.md §5 前提 2）。
   const next = new Map();
   for (const s of slot.parsed.sessions || []) {
     for (const t of s.turns || []) {

@@ -1,7 +1,7 @@
 /**
  * 事件 writer —— transcript 的唯一出口。
  *
- * 合同是 `skills/agent-bridge-graph/EVENTS.md`,这里只做三件事:
+ * 合同是 `docs/EVENTS-graph.md`,这里只做三件事:
  *   ① **有界化**(§6 上限表 + §7 不变式) → ② **分配 seq**(§2 稠密) → ③ **落盘**(§2.1 半行容错)
  * 顺序不能换:seq 在有界化之后分配,被丢弃的 `node:progress` 才不会占号。
  *

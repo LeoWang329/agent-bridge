@@ -1,5 +1,5 @@
 {
-  "note": "按 STATE.md 手工构造的冻结样例。**不是** writer 输出的录制——录出来的样例只会把 writer 当时的 bug 一起冻住。",
+  "note": "按 docs/STATE-session-viz.md 手工构造的冻结样例。**不是** writer 输出的录制——录出来的样例只会把 writer 当时的 bug 一起冻住。",
   "samples": [
     {
       "name": "normal-completed-final-collected",

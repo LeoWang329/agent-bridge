@@ -347,7 +347,7 @@ turnSpecHash = H(key, prompt 正文, timeoutMs, schema, outputShape, reask)
 
 ---
 
-## 6. 与 viz 事件的关系（**为什么 EVENTS.md 要等这份**）
+## 6. 与 viz 事件的关系（**为什么 docs/EVENTS-graph.md 要等这份**）
 
 事件模型里现在一个节点只有一条命：`node:observed …→ node:settled`；而 `node:attempt` 指的是**格式打回重说**（≤1 次），**不是"轮"**。
 
@@ -360,7 +360,7 @@ turnSpecHash = H(key, prompt 正文, timeoutMs, schema, outputShape, reask)
                       └── 尝试
 ```
 
-EVENTS.md v1 必须直接包含：
+docs/EVENTS-graph.md v1 必须直接包含：
 
 - `node:turn` / `node:turn-settled`（与 `node:attempt` 平级但更外层）
 - 顺序**严格**：`node:turn → node:attempt → node:attempt-settled → node:turn-settled`
@@ -562,9 +562,9 @@ v3 让两条路共用同一套八步，于是回放会去写回执——**那是
 
 **回归**：`repro-graph-node` 74 + `repro-graph-worktree` 176 + `repro-graph-conversation` 137 = **387**。
 
-### 11.1 EVENTS.md 复审又指回了实现（两条真 bug）
+### 11.1 docs/EVENTS-graph.md 复审又指回了实现（两条真 bug）
 
-写 `EVENTS.md` 的「轮」那一层时，**文档复审顺着规范指回了运行时**，抓到两条 387 条断言没覆盖的：
+写 `docs/EVENTS-graph.md` 的「轮」那一层时，**文档复审顺着规范指回了运行时**，抓到两条 387 条断言没覆盖的：
 
 | 提交 | 问题 | 根因（**不是措辞**） |
 |---|---|---|

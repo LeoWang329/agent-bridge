@@ -5,7 +5,7 @@
  * **不写任何状态文件**(判活只有一条合同:生命管道)。
  *
  * 由 `withBridge({viz:true})` 用 `fork()` 拉起,靠 IPC 收控制消息、靠管道 EOF 判 owner 结束。
- * 合同全文见 `skills/agent-bridge-graph/EVENTS.md` §8 与 §10.4~§10.6。
+ * 合同全文见 `docs/EVENTS-graph.md` §8 与 §10.4~§10.6。
  */
 
 import http from "node:http";
@@ -29,7 +29,7 @@ const QUEUE_LIMIT = 33554432; // 32 MiB
 const POLL_MS = 500;
 /** owner 结束且没有客户端之后的宽限期。 */
 const GRACE_MS = 60000;
-/** 可降级字段的阈值(与 EVENTS.md §3.3 同档,不许更小)。 */
+/** 可降级字段的阈值(与 docs/EVENTS-graph.md §3.3 同档,不许更小)。 */
 const DEGRADE_THRESHOLD = 2048;
 
 /* ============================================================

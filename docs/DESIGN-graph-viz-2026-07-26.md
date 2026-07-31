@@ -1,7 +1,7 @@
 # agent-bridge-graph 可视化 —— 方案设计
 
 **日期** 2026-07-26 · **修订 v14** 2026-07-27 · **状态** ✅ **codex 第 13 轮 APPROVE，可施工**
-**关联** `skills/agent-bridge-graph/`、`skills/agent-bridge-roundtable/EVENTS.md`、`docs/PLAN-agent-bridge-session-viz-impl-2026-07-27.md`
+**关联** `skills/agent-bridge-graph/`、`skills/agent-bridge-roundtable/docs/EVENTS-graph.md`、`docs/PLAN-agent-bridge-session-viz-impl-2026-07-27.md`
 
 > **修订史与逐轮复审记录** 移到 `docs/REVIEW-LOG-graph-viz-2026-07-26.md`。
 > **一句话**：这份提案经过 **13 轮** codex 对抗复审（第 13 轮 APPROVE），每一轮都是 CHANGES-REQUIRED、每一轮的发现都成立；最近五轮**每轮还能删掉三四样机制**。这份文档只留**现行合同**与「为什么是这样」，**不再留考古**——历史越堆越厚会开始污染活跃条款（最近一轮就抓到一条：正文里当规模依据的那句话，早被后来加的进度事件证伪了）。
@@ -12,7 +12,7 @@
 
 ## 0. 结论摘要
 
-沿用圆桌 / loop 的形态：**`EVENTS.md` 定 schema → 事件流 JSONL → 零依赖 `serve.mjs`（SSE）→ 单文件 `index.html`**。
+沿用圆桌 / loop 的形态：**`docs/EVENTS-graph.md` 定 schema → 事件流 JSONL → 零依赖 `serve.mjs`（SSE）→ 单文件 `index.html`**。
 
 graph 与那两个的**三处结构性不同**：
 
@@ -263,7 +263,7 @@ codex 建议加一把 `<out-dir>/viz.writer.lock`，配 ownerToken / 陈旧锁 f
 <out-dir>/nodes/.runs/<graphId>/                  ← 本次 graph 的全部 viz 产物,只有开 viz 才有
         ├── transcript.jsonl    事件流(§3.1③)
         └── <seq>-<id>/         每个节点一份不可变归档(事件里**没有**字段指向这个目录,见下)
-            ├── input.json          冻结的 spec 字段(**只是快照,不兼任资产目录**;键集与序列化见 EVENTS.md)
+            ├── input.json          冻结的 spec 字段(**只是快照,不兼任资产目录**;键集与序列化见 docs/EVENTS-graph.md)
             ├── prompt.md           冻结的 user 侧原文(**同时就是 attempt 1 的输入**,见下)
             ├── role.md             冻结的 system 侧原文(有才写)
             ├── attempt-<n>.input.md    **n ≥ 2 才有**(attempt 1 的输入就是上面的 prompt.md)
@@ -616,7 +616,7 @@ scene:
 
    > **除 `node:progress` 外：字段级有界化之后，schema 里实际存在的字段一个都不能少；只有语义上标 `?` 的字段可以缺席。若一条完整的、已经有界化的事件仍然超过行上限，说明是 §3.2 的上限本身定失算了——这时转 `recording-failed`，而不是砍字段。**
 
-   ⚠️ **这条不变式要成立，"schema"必须是唯一且完整的一份**：现在它散在 §3.2 信封 / §3.1a 的 `AssetState` 与控制消息 / §3.3 事件表 / `node:settled` 的独立代码块 / 以及"所有 node 事件隐含带 `nodeSeq`"这条表外规则里。**施工时必须先把它们合成一份 `EVENTS.md`**（写成完整判别联合，照 `skills/agent-bridge-roundtable/EVENTS.md` 的体例），**那一份才是规范**；本文档从那时起只解释"为什么"，不再当字段清单用。**否则这条不变式又会退化成早先的稿子那个"两个真理源"**。
+   ⚠️ **这条不变式要成立，"schema"必须是唯一且完整的一份**：现在它散在 §3.2 信封 / §3.1a 的 `AssetState` 与控制消息 / §3.3 事件表 / `node:settled` 的独立代码块 / 以及"所有 node 事件隐含带 `nodeSeq`"这条表外规则里。**施工时必须先把它们合成一份 `docs/EVENTS-graph.md`**（写成完整判别联合，照 `skills/agent-bridge-roundtable/docs/EVENTS-graph.md` 的体例），**那一份才是规范**；本文档从那时起只解释"为什么"，不再当字段清单用。**否则这条不变式又会退化成早先的稿子那个"两个真理源"**。
 
    **为什么必须是不变式而不是清单**：早先的稿子只写了笼统的"保住骨架"，早先的稿子改成逐事件列 MUST——**结果第二轮就又漏了** `execution`（复用标记）、`outcome`（write 的权威结论）、`counts`、`inputSha256`、`rejectedReason`，还给 `run:final` 列了它根本没有的 `nodeRunId`/`id`。**"每轮重新猜哪些小字段可以牺牲"这件事本身就是缺陷源**。§3.2 已经给每个字段、每个数组、每个资产、`attempts[]` 都定了上限，所以"完整事件"天然有界，不需要再挑一遍。——早先的稿子写成"非终态事件超限可以整条丢"是错的：`node:observed` 带着 spec/prompt/role 三份资产状态，`node:attempt` 带着本轮 input，`node:queued`/`node:started`/`node:workspace-*` 决定了中断时落在六档 `abandoned` 的哪一档。**这些一旦没进 transcript，"从文件完整回放"也回放不出来**——那正是无 manifest 方案的地基。
 
@@ -1060,13 +1060,13 @@ SKILL.md 必须写明：**开 viz = 在 out-dir 里留下一份全量 prompt 明
 
 **前三步的顺序（codex APPROVE 时给的，照这个开工）：**
 
-1. **先建唯一规范 `EVENTS.md`**——事件 schema、`AssetState`、全部字段上限，外加一组校验 fixture。⚠️ 它是后面所有东西的真理源，**不先落它，第 2、3 步就会各自长出一份 schema**。
+1. **先建唯一规范 `docs/EVENTS-graph.md`**——事件 schema、`AssetState`、全部字段上限，外加一组校验 fixture。⚠️ 它是后面所有东西的真理源，**不先落它，第 2、3 步就会各自长出一份 schema**。
 2. **记录基础层**：graph 作用域（绑定 outDir / `graphId` / `wx` 建 transcript）、顺序 writer、归档闭包、控制通道——**连同故障注入测试一起**。
 3. **接进 `node-core.mjs`**：`nodeSeq`、完整插桩顺序、in-flight promise 登记与 admission 封闭、十二步收尾协议。
 
 ⚠️ **页面本体不在这条路径上**（2026-07-28 定）：`viz/index.html` 由 **UI 设计师**照 `docs/UI-REQUIREMENTS-graph-viz-2026-07-26.md` 产出，本项目只交**数据面**——`viz/serve.mjs`（SSE + `/file`）、`viz/sample/`（冻结样例，供他离线开发）、以及他交付后的接入。
 
-**因此「页面要接的那份契约」必须是可执行的**：就是 `EVENTS.md` 的传输一节（SSE endpoint、frame 编码、控制槽的 event 名与 data 形状、`/file?ref=` 的接受范围）。**这一节从此是对外接口文档，不再只是内部约定**——设计师照着它写 reducer，写错了是我们没定清楚。
+**因此「页面要接的那份契约」必须是可执行的**：就是 `docs/EVENTS-graph.md` 的传输一节（SSE endpoint、frame 编码、控制槽的 event 名与 data 形状、`/file?ref=` 的接受范围）。**这一节从此是对外接口文档，不再只是内部约定**——设计师照着它写 reducer，写错了是我们没定清楚。
 
 
 | # | 改动 | 位置（**按函数名定位**） | viz 关时也生效 |
@@ -1084,7 +1084,7 @@ SKILL.md 必须写明：**开 viz = 在 out-dir 里留下一份全量 prompt 明
 | 11 | `node:settled`（资产联合 + 恒带 `attempts[]` + 封闭兜底） / `node:attempt-settled`（**每轮收场时发，四种 status 都发**） | `finish()` 之后 / 尝试循环内 | 否 |
 | 12 | **§3.4① 的十二步收尾**（封 admission → 排空 → close → 定 result → 写 final → **writer 坏了就补 owner-final** → 关管道 → 删临时目录 → 原样重抛） | `withBridge` 的 `finally` | 否 |
 | 13 | 可选 `deps` 注解 + prompt 路径推断 | `normalizeSpec` | 否 |
-| 14 | `EVENTS.md` | `skills/agent-bridge-graph/EVENTS.md` | — |
+| 14 | `docs/EVENTS-graph.md` | `docs/EVENTS-graph.md` | — |
 | 15 | `viz/serve.mjs`（圆桌为基座 + 生命管道 + synthetic abandoned 六档 + **EOF 前同步 drain** + **`/file` 收窄到当前 graph 归档** + **异步流式回放/每客户端队列/背压** + **单 tail reader + `lastGoodOffset` 状态机** + **事件不得因超长被丢：按 §3.2 那条不变式，不是"只保终态"** + **自灭状态机整条换成 §3.3 那个 `ownerEnded` 谓词，并删掉"无客户端 10 分钟"兜底**） | — | — |
 | 16 | ~~`viz/index.html`~~ —— **页面不由本项目实现**(2026-07-28 定):`docs/UI-REQUIREMENTS-graph-viz-2026-07-26.md` 交给 UI 设计师,页面由他产出,我方只交**数据面**并在他交付后接上 | — | — |
 | 17 | `viz/sample/` + `test-viz.mjs`(**提前、且升为必需**):一份冻结的样例 transcript + 归档目录。**设计师要靠它离线开发页面**,没有它他就得对着文字想象数据 | 仿 loop | — |

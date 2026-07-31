@@ -231,7 +231,7 @@ function adaptSession(s, c) {
 }
 
 function adaptTurn(t, c) {
-  // run gone 时把仍是 dispatched 的轮次**合成**为 abandoned（STATE.md §9）。
+  // run gone 时把仍是 dispatched 的轮次**合成**为 abandoned（docs/STATE-session-viz.md §9）。
   // 快照永远发不出终态——`run.status` 只有一档，终态是传输层的一帧。
   const synthesized = c.runGone && t.state === "dispatched";
   const running = t.state === "dispatched" && !synthesized;
@@ -357,7 +357,7 @@ export function deriveView(snapshot, progress = new Map(), ctx = {}) {
 }
 
 function deriveTurn(t, progress, runGone) {
-  // ⚠️ **run gone 时把仍是 dispatched 的轮次合成为 abandoned**（STATE.md §9）。
+  // ⚠️ **run gone 时把仍是 dispatched 的轮次合成为 abandoned**（docs/STATE-session-viz.md §9）。
   //    这是页面合成的，不是快照里写的——快照永远发不出终态（§4 的 run.status 只有一档）。
   const synthesized = runGone && t.state === "dispatched";
   const outcome = synthesized ? "abandoned" : t.outcome;

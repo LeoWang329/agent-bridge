@@ -7,7 +7,7 @@
 > 行号一律不作数(PLAN 已实测到偏差),定位一律按**函数名 + 邻近唯一语句**。
 > 每条 anchorStatement 都经报告方核过「在该函数内出现恰好一次」。
 
-真理源仍是 `skills/agent-bridge/viz/STATE.md`;本文与它冲突时以 STATE.md 为准。
+真理源仍是 `docs/STATE-session-viz.md`;本文与它冲突时以 docs/STATE-session-viz.md 为准。
 
 ---
 
@@ -255,7 +255,7 @@
 > 
 > 不确定项：终态 failed 的 poller具体函数/周期、active attempt API、pendingRpc 复合 key 编码、OMP 250ms 正文两阶段接口目前都未在两份文档或 recorder API 中钉死，因此这里只能给可靠源码边界，不能声称这些接线细节已有唯一实现。
 > 
-> 已只读核验：上述每个 anchorStatement 在其 functionName 内出现恰好一次；未修改任何文件。工作树中 scripts/viz-writer.mjs 与 skills/agent-bridge/viz/STATE.md 原本就是 untracked，本次未触碰。
+> 已只读核验：上述每个 anchorStatement 在其 functionName 内出现恰好一次；未修改任何文件。工作树中 scripts/viz-writer.mjs 与 docs/STATE-session-viz.md 原本就是 untracked，本次未触碰。
 > 
 > 
 

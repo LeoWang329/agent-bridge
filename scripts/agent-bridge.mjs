@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 // ⚠️ **零副作用 import**:viz-writer 模块顶层什么都不做,只有 `createVizRun()` 被调用才建目录。
-//    这是它能被 `doctor` / `cleanup` / 测试 import 的前提(STATE.md §7)。
+//    这是它能被 `doctor` / `cleanup` / 测试 import 的前提(docs/STATE-session-viz.md §7)。
 import { createVizRun, vizCleanup } from "./viz-writer.mjs";
 
 const IS_WINDOWS = process.platform === "win32";
@@ -1382,7 +1382,7 @@ const DELIVERED_TURN = Symbol("agent-bridge.deliveredTurn");
 
 // ── 委托会话史观测台（session viz）的接线 ─────────────────────────────────────
 //
-// 合同在 `skills/agent-bridge/viz/STATE.md`,实现在 `scripts/viz-writer.mjs`。
+// 合同在 `docs/STATE-session-viz.md`,实现在 `scripts/viz-writer.mjs`。
 // 这里只有**两样东西**:一个 recorder 单例,和一道护栏。
 //
 // ⚠️ **护栏必须只有一处。** 桥里有 70 多个插桩点,而纪律是死的:
@@ -1436,7 +1436,7 @@ function vizBodyKind(text, outcome) {
   return text.length >= MAX_TEXT ? "partial" : "final";
 }
 
-/** `appendSystemPrompt` 到底是怎么注进去的(STATE.md §4.3 三档,**照抄源码枚举,不许自创**)。
+/** `appendSystemPrompt` 到底是怎么注进去的(docs/STATE-session-viz.md §4.3 三档,**照抄源码枚举,不许自创**)。
  *
  *  页面靠它说出「这份角色文件是真 system prompt」还是「只是首轮用户消息的前缀」——
  *  后者遵从与否**看模型**,把两者混成一句话就等于替一个软注入背书。 */
@@ -1445,7 +1445,7 @@ function vizBodyKind(text, outcome) {
 const OMP_VIZ_SETTLE_GRACE_MS = 250;
 
 /** 算「后端真的动起来了」的事件类型。**只用于诊断字段 `firstBackendEventAt`**,
- *  不作轮次出现的门槛(STATE.md §4.5),也不参与任何状态判定。 */
+ *  不作轮次出现的门槛(docs/STATE-session-viz.md §4.5),也不参与任何状态判定。 */
 const VIZ_BACKEND_EVENTS = new Set([
   "agent_start", "turn_start", "message_update", "agent_end", "turn_end",
   "tool_execution_start", "tool_execution_end",
@@ -1474,7 +1474,7 @@ function collectDeliveries(payload, depth = 0, via = null) {
   const prov = payload[DELIVERED_TURN];
   if (prov) {
     dischargeTurn(prov.sessionId, prov.turnId, "collected");
-    // 观测台的 `collected`(STATE.md §4.8)。**同一轮重复 result/wait 只记第一次**——
+    // 观测台的 `collected`(docs/STATE-session-viz.md §4.8)。**同一轮重复 result/wait 只记第一次**——
     // 这条幂等由 writer 保证,这里只管如实上报每一次交付。
     // 搭已有的溯源通道,不新造第二条:交付面有五种返回形状,而"维护一张会漏的清单"
     // 正是这个仓库反复栽跟头的形状。
@@ -1488,7 +1488,7 @@ function collectDeliveries(payload, depth = 0, via = null) {
   for (const v of Object.values(payload)) collectDeliveries(v, depth + 1, via);
 }
 
-/** MCP 工具名 → STATE.md §4.8 的 `via` 枚举。不认识的一律 null(未知,不是瞎猜一个)。 */
+/** MCP 工具名 → docs/STATE-session-viz.md §4.8 的 `via` 枚举。不认识的一律 null(未知,不是瞎猜一个)。 */
 const VIA_BY_TOOL = new Map([
   ["agent_bridge_open_session", "open_session"],
   ["agent_bridge_send_message", "send_message"],
@@ -1659,7 +1659,7 @@ function buildSessionResult(session, fullText, options = {}) {
         也绝不能说"你不欠了"** —— 后者会让人放心地把还救得回来的产出关掉。 */
   const deliveredTurnId = result.session?.lastTurn?.id || null;
   if (settledNow && deliveredTurnId) {
-    // 观测台的 `collected` 记录也搭这条已有通道走(STATE.md §4.8),**不新造第二条**:
+    // 观测台的 `collected` 记录也搭这条已有通道走(docs/STATE-session-viz.md §4.8),**不新造第二条**:
     // 溯源载荷本身就是"这一轮真的交到调用方手上了"的证据,而它已经解决了最难的部分
     // (可枚举 Symbol,跟着 spread 自动走完五种返回形状)。
     // `returnedChars` 是**实际内联返回的字符数**,不是正文长度——`returnMode:"ref"` 时它可以是 0。
@@ -2616,7 +2616,7 @@ class OmpRpcSession {
       // arriving after request()'s timer already deleted its pending, takes the !has(id) path below and
       // deliberately does NOT clear it — a consistently-late backend stays "wedged".)
       this.unresponsiveSince = null;
-      // 观测台:OMP 的**派发边界就在这里**(STATE.md §4.6 的 `rpc_ack`,协议级证据)。
+      // 观测台:OMP 的**派发边界就在这里**(docs/STATE-session-viz.md §4.6 的 `rpc_ack`,协议级证据)。
       //
       // ⚠️ **不能挪到 `send()` 里 await 之后**。`pending.resolve(message)` 只排一个微任务,
       //    而同一个 stdout chunk 里的后续行会被 readline **同步**送进 `#applyEvent` ——
@@ -2651,7 +2651,7 @@ class OmpRpcSession {
     if (this.dead) return;
     // 观测台:第一条真正来自后端的事件。**放在 `if (this.dead) return` 之后**是刻意的——
     // 濒死进程 stdout 里的缓冲尾行不算"后端还活着"的证据。
-    // 它只是**诊断**,不是轮次出现的门槛(STATE.md §4.5:允许早于 dispatchedAt)。
+    // 它只是**诊断**,不是轮次出现的门槛(docs/STATE-session-viz.md §4.5:允许早于 dispatchedAt)。
     // ⚠️ 这里拿不到 pendingRpc:ACK 一到就删了。所以走会话级的 activeAttempt()——
     //    「当前这个会话正在跑哪一轮」是 recorder 自己知道的事,不该让桥去扫核心的 this.pending。
     if (VIZ_BACKEND_EVENTS.has(message.type)) {
@@ -2821,7 +2821,7 @@ class OmpRpcSession {
       if (typeof update?.text === "string") {
         this.lastAssistantText = clampText(update.text);
       }
-      // 观测台:实时预览(STATE.md §5 的 sidecar)。
+      // 观测台:实时预览(docs/STATE-session-viz.md §5 的 sidecar)。
       // ⚠️ 这是**每 token 级**频率。节流不在这里做,在 writer 的合并槽里做——
       //    五个后端各自自律的话,迟早有一处忘;而它一旦漏进有界队列,
       //    一个正常跑着的轮次几百毫秒就能把队列打满 → queue_full → 页面挂出
@@ -3529,7 +3529,7 @@ class CodexAppServerSession {
         if (this.turn) this.#beginTurn(params.turn?.id || null);
         this.currentTurnId = params.turn?.id || this.currentTurnId;
         // 观测台:`turn/started` 通知 —— 也是协议级证据,但与 `turn_start_ack` **是两档**
-        // (STATE.md §4.6 要求按证据来源分开钉死)。
+        // (docs/STATE-session-viz.md §4.6 要求按证据来源分开钉死)。
         //
         // ⚠️ 位置必须落在上面 `if (this.turn) this.#beginTurn(...)` 那道 guard **之外**:
         //    这一行是本 case 里唯一无条件执行的语句。`turn/start` 超时之后 `this.turn` 已是 null,
@@ -4392,7 +4392,7 @@ class ClaudeCodeSession {
     this.#beginTurn(turnId);
     // 观测台:claude 的 `#write` 是**无 callback 的裸 `stdin.write`**(返回值都没接、没有背压处理、
     // 没有 flush 确认),所以这里能证明的**只有「字节交给了 Node/OS 管道」** ⇒ `pipe_enqueued`。
-    // 页面对这一档只能写「已派发,等待后端输出」,**不能写「后端已接受」**(STATE.md §4.6)。
+    // 页面对这一档只能写「已派发,等待后端输出」,**不能写「后端已接受」**(docs/STATE-session-viz.md §4.6)。
     // claude 全程没有任何协议级 ACK(首条用户消息之前 stdout 完全沉默),所以不存在更强的证据可等。
     // ⚠️ 挂在 `#beginTurn` 之后而不是 `#writeUser` 之后:夹在两者之间会让 viz 的时间戳
     //    早于桥自己的 turnStartedAt。也**不能**挂进 `options.wait` 分支——那样非阻塞 send 永远不产生轮次。
@@ -5989,12 +5989,12 @@ async function openSession(params) {
   //
   // ⚠️ 这一条与 PLAN §2.3 相反,而 PLAN 是错的:writer 的 `sessionOpenFailed()` 第一句就是
   //    「这个 session 没登记过就直接返回」——会话若不先登记,`phase:"start"` 那条失败分支
-  //    **结构上永远是 no-op**。而 STATE.md §4.2 明写「启动失败的会话也要占一个位置
+  //    **结构上永远是 no-op**。而 docs/STATE-session-viz.md §4.2 明写「启动失败的会话也要占一个位置
   //    (页面要把它渲染成一张『生下来就死了』的卡片)」,数组还要按**创建顺序**排。
   //    附带收益:start() 期间的 `setSessionStatus` 会被状态钩子实时收到——cursor 的
   //    `#createChat` 可能耗几十秒,这段时间页面能显示一张 starting 卡片而不是一片空白。
   //
-  // ⚠️ **逐字段白名单,绝不 spread `session.summary()`**(STATE.md §4.2 明令):
+  // ⚠️ **逐字段白名单,绝不 spread `session.summary()`**(docs/STATE-session-viz.md §4.2 明令):
   //    否则后端将来新增字段会静默流进快照,绕过白名单纪律。
   vz(v => v.sessionOpened({
     sessionId: session.id,
@@ -6624,7 +6624,7 @@ async function runCli(argv) {
       // was SIGKILLed before it could clean up its own sessions (matched by pid records whose
       // owner MCP is gone), and remove abandoned logs/<runId>/ dirs from those dead servers.
       // 顺带回收孤儿 viz 目录 —— 这是**唯一**的回收入口。被 SIGKILL 掉的 run 来不及删自己的
-      // 临时目录,而那里面是全量委托明文(STATE.md §7)。判据是 owner 里的 pid 还活不活着,
+      // 临时目录,而那里面是全量委托明文(docs/STATE-session-viz.md §7)。判据是 owner 里的 pid 还活不活着,
       // 判错的方向是"留下一个孤儿"而不是"删掉一个活 run"。
       // ⚠️ `vizCleanup()` **只读 tmpdir、不建目录**,所以放在 CLI 里不违反零副作用;
       //    也**只能**出现在这个子命令里(别的 CLI 路径不该碰别人的临时目录)。
@@ -6799,7 +6799,7 @@ function serveMcp() {
   // 观测台的**唯一**初始化点。
   // ⚠️ 只能在这里:`createVizRun()` 一被调用就 `mkdtempSync`,而 `doctor` / `cleanup` / `help` /
   //    任何测试 import 都走不到 `serveMcp()`。放模块顶层或 `runCli()` 开头,那几条路径
-  //    都会凭空建一个临时目录(STATE.md §7 的零副作用是硬要求)。
+  //    都会凭空建一个临时目录(docs/STATE-session-viz.md §7 的零副作用是硬要求)。
   // ⚠️ 在 `installProcessHandlers()` **之前**:RUN_LOG_DIR 与 ensureDirs 已就绪(会话的 logFile
   //    路径要进快照),而退出处理器一装上就可能触发 `cleanupAndExit`——那时 recorder 必须已存在。
   //    代价如实记:这是本设计里唯一一处主动的同步 IO(mkdtempSync + 两次 writeFileSync),
@@ -7057,11 +7057,11 @@ function cleanupAndExit(code = 0, reason = "shutdown", error = null) {
   cleanupSessions({ removePidRecord: false });
   // 观测台封账。**顺序不能反**:先 cleanupSessions,让每个 close 钩子把 ledger 收干净,
   // 再 seal;反过来的话 sessionClosed / finalizeSession 全被封账挡在门外。
-  // ⚠️ **只做 O(1) 的封账 + 停止接收新任务,不同步写大快照**(STATE.md §9)。
+  // ⚠️ **只做 O(1) 的封账 + 停止接收新任务,不同步写大快照**(docs/STATE-session-viz.md §9)。
   //    同步文件写没有可执行的超时,Defender 一卡就把退出本身拖死;何况正常退出
   //    紧接着就把整个 VIZ_DIR 删掉——写完即删的最终快照**没有可靠消费者**。
   vz(v => v.sealAndStop());
-  // 正常退出连同临时目录一起删:那里面是全量委托明文(STATE.md §7 的隐私代价压在这上面)。
+  // 正常退出连同临时目录一起删:那里面是全量委托明文(docs/STATE-session-viz.md §7 的隐私代价压在这上面)。
   // 崩溃(code !== 0)留着,理由和下面留 run 日志目录一样——现场比隐私优先级低,但比"什么都查不到"高;
   // 留下来的目录随后由别的 run 的 `cleanup` 按 owner 存活性回收。
   if (code === 0) vz(v => v.cleanup());
@@ -7085,7 +7085,7 @@ function installProcessHandlers() {
   process.once("unhandledRejection", err => cleanupAndExit(1, "unhandledRejection", err));
   process.once("exit", () => {
     if (!shuttingDown) cleanupSessions({ removePidRecord: false });
-    // ⚠️ 这一格**严格零 snapshot I/O**(STATE.md §9)。`exit` 回调里只能跑同步代码,
+    // ⚠️ 这一格**严格零 snapshot I/O**(docs/STATE-session-viz.md §9)。`exit` 回调里只能跑同步代码,
     //    而同步文件写没有可执行的超时——在这里刷快照就是拿退出去赌磁盘。
     //    `sealAndStop()` 只是 O(1) 地封账、停止接收新任务,不写盘。
     vz(v => v.sealAndStop());

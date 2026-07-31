@@ -10,7 +10,7 @@
  *
  * ⚠️ 时间戳是**写死的**,不取 Date.now() —— 样例要逐字节可重现,否则每次重跑都是一次 diff。
  *
- * ⚠️ **这份样例按 `EVENTS.md` 建,不按 `viz-events.mjs` 建。**
+ * ⚠️ **这份样例按 `docs/EVENTS-graph.md` 建,不按 `viz-events.mjs` 建。**
  *    这两者不是一回事:后者是**写方**的实现,它自己也可能漂。拿写方的实现造样例、再拿
  *    写方的 schema 去验它,证明的只是"我和我自己一致" —— 一个同源的同义反复。
  *    所以这里逐条按合同的**散文**摆事实,尤其是那几条合同点名"**可验的断言**"的地方(§1.3):
@@ -81,7 +81,7 @@ const na = () => ({ state: "not-applicable" });
 const unavail = (code) => ({ state: "unavailable", code });
 /** 现场是个**容器**,它自己没有 ref/sha256/byteCount(§3.2)。 */
 const sceneP = (turnBase) => ({ state: "present", files: {
-  // 键是**逻辑名**,不是磁盘上的文件名(EVENTS.md §3.2)——两者刻意不同。
+  // 键是**逻辑名**,不是磁盘上的文件名(docs/EVENTS-graph.md §3.2)——两者刻意不同。
   sessionLog: present(`${turnBase}/scene/session.log`),
   answer:     present(`${turnBase}/scene/answer.txt`),
   status:     present(`${turnBase}/scene/status.json`) } });
@@ -107,7 +107,7 @@ const specHash = (s) => crypto.createHash("sha256").update(s).digest("hex").slic
  * 一个"跑起来过"的节点:observed → (workspace) → 每轮 turn → started → attempt* → turn-settled → settled。
  *
  * ⚠️ 这个函数是**合同的可执行版本**:上面注释里那四条"可验的断言"全在这里落地。
- *    改它之前先把 EVENTS.md §1.3 与 §5.8 读一遍 —— 这里每一处 ref 的选择都是合同指定的,
+ *    改它之前先把 docs/EVENTS-graph.md §1.3 与 §5.8 读一遍 —— 这里每一处 ref 的选择都是合同指定的,
  *    不是随手起的名字。
  */
 function node(tp, o) {

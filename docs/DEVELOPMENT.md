@@ -13,8 +13,15 @@ agent-bridge/
   docs/REQUIREMENTS.md               Product requirements and TODOs
   docs/INSTALLATION.md               Installation and usage guide
   docs/DEVELOPMENT.md                Development notes
+  docs/EVENTS-graph.md               Wire contract: graph observatory event stream
+  docs/STATE-session-viz.md          Wire contract: delegated-session observatory snapshot
   README.md                          User-facing documentation
 ```
+
+⚠️ **`skills/` 下只放一次 skill 调用里真会被打开的东西**（`SKILL.md` + `tools/` `templates/`
+`examples/` `roles/` `modes/` + 观测台的 `serve.mjs` / `index.html`）。给开发者看的规范、设计稿、
+复盘一律进 `docs/` —— 否则 agent 顺手列一下 skill 目录，就可能把一份上千行的规范读进上下文，
+而它在那次调用里一个字都用不上。
 
 There are no npm dependencies. The runtime uses Node built-ins plus external CLIs. Agent Bridge only bridges to these — it never installs them, and each is optional (a backend that is not installed is reported by `doctor` as `missing` / `available:false`; it does not break the server):
 
@@ -108,6 +115,71 @@ node --check scripts/agent-bridge.mjs
 node scripts/agent-bridge.mjs doctor
 node scripts/agent-bridge.mjs cleanup
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | node scripts/agent-bridge.mjs mcp
+```
+
+## 字节合同（改 writer / viewer 之前先读）
+
+这两份是**规范**，不是说明：落到磁盘、管道、SSE 上的字节、顺序、含义。
+写产生方或写页面的人只读它就够，不用回头翻 DESIGN；两边打架以它为准，回去把 DESIGN 改对。
+
+| 合同 | 管的是 | 谁按它施工 |
+|---|---|---|
+| `docs/EVENTS-graph.md` | graph 观测台的 `transcript.jsonl` 事件流 | `skills/agent-bridge-graph/tools/viz-events.mjs`（写）· `viz/serve.mjs` + `viz/index.html`（读） |
+| `docs/STATE-session-viz.md` | 委托会话观测台的双槽快照 | `scripts/viz-writer.mjs`（写）· `skills/agent-bridge/viz/serve.mjs` + `index.html`（读） |
+
+⚠️ **它们刻意不在 `skills/` 下面**：skill 目录只放一次调用里真会被打开的东西。
+这两份合同的读者是改 agent-bridge 的人，不是跑 skill 的 agent。
+
+> 对照：`skills/agent-bridge-loop/EVENTS.md` 与 `skills/agent-bridge-roundtable/EVENTS.md`
+> **留在各自 skill 目录里**，因为那两个 skill 的事件是**主控 agent 自己 append 的**
+> （「单 writer = 你」「桥不替你写事件」），跑的时候要照着它写 —— 那是运行时资产，不是开发文档。
+
+## Skill 回归测试（graph / 两个观测台）
+
+假后端，零消耗，**推送前必过**：
+
+```sh
+node docs/repro-mcp-hang/repro-graph-node.mjs        # 环节生命周期 / 失败三档 / 幂等 / 零残留
+node docs/repro-mcp-hang/repro-graph-worktree.mjs    # write 隔离 / 基线闸 / 复用闸 / 并发闸
+node docs/repro-mcp-hang/repro-viz-events.mjs        # 事件 writer：schema / 有界化 / 半行安全
+node docs/repro-mcp-hang/repro-viz-graph.mjs         # graph 作用域与归档写入器
+node docs/repro-mcp-hang/repro-graph-conversation.mjs # 多轮对话：轮的生命周期 / 会话毒化 / 记忆边界
+node docs/repro-mcp-hang/repro-graph-viz.mjs         # viz 开着时的事件流 / SSE / /file 四道闸
+node skills/agent-bridge-graph/viz/test-viz.mjs      # graph 页面这一侧：事件流 → 页面上写了什么
+
+node docs/repro-mcp-hang/repro-viz-writer.mjs        # 会话快照 writer：双槽 / 有界队列 / 降级三处同步
+node docs/repro-mcp-hang/repro-viz-bridge.mjs        # 桥真的按合同调 writer 了吗（含开服时孤儿目录回收）
+node skills/agent-bridge/viz/test-viz.mjs            # 会话页面这一侧：快照 → 页面上写了什么
+```
+
+⚠️ `repro-graph-viz` 与 `skills/agent-bridge-graph/viz/test-viz.mjs` **都**会跑
+`viz/contract-invariants.mjs` —— 合同里那些**跨字段的等式**
+（「这两处 sha256 必须相等」「这个字段只在那个字段不是 present 时才许出现」）。
+它**刻意不 import `tools/viz-events.mjs`**：schema 只管单个字段的形状，
+拿写方的 schema 去验写方造的事件，验的只是"我和我自己一致"。
+前者验**每一次真跑出来的 transcript**，后者验**冻结样例** ——
+写方与样例任何一侧漂离合同，当场变红。
+
+**真浏览器** e2e（零消耗，但要 playwright；改了页面之后跑一次）：
+
+```sh
+npm i playwright && npx playwright install chromium         # 装在哪个目录都行
+PLAYWRIGHT_DIR=<那个目录> node docs/repro-mcp-hang/e2e-viz-browser.mjs
+```
+
+它同时考 **graph 观测台**和**委托会话观测台**，只问「只有真浏览器答得上来」的问题，
+不重复 `test-viz` 已经守住的内容断言。为什么非要它：`test-viz` 是在 **vm 沙箱**里跑页面脚本、
+断言吐出来的 HTML 字符串 —— 没有排版引擎、没有命中测试、没有焦点、也没有真的 JS 运行时。
+两个真事都是它照不出来的：**推断边"可点开看依据"实测命中率只有 8%**（线宽 1.4px 又是虚线，
+命中区就是那条线本身）；**会话观测台调了一个没 export 的函数，每秒抛一次 ReferenceError，
+连带把定时刷新整个弄死**。两处的 HTML 字符串都挑不出毛病，一路全绿。
+装不上 playwright 时它**如实跳过并退 0**，所以不进推送前的闸。
+
+真后端 e2e（**真花钱**，改了归档布局 / 事件形状 / 页面读法之后跑一次）：
+
+```sh
+node docs/repro-mcp-hang/e2e-graph-viz.mjs           # 真跑 → 观测台上看到的就是磁盘上那份
+node docs/repro-mcp-hang/e2e-viz.mjs                 # 会话观测台的真后端一轮
 ```
 
 ## End-to-End Test (real backends)

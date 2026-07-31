@@ -1,9 +1,9 @@
 /**
  * 委托会话史观测台 —— writer 侧。
  *
- * **合同在 `skills/agent-bridge/viz/STATE.md`，不在这里。** 本文件是那份散文的一个实现；
+ * **合同在 `docs/STATE-session-viz.md`，不在这里。** 本文件是那份散文的一个实现；
  * `skills/agent-bridge/viz/contract-invariants.mjs` 是**另一个**实现，两者刻意互不 import、
- * 不共用常量表。理由见 STATE.md §11：同源的校验器只能证明「我和我自己一致」。
+ * 不共用常量表。理由见 docs/STATE-session-viz.md §11：同源的校验器只能证明「我和我自己一致」。
  *
  * 为什么单独一个文件而不是塞进 `agent-bridge.mjs`：
  *   +900 行进 6000 行的 core，writer / ledger / 队列 / cleanup 就**无法直接单测**，
@@ -73,7 +73,7 @@ const SAFE_ID = /^[A-Za-z0-9._-]+$/;
 
 // ── 小工具 ──────────────────────────────────────────────────────────────────
 
-/** 错误文本有界化。**注意单位是 code unit**（STATE.md §3）。 */
+/** 错误文本有界化。**注意单位是 code unit**（docs/STATE-session-viz.md §3）。 */
 function boundError(v) {
   if (v === null || v === undefined) return null;
   const s = typeof v === "string" ? v : (v?.message ? String(v.message) : String(v));
@@ -143,7 +143,7 @@ function nowIso(clock) {
 
 /**
  * 文件 IO 全部走这一层，方便测试注入故障与断言并发写数。
- * ⚠️ 这**不是**目录参数：注入的是「怎么写」，不是「写去哪」（STATE.md §2.2）。
+ * ⚠️ 这**不是**目录参数：注入的是「怎么写」，不是「写去哪」（docs/STATE-session-viz.md §2.2）。
  */
 function defaultIo() {
   return {
@@ -162,7 +162,7 @@ function defaultIo() {
 /**
  * **严格串行**：同一时刻在途的写有且只有一个。
  *
- * 为什么不并发：双槽协议的正确性建立在「永不重叠写」上（STATE.md §2）。
+ * 为什么不并发：双槽协议的正确性建立在「永不重叠写」上（docs/STATE-session-viz.md §2）。
  * 两个写同时进行时，「始终覆盖较旧的槽」这句话就没有意义了。
  *
  * 队列分两条通道，**故意不共用预算**：
@@ -493,7 +493,7 @@ function disabledRecorder(reason) {
 /**
  * 建一次 run 的观测目录并返回 recorder。
  *
- * ⚠️ **签名里没有目录参数，这是刻意的**（STATE.md §2.2）。
+ * ⚠️ **签名里没有目录参数，这是刻意的**（docs/STATE-session-viz.md §2.2）。
  *    唯一入口自己 `mkdtemp`，公开面上就**没有任何办法**让 writer 指向别的目录——
  *    于是「指向了已存在的旧目录」这个状态**结构上不可达**。
  *    为一个到不了的状态写实现 + 原因码 + 机器验收，等于给测试造一个只有测试能构造出来的绿灯。
@@ -511,7 +511,7 @@ export function createVizRun({
   // 而默认关等于把这个决定推给一个**当时还没有信息**的人 —— 他要在什么都还没发生的时候
   // 预判自己以后会不会需要它。默认开则把决定挪到有信息的一侧:知道这次要跑敏感内容,才去关。
   //
-  // 判定规则**刻意不对称**(代价见 STATE.md §7:开着就等于「本机磁盘上存在全部委托原文」):
+  // 判定规则**刻意不对称**(代价见 docs/STATE-session-viz.md §7:开着就等于「本机磁盘上存在全部委托原文」):
   //   未设 / 空串        → 开(默认路径)
   //   on / 1 / true / yes → 开
   //   **其余任何值**      → 关
@@ -530,7 +530,7 @@ export function createVizRun({
     dir = IO.mkdtempSync(path.join(os.tmpdir(), VIZ_DIR_PREFIX));
     runId = `mcp-${path.basename(dir).slice(VIZ_DIR_PREFIX.length)}`;
     const startedAt = nowIso(clock);
-    // meta.json **只放不可变身份字段**,写一次就再也不动(STATE.md §6.1:
+    // meta.json **只放不可变身份字段**,写一次就再也不动(docs/STATE-session-viz.md §6.1:
     // 同一个事实有两份可写的副本,就一定会漂)。
     IO.writeFileSync(path.join(dir, "meta.json"), JSON.stringify({
       runId, pid: process.pid, processStartedAt: startedAt,
@@ -575,7 +575,7 @@ class VizRecorder {
     // (两个槽都不存在 ⇒ `readLatestState()` 返 null ⇒ 报「暂时读不到记录」+「以下为断连前状态」)。
     // 那是**刚开的服**最常见的样子,于是用户看到的第一眼就是一个假故障。
     // 修在**写的这一侧**:让"没有快照"这个状态在实践中根本不存在,viewer 一个字不用改、
-    // STATE.md §6.2 那三种「看不到内容」的状态也不用加第四种。
+    // docs/STATE-session-viz.md §6.2 那三种「看不到内容」的状态也不用加第四种。
     // 走 `#markDirty` ⇒ 排进 SerialWriter 的合并槽,**异步**落盘 —— 启动路径不新增同步 IO。
     this.#markDirty();
   }
@@ -788,7 +788,7 @@ class VizRecorder {
       if (!res || !res.attempt) return null;
       const a = res.attempt;
       if (backendTurnId) this.bindBackendTurnId(attemptId, backendTurnId);
-      // 输入正文：dispatch 时文件**还没写完**，所以先不公布 ref（STATE.md §4.7 悬空 ref）。
+      // 输入正文：dispatch 时文件**还没写完**，所以先不公布 ref（docs/STATE-session-viz.md §4.7 悬空 ref）。
       if (a.pendingInput != null) { const t = a.pendingInput; a.pendingInput = null; this.#writeInput(a, t); }
       // ACK 之前到的事件在这里归并。
       if (res.buffered) {
@@ -1065,7 +1065,7 @@ class VizRecorder {
     } else {
       a.input.chars = safeCount(String(text ?? "").length);
       a.input.bytes = safeCount(buf.length);
-      // ⚠️ **不截断时 `originalBytes` 必须恒等于 `bytes`**（STATE.md §4.7），
+      // ⚠️ **不截断时 `originalBytes` 必须恒等于 `bytes`**（docs/STATE-session-viz.md §4.7），
       //    包括两者同为 `null` 的情形——所以它必须和 `bytes` 在**同一处**赋值。
       //    早先它写在入队之前、无条件赋 `buf.length`，于是入队被拒时
       //    `bytes=null` 而 `originalBytes=N`，快照当场自相矛盾：
@@ -1118,7 +1118,7 @@ class VizRecorder {
       ]);
     } catch (err) { this.#diag("body_provider_error", err); }
     // 供体超时或抛错 ⇒ 当作"没有正文"，**绝不因此改动 outcome**：
-    // 后端确实完成了，只是我们没记下来（STATE.md §4.9 的 completed + none）。
+    // 后端确实完成了，只是我们没记下来（docs/STATE-session-viz.md §4.9 的 completed + none）。
     if (body === undefined || body === null) {
       return { ...result, body: null, bodyKind: "none", output: { error: "write_failed" } };
     }
@@ -1182,7 +1182,7 @@ class VizRecorder {
           a.output.state = "missing"; a.output.ref = null; a.output.sha256 = null;
           a.output.chars = null; a.output.bytes = null;
           a.output.previewBytes = null; a.output.previewSha256 = null;
-          // ⚠️ `completed + none` **只在 `output.error` 非空时合法**（STATE.md §4.9）——
+          // ⚠️ `completed + none` **只在 `output.error` 非空时合法**（docs/STATE-session-viz.md §4.9）——
           //    「后端正常完成，但观测侧没记下来」。所以这一格必须带上原因码，
           //    否则 writer 会自己造出一个连独立校验器都判非法的快照。
           //    而它确实**就是**一次观测失败：后端完成了，我们手上没有正文。
@@ -1338,7 +1338,7 @@ class VizRecorder {
         pid: process.pid,
         bridgeVersion: this.#bridgeVersion,
         startedAt: this.#startedAt,
-        // **只有 running 一档。** 终态是传输层的一帧,不是快照里的字段(STATE.md §4)。
+        // **只有 running 一档。** 终态是传输层的一帧,不是快照里的字段(docs/STATE-session-viz.md §4)。
         status: "running",
         degraded: this.#degraded,
         recordingErrors: this.#recordingErrors.slice(),
