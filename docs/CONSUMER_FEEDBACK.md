@@ -186,7 +186,7 @@
 
 ## v0.8.0 · 第二轮消费方反馈(进程可识别 / 进度可见 / 批量关闭 / 误杀防护)(2026-06-09)
 
-一位真实编排方使用者(用 agent-bridge 给 omp/codex/deepseek 派活做交叉审核)提了 6 条摩擦点。先做第一性原理评估(哪些是真缺口、哪些已被现有能力覆盖),完整评估与设计见 [docs/FIX_PLAN.md](FIX_PLAN.md)。
+一位真实编排方使用者(用 agent-bridge 给 omp/codex/deepseek 派活做交叉审核)提了 6 条摩擦点。先做第一性原理评估(哪些是真缺口、哪些已被现有能力覆盖),完整评估与设计当时写在 `docs/FIX_PLAN.md`,四条修复全部落地后该文档已删除(见 git 历史)。
 
 | # | 反馈 | 结论 | 落地 |
 |---|---|---|---|
@@ -206,7 +206,7 @@
 
 | 轮 | 发现 | 处置 |
 |---|---|---|
-| **1**(评审计划) | 两方认可评估表;补出 **N1 孤儿会话**(deepseek)、**N2 误杀**(codex 标"最该优先");修订 #5 prune 合一+诚实返回、#2 覆盖 any 分支+`tail_chars` 入 schema 并 clamp、#3 仅 Level 1。 | 全数纳入 [FIX_PLAN.md](FIX_PLAN.md)。 |
+| **1**(评审计划) | 两方认可评估表;补出 **N1 孤儿会话**(deepseek)、**N2 误杀**(codex 标"最该优先");修订 #5 prune 合一+诚实返回、#2 覆盖 any 分支+`tail_chars` 入 schema 并 clamp、#3 仅 Level 1。 | 全数纳入当时的修复计划并已落地。 |
 | **2**(评审实现) | N2 的 locale 解析(`ps lstart` 本地化→`Date.parse` 失败)、skew 误杀窗口、force-kill 绕过守卫、`""`→全关、#3 文案误导。 | `LC_ALL=C`;改 confirm-before-kill;`scheduleForceKill` 加 verify;`session_id===undefined` 才全关;#3 不再断言因果。 |
 | **3**(收敛轮) | deepseek:旧记录无 `spawnedAt` 永久漏杀 → 加 `createdAt` 兜底。codex:start-time 仍有窗口 → 改用 **env marker 权威身份**;`arguments` falsy 校验。**又抓出**:pre-0.8.0 子进程在可读 env 平台 marker=false 会被误判 reuse → 加 `expectMarker`(仅 0.8.0+ 记录采信 marker)。 |
 | **4**(最终确认) | 两方一致 **converged / 已收敛**,无新回归、无遗留 blocker。 | — |

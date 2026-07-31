@@ -1,4 +1,4 @@
-// Repro / proof for R1 — durable exit journal (docs/PLAN-append-system-and-exit-journal-2026-07-03.md,
+// Repro / proof for R1 — durable exit journal (施工计划已随落地删除,
 // INVESTIGATION-mcp-cleanexit-heavy-delegation-2026-07-02.md §4-§5).
 //
 // The field-report gap: a clean code-0 teardown deletes the run dir (and its bridge.log), so AFTERWARDS

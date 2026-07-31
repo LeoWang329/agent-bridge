@@ -1,6 +1,6 @@
 # agent-bridge-graph 事件 schema(`transcript.jsonl`)—— **唯一规范**
 
-**关联** `docs/DESIGN-graph-viz-2026-07-26.md`(理由书:只回答「为什么这样定」)、`docs/UI-REQUIREMENTS-graph-viz-2026-07-26.md`、`skills/agent-bridge-graph/tools/node-core.mjs`(事件的产生方)。
+**关联** `docs/DESIGN-graph-viz-2026-07-26.md`(理由书:只回答「为什么这样定」)、`skills/agent-bridge-graph/tools/node-core.mjs`(事件的产生方)。
 
 > **这份文件是规范,不是说明。** writer(`node-core.mjs` 里的记录层)与 viewer(`viz/serve.mjs` + `viz/index.html`)**只读这一份**就能写出来:字段、类型、可空性、上限与数值域、顺序、控制通道与 SSE 的 wire 格式、判定优先级、安全边界都在这里,不需要回头翻 DESIGN。
 > DESIGN 解释每条规定**为什么**是这样(以及历轮复审删掉了什么、代价是什么);两份打架时**以本文件为准**,并回去把 DESIGN 改对。

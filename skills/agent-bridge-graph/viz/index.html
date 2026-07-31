@@ -1384,7 +1384,7 @@ SCENES.push({
 /* ============================================================
    2.5 归约器：事件流 → 页面 view-model
 
-   合同：`../docs/EVENTS-graph.md`（wire）· 翻译规则：`docs/MAPPING-viz-wire-to-viewmodel-2026-07-28.md`。
+   合同：`docs/EVENTS-graph.md`（wire）。wire → view-model 的翻译规则**就在本文件里**，没有第二份文档。
    三者冲突时 docs/EVENTS-graph.md 定 wire，映射表定翻译，**页面的内部词表可以改、wire 不能**。
 
    这一段是**纯函数 + 一个累加器**，不碰 DOM、不发请求 —— 于是它能被零消耗回归直接喂事件、

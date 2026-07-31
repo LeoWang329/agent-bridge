@@ -1,7 +1,7 @@
 # agent-bridge-graph 可视化 —— 方案设计
 
 **日期** 2026-07-26 · **修订 v14** 2026-07-27 · **状态** ✅ **codex 第 13 轮 APPROVE，可施工**
-**关联** `skills/agent-bridge-graph/`、`skills/agent-bridge-roundtable/docs/EVENTS-graph.md`、`docs/PLAN-agent-bridge-session-viz-impl-2026-07-27.md`
+**关联** `skills/agent-bridge-graph/`、`docs/EVENTS-graph.md`(规范,两份打架以它为准)
 
 > **修订史与逐轮复审记录** 移到 `docs/REVIEW-LOG-graph-viz-2026-07-26.md`。
 > **一句话**：这份提案经过 **13 轮** codex 对抗复审（第 13 轮 APPROVE），每一轮都是 CHANGES-REQUIRED、每一轮的发现都成立；最近五轮**每轮还能删掉三四样机制**。这份文档只留**现行合同**与「为什么是这样」，**不再留考古**——历史越堆越厚会开始污染活跃条款（最近一轮就抓到一条：正文里当规模依据的那句话，早被后来加的进度事件证伪了）。
@@ -1064,7 +1064,7 @@ SKILL.md 必须写明：**开 viz = 在 out-dir 里留下一份全量 prompt 明
 2. **记录基础层**：graph 作用域（绑定 outDir / `graphId` / `wx` 建 transcript）、顺序 writer、归档闭包、控制通道——**连同故障注入测试一起**。
 3. **接进 `node-core.mjs`**：`nodeSeq`、完整插桩顺序、in-flight promise 登记与 admission 封闭、十二步收尾协议。
 
-⚠️ **页面本体不在这条路径上**（2026-07-28 定）：`viz/index.html` 由 **UI 设计师**照 `docs/UI-REQUIREMENTS-graph-viz-2026-07-26.md` 产出，本项目只交**数据面**——`viz/serve.mjs`（SSE + `/file`）、`skills/agent-bridge-graph/viz/sample/`（冻结样例，供他离线开发）、以及他交付后的接入。
+⚠️ **页面本体不在这条路径上**（2026-07-28 定）：`viz/index.html` 由 **UI 设计师**照一份交给 UI 设计师的需求文档产出(该文档已随交付删除)，本项目只交**数据面**——`viz/serve.mjs`（SSE + `/file`）、`skills/agent-bridge-graph/viz/sample/`（冻结样例，供他离线开发）、以及他交付后的接入。
 
 **因此「页面要接的那份契约」必须是可执行的**：就是 `docs/EVENTS-graph.md` 的传输一节（SSE endpoint、frame 编码、控制槽的 event 名与 data 形状、`/file?ref=` 的接受范围）。**这一节从此是对外接口文档，不再只是内部约定**——设计师照着它写 reducer，写错了是我们没定清楚。
 
@@ -1086,7 +1086,7 @@ SKILL.md 必须写明：**开 viz = 在 out-dir 里留下一份全量 prompt 明
 | 13 | 可选 `deps` 注解 + prompt 路径推断 | `normalizeSpec` | 否 |
 | 14 | `docs/EVENTS-graph.md` | `docs/EVENTS-graph.md` | — |
 | 15 | `viz/serve.mjs`（圆桌为基座 + 生命管道 + synthetic abandoned 六档 + **EOF 前同步 drain** + **`/file` 收窄到当前 graph 归档** + **异步流式回放/每客户端队列/背压** + **单 tail reader + `lastGoodOffset` 状态机** + **事件不得因超长被丢：按 §3.2 那条不变式，不是"只保终态"** + **自灭状态机整条换成 §3.3 那个 `ownerEnded` 谓词，并删掉"无客户端 10 分钟"兜底**） | — | — |
-| 16 | ~~`viz/index.html`~~ —— **页面不由本项目实现**(2026-07-28 定):`docs/UI-REQUIREMENTS-graph-viz-2026-07-26.md` 交给 UI 设计师,页面由他产出,我方只交**数据面**并在他交付后接上 | — | — |
+| 16 | ~~`viz/index.html`~~ —— **页面不由本项目实现**(2026-07-28 定):需求文档交给 UI 设计师,页面由他产出,我方只交**数据面**并在他交付后接上 | — | — |
 | 17 | `skills/agent-bridge-graph/viz/sample/` + `tests/test-viz-graph.mjs`(**提前、且升为必需**):一份冻结的样例 transcript + 归档目录。**设计师要靠它离线开发页面**,没有它他就得对着文字想象数据 | 仿 loop | — |
 | 18 | SKILL.md：①**删掉「这一版明确不做」里的"不做可视化"那一项**（⚠️ 只加新章不删旧句，会得到一份同时说"支持"和"不做"的 SKILL）；②"不做通用流程引擎 / 依赖解析 / 调度器"**保留不动**；③新增可视化章（含隐私口径、**回执升版的迁移代价**、**同 outDir 每个 `withBridge` 是独立页面、不提供跨波全貌**） | — | — |
 

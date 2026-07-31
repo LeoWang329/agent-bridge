@@ -2,7 +2,7 @@
 
 **日期:** 2026-07-02
 **状态:** 现场复盘（field report）。**结论:bridge 未崩溃——它按设计做了 code 0 的优雅退出。** 本次没有代码 bug；暴露的是一个**取证盲点**（clean-exit 也删 run dir → 退出原因永久丢失）与一条**客户端侧 + 重载**的触发链。含一条可落地的修复建议（durable exit journal）。
-**关联既有文档:** [INVESTIGATION-mcp-disconnect-2026-06-10.md](INVESTIGATION-mcp-disconnect-2026-06-10.md)（P1–P6 已修）、[PLAN-heavy-user-fixes-2026-07-02.md](PLAN-heavy-user-fixes-2026-07-02.md)、[变更说明-重度用户优化-2026-07-02.md](变更说明-重度用户优化-2026-07-02.md)。
+**关联既有文档:** [INVESTIGATION-mcp-disconnect-2026-06-10.md](INVESTIGATION-mcp-disconnect-2026-06-10.md)（P1–P6 已修）、[变更说明-重度用户优化-2026-07-02.md](变更说明-重度用户优化-2026-07-02.md)。
 
 ---
 
@@ -68,7 +68,7 @@ rl.on("close", () => {                 // 客户端把 stdin 关了
  "pid":1234,"ppid":5678,"uptimeSec":…,"activeRequests":1,
  "sessions":[{"id":"omp-…","status":"running","backendPid":…}]}
 ```
-这样即便优雅退出把 run dir 删了,**“这个 server 为什么、在什么状态下退出”仍可追溯**——本次调查就不必靠“目录没了”反推。成本极低(单行 append),且直接服务重度用户的可诊断性。与 [PLAN-heavy-user-fixes] 的可观测性主线一致,建议并入。
+这样即便优雅退出把 run dir 删了,**“这个 server 为什么、在什么状态下退出”仍可追溯**——本次调查就不必靠“目录没了”反推。成本极低(单行 append),且直接服务重度用户的可诊断性。与当时那批重度用户修复的可观测性主线一致,建议并入。
 
 ### R2（可选）— 长 `wait` 期间给客户端心跳,降低重载下被 teardown 的概率
 重载时若 bridge 长时间不向客户端回刷任何字节,客户端更可能判其“停滞”而 teardown。可在长 `wait` 未 settle 时按固定间隔向 stdout 发一个轻量 keepalive/进度通知(不改变 wait 语义),让客户端在重载下也能看到“还活着”。需先确认目标 harness 对 MCP 通知的容忍度,避免噪声。

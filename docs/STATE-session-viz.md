@@ -3,7 +3,7 @@
 **版本** schemaVersion `1` · **日期** 2026-07-29 · **状态** 生效
 
 > **这份文件是 wire 的唯一真理源。**
-> `docs/PLAN-agent-bridge-session-viz-impl-2026-07-27.md` §6 的那段 JSONC 是它的草稿；
+> （早期的实施计划已随落地删除，本文件是唯一现存的 wire 定义。）
 > 两处不一致时**改 PLAN，不改本文**。
 >
 > **写给谁看**：写 writer 的人、写 viewer 的人、写校验器的人。

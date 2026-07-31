@@ -22,7 +22,7 @@
 
 **测试:** 新增 `tests/repro-collect-discipline.mjs`(T1–T28,143 断言),配套新增四个桩:`fake-omp` 的 `slowsettle`/`partialslow`、`fake-codex` 的 `sameflush`/`slowstart`/`schemaslowpartial`。同时修掉一处**既有假绿**:`repro-turnstate` 的收尾 close 从不检查响应,加闸门后会被静默挡住而测试照绿。
 
-**施工说明书:** `docs/PLAN-collect-discipline-hardening-2026-07-26.md`(含两轮异引擎复审闭环与全部"不要做什么")。
+**契约测试:** `tests/repro-collect-discipline.mjs` —— 施工说明书已随落地删除,那 149 条断言现在是这批纪律的真理源。
 
 **顺带订正说明书的一处事实错误:** T14 不能用 `slowturn` —— 它的 `get_state` 恒报 `isStreaming:true`,而 `waitIdle` 要的正是 `!isStreaming`,所以 inline `wait:true` 在它上面**永远完不成**,那条用例会退化成"卡满 30 分钟"而不是在考时钟隔离。为此新增了会如实收尾的 `slowsettle`。
 
