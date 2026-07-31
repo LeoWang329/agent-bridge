@@ -958,6 +958,25 @@ function vizCount(bridge, bucket, alsoReused = false) {
 /** 弱检查(非 codex 后端用):只做「能不能 parse + 顶层必需键在不在」。
  *  **刻意不做完整 JSON Schema 校验** —— 桥本身就因为「不想有第二套跟 codex 不一致的判定标准」
  *  而不带校验器,这里同理。指望它给出 codex 那种保证是自欺。 */
+/**
+ * 「JSON 被 markdown 代码围栏包住」是**包装**,不是格式错。
+ *
+ * 实测:重问的提示词里已经明写「不要 markdown 代码围栏」,模型照裹不误 ——
+ * 于是全系统唯一的那一次 reask 被烧在一个"其实答对了"的输出上,整个环节报废。
+ *
+ * ⚠️ **只在「原样解析不了、剥掉之后能解析」时才算数** —— 所以不可能误伤本来就合法的输出
+ *    (合法的那份第一步就过了,压根走不到这里)。判据是"剥了能不能用",不是"长得像不像围栏"。
+ * @returns 剥掉围栏后的正文;不适用就 null
+ */
+function unwrapFenceIfItHelps(text) {
+  if (typeof text !== "string") return null;
+  try { JSON.parse(text); return null; } catch { /* 原样解析不了,才轮到剥围栏 */ }
+  const m = /^\s*```[A-Za-z0-9_+-]*[ \t]*\r?\n([\s\S]*?)\r?\n?[ \t]*```\s*$/.exec(text);
+  if (!m) return null;
+  try { JSON.parse(m[1]); } catch { return null; }   // 剥了还是不行 ⇒ 不是这个毛病,别乱动
+  return m[1];
+}
+
 function weakCheck(text, outputShape) {
   let parsed;
   try { parsed = JSON.parse(text); }
@@ -1967,7 +1986,8 @@ export function hasOrphanArtifacts(nodesDir, id) {
       `  确认目录可读之后再重试。`,
     );
   }
-  return ownedEntries(entries, id).some((n) => !/^f\d+\./.test(n.slice(id.length + 1)));
+  return ownedEntries(entries, id, fsFoldsCase(nodesDir, entries))
+    .some((n) => !/^f\d+\./.test(n.slice(id.length + 1)));
 }
 
 /**
@@ -1979,8 +1999,39 @@ export function hasOrphanArtifacts(nodesDir, id) {
  * 紧接着新的一次把 `foo.*` **覆盖掉**。现场就这么无声销毁了。
  * 决定"这两个名字是不是同一个文件"的是文件系统,那判归属就得用它那套规则。
  */
-function ownedEntries(entries, id) {
-  const fold = (s) => (IS_WINDOWS ? s.toLowerCase() : s);
+const CASE_FOLD_CACHE = new Map();
+
+/**
+ * **这套文件系统把只差大小写的两个名字当同一个文件吗?**
+ *
+ * ⚠️ 原先这里问的是「是不是 Windows」—— 那是**拿平台当文件系统的代名词**,而 macOS 默认的
+ *    APFS 同样大小写不敏感。于是在 macOS 上:`fs.existsSync("Foo.receipt.json")` 命中磁盘上的
+ *    `foo.receipt.json` 返回真(于是走进归档分支),而这里逐字比对一个都匹配不上 ——
+ *    归档列表为空、什么都没搬,紧接着新的一次把 `foo.*` 覆盖掉,现场无声销毁。
+ *    上面那段注释早就把机理写对了,判据却写成了平台。**问文件系统,别问平台。**
+ *
+ * 不写探针文件,直接拿已经读到的目录清单问:把某个真实条目的一个字母翻转大小写,
+ * 若翻转后的名字**不在清单里**却 `existsSync` 为真 ⇒ 这套文件系统会折叠大小写。
+ * (两个名字都在清单里 ⇒ 它们是两个独立文件 ⇒ 区分大小写。)
+ */
+function fsFoldsCase(dir, entries) {
+  if (CASE_FOLD_CACHE.has(dir)) return CASE_FOLD_CACHE.get(dir);
+  let ans = IS_WINDOWS;                    // 探不出结论时的保守回退
+  const probe = entries.find((n) => /[A-Za-z]/.test(n));
+  if (probe) {
+    const flipped = probe.replace(/[A-Za-z]/, (c) =>
+      (c === c.toLowerCase() ? c.toUpperCase() : c.toLowerCase()));
+    if (flipped !== probe) {
+      if (entries.includes(flipped)) ans = false;   // 两个都在 ⇒ 区分大小写
+      else { try { ans = fs.existsSync(path.join(dir, flipped)); } catch { /* 保守回退 */ } }
+    }
+  }
+  CASE_FOLD_CACHE.set(dir, ans);
+  return ans;
+}
+
+function ownedEntries(entries, id, foldCase) {
+  const fold = (s) => (foldCase ? s.toLowerCase() : s);
   const prefix = fold(`${id}.`);
   const lock = fold(`${id}.lock`);
   return entries.filter((n) => fold(n).startsWith(prefix) && fold(n) !== lock);
@@ -2010,7 +2061,21 @@ export function archiveFailedRun(nodesDir, id, prevStatus) {
       `  **没有覆盖任何东西**就停下了。确认目录可读之后再重试。`,
     );
   }
-  const mine = ownedEntries(entries, id);
+  const mine = ownedEntries(entries, id, fsFoldsCase(nodesDir, entries));
+  // ⚠️ **进了归档分支,却一个都认不出来 ⇒ 停下。**
+  //    调用方是因为"上一次的回执还在磁盘上"才走到这儿的,所以按前缀至少该认出那张回执。
+  //    一个都没有,说明「按 `<id>.` 前缀认归属」这条假设在**这套文件系统上不成立**
+  //    (大小写折叠是已知的一种,别的原因同样致命)。原先这里静静地返回 `files: []`,
+  //    调用方只把它记进回执、不校验,紧接着这一次就把上一次的现场覆盖掉 —— 无声销毁。
+  //    宁可响亮地停下:留档是 retryFailed 的**全部意义**,留不成就不该往下走。
+  if (mine.length === 0) {
+    throw new UsageError(
+      `retryFailed:${nodesDir} 里认不出任何属于环节 ${JSON.stringify(id)} 的产物,` +
+      `但上一次的回执确实在那儿。\n` +
+      `  按 "<id>." 前缀判归属的前提在这套文件系统上不成立(比如只差大小写被当成同一个文件)。\n` +
+      `  **没有覆盖任何东西**就停下了 —— 硬要重跑请换一个新 id,或先自己把上一次的产物挪走。`,
+    );
+  }
   // 下一个可用的 <n>:**扫已存在的归档号取最大 + 1**,不从 1 开始试 ——
   // 中间某个号被人手工删掉时,从 1 试会把新的一次塞进那个空档,顺序就乱了。
   let maxN = 0;
@@ -2284,15 +2349,45 @@ export const FAILURE_KINDS = Object.freeze([
 
 // 判据表。**顺序有意义**:先判"重试没用"的,再判"该重试"的 ——
 // 判错的方向很贵:把欠费当成瞬时错,就是在余额为零时把钱包按着继续刷。
+/**
+ * HTTP 状态码要**带上下文**才算数。
+ *
+ * ⚠️ 裸的 `\b402\b` 会命中**堆栈行号**:`node-core.mjs:402:11` 里 `402` 两侧都是非词字符,
+ *    `\b` 照样成立 —— 于是一个普通崩溃被判成"欠费",调用方被指去充值页面。
+ *    本文件自己就有三千多行,而分类读的是现场日志的 64KB 尾部,撞上堆栈几乎是必然。
+ *    (真跑一次 graph 就被独立复审揪出来了,当场复现。)
+ *    数字前面必须有 http / status / code / error 这类词,或者后面跟着它的标准短语。
+ */
+const httpCode = (codes, phrase) =>
+  `(?:\\b(?:http|https|status(?:[_ ]code)?|code|error|err)\\b\\W{0,12}(?:${codes})\\b)` +
+  (phrase ? `|(?:\\b(?:${codes})\\b\\W{0,3}(?:${phrase}))` : "");
+
 const FAILURE_PATTERNS = [
-  ["quota", /insufficient[_ ]?quota|quota[_ ]?exceeded|exceeded your current quota|payment[_ ]?required|billing|余额不足|额度(已)?(用尽|耗尽|不足)|欠费|\b402\b|credit balance|out of credits|no credits/i],
-  ["auth", /unauthorized|invalid[_ ]?api[_ ]?key|authentication[_ ]?(failed|error)|not (logged in|authenticated)|token (has )?expired|please (run )?.{0,12}login|\b401\b|\b403\b|未登录|登录(已)?(过期|失效)/i],
+  // ⚠️ 这里**不放**孤零零的日常英文词。`billing` 出现在 "see your billing page for usage details"
+  //    这种纯提示里,`capacity` 出现在 "disk capacity" 里 —— 两个都实测误判过。
+  //    判据宁可漏判成 unknown(= "不知道,你自己看现场"),也不能把人指向充值页面。
+  ["quota", new RegExp(
+    `insufficient[_ ]?quota|quota[_ ]?exceeded|exceeded your current quota|payment[_ ]?required` +
+    `|billing\\s+(?:issue|problem|error|hard limit|limit|account\\s+(?:is|has))` +
+    `|余额不足|额度(已)?(用尽|耗尽|不足)|欠费|credit balance|out of credits|no credits` +
+    `|${httpCode("402", "payment[_ ]?required")}`, "i")],
+  ["auth", new RegExp(
+    `unauthorized|invalid[_ ]?api[_ ]?key|authentication[_ ]?(failed|error)` +
+    `|not (logged in|authenticated)|token (has )?expired|please (run )?.{0,12}login` +
+    `|未登录|登录(已)?(过期|失效)` +
+    `|${httpCode("401|403", "unauthorized|forbidden")}`, "i")],
   // ⚠️ `concurren(t|cy)` 的括号位置是要紧的:原先写成 `concurrent(cy)? limit`,
   //    它匹配的是 `concurrent limit` 和 `concurrentcy limit`(拼错的那个),
   //    **匹配不到英文里正常的 `concurrency limit`** —— concurrent 结尾是 t,
   //    concurrency 是 concurren + cy。于是真后端报 "concurrency limit exceeded"
   //    压根判不出 rate_limited。(写"我们说过同一个词"的用例时撞出来的。)
-  ["rate_limited", /rate[_ ]?limit|too many requests|\b429\b|overloaded|server is busy|capacity|slow ?down|concurren(t|cy) limit|请求过于频繁|限流/i],
+  // `capacity` / `slow down` 同样不能裸放:前者出现在 "disk capacity of the target volume",
+  // 后者出现在 "这会 slow down 构建" 这种正常叙述里。要么带上下文,要么只认错误码那个写法。
+  ["rate_limited", new RegExp(
+    `rate[_ ]?limit|too many requests|overloaded|server is busy` +
+    `|(?:at|over|near|insufficient|exceeded?)\\s+capacity|capacity\\s+(?:exceeded|limit|reached)` +
+    `|\\bslowdown\\b|please\\s+slow\\s+down|concurren(t|cy) limit|请求过于频繁|限流` +
+    `|${httpCode("429", "too\\s+many\\s+requests")}`, "i")],
   ["backend_crash", /\bEPIPE\b|\bECONNRESET\b|\bECONNREFUSED\b|\bENOENT\b|broken pipe|exited (before|without)|exit(ed)? with code|killed|segmentation fault|panic|process (tree )?(died|gone)|起不来/i],
 ];
 
@@ -2324,6 +2419,12 @@ const FAILURE_EVIDENCE_TAIL_BYTES = 64 * 1024;
 function markStderrWindow(bridge, run) {
   run.stderrMark = bridge?.stderrChars ?? 0;
   run.stderrExclusive = true;
+  // 现场里的 `session.log` 是**整个会话**的(saveScene 每轮都把它整份拷一遍),
+  // 而分类读的是它的尾部 —— 多轮对话里,前一轮的正文就这么混进后一轮的判定。
+  // 同一个毛病 stderr 那边已经用水位线解决了,这一路当时漏了:第 1 轮正常答复里提到
+  // "billing",第 2 轮以一句没有分类词的错误挂掉,就会被判成欠费。
+  // 记下本轮开跑那一刻的字节数,分类时不许往这个位置之前读。
+  run.logMark = (run.logFile ? statSafe(run.logFile)?.size : 0) ?? 0;
   const active = bridge?._activeNodes;
   if (!active) return;
   active.add(run);
@@ -2417,7 +2518,7 @@ function ownTextTrips(re, own) {
   return new RegExp(re.source, re.flags.replace(/[gy]/g, "")).test(own);
 }
 
-export function classifyFailure({ status, error, stderrTail, sceneDir, ownTexts } = {}) {
+export function classifyFailure({ status, error, stderrTail, sceneDir, ownTexts, logStartByte } = {}) {
   if (status === "ok") return { failureKind: null, failureEvidence: null };
   if (status === "contract_error") {
     // 这一档不用猜:它的定义就是"收场了但形状不对"。
@@ -2433,13 +2534,22 @@ export function classifyFailure({ status, error, stderrTail, sceneDir, ownTexts 
       const st = statSafe(p);
       if (!st || !st.isFile() || st.size === 0) continue;
       try {
-        const start = Math.max(0, st.size - FAILURE_EVIDENCE_TAIL_BYTES);
+        let start = Math.max(0, st.size - FAILURE_EVIDENCE_TAIL_BYTES);
+        // `session.log` 是整个会话的,得先切到**本轮**开跑那一刻;`answer.txt` 每轮覆盖,
+        // 本来就只有本轮的答案,不需要也不能这么切(它的字节位置跟会话日志无关)。
+        if (name === "session.log" && Number.isFinite(logStartByte) && logStartByte > 0) {
+          start = Math.max(start, Math.min(logStartByte, st.size));
+        }
+        if (start >= st.size) continue;    // 本轮期间这个文件一个字都没长
         const fd = fs.openSync(p, "r");
         try {
           const len = st.size - start;
           const buf = Buffer.allocUnsafe(len);
           fs.readSync(fd, buf, 0, len, start);
-          sources.push([`${name}${start > 0 ? "(尾部)" : ""}`, buf.toString("utf8")]);
+          // 标签要说清**读的是哪一段** —— 证据得能让人回去复核。
+          const cut = name === "session.log" && Number.isFinite(logStartByte) && start <= logStartByte
+            ? "(本轮)" : (start > 0 ? "(尾部)" : "");
+          sources.push([`${name}${cut}`, buf.toString("utf8")]);
         } finally { fs.closeSync(fd); }
       } catch { /* 读不到就少一份证据,不影响判定,更不许因此抛 */ }
     }
@@ -2447,8 +2557,13 @@ export function classifyFailure({ status, error, stderrTail, sceneDir, ownTexts 
 
   const own = ownTextHaystack(ownTexts);
   const muted = [];   // 命中了、但那句话我们自己也说过 ⇒ 分不清,不据此判定
-  for (const [kind, re] of FAILURE_PATTERNS) {
-    for (const [where, text] of sources) {
+  // ⚠️ **来源在外、类别在内。** 反过来写(类别在外)的话,类别表的先后就压过了来源的先后:
+  //    `error` 明说 "authentication failed: invalid api key",而日志尾部随便飘一个 quota 字样,
+  //    因为 quota 在表里排第一,结果就判成欠费 —— 和上面那句"证据按离后端多近取"正好相反。
+  //    **这个函数的注释写的是来源优先,代码原先做的是类别优先**,真跑一次就被独立复审揪出来了。
+  //    最权威的那份证据(桥明确回报的 `error`)必须先被问完所有类别,才轮得到下一份。
+  for (const [where, text] of sources) {
+    for (const [kind, re] of FAILURE_PATTERNS) {
       const m = re.exec(text);
       if (!m) continue;
       // ⚠️ **这条判据在我们自己的话上也命中了吗?** 命中了就分不清 ——
@@ -2504,11 +2619,10 @@ export function reconcileOutcome(run, turnStatus) {
     if (culprit) {
       receipt.failureKind = culprit.failureKind;
       receipt.failureEvidence = `第 ${culprit.key ?? "?"} 轮:${culprit.failureEvidence}`;
-      // ⚠️ **记下这个分类对应的是哪个结局。** 少了这一句,对话节点就绕过了下面那道降级闸:
-      //    `settleTurn` 那次记账只对单轮节点生效(`rec === run.receipt`),对话轮不进那一支,
-      //    于是 `kindForStatus` 一直是 undefined、降级判据永不触发 ——
-      //    对话节点照样长出 `status:"unknown"` + `failureKind:"quota"`,正是本函数要修的那个组合。
-      run.kindForStatus = receipt.status;
+      // ⚠️ **这里不许重记代号。** 投影过来的判定是那一轮做的,属于**降级之前**那一代;
+      //    在这儿把它盖成当前代,等于宣称"这个判定是针对现在这个结局做的",
+      //    下面那道闸就永远不触发了 —— 对话节点照样长出 status:unknown + failureKind:quota。
+      //    `settleTurn` 已经把那一代记在 `run.kindEpoch` 上了,原样留着就是对的。
     }
   }
 
@@ -2519,16 +2633,26 @@ export function reconcileOutcome(run, turnStatus) {
   //    但收尾没能确认收场。下游按 `quota` 分派 = 去充值,而真正该做的是**看本地收尾错误**。
   //    "为什么"必须描述**这张回执为什么是现在这个结局**,不是"路上曾经发生过什么"。
   //    路上那件事不丢:原分类和原证据整段折进 evidence 里。
-  if (run.kindForStatus !== undefined && run.kindForStatus !== receipt.status) {
+  // ⚠️ **比的是"代号"不是"状态值"。** 原先写的是 `kindForStatus !== receipt.status`,
+  //    也就是拿"值变没变"当"有没有发生新的降级"的代名词 —— 两回事。
+  //    一轮已经以 `unknown` 收场并被判成 `rate_limited`,收尾又因为工作区交付不明
+  //    把结局压成 `unknown`:**值没变**,于是这道闸整个跳过,回执长成
+  //    `status:"unknown"` + `failureKind:"rate_limited"` ——
+  //    意思是"不知道后端干没干",读起来却是"限流而已,重跑就行";
+  //    而重跑常带 `force`,`force` 会删掉正因为说不清才被保留下来的那棵工作树。
+  //    (同一个形状栽过不止一次:用某个字段的**值**去推断"有没有别的事情发生过",
+  //     只要两件不同的事能算出同一个值,判据就漏。改成问"这个判定是哪一代做的"。)
+  const curEpoch = run.statusEpoch ?? 0;
+  if (run.kindEpoch !== undefined && run.kindEpoch !== curEpoch) {
     const was = receipt.failureKind, wasWhy = receipt.failureEvidence;
     receipt.failureKind = "internal";
     receipt.failureEvidence =
-      `收尾把结局从 ${run.kindForStatus} 降级为 ${receipt.status} —— 不是后端的错,是本工具没能确认收场;` +
+      `收尾把结局降级为 ${receipt.status} —— 不是后端的错,是本工具没能确认收场;` +
       `${String(receipt.error || "").slice(0, 200)}` +
       (was ? `。降级前那一轮的判定是 ${was}:${wasWhy}` : "");
-    // 记下"现在这个分类是针对哪个结局做的",于是第二次对账是**幂等**的
+    // 记下"这个分类是第几代做的",于是第二次对账是**幂等**的
     //(写盘失败会让本函数再跑一次;不记的话前缀会叠两遍)。
-    run.kindForStatus = receipt.status;
+    run.kindEpoch = curEpoch;
     return;
   }
 
@@ -2537,9 +2661,12 @@ export function reconcileOutcome(run, turnStatus) {
     receipt.failureEvidence =
       `收尾阶段把结局定为 ${receipt.status}(轮结局=${turnStatus ?? "?"}) —— 不是后端的错,` +
       `是本工具没能确认收场;${String(receipt.error || "").slice(0, 200)}`;
-    run.kindForStatus = receipt.status;
+    run.kindEpoch = curEpoch;
   }
 }
+
+/** 顶层结局又被收尾改了一次 ⇒ 代号 +1,之前做的分类就此过期。 */
+function bumpStatusEpoch(run) { run.statusEpoch = (run.statusEpoch ?? 0) + 1; }
 
 /** 结束**这一轮**:定状态 +(非 ok 时)立刻冻结现场。
  *
@@ -2561,13 +2688,16 @@ async function settleTurn(run, status, extra = {}) {
       stderrTail: nodeStderrTail(run),
       sceneDir: status === "ok" ? null : run.sceneDirFor(run.currentKey),
       ownTexts: run.ownTexts,
+      // 本轮开跑那一刻会话日志有多长 —— 分类不许读到这之前(那是上一轮的话)。
+      logStartByte: run.logMark,
     });
     rec.failureKind = cls.failureKind;
     rec.failureEvidence = cls.failureEvidence;
-    // 记下这个分类是**针对哪个结局**做的。顶层后来被降级时,`reconcileOutcome` 靠它判断
-    // "旧分类还算不算数" —— 不记的话,一张 status:unknown 的回执会顶着后端那档 quota,
-    // 下游照着去充值,而真正该做的是看本地收尾错误。
-    if (rec === run.receipt) run.kindForStatus = status;
+    // 记下这个分类是**在第几代结局上**做的。顶层后来每被降级一次,代号就 +1;
+    // `reconcileOutcome` 比代号,而不是比状态值 —— 见那边那段"为什么不能比值"。
+    // (不再限定 `rec === run.receipt`:代号对所有轮都是同一套,轮又都settle在收尾之前,
+    //  于是对话节点的投影天然拿到"降级前那一代",不必再单独记一次。)
+    run.kindEpoch = run.statusEpoch ?? 0;
   }
   // 这一轮结束了,从"此刻在跑的环节"里退出来。
   // ⚠️ **必须在这里退,不能只等 `releaseRun`。** 对话节点的 `releaseRun` 要到整段结束才跑,
@@ -2978,20 +3108,52 @@ export async function runTurn(run, t) {
       if (text === null) {
         return await finish("unknown", { error: "本轮完成了,但取不到任何答案正文(textRef 拿不到或复制失败)" });
       }
+      // --- 剥围栏(仅弱检查那条路;codex 走后端强制格式,轮不到这儿)
+      // ⚠️ 这是**「字节直传」唯一的例外**,而且是有记录的例外:
+      //    审计原件(attemptPath)上面已经拷好了,里面是**原封不动**的那一份 —— 证据一个字节不丢;
+      //    canonical 产出改放剥掉围栏的正文,好让下游 `JSON.parse(readFileSync(...))` 真的能用。
+      //    只放松校验、不动文件是**更坏**的做法:节点报 ok,磁盘上那份却仍然解析不了,
+      //    失败被推迟到调用方那里,还没了线索。
+      const rawText = text;
+      let unwrapped = false;
+      if (t.outputShape && !t.schema) {
+        const un = unwrapFenceIfItHelps(text);
+        if (un !== null) {
+          try {
+            writeAtomic(artifactPath, un);
+            text = un;
+            unwrapped = true;
+            receipt.diagnostics.push(
+              "产出被 markdown 代码围栏包着 —— 已剥掉围栏写入 canonical 产出(原文留在本次尝试的审计原件里)");
+          } catch (e) {
+            receipt.diagnostics.push(`剥围栏后写回失败(${e.message}),按原样继续`);
+          }
+        }
+      }
       receipt.artifactPath = artifactPath;
-      receipt.charCount = typeof settled.charCount === "number" ? settled.charCount : text.length;
-      receipt.byteCount = typeof settled.byteCount === "number" ? settled.byteCount : Buffer.byteLength(text, "utf8");
+      // 剥过围栏时,长度必须按**磁盘上那份**算 —— 桥报的是原文的长度,跟产出文件对不上了。
+      receipt.charCount = !unwrapped && typeof settled.charCount === "number" ? settled.charCount : text.length;
+      receipt.byteCount = !unwrapped && typeof settled.byteCount === "number" ? settled.byteCount : Buffer.byteLength(text, "utf8");
       receipt.artifactSha256 = await sha256File(artifactPath);
       // 算不出产出的哈希 = 刚写下的文件读不回来,本地落盘完整性有问题。
       // 这时不能报 ok:否则会写出一张**没有指纹**的成功回执,让下次复用绕过内容校验。
       if (!receipt.artifactSha256) {
         return await finish("unknown", { error: `产出已落盘但算不出内容指纹(读不回来):${artifactPath}` });
       }
-      // 这一次尝试的产出与该轮 `artifactPath` 是**同一份字节**(上面 `keepAudit` 就是从它拷的),
+      // 这一次尝试的产出与该轮 `artifactPath` 通常是**同一份字节**(上面 `keepAudit` 就是从它拷的),
       // 所以指纹直接沿用 —— 再算一遍只是把同样的字节读第二次。
-      liveAttempt.charCount = receipt.charCount;
-      liveAttempt.byteCount = receipt.byteCount;
-      if (liveAttempt.artifactPath) liveAttempt.artifactSha256 = receipt.artifactSha256;
+      // ⚠️ **剥过围栏就不是同一份了**:审计原件里是模型原话,canonical 产出是剥完的正文。
+      //    这时三个数都得按原件自己算,沿用会让审计原件顶着一份对不上的指纹 ——
+      //    而"逐项对得上"正是复用闸赖以成立的东西。
+      if (unwrapped && liveAttempt.artifactPath) {
+        liveAttempt.charCount = rawText.length;
+        liveAttempt.byteCount = Buffer.byteLength(rawText, "utf8");
+        liveAttempt.artifactSha256 = await sha256File(liveAttempt.artifactPath);
+      } else {
+        liveAttempt.charCount = receipt.charCount;
+        liveAttempt.byteCount = receipt.byteCount;
+        if (liveAttempt.artifactPath) liveAttempt.artifactSha256 = receipt.artifactSha256;
+      }
 
       // --- 契约校验:codex 走后端强制(桥回 json / schemaError),其余四家走弱检查
       let bad = null;
@@ -3117,6 +3279,9 @@ export async function finalizeRun(run, { callbackError = null, callbackThrew = f
     if (rest.outcome !== "delivered" && rest.outcome !== "no-changes") {
       const was = receipt.status;
       receipt.status = "unknown";
+      // 结局又被改了一次 ⇒ 之前那一轮做的分类过期。**不能靠"值变没变"判**:
+      // 本来就是 unknown 的再压一次 unknown,值一样,但"为什么"已经完全换了一件事。
+      bumpStatusEpoch(run);
       if (was !== "ok") {
         receipt.diagnostics.push(
           `原始结局是 ${was},但工作区状态无法确认 —— 已按 unknown 处理(${was} 会被理解成"可安全重跑",` +
@@ -3131,6 +3296,7 @@ export async function finalizeRun(run, { callbackError = null, callbackThrew = f
     // 分不清收尾走到哪一步就断了 ⇒ 按 unknown 停下等人,**绝不**报成"可安全重跑"
     // (重跑常带 force,而 force 会把可能刚保留下来的工作树连同分支一起删掉)。
     receipt.status = "unknown";
+    bumpStatusEpoch(run);
     receipt.error = `收尾时出错(${e?.name || "Error"}:${e?.message || String(e)});原始结局=${turnStatus}` +
       (receipt.error ? `;${receipt.error}` : "");
     receipt.diagnostics.push(`收尾异常:${e?.stack || e}`.slice(0, 2000));
@@ -3145,6 +3311,7 @@ export async function finalizeRun(run, { callbackError = null, callbackThrew = f
     // 回执落盘是成功的**前提**:回执写不下去,下一次就无法靠它做幂等判断。
     // 绝不能"退出 0 但没有回执"。
     receipt.status = "unknown";
+    bumpStatusEpoch(run);
     receipt.error = `回执写入失败(${e.message});原始结局=${turnStatus}${receipt.error ? `;${receipt.error}` : ""}`;
     // 这一句降级发生在上面那次对账**之后**,所以必须再对一次 —— 否则调用方拿到的是
     // `status:"unknown"` 配 `failureKind:null`,正是"有字段但拿不到结论"那种最难查的形状。

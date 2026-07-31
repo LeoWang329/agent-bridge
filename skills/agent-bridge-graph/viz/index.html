@@ -223,6 +223,12 @@ button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:poin
 .gcanvas{position:relative;transform-origin:0 0;padding:22px}
 .gedges{position:absolute;inset:0;overflow:visible;pointer-events:none}
 .gedges path{fill:none;pointer-events:stroke;cursor:pointer}
+/* ⚠️ 命中区**就是那条线本身**,而线宽 1.4px 又是虚线 —— 实测:曲线的数学中点都点不中
+   (正落在虚线空隙里),瞄准 ±6px 的 49 个落点只中 4 次,命中率 8%。
+   图例上写着「可点开看依据」,实际等于点不开。所以另铺一条**透明的粗线**当热区:
+   看不见、不改观感,但手指和鼠标够得着;它还带 tabindex,键盘也到得了(<path> 本身不可聚焦)。 */
+.gedges path.ehit{stroke:#000;stroke-opacity:0;stroke-width:18;stroke-dasharray:none;marker-end:none}
+.gedges path.ehit:focus-visible{stroke:var(--accent);stroke-opacity:.32;outline:none}
 
 /* 环节卡 */
 .nodebox{
@@ -1980,7 +1986,18 @@ function buildScene(R){
   const state = runStateOf(R);
   const t0 = R.run.startedTs;
   const sec = ts => (ts == null || t0 == null) ? null : (ts - t0)/1000;
-  const nowMs = R.run.final ? (t0 != null ? t0 + R.run.final.durationMs : R.run.lastTs) : R.run.lastTs;
+  /* ⚠️ **运行中的「现在」取墙上时钟,不能取最后一条事件的时间戳。**
+     桥内部按 5 分钟切片 wait,模型思考期间一条事件都不发 —— 取 lastTs 的话页面会顶着
+     绿灯「实时」冻在原地:真跑一次实测到"页面显示已跑 8s、实际已跑 281 秒",
+     第二次"显示 5m08s、实际 494s",差值精确等于"距最后一条事件的时间"。
+     而观测台的全部用途就是判断"还在动还是卡住了" —— 冻住的那几分钟恰恰是最需要答案的时候,
+     而且方向是反的:一个安静了五分钟的 run,看起来像刚起步。
+     ⚠️ **只在真的连着一个活着的 run 时才这么算。** 打开一份静态归档时没有「现在」可言
+        (那时 owner 已经丢了,state 不会是 running),只能按记录里的最后一刻算。 */
+  const liveClock = state === 'running' && R.replay.mode === 'live' && !R.ctl.overflow;
+  const nowMs = R.run.final ? (t0 != null ? t0 + R.run.final.durationMs : R.run.lastTs)
+              : liveClock ? Math.max(Date.now(), R.run.lastTs ?? 0)
+              : R.run.lastTs;
   const now = sec(nowMs) ?? 0;
 
   const nodes = R.order.map(seq => {
@@ -2463,7 +2480,11 @@ function edgeSvg(e, i, x1, y1, x2, y2){
   const dx = Math.max(34, (x2-x1)/2);
   const d = 'M'+x1+' '+y1+' C'+(x1+dx)+' '+y1+' '+(x2-dx)+' '+y2+' '+x2+' '+y2;
   const inf = e.kind==='inferred';
-  return '<path d="'+d+'" data-edge="'+i+'" stroke="'+(inf?'var(--faint)':'var(--ink-soft)')+'"'+
+  // 先铺一条透明粗线当热区(见 .ehit 的样式注释:细虚线实测命中率只有 8%)。
+  // 它排在可见线**之前**,所以不挡任何观感;`tabindex` 让键盘也够得到。
+  return '<path class="ehit" d="'+d+'" data-edge="'+i+'" tabindex="0" role="button"'+
+    ' aria-label="'+(inf?'推断的依赖，回车看依据':'声明的依赖，回车看依据')+'"></path>'+
+    '<path d="'+d+'" data-edge="'+i+'" stroke="'+(inf?'var(--faint)':'var(--ink-soft)')+'"'+
     ' stroke-width="'+(inf?1.4:1.8)+'"'+(inf?' stroke-dasharray="5 5"':'')+
     ' marker-end="url(#'+(inf?'mi':'md')+')" opacity="'+(inf?.8:.72)+'"></path>'+
     (e.warn ? '<circle cx="'+((x1+x2)/2)+'" cy="'+((y1+y2)/2)+'" r="7" fill="var(--c-timeout)" data-edge="'+i+'"></circle>'+
@@ -3127,8 +3148,16 @@ function render(){
   renderTop(SC); renderBanners(SC); renderLegend(SC);
   if (VIEW === 'graph'){ renderGraph(SC, SEL); applyZoom(); $('#tlKey').hidden = true; }
   else { renderTimeline(SC, SEL); applyTlZoom(); }
+  /* 详情面板是整段 innerHTML 重建的,重建就把读者的滚动条弹回顶部。
+     以前只有来事件时才弹一下,现在「已跑」要每秒走字,不保住位置就变成**持续**往上弹,
+     长报告根本没法读。看的还是同一个环节的同一次尝试时,滚动位置就该留着。 */
+  const dKey = JSON.stringify([SEL, ATT.turn, ATT.idx, ATT.raw]);
+  const keepY = dKey === LAST_DETAIL_KEY ? ($('#dScroll') || {}).scrollTop : null;
   renderDetail(SC, SEL);
+  LAST_DETAIL_KEY = dKey;
+  if (keepY) { const s = $('#dScroll'); if (s) s.scrollTop = keepY; }
 }
+let LAST_DETAIL_KEY = null;
 
 function setScene(key){
   const sc = SCENES.find(s => s.key === key); if (!sc) return;
@@ -3251,6 +3280,17 @@ document.addEventListener('keydown', ev => {
   if (ev.key === 'Escape'){
     const p = document.getElementById('edgePop');
     if (p) p.remove(); else if (SEL != null){ SEL = null; render(); }
+    return;
+  }
+  /* 边的依据也得能用键盘看。热区是 <path>,它没有原生的"回车 = 点击",得自己接。
+     弹窗按鼠标坐标定位,键盘触发时没有坐标 —— 拿热区自己的外框中心顶上。 */
+  if (ev.key === 'Enter' || ev.key === ' ' || ev.key === 'Spacebar'){
+    const a = document.activeElement;
+    if (a && a.classList && a.classList.contains('ehit')){
+      ev.preventDefault();
+      const b = a.getBoundingClientRect();
+      showEdgePop(+a.getAttribute('data-edge'), {clientX: b.left + b.width/2, clientY: b.top + b.height/2});
+    }
   }
 });
 addEventListener('resize', () => { if (VIEW==='graph' && SC.key==='scale') fitZoom(); });
@@ -3356,6 +3396,18 @@ function pushLive(){
     render();
   }
 }
+
+/* 「已跑」得自己走字。
+   ⚠️ 页面原先只在**来事件**时重绘,而桥按 5 分钟切片 wait —— 安静期一条事件都没有,
+      于是时钟冻住、进行中的横条也不再变长,页面却还亮着绿灯「实时」。
+      这一秒一次的心跳只在**真的连着一个活着的 run** 时跳;静态归档、断线、回放中都不跳
+      (那些情况下没有「现在」可言,自己走字就是编数字)。 */
+setInterval(() => {
+  if (R.run.final || R.ctl.overflow) return;
+  if (R.replay.mode !== 'live') return;
+  if (runStateOf(R) !== 'running') return;
+  pushLive();
+}, 1000);
 
 /* 渲染节流：一次回放可能是几万条事件，每条都渲一次会把主线程钉死。
    ⚠️ 节流的是**渲染**，不是消费 —— 事件一条不少地进归约器。 */

@@ -493,4 +493,16 @@ const hb = setInterval(() => {
 }, 15000);
 hb.unref?.();
 
+/* 独立打开一份已有归档时(`VIZ_OUT_DIR=… node serve.mjs`)**根本没有 owner**:
+   没有 IPC 父进程,`process.on("disconnect")` 永远不会触发,于是 `owner-lost` 也永远不发。
+   后果是:一份**跑到一半被中断**的归档(transcript 里没有 run:final),页面会一直显示
+   「运行中 · 绿灯实时」—— 而那个 run 可能几天前就没了。
+   「没有 owner」正是 `owner-lost` 这一帧的字面意思,所以这里如实地把它发出去。
+   ⚠️ 归档完整(有 run:final)时,`controlFramesFor` 里那道 `!sawRunFinal` 的闸会照常把它压掉 ——
+      正常归档一条 control 帧都不多发,这一点没变。 */
+if (!process.connected) {
+  state.pipeEnded = true;
+  state.drainSettled = true;
+}
+
 pumpReader();

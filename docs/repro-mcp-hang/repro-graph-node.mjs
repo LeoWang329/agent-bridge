@@ -1341,8 +1341,10 @@ async function t14_review_round1() {
   // 「后端吐欠费」和「收尾失败」两个条件,假后端造不出来(它吐了欠费就已经收在 unknown 上了)。
   // 与其拿一个凑不出来的夹具糊过去,不如直接把这个函数的语义钉死。
   {
+    // 判据是**代号**不是状态值:`kindEpoch` = 做这次分类时是第几代,`statusEpoch` = 现在第几代。
+    // 收尾每降级一次代号 +1,于是"分类是不是过期了"是直接问出来的,不是拿值推的。
     const mkRun = () => ({
-      kindForStatus: "backend_failed",
+      kindEpoch: 0, statusEpoch: 1,
       receipt: { status: "unknown", failureKind: "quota",
                  failureEvidence: "session.log:命中 \"insufficient_quota\" —— …余额不足…",
                  error: "回执写入失败(EISDIR)", diagnostics: [] },
@@ -1359,26 +1361,43 @@ async function t14_review_round1() {
     reconcileOutcome(run, "backend_failed");
     ok("R13 ★ 对账跑两次是幂等的(写盘失败会让它再跑一遍,叠两遍前缀就没法读了)",
       run.receipt.failureEvidence === before
-        && (String(run.receipt.failureEvidence).match(/收尾把结局从/g) || []).length === 1,
+        && (String(run.receipt.failureEvidence).match(/收尾把结局降级为/g) || []).length === 1,
       String(run.receipt.failureEvidence).slice(0, 220));
+
+    // ★★ **状态值没变的那次降级** —— 真跑一次 graph、由独立复审揪出来的漏网之鱼。
+    // 一轮已经以 unknown 收场并判成 rate_limited,收尾又因为工作区交付不明把结局再压成
+    // unknown:**值一模一样**。旧判据 `kindForStatus !== receipt.status` 在这里整个跳过,
+    // 于是回执长成 status:unknown + failureKind:rate_limited ——
+    // 意思是"不知道后端干没干",读起来却是"限流而已,重跑就行";
+    // 而重跑常带 force,force 会删掉正因为说不清才被保留下来的那棵工作树。
+    const same = { kindEpoch: 0, statusEpoch: 1,
+      receipt: { status: "unknown", failureKind: "rate_limited", failureEvidence: "轮里撞了限流",
+                 error: "write 环节的交付物没能确认落到分支上(outcome=unknown)", diagnostics: [] } };
+    reconcileOutcome(same, "unknown");
+    ok("R13 ★★ 降级前后状态值一样(unknown→unknown)时也必须降级(旧判据比的是值,这一支整个漏掉)",
+      same.receipt.failureKind === "internal", String(same.receipt.failureKind));
+    ok("R13 ★ 值没变那次降级同样要把原判定折进证据(不能把路上发生过的事抹掉)",
+      /rate_limited/.test(String(same.receipt.failureEvidence)), String(same.receipt.failureEvidence).slice(0, 200));
+
     // 结局没变过的时候不许乱动:轮里判的 quota 就是这张回执的答案。
-    const stable = { kindForStatus: "backend_failed",
+    const stable = { kindEpoch: 0, statusEpoch: 0,
       receipt: { status: "backend_failed", failureKind: "quota", failureEvidence: "原判定", diagnostics: [] } };
     reconcileOutcome(stable, "backend_failed");
     ok("R13 结局没被降级过就别乱动(这道闸不许误伤正常的后端分类)",
       stable.receipt.failureKind === "quota" && stable.receipt.failureEvidence === "原判定",
       JSON.stringify(stable.receipt));
     // ok 的回执必须被清干净。
-    const fine = { kindForStatus: "ok", receipt: { status: "ok", failureKind: "quota", failureEvidence: "x", diagnostics: [] } };
+    const fine = { kindEpoch: 0, statusEpoch: 1, receipt: { status: "ok", failureKind: "quota", failureEvidence: "x", diagnostics: [] } };
     reconcileOutcome(fine, "ok");
     ok("R13 ok 的回执上两个字段一律清成 null",
       fine.receipt.failureKind === null && fine.receipt.failureEvidence === null);
 
     // ── 对话节点那一支(第 3 轮复审点名的第二个阻塞项)──
-    // 顶层分类是从轮记录**投影**上来的,投影时不记 kindForStatus 的话,下面那道降级闸
-    // 永远不触发(`settleTurn` 那次记账只对单轮节点生效)——于是对话节点照样长出
-    // `status:"unknown"` + `failureKind:"quota"`,正是本函数声称修掉的组合。
+    // 顶层分类是从轮记录**投影**上来的。投影过来的判定属于**降级之前**那一代 ——
+    // 要是在投影时把代号盖成当前这一代,下面那道降级闸就永远不触发,
+    // 于是对话节点照样长出 `status:"unknown"` + `failureKind:"quota"`,正是本函数声称修掉的组合。
     const conv = {
+      kindEpoch: 0, statusEpoch: 0,     // settleTurn 给每一轮记的那一代
       receipt: {
         kind: "conversation", status: "backend_failed", failureKind: null, failureEvidence: null,
         turns: [{ key: "t1", status: "ok" },
@@ -1393,8 +1412,9 @@ async function t14_review_round1() {
     // 然后模拟"回执写盘失败" —— 顶层被压成 unknown,再对一次账。
     conv.receipt.status = "unknown";
     conv.receipt.error = "回执写入失败(EISDIR)";
+    conv.statusEpoch = 1;                 // 收尾降了一次级 ⇒ 代号 +1
     reconcileOutcome(conv, "backend_failed");
-    ok("R13 ★★ 对话节点降级后也不许顶着 quota(投影时没记 kindForStatus 就会漏掉这一支)",
+    ok("R13 ★★ 对话节点降级后也不许顶着 quota(投影时把代号盖成当前代就会漏掉这一支)",
       conv.receipt.failureKind === "internal", String(conv.receipt.failureKind));
     ok("R13 ★ 对话节点降级后同样要把原判定折进证据",
       /quota/.test(String(conv.receipt.failureEvidence)), String(conv.receipt.failureEvidence).slice(0, 200));
@@ -1467,6 +1487,126 @@ async function t14_review_round1() {
       names.join(", "));
     ok("R9 回执也记了这是重试来的(而不是当成一次全新的首跑)",
       r.retriedFrom?.n === 1, JSON.stringify(r.retriedFrom));
+  }
+
+  // ── R18:判据里的数字和日常词必须**带上下文** ──────────────────────────────
+  // 坏在哪:裸 `\b402\b` 会命中**堆栈行号**(`node-core.mjs:402:11` 里 402 两侧都是非词字符),
+  //        裸 `billing` 命中 "see your billing page",裸 `capacity` 命中 "disk capacity"。
+  //        后果不是"标签难看",是**把人指向充值页面** —— 一个普通崩溃被判成欠费。
+  //        (真跑一次 graph、由独立复审揪出来,当场复现。)
+  {
+    const cls = (error, stderrTail) => classifyFailure({ status: "backend_failed", error, stderrTail }).failureKind;
+    ok("R18 ★ 堆栈行号里的 402 不许判成欠费(这文件自己就三千多行,现场取 64KB 尾部必撞)",
+      cls("backend exited unexpectedly", "    at settleTurn (node-core.mjs:402:11)") !== "quota",
+      cls("backend exited unexpectedly", "    at settleTurn (node-core.mjs:402:11)"));
+    ok("R18 ★ 401/403/429 的行号同样不许命中",
+      ["node.mjs:401:3", "x.js:403:9", "y.ts:429:1"].every((s) => {
+        const k = cls("crashed", `    at f (${s})`);
+        return k !== "auth" && k !== "rate_limited";
+      }));
+    ok("R18 ★ 日常英文词 capacity / billing 不许单独成为判据",
+      cls("crashed while planning", "reasoning about disk capacity of the target volume") !== "rate_limited"
+      && cls("crashed", "note: see your billing page for usage details") !== "quota");
+    // 反面:收紧不等于判钝 —— 真失败照样要认得出,否则这道修复就是把判据废了。
+    ok("R18 ★ 带上下文的状态码照常认得出(收紧不等于判钝)",
+      cls("request failed with status code 401", "") === "auth"
+      && cls("HTTP 429 returned by upstream", "") === "rate_limited"
+      && cls("", "upstream said 402 Payment Required") === "quota");
+    ok("R18 ★ 明确措辞的真失败一条都不许漏",
+      cls("", "Error: insufficient_quota: your credit balance is too low") === "quota"
+      && cls("", "error: concurrency limit exceeded") === "rate_limited"
+      && cls("authentication failed: invalid api key", "") === "auth");
+  }
+
+  // ── R19:来源优先级不许被类别顺序压过 ──────────────────────────────────────
+  // 坏在哪:循环原先是**类别在外、来源在内**,于是类别表的先后压过了来源的先后 ——
+  //        `error` 明说 auth,日志尾部飘一个 quota 字样,因为 quota 在表里排第一就判成欠费。
+  //        而这个函数自己的注释写的是"证据按离后端多近取:先 error、再 stderr、最后日志"。
+  //        **文档说一套、代码做一套**,两边总有一边是错的。
+  {
+    const k = classifyFailure({
+      status: "backend_failed",
+      error: "authentication failed: invalid api key",
+      stderrTail: "Error: insufficient_quota: your credit balance is too low",
+    });
+    ok("R19 ★★ 最权威那份证据(error)说 auth,就不许被日志里排在前面的 quota 压过去",
+      k.failureKind === "auth", `${k.failureKind} | ${k.failureEvidence}`);
+    ok("R19 ★ 凭据要指明是从哪份证据判的(人得能回去复核)",
+      /^error:/.test(String(k.failureEvidence)), String(k.failureEvidence).slice(0, 120));
+    // 反面:error 里没线索时,该往下一份证据找,不能因为"优先级"就不看了。
+    ok("R19 error 没线索时照常往下一份证据找",
+      classifyFailure({ status: "backend_failed", error: "something went wrong",
+                        stderrTail: "insufficient_quota" }).failureKind === "quota");
+  }
+
+  // ── R20:分类不许读到**上一轮**的话 ────────────────────────────────────────
+  // 坏在哪:`saveScene` 每轮把**整个会话**的 session.log 拷一份,分类读它的 64KB 尾部 ——
+  //        第 1 轮正常答复里提到 quota,第 2 轮以一句没有分类词的错误挂掉,就被判成欠费。
+  //        同一个毛病桥 stderr 那边早就用水位线解决了,这一路当时漏了。
+  {
+    const sceneDir = path.join(RUN_ROOT, "t14-turnbound");
+    fs.mkdirSync(sceneDir, { recursive: true });
+    const turn1 = "第 1 轮:我看了一下 insufficient_quota 这个错误码的处理逻辑。\n";
+    fs.writeFileSync(path.join(sceneDir, "session.log"), turn1);
+    const mark = Buffer.byteLength(turn1);
+    fs.appendFileSync(path.join(sceneDir, "session.log"), "第 2 轮:backend closed the stream\n");
+    // 先证明夹具**有牙**:不给轮边界时它确实会被上一轮污染(否则下面那条断言永远不会红)
+    ok("R20 前提:不给轮边界时,上一轮的话确实会污染判定(证明这个夹具考得到东西)",
+      classifyFailure({ status: "backend_failed", error: "", sceneDir }).failureKind === "quota");
+    const bounded = classifyFailure({ status: "backend_failed", error: "", sceneDir, logStartByte: mark });
+    ok("R20 ★★ 给了轮边界之后,第 1 轮的 quota 字样不再算进第 2 轮的判定",
+      bounded.failureKind !== "quota", `${bounded.failureKind} | ${bounded.failureEvidence}`);
+    ok("R20 ★ 凭据要说清读的是哪一段(证据得能让人回去复核)",
+      /本轮/.test(String(bounded.failureEvidence)), String(bounded.failureEvidence).slice(0, 140));
+  }
+
+  // ── R21:进了归档分支却一个都认不出来 ⇒ 响亮停下 ────────────────────────────
+  // 坏在哪:`ownedEntries` 一个都匹配不上时,原先静静返回 `files: []`,调用方只记进回执、
+  //        不校验,紧接着这一次就把上一次的现场覆盖掉 —— 无声销毁。
+  //        (大小写折叠是已知的一种成因;别的成因一样致命,所以闸设在"搬了几个"上,
+  //         而不是设在"是不是那个已知成因"上。)
+  {
+    const d = path.join(RUN_ROOT, "t14-nomatch");
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(d, "someone-else.md"), "别人的产出\n");
+    let t = null;
+    try { archiveFailedRun(d, "ghost", "backend_failed"); } catch (e) { t = e; }
+    ok("R21 ★★ 一个都没认出来时抛,绝不「搬了零个还宣称归档成功」",
+      t instanceof UsageError, `${t?.constructor?.name}: ${String(t?.message).slice(0, 120)}`);
+    ok("R21 ★ 报错要说清没覆盖任何东西、以及该怎么办",
+      /没有覆盖任何东西/.test(String(t?.message)) && /新 id/.test(String(t?.message)),
+      String(t?.message).slice(0, 220));
+    ok("R21 别人的文件一个都没被动过",
+      fs.readdirSync(d).join(",") === "someone-else.md", fs.readdirSync(d).join(","));
+  }
+
+  // ── R22:JSON 被 markdown 围栏包着 = 包装,不是格式错 ────────────────────────
+  // 坏在哪:真跑一次 graph,deepseek 把合法 JSON 裹进 ```json 围栏,**重问那次照裹不误**
+  //        (重问提示词里已经明写"不要 markdown 代码围栏"),于是全系统唯一的 reask 被烧掉、
+  //        整个环节报废 —— 而它其实答对了。
+  // ⚠️ 光放松校验是**更坏**的:节点报 ok,磁盘上那份却仍然 JSON.parse 不了,
+  //    失败被推迟到调用方那边,还没了线索。所以 canonical 产出必须真的能用。
+  {
+    const outDir = path.join(RUN_ROOT, "t14-fence");
+    const r = await withBridge(async (bridge) =>
+      bridge.runNode({ id: "fenced", agent: "omp", cwd: REPO, prompt: "给我 JSON", timeoutMs: 30000,
+                       outDir, outputShape: { requiredKeys: ["findings"] } }),
+      { env: { ...BASE_ENV, FAKE_OMP_MODE: "fenceturn" } });
+    ok("R22 ★★ 裹了围栏的合法 JSON 要判 ok,不许烧掉那一次 reask",
+      r.status === "ok", `${r.status} ${r.error ?? ""}`);
+    ok("R22 ★ 而且一次都没重问(重问是唯一的retry,不该花在包装上)",
+      !r.reaskCount, String(r.reaskCount));
+    const onDisk = fs.readFileSync(r.artifactPath, "utf8");
+    let parsed = null; try { parsed = JSON.parse(onDisk); } catch { /* 下面报红 */ }
+    ok("R22 ★★ canonical 产出必须**真的能 parse** —— 只放松校验、不动文件等于把失败推给下游",
+      parsed?.findings?.[0] === "FENCED_OK", onDisk.slice(0, 80));
+    ok("R22 ★ 回执长度按磁盘上那份算(桥报的是原文长度,剥完就对不上了)",
+      r.charCount === onDisk.length, `${r.charCount} vs ${onDisk.length}`);
+    ok("R22 ★ 剥围栏这件事要留在回执上(改过字节就必须说出来)",
+      (r.diagnostics || []).some((d) => /围栏/.test(d)), JSON.stringify(r.diagnostics));
+    // 审计原件里必须是**模型原话**(带围栏)——证据一个字节都不能少
+    const attempts = fs.readdirSync(path.join(outDir, "nodes")).filter((n) => /^fenced\./.test(n));
+    ok("R22 前提:这一轮确实留下了产出文件", attempts.length > 0, attempts.join(","));
   }
 
   // ── R7:runAll 的合成回执必须和真回执**同形** ──────────────────────────────

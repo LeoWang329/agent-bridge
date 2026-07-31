@@ -118,7 +118,7 @@ process.stdin.on("data", d => {
           ? slowsettleStreaming
           : (MODE === "multiturn" || MODE === "multiturn-fast")
           ? multiturnStreaming
-          : !(MODE === "okturn" || MODE === "okturn-exit" || MODE === "errturn" || MODE === "errecho" || MODE === "quotaturn" || MODE === "roleecho" || MODE === "echoturn" || MODE === "reaskturn" || WRITE_MODES.includes(MODE) || MODE === "ctxturn" || MODE === "logstress" || MODE === "badline" || MODE === "toolturns" || MODE === "agentenderr" || MODE === "hugeturn");
+          : !(MODE === "okturn" || MODE === "okturn-exit" || MODE === "errturn" || MODE === "errecho" || MODE === "quotaturn" || MODE === "roleecho" || MODE === "echoturn" || MODE === "reaskturn" || MODE === "fenceturn" || WRITE_MODES.includes(MODE) || MODE === "ctxturn" || MODE === "logstress" || MODE === "badline" || MODE === "toolturns" || MODE === "agentenderr" || MODE === "hugeturn");
         const data = { isStreaming, queuedMessageCount: 0, sessionId: "fake", messageCount: 1 };
         // ctx* modes: real omp reports current-context occupancy in get_state.data (contextUsage sub-object
         // + isCompacting/autoCompactionEnabled siblings — see the probe dump). The bridge normalizes this to
@@ -242,6 +242,17 @@ process.stdin.on("data", d => {
           say({ type: "agent_start" });
           setTimeout(() => {
             say({ type: "message_update", message: { type: "text_delta", delta: body } });
+            say({ type: "turn_end" });
+            say({ type: "agent_end" });
+          }, 60);
+        } else if (MODE === "fenceturn") {
+          // 把**合法的 JSON** 裹进 markdown 代码围栏 —— 真后端(deepseek)实测就是这么干的,
+          // 而且重问的提示词里已经明写「不要 markdown 代码围栏」,它照裹不误。
+          // 这一轮必须以 `ok` 收场:围栏是包装、不是格式错。
+          say({ type: "agent_start" });
+          const fenced = "```json\n{\"findings\":[\"FENCED_OK\"]}\n```";
+          setTimeout(() => {
+            say({ type: "message_update", message: { type: "text_delta", delta: fenced } });
             say({ type: "turn_end" });
             say({ type: "agent_end" });
           }, 60);
