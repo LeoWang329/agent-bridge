@@ -549,7 +549,7 @@ viewer 收到 `settled` 立即停止轮询该 sidecar。
 
 理由不是洁癖：viewer 一旦改写快照，页面收到的就**不再是「那份快照」**，
 而合同对「那份快照 + viewer 的一些加工」这个东西**没有任何定义**——
-`contract-invariants.mjs` 验的是前者，页面吃的是后者，中间这道缝正是漂移的产地。
+`tests/contract-invariants-session.mjs` 验的是前者，页面吃的是后者，中间这道缝正是漂移的产地。
 （这个仓库刚在 graph 观测台上按这个形状栽过，见 `docs/DRIFT-events-contract-vs-producer-2026-07-28.md`。）
 
 所以实时预览走**独立的 `progress` 帧**，**由页面在渲染时合并**，
@@ -697,14 +697,14 @@ run 存活期间 tmpdir 里就是一份全量明文，本机任何进程可读�
 
 ⚠️ **同一个人写规格、写生产者、再写校验器，校验器只能证明「生产者和它自己一致」。**
 
-这不是理论风险：graph 观测台最狠的几个 bug 全是被 `viz/contract-invariants.mjs` 抓到的，
+这不是理论风险：graph 观测台最狠的几个 bug 全是被 `tests/contract-invariants-session.mjs` 抓到的，
 而它之所以抓得到，正因为它是**照着合同散文另写一遍、刻意不 import 生产端**的第二实现
 （见 `docs/DRIFT-events-contract-vs-producer-2026-07-28.md`）。
 
 **四条硬规则：**
 
 1. **本文是唯一 wire 真理源。** PLAN §6 的 JSONC 只是草稿。
-2. 生产侧的 schema / 有界化器 与 `skills/agent-bridge/viz/contract-invariants.mjs`
+2. 生产侧的 schema / 有界化器 与 `tests/contract-invariants-session.mjs`
    **必须独立实现、互不 import**（**包括不共用常量表与枚举字面量**）。
 3. **冻结样例按本文手工构造**，不是把 writer 的输出录下来当样例——
    录出来的样例只会把 writer 当时的 bug 一起冻住。

@@ -7,7 +7,7 @@
 ## 0. 这份文件解决什么
 
 复审揪出：**冻结样例与归约器是照着 `viz-events.mjs` 写的，而它本身已经偏离 `docs/EVENTS-graph.md`。**
-于是 `test-viz.mjs` 里那条「每一条都过生产 schema」是**同源自证** —— 拿生产者验生产者。
+于是 `tests/test-viz-graph.mjs` 里那条「每一条都过生产 schema」是**同源自证** —— 拿生产者验生产者。
 
 真理源的优先级在复审简报里写死了：**`docs/EVENTS-graph.md` 定 wire**。所以下面每一条的**默认方向是「改代码」**，
 要反过来改合同的必须单独给理由。
@@ -69,14 +69,14 @@ D6 让页面分不开「确知没有改动」与「探测失败、说不清」�
   以及现场三个槽的**逻辑名 ↔ 文件名**映射。
 - `viz-events.mjs` 新增一个 `NULLABLE` 描述子 —— 「恒在、可 null」此前**没有**表达方式，
   只能退而用「可缺席」，D5 就是这么来的。**缺一种描述子，就会长出一种漂移。**
-- `docs/repro-mcp-hang/repro-viz-events.mjs` 与 `repro-graph-viz.mjs` 里断言了旧形状的用例。
+- `tests/repro-viz-events.mjs` 与 `repro-graph-viz.mjs` 里断言了旧形状的用例。
 - `viz/index.html` 的 `mapScene()`（读 D1 的键）。
 - `viz/sample/build.mjs` —— 但它**不该再照着生产者写**，见下。
 
 ## 4. 样例的构造方式要换
 
 复审第 7 条的根子不在样例写错了哪三个键，而在**它是照着生产者构造的**。
-改法：`sample/build.mjs` 按 **`docs/EVENTS-graph.md`** 独立构造；`test-viz.mjs` 那条
+改法：`sample/build.mjs` 按 **`docs/EVENTS-graph.md`** 独立构造；`tests/test-viz-graph.mjs` 那条
 「过生产 schema」**保留但降级**为一条辅助断言（它能抓生产者回退），
 **另加**一条按合同写死的字段集断言 —— 两边都对得上才算数。
 
@@ -86,7 +86,7 @@ D6 让页面分不开「确知没有改动」与「探测失败、说不清」�
 
 前四节是**复审提出来**的那一批。下面三条是**改完之后**才照出来的 ——
 它们能被照出来，是因为这一轮多做了两件事：样例改成按合同独立构造（不再照抄生产者），
-以及把合同里那些**跨字段的等式**抽成一份独立实现（`viz/contract-invariants.mjs`），
+以及把合同里那些**跨字段的等式**抽成一份独立实现（`tests/contract-invariants-graph.mjs`），
 让**写方**与**冻结样例**各过一遍。
 
 | # | 事实 | 合同怎么说 | 生产者怎么做 | 定向 |
@@ -108,12 +108,12 @@ D6 让页面分不开「确知没有改动」与「探测失败、说不清」�
 
 ### 这一轮留下的守卫
 
-`viz/contract-invariants.mjs` **刻意不 import `viz-events.mjs`**：schema 只管单个字段的形状，
+`tests/contract-invariants-graph.mjs` **刻意不 import `viz-events.mjs`**：schema 只管单个字段的形状，
 管不了「这两处 sha256 必须相等」「这个字段只在那个字段不是 present 时才许出现」。
 两个调用点都在推送前必过的回归里：
 
 - `viz/test-viz.mjs` —— 验**冻结样例**（消费侧的地基：样例歪了，后面每条断言都在验假合同）
-- `docs/repro-mcp-hang/repro-graph-viz.mjs` —— 验**每一次真跑出来的 transcript**（写方有没有漂）
+- `tests/repro-graph-viz.mjs` —— 验**每一次真跑出来的 transcript**（写方有没有漂）
 
 D9 就是接上第二个调用点之后**当场**红的。
 
@@ -146,7 +146,7 @@ D9 就是接上第二个调用点之后**当场**红的。
 
 ### D11 —— 用来判对错的检查器自己会崩
 
-`viz/contract-invariants.mjs` 不变式②：
+`tests/contract-invariants-graph.mjs` 不变式②：
 
 ```js
 if (a.inputSha256 !== t.inputSha256 || a.input.ref !== t.input.ref) …

@@ -1,7 +1,7 @@
 # Bug — OMP session reports `lastTurn.endedAt` set **while** `status:"running"` (incoherent turn clock)
 
 **Date:** 2026-06-10
-**Status:** **FIXED in v0.8.3** (F7 + F8 below). Deterministic regression test: `docs/repro-mcp-hang/repro-turnstate.mjs` (PASS; a negative control with F8 reverted FAILs, confirming the test discriminates). Cross-reviewed by codex + deepseek-v4-pro before implementation.
+**Status:** **FIXED in v0.8.3** (F7 + F8 below). Deterministic regression test: `tests/repro-turnstate.mjs` (PASS; a negative control with F8 reverted FAILs, confirming the test discriminates). Cross-reviewed by codex + deepseek-v4-pro before implementation.
 **Severity:** Minor (observability/contract bug; no crash, no data loss). Independent of the v0.8.1/0.8.2 disconnect fixes — a pre-existing latent bug, surfaced by a backend model that loops.
 
 ## Observed
@@ -66,7 +66,7 @@ Did **both** of the following — they are complementary, not either/or:
 
 ## Repro
 
-`docs/repro-mcp-hang/repro-turnstate.mjs` (+ `fake-omp.mjs` `FAKE_OMP_MODE=turnstate`): the fake backend acks the prompt then churns `turn_start → turn_end → turn_start → turn_end` on its own (no new prompt) and settles on `turn_end` with `get_state` still reporting `isStreaming:true`. The harness then polls `agent_bridge_status` (which drives `state()` → the "second path" that flips status→running) and asserts it **never** observes `status:"running"` together with a non-null `lastTurn.endedAt`. **PASS** on v0.8.3; a negative control that reverts F8 (un-gates `lastTurnOf`) **FAILs** immediately (`running` + `endedAt` set, `durationMs:122`), proving the test discriminates the bug rather than trivially passing.
+`tests/repro-turnstate.mjs` (+ `fake-omp.mjs` `FAKE_OMP_MODE=turnstate`): the fake backend acks the prompt then churns `turn_start → turn_end → turn_start → turn_end` on its own (no new prompt) and settles on `turn_end` with `get_state` still reporting `isStreaming:true`. The harness then polls `agent_bridge_status` (which drives `state()` → the "second path" that flips status→running) and asserts it **never** observes `status:"running"` together with a non-null `lastTurn.endedAt`. **PASS** on v0.8.3; a negative control that reverts F8 (un-gates `lastTurnOf`) **FAILs** immediately (`running` + `endedAt` set, `durationMs:122`), proving the test discriminates the bug rather than trivially passing.
 
 ## Key code locations
 

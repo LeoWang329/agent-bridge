@@ -20,7 +20,7 @@
 
 ## 特性 1(主):`open_session` 支持指定 md 文件作为 append system prompt
 
-> **状态:已实施 + e2e 11/11 + codex&deepseek 双评 APPROVE(2026-07-03,未提交)。** 三后端注入全部运行时验证。关键坑:omp 注入成功(get_state 证内容进 `systemPrompt[2]`)但**默认模型遵从波动**,能干模型(deepseek)稳定 honor → 已在 schema 描述与代码注释注明。测试 `docs/repro-mcp-hang/e2e-append-system.mjs`。
+> **状态:已实施 + e2e 11/11 + codex&deepseek 双评 APPROVE(2026-07-03,未提交)。** 三后端注入全部运行时验证。关键坑:omp 注入成功(get_state 证内容进 `systemPrompt[2]`)但**默认模型遵从波动**,能干模型(deepseek)稳定 honor → 已在 schema 描述与代码注释注明。测试 `tests/e2e-append-system.mjs`。
 
 ### 目标
 拉起后端 agent 时,可指定一个 md/文本文件,把其内容作为**持久的追加系统指令**注入,覆盖 omp/codex/claude 三后端。用途:可复用的"角色/指令库"文件(如 `~/prompts/reviewer.md`)。

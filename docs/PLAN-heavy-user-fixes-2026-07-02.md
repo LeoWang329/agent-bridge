@@ -14,8 +14,8 @@
 > **不考虑 token / 成本**（用户明确指示）：本计划一切取舍只看**质量、正确性、验证充分度**，不为省 token 缩减 effort、并行度或复核轮次。（因此原 T8「usage/token 计量」已删除——它的唯一动机是成本可见性。）
 
 ## 验证基线（每个 task 至少满足）
-- `node docs/repro-mcp-hang/<相关 repro>.mjs` 全 PASS。
-- 触及用户可见接口的：`node docs/repro-mcp-hang/e2e-real.mjs` 相关场景 `>>> PASS`。
+- `node tests/<相关 repro>.mjs` 全 PASS。
+- 触及用户可见接口的：`node tests/e2e-real.mjs` 相关场景 `>>> PASS`。
 - 回归：跑既有相关 repro（`repro-turnstate`/`repro-waitany`/`repro-waitfail`/`repro-halfdead`）确认无破坏。
 
 ## 范围

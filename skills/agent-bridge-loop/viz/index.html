@@ -1024,7 +1024,7 @@ function startDemo(force){
 
 /* ============================================================
    内联样例数据(仅原型/离线回放用;真实服务器在场时永不触发)
-   —— 与 viz/sample **字节同源**:DEMO_FILES 块由同目录 regen-demo-files.mjs 从 sample/ 生成,
+   —— 与 viz/sample **字节同源**:DEMO_FILES 块由 tools/regen-loop-viz-demo.mjs 从同目录 sample/ 生成,
       改样例后必须重跑它(fe-e2e 有逐字相等断言,漂移会被抓);覆盖全部事件类型
    ============================================================ */
 var DEMO_EVENTS = [

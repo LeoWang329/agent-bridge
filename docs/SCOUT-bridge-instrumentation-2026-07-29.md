@@ -839,7 +839,7 @@ printCliResult({ childProcesses: await cleanupStalePidRecords(), staleLogs: recl
 > 
 > D3 PLAN §2.2 把 cursor/kimi 的结算写成「`#settleTurn`，四个本体都幂等」——属实，但**漏了第二个结算点**：`abort()` 超时毒化分支（cursor 与 kimi 各一处）是**手工结算**，自己 `this.turn=null` / `turnCount+=1` / `setSessionStatus(failed)` / `turn.reject(err)`，完全绕过 `#settleTurn`。只挂 `#settleTurn` 的话，那一轮在 viz 上会一直显示 dispatched 直到会话关闭。（顺带：源码注释自称「The ONE idempotent settlement point」，这句话本身就不准。）
 > 
-> D4 writer 与 STATE §4.7 冲突：`#writeInput` 从不写 `truncated` / `originalBytes`，attempt 初始化是 `truncated:false, originalBytes:null` 并且再没人动过。§4.7 的蕴含式是「`truncated === false` ⟹ `bytes === originalBytes`」，而 `null !== bytes`——**任何一次成功记录的 input 都会踩这条**。作为第二实现的 `contract-invariants.mjs` 若严格照散文写，会在真实快照上直接变红。要么 writer 补 `originalBytes = bytes`，要么 STATE 改口径（把 null 定义成「未截断，原始量即 bytes」）。
+> D4 writer 与 STATE §4.7 冲突：`#writeInput` 从不写 `truncated` / `originalBytes`，attempt 初始化是 `truncated:false, originalBytes:null` 并且再没人动过。§4.7 的蕴含式是「`truncated === false` ⟹ `bytes === originalBytes`」，而 `null !== bytes`——**任何一次成功记录的 input 都会踩这条**。作为第二实现的 `tests/contract-invariants-session.mjs` 若严格照散文写，会在真实快照上直接变红。要么 writer 补 `originalBytes = bytes`，要么 STATE 改口径（把 null 定义成「未截断，原始量即 bytes」）。
 > 
 > D5 有损点（不是违约，但要知情）：`finalizeSession` 收 abandoned 时硬写 `body:null, bodyKind:"none"`，而 §4.9 矩阵允许 `abandoned + partial`。cursor/kimi 被 close 打断时 `finalAnswer` 常常非空，这段已经写出来的正文会被丢掉。
 > 

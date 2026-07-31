@@ -35,7 +35,7 @@
 
 - [ ] **Step 1: Write the failing test**
 
-Create `docs/repro-mcp-hang/probe-claude-doctor.mjs`:
+Create `tests/probe-claude-doctor.mjs`:
 
 ```js
 // Asserts the `claude` backend is registered and doctor probes it.
@@ -53,7 +53,7 @@ process.exit(ok ? 0 : 1);
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `node docs/repro-mcp-hang/probe-claude-doctor.mjs`
+Run: `node tests/probe-claude-doctor.mjs`
 Expected: FAIL — doctor lists only `omp:` and `codex:`, no `claude:` line.
 
 - [ ] **Step 3: Add the registry entry**
@@ -74,13 +74,13 @@ In `scripts/agent-bridge.mjs`, add to the `AGENTS` object (after the `codex` ent
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `node docs/repro-mcp-hang/probe-claude-doctor.mjs`
+Run: `node tests/probe-claude-doctor.mjs`
 Expected: PASS — output contains `claude: ok (claude) 2.1.x` (or `claude: missing` on a machine without the CLI; either proves registration).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add scripts/agent-bridge.mjs docs/repro-mcp-hang/probe-claude-doctor.mjs
+git add scripts/agent-bridge.mjs tests/probe-claude-doctor.mjs
 git commit -m "feat(claude): register Claude Code backend in AGENTS (doctor + dispatch enum)"
 ```
 
@@ -97,7 +97,7 @@ git commit -m "feat(claude): register Claude Code backend in AGENTS (doctor + di
 
 - [ ] **Step 1: Write the failing test**
 
-Create `docs/repro-mcp-hang/probe-claude-open.mjs`:
+Create `tests/probe-claude-open.mjs`:
 
 ```js
 // Open a read-only AND a write claude session, assert each reaches status "idle", then close.
@@ -139,7 +139,7 @@ finally { srv.stdin.end(); await sleep(800); if (!exited) srv.kill(); await slee
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `node docs/repro-mcp-hang/probe-claude-open.mjs`
+Run: `node tests/probe-claude-open.mjs`
 Expected: FAIL — `open claude` errors with a `TypeError` (`AGENTS.claude.Session` is undefined; not yet bound).
 
 - [ ] **Step 3: Add the ClaudeCodeSession class (start/close/summary)**
@@ -309,13 +309,13 @@ AGENTS.claude.Session = ClaudeCodeSession;
 
 - [ ] **Step 5: Run test to verify it passes**
 
-Run: `node docs/repro-mcp-hang/probe-claude-open.mjs`
+Run: `node tests/probe-claude-open.mjs`
 Expected: PASS — both sessions reach `idle`, `write:true` reflected, close-all and clean shutdown all PASS. (SKIP exit 0 if `claude` missing.)
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add scripts/agent-bridge.mjs docs/repro-mcp-hang/probe-claude-open.mjs
+git add scripts/agent-bridge.mjs tests/probe-claude-open.mjs
 git commit -m "feat(claude): ClaudeCodeSession start/close/summary + registry late-bind"
 ```
 
@@ -332,7 +332,7 @@ git commit -m "feat(claude): ClaudeCodeSession start/close/summary + registry la
 
 - [ ] **Step 1: Write the failing test**
 
-Create `docs/repro-mcp-hang/probe-claude-turn.mjs` (same harness boilerplate as `probe-claude-open.mjs` Steps; only the `try` body differs):
+Create `tests/probe-claude-turn.mjs` (same harness boilerplate as `probe-claude-open.mjs` Steps; only the `try` body differs):
 
 ```js
 // --- identical boilerplate header as probe-claude-open.mjs: SKIP-if-missing, srv spawn, rpc/call, check ---
@@ -360,7 +360,7 @@ try {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `node docs/repro-mcp-hang/probe-claude-turn.mjs`
+Run: `node tests/probe-claude-turn.mjs`
 Expected: FAIL — `send_message` errors (`session.send is not a function`).
 
 - [ ] **Step 3: Replace #handleLine and add the turn methods**
@@ -486,13 +486,13 @@ Note: `send()` and `#handleLine` reference `this.abort()` / `this.#handleControl
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `node docs/repro-mcp-hang/probe-claude-turn.mjs`
+Run: `node tests/probe-claude-turn.mjs`
 Expected: PASS — turn 1 returns `CLAUDE_T1`, settles idle, reports charCount; turn 2 reuse returns `CLAUDE_T2`.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add scripts/agent-bridge.mjs docs/repro-mcp-hang/probe-claude-turn.mjs
+git add scripts/agent-bridge.mjs tests/probe-claude-turn.mjs
 git commit -m "feat(claude): turn lifecycle — send/result/isSettled/refreshStatus over stream-json"
 ```
 
@@ -509,7 +509,7 @@ git commit -m "feat(claude): turn lifecycle — send/result/isSettled/refreshSta
 
 - [ ] **Step 1: Write the failing test**
 
-Create `docs/repro-mcp-hang/probe-claude-abort.mjs` (same boilerplate; `try` body below):
+Create `tests/probe-claude-abort.mjs` (same boilerplate; `try` body below):
 
 ```js
 try {
@@ -533,7 +533,7 @@ try {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `node docs/repro-mcp-hang/probe-claude-abort.mjs`
+Run: `node tests/probe-claude-abort.mjs`
 Expected: FAIL — `agent_bridge_abort` errors (`session.abort is not a function`).
 
 - [ ] **Step 3: Add the control + abort methods**
@@ -579,13 +579,13 @@ Add to `ClaudeCodeSession`:
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `node docs/repro-mcp-hang/probe-claude-abort.mjs`
+Run: `node tests/probe-claude-abort.mjs`
 Expected: PASS — abort accepted, session idle and reusable, follow-up turn returns `CLAUDE_AFTER_ABORT`.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add scripts/agent-bridge.mjs docs/repro-mcp-hang/probe-claude-abort.mjs
+git add scripts/agent-bridge.mjs tests/probe-claude-abort.mjs
 git commit -m "feat(claude): abort via stream-json control_request interrupt (session stays reusable)"
 ```
 
@@ -594,7 +594,7 @@ git commit -m "feat(claude): abort via stream-json control_request interrupt (se
 ### Task 5: write:true file-edit proof + extend the real-backend e2e
 
 **Files:**
-- Modify: `docs/repro-mcp-hang/e2e-real.mjs` (add claude coverage)
+- Modify: `tests/e2e-real.mjs` (add claude coverage)
 
 **Interfaces:**
 - Consumes: the full `ClaudeCodeSession` (Tasks 2-4).
@@ -602,7 +602,7 @@ git commit -m "feat(claude): abort via stream-json control_request interrupt (se
 
 - [ ] **Step 1: Write the failing assertions**
 
-In `docs/repro-mcp-hang/e2e-real.mjs`, extend the doctor gate to also detect claude (do NOT make claude mandatory — keep the suite runnable where only omp/codex exist). Add after the existing `cdxOk` line:
+In `tests/e2e-real.mjs`, extend the doctor gate to also detect claude (do NOT make claude mandatory — keep the suite runnable where only omp/codex exist). Add after the existing `cdxOk` line:
 
 ```js
   const claudeOk = /claude:\s*ok/i.test(docText);
@@ -652,13 +652,13 @@ Then add a claude block before the final "9. close all" section:
 
 - [ ] **Step 2: Run test to verify it fails first, then passes**
 
-Run: `node docs/repro-mcp-hang/e2e-real.mjs`
+Run: `node tests/e2e-real.mjs`
 Expected (before this task's code on a machine WITH claude): the new claude `check(...)` lines would FAIL/throw. After Step 1's additions: PASS — all claude checks green (and the whole suite still SKIPs cleanly where omp/codex are absent).
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add docs/repro-mcp-hang/e2e-real.mjs
+git add tests/e2e-real.mjs
 git commit -m "test(claude): cover claude backend in real-backend e2e (turn, abort, write:true)"
 ```
 

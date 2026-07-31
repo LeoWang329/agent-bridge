@@ -7,7 +7,7 @@
 
 > **v4 更新（已实现 + 实现后双评 + 实测）**
 >
-> 实现落在 `scripts/agent-bridge.mjs`（未提交，~+600 行）：CURSOR_* 常量、AGENTS.cursor 注册项、`resolveCursorLauncher`/`cursorPickLauncherFromDir`/`cursorVersionKey`、`class CursorAgentSession`、`deriveHealth` isReusable 钩子、doctor cursor 分支、openSession append_system 拒绝、doctor/usage 文案。测试 `docs/repro-mcp-hang/fake-cursor-index.js` + `repro-cursor.mjs`（15 场景全过）。
+> 实现落在 `scripts/agent-bridge.mjs`（未提交，~+600 行）：CURSOR_* 常量、AGENTS.cursor 注册项、`resolveCursorLauncher`/`cursorPickLauncherFromDir`/`cursorVersionKey`、`class CursorAgentSession`、`deriveHealth` isReusable 钩子、doctor cursor 分支、openSession append_system 拒绝、doctor/usage 文案。测试 `tests/fake-cursor-index.js` + `repro-cursor.mjs`（15 场景全过）。
 >
 > **验证**：hermetic 15/15；`repro-health` 回归通过（三旧后端 deriveHealth 字节级不变）；真 doctor `cursor: ok … 2026.07.09-a3815c0`；**真 e2e**（登录 cn-coding）：真 cursor 跑 read+shell 一轮、经 shellToolCall 读文件返回随机 nonce、contextUsage=null（发布前又遇 Cursor 云端 `Error:[unavailable]` 持续抖动——桥正确按失败轮/degraded/可复用处理，非代码问题，调用行完全正确）。
 >

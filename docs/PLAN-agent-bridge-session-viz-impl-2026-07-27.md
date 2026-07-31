@@ -464,7 +464,7 @@ graph 那边把这些钉到了逐字节（`docs/EVENTS-graph.md` 传输章 + `vi
 JSON Schema + `validateState()`——**没有一个字禁止它们与 writer 同源**。
 
 ⚠️ **同一个人写规格、写生产者、再写校验器，校验器只能证明"生产者和它自己一致"。**
-这不是理论风险：graph 观测台最狠的几个 bug 全是被 `viz/contract-invariants.mjs` 抓到的，
+这不是理论风险：graph 观测台最狠的几个 bug 全是被 `tests/contract-invariants-session.mjs` 抓到的，
 而它之所以抓得到，正因为它是**照着合同散文另写一遍、刻意不 import 生产端**的第二实现
 （见 `docs/DRIFT-events-contract-vs-producer-2026-07-28.md`）。
 
@@ -472,7 +472,7 @@ JSON Schema + `validateState()`——**没有一个字禁止它们与 writer 同
 
 1. **`docs/STATE-session-viz.md` 是唯一 wire 真理源。** PLAN §6 的 JSONC 只是它的草稿，
    S1 落地后**以 `docs/STATE-session-viz.md` 为准**，两处不一致时改 PLAN，不改 `docs/STATE-session-viz.md`。
-2. 生产侧的 schema/有界化器 与 `skills/agent-bridge/viz/contract-invariants.mjs`
+2. 生产侧的 schema/有界化器 与 `tests/contract-invariants-session.mjs`
    **必须独立实现、互不 import**（包括不共用常量表与枚举字面量）。
 3. **冻结样例按 `docs/STATE-session-viz.md` 手工构造**，不是把 writer 的输出录下来当样例——
    录出来的样例只会把 writer 当时的 bug 一起冻住。
@@ -522,7 +522,7 @@ JSON Schema + `validateState()`——**没有一个字禁止它们与 writer 同
 - 新 run `generation===1`
 - **v5 删掉**「指向已存在旧目录 → 拒绝初始化 + degraded」这条验收：那个状态结构上到不了（§3.2），
   留着它就是**一条只有测试构造得出来的绿灯**。改为断言 `createVizRun()` 的签名里**没有目录参数**
-- **v5 新增**：`docs/STATE-session-viz.md` 与 `contract-invariants.mjs` 落地（§6.5），断言 `contract-invariants.mjs`
+- **v5 新增**：`docs/STATE-session-viz.md` 与 `tests/contract-invariants-session.mjs` 落地（§6.5），断言 `tests/contract-invariants-session.mjs`
   **没有 import 生产侧任何模块**（源码级检查，不是口头约定）
 - ownerless 60s 宽限**用可注入的 fake clock / 可配置测试宽限**，不真 sleep 60 秒
 - 三条退出路径各造一次，断言目录被删；SIGKILL 后 `cleanup` 能回收
@@ -612,7 +612,7 @@ JSON Schema + `validateState()`——**没有一个字禁止它们与 writer 同
 
 ### S5 —— collected + viewer
 
-`turn:collected`（§5）· `viz/serve.mjs`（双槽读 + owner 检查 + sidecar 轮询）· `viz/index.html` · `viz/sample/` · `test-viz.mjs`
+`turn:collected`（§5）· `viz/serve.mjs`（双槽读 + owner 检查 + sidecar 轮询）· `viz/index.html` · `viz/sample/` · `tests/test-viz-session.mjs`
 
 ⚠️ **v5 改：基线不再是圆桌那份。** `DESIGN §9` 写"拷圆桌 + 改五处"时，仓库里还没有别的选择。
 现在有了——`skills/agent-bridge-graph/viz/serve.mjs` 是**已经改好并过了真后端 e2e** 的那一份：
@@ -652,7 +652,7 @@ JSON Schema + `validateState()`——**没有一个字禁止它们与 writer 同
      > 该约束的实质目的（**零外部依赖、无构建步骤、离线可用**）完全保留——`reconcile.mjs` 是同目录本地模块，
      > `serve.mjs` 本来就从自己目录供文件。**必须在 S5 交付说明里写明这次偏离及理由**，不许默默改。
   2. 纯决策函数签名：`reconcile(prevState, nextSnapshot, uiState) → {keep[], patch[], replace[], scrollAnchor, selection}`；`index.html` 只留**薄 DOM 应用层**。
-  3. `test-viz.mjs` 里写**最小 DOM shim**，只需模型化 `id` / 子节点身份 / `scrollTop` / `open` 四样，喂两代快照，跑四条断言：
+  3. `tests/test-viz-session.mjs` 里写**最小 DOM shim**，只需模型化 `id` / 子节点身份 / `scrollTop` / `open` 四样，喂两代快照，跑四条断言：
 
      | | 断言 |
      |---|---|
@@ -661,7 +661,7 @@ JSON Schema + `validateState()`——**没有一个字禁止它们与 writer 同
      | **A3** | `scrollTop` 不被重置 |
 
   4. ⚠️ **自动化负对照**（不是"我改坏看过它红了"的文字记录——那本身可以假绿）：
-     `test-viz.mjs` **在同一次运行里跑两遍同一套断言**：
+     `tests/test-viz-session.mjs` **在同一次运行里跑两遍同一套断言**：
 
      | 注入的实现 | A1 | A2 | A3 |
      |---|---|---|---|

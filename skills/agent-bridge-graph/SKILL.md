@@ -268,7 +268,7 @@ bridge.runNode({ id: "implement", agent: "claude", cwd: REPO, outDir,
   **要硬保证不写盘的环节,就点名 codex。**
 - **关键判断环节(挑刺/裁判/汇总)别用 cursor 和 kimi**(每轮短进程,角色设定容易飘);让它们干普通生产环节。
 - ⚠️ **cursor 的会话隔离弱于其余四家(实测)**:同一个 `cwd` 下开的**全新**节点,能读到**先前**节点的内容
-  (`docs/repro-mcp-hang/e2e-graph-memory.mjs` 用随机口令量过;换个 `cwd` 就读不到 ⇒ 按 **workspace 划界**)。
+  (`tests/e2e-graph-memory.mjs` 用随机口令量过;换个 `cwd` 就读不到 ⇒ 按 **workspace 划界**)。
   编排上的后果:**同一 `cwd` 里先后跑的两个 cursor 环节不构成"互相独立"** ——
   「一个干、另一个挑刺」这种形状**别把两头都排给 cursor**,挑刺那头会看见实施那头的上文
   (纪律 4「汇总/评审/挑刺一定换引擎」在这里是硬要求,不是偏好)。

@@ -7,21 +7,28 @@ This document explains how Agent Bridge is structured, how to test it, and how t
 ```text
 agent-bridge/
   .mcp.json                          Project-scoped MCP server declaration (auto-loaded when a client runs in the repo)
-  scripts/agent-bridge.mjs           MCP server and backend adapter implementation
-  skills/agent-bridge/SKILL.md       Bridge usage guide the delegating agent follows
-  skills/agent-bridge-dev/SKILL.md   Optional companion: delegated-role dev/review/design/debug orchestration
-  docs/REQUIREMENTS.md               Product requirements and TODOs
-  docs/INSTALLATION.md               Installation and usage guide
-  docs/DEVELOPMENT.md                Development notes
-  docs/EVENTS-graph.md               Wire contract: graph observatory event stream
-  docs/STATE-session-viz.md          Wire contract: delegated-session observatory snapshot
+  scripts/                           产品代码：MCP server 与后端适配、观测快照 writer
+  skills/                            skill 包 —— 只放一次调用里真会被打开的东西（见下）
+  tests/                             全部测试与假后端桩（零消耗的 repro-* / 真花钱的 e2e-* / 页面侧 test-viz-*）
+  tools/                             开发用生成器（产物提交进仓，跑 skill 时用不到）
+  docs/                              规范、设计稿、复盘、安装与开发说明
   README.md                          User-facing documentation
 ```
 
-⚠️ **`skills/` 下只放一次 skill 调用里真会被打开的东西**（`SKILL.md` + `tools/` `templates/`
-`examples/` `roles/` `modes/` + 观测台的 `serve.mjs` / `index.html`）。给开发者看的规范、设计稿、
-复盘一律进 `docs/` —— 否则 agent 顺手列一下 skill 目录，就可能把一份上千行的规范读进上下文，
-而它在那次调用里一个字都用不上。
+四条目录判据，一条比一条硬：
+
+| 目录 | 判据 |
+|---|---|
+| `scripts/` | 装了 agent-bridge 的人在跑的**产品代码** |
+| `skills/` | **一次 skill 调用里真会被打开的东西**：`SKILL.md` + `tools/` `templates/` `examples/` `roles/` `modes/` + 观测台的 `serve.mjs` / `index.html` / `reconcile.mjs` / `sample/` |
+| `tests/` | 验证用的一切。**不进 `skills/`** —— 否则 agent 顺手列一下 skill 目录，就可能把上千行测试读进上下文，而它在那次调用里一个字都用不上 |
+| `tools/` | 生成器（`build-session-viz-index.mjs` 造页面、`build-graph-viz-sample.mjs` 造冻结样例、`regen-loop-viz-demo.mjs`）。它们的**产物**在 `skills/` 里，**它们自己**不在 |
+
+> `tests/` 以前叫 `docs/repro-mcp-hang/` —— 名字两头都不对：它不是文档，也早就不只是那次 MCP
+> 卡死的复现了（59 个文件、覆盖全部后端与两个观测台）。2026-07-31 改名。
+>
+> ⚠️ 目录深度从两层变一层，所以 `tests/` 里所有 `../../` 都降成了 `../`。
+> 新加测试时注意：`../skills/…`、`../scripts/…`、`path.resolve(HERE, "..")` 才是仓根。
 
 There are no npm dependencies. The runtime uses Node built-ins plus external CLIs. Agent Bridge only bridges to these — it never installs them, and each is optional (a backend that is not installed is reported by `doctor` as `missing` / `available:false`; it does not break the server):
 
@@ -78,7 +85,7 @@ The MCP server owns its sessions directly and cleans up every active session whe
 
 Normal `agent_bridge_close_session` calls remove the pid record immediately. Process-level shutdown leaves pid records in place after sending `SIGTERM`; this is intentional. If a child ignores termination or Agent Bridge is killed abruptly, the next MCP startup reads those records, verifies that the process command still matches an Agent Bridge backend such as `omp --mode rpc` or `codex app-server`, and terminates the recorded process tree. Stale records for already-exited processes are removed.
 
-`close_session` refuses by default when the session's turn is still running (`{blocked:true, runningSessionIds}`; the bulk form is an atomic preflight — one running session blocks all of them) — pass `force:true` to close anyway. Once it does close, it is fire-and-forget by design: it SIGTERMs the backend, schedules a 3s force-kill backstop, and returns immediately so a bulk close stays cheap. The backend process tree therefore dies *after* the call returns. On Windows this matters to any caller that deletes the session's `cwd` right after closing: the OMP/Codex backend is a process **tree**, and a child can hold that directory open for a few hundred ms past close — *even after the root process is gone* — so an immediate `rmdir`/`fs.rm` races the teardown and hits `EPERM` (the dir is left in `STATUS_DELETE_PENDING`). Waiting only for the root process to exit is NOT enough: a surviving child still holds the handle (verified — even confirming the root pid is OS-reaped still EPERM'd). The robust contract is to **poll-and-retry the delete itself** — a fresh `fs.rm` after a short async sleep, which lands cleanly once the tree has fully released the directory (~0.5–1s). The real-backend e2e harness (`docs/repro-mcp-hang/e2e-real.mjs`, step 7) demonstrates this pattern. POSIX is unaffected — it lets you unlink a directory a process is still `cwd`'d into.
+`close_session` refuses by default when the session's turn is still running (`{blocked:true, runningSessionIds}`; the bulk form is an atomic preflight — one running session blocks all of them) — pass `force:true` to close anyway. Once it does close, it is fire-and-forget by design: it SIGTERMs the backend, schedules a 3s force-kill backstop, and returns immediately so a bulk close stays cheap. The backend process tree therefore dies *after* the call returns. On Windows this matters to any caller that deletes the session's `cwd` right after closing: the OMP/Codex backend is a process **tree**, and a child can hold that directory open for a few hundred ms past close — *even after the root process is gone* — so an immediate `rmdir`/`fs.rm` races the teardown and hits `EPERM` (the dir is left in `STATUS_DELETE_PENDING`). Waiting only for the root process to exit is NOT enough: a surviving child still holds the handle (verified — even confirming the root pid is OS-reaped still EPERM'd). The robust contract is to **poll-and-retry the delete itself** — a fresh `fs.rm` after a short async sleep, which lands cleanly once the tree has fully released the directory (~0.5–1s). The real-backend e2e harness (`tests/e2e-real.mjs`, step 7) demonstrates this pattern. POSIX is unaffected — it lets you unlink a directory a process is still `cwd`'d into.
 
 Pid-record cleanup treats only `agent-bridge mcp` as a live owner (the owner-alive check matches `\bmcp\b` in the owning process command). A record whose owning MCP process is still running is skipped so its active OMP/Codex children are never terminated; `cleanup` only reaps orphans whose owning MCP server is gone (SIGTERM followed by a SIGKILL backstop), and also deletes abandoned `logs/<runId>/` dirs from those dead servers.
 
@@ -139,20 +146,20 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | nod
 假后端，零消耗，**推送前必过**：
 
 ```sh
-node docs/repro-mcp-hang/repro-graph-node.mjs        # 环节生命周期 / 失败三档 / 幂等 / 零残留
-node docs/repro-mcp-hang/repro-graph-worktree.mjs    # write 隔离 / 基线闸 / 复用闸 / 并发闸
-node docs/repro-mcp-hang/repro-viz-events.mjs        # 事件 writer：schema / 有界化 / 半行安全
-node docs/repro-mcp-hang/repro-viz-graph.mjs         # graph 作用域与归档写入器
-node docs/repro-mcp-hang/repro-graph-conversation.mjs # 多轮对话：轮的生命周期 / 会话毒化 / 记忆边界
-node docs/repro-mcp-hang/repro-graph-viz.mjs         # viz 开着时的事件流 / SSE / /file 四道闸
-node skills/agent-bridge-graph/viz/test-viz.mjs      # graph 页面这一侧：事件流 → 页面上写了什么
+node tests/repro-graph-node.mjs        # 环节生命周期 / 失败三档 / 幂等 / 零残留
+node tests/repro-graph-worktree.mjs    # write 隔离 / 基线闸 / 复用闸 / 并发闸
+node tests/repro-viz-events.mjs        # 事件 writer：schema / 有界化 / 半行安全
+node tests/repro-viz-graph.mjs         # graph 作用域与归档写入器
+node tests/repro-graph-conversation.mjs # 多轮对话：轮的生命周期 / 会话毒化 / 记忆边界
+node tests/repro-graph-viz.mjs         # viz 开着时的事件流 / SSE / /file 四道闸
+node tests/test-viz-graph.mjs          # graph 页面这一侧：事件流 → 页面上写了什么
 
-node docs/repro-mcp-hang/repro-viz-writer.mjs        # 会话快照 writer：双槽 / 有界队列 / 降级三处同步
-node docs/repro-mcp-hang/repro-viz-bridge.mjs        # 桥真的按合同调 writer 了吗（含开服时孤儿目录回收）
-node skills/agent-bridge/viz/test-viz.mjs            # 会话页面这一侧：快照 → 页面上写了什么
+node tests/repro-viz-writer.mjs        # 会话快照 writer：双槽 / 有界队列 / 降级三处同步
+node tests/repro-viz-bridge.mjs        # 桥真的按合同调 writer 了吗（含开服时孤儿目录回收）
+node tests/test-viz-session.mjs        # 会话页面这一侧：快照 → 页面上写了什么
 ```
 
-⚠️ `repro-graph-viz` 与 `skills/agent-bridge-graph/viz/test-viz.mjs` **都**会跑
+⚠️ `repro-graph-viz` 与 `tests/test-viz-graph.mjs` **都**会跑
 `viz/contract-invariants.mjs` —— 合同里那些**跨字段的等式**
 （「这两处 sha256 必须相等」「这个字段只在那个字段不是 present 时才许出现」）。
 它**刻意不 import `tools/viz-events.mjs`**：schema 只管单个字段的形状，
@@ -164,7 +171,7 @@ node skills/agent-bridge/viz/test-viz.mjs            # 会话页面这一侧：�
 
 ```sh
 npm i playwright && npx playwright install chromium         # 装在哪个目录都行
-PLAYWRIGHT_DIR=<那个目录> node docs/repro-mcp-hang/e2e-viz-browser.mjs
+PLAYWRIGHT_DIR=<那个目录> node tests/e2e-viz-browser.mjs
 ```
 
 它同时考 **graph 观测台**和**委托会话观测台**，只问「只有真浏览器答得上来」的问题，
@@ -178,16 +185,16 @@ PLAYWRIGHT_DIR=<那个目录> node docs/repro-mcp-hang/e2e-viz-browser.mjs
 真后端 e2e（**真花钱**，改了归档布局 / 事件形状 / 页面读法之后跑一次）：
 
 ```sh
-node docs/repro-mcp-hang/e2e-graph-viz.mjs           # 真跑 → 观测台上看到的就是磁盘上那份
-node docs/repro-mcp-hang/e2e-viz.mjs                 # 会话观测台的真后端一轮
+node tests/e2e-graph-viz.mjs           # 真跑 → 观测台上看到的就是磁盘上那份
+node tests/e2e-viz.mjs                 # 会话观测台的真后端一轮
 ```
 
 ## End-to-End Test (real backends)
 
-`docs/repro-mcp-hang/e2e-real.mjs` drives the working-tree MCP server over real JSON-RPC stdio against **real `omp` + `codex`** and asserts the full delegated-session surface: registry dispatch (open both backends), `wait` mode all/any across both backend types, session reuse, `status` refresh, `abort` + settle, a `write: true` file edit in a temp dir, `assertAgent` rejection of a bad agent, and clean shutdown. Unlike the `repro-*.mjs` (which use the fake-omp stub for zero model usage), this spends **real model tokens** and needs both backends on `PATH`; it SKIPs cleanly (exit 0) if either is missing. Transient backend network blips can flake individual scenarios — re-run to confirm.
+`tests/e2e-real.mjs` drives the working-tree MCP server over real JSON-RPC stdio against **real `omp` + `codex`** and asserts the full delegated-session surface: registry dispatch (open both backends), `wait` mode all/any across both backend types, session reuse, `status` refresh, `abort` + settle, a `write: true` file edit in a temp dir, `assertAgent` rejection of a bad agent, and clean shutdown. Unlike the `repro-*.mjs` (which use the fake-omp stub for zero model usage), this spends **real model tokens** and needs both backends on `PATH`; it SKIPs cleanly (exit 0) if either is missing. Transient backend network blips can flake individual scenarios — re-run to confirm.
 
 ```sh
-node docs/repro-mcp-hang/e2e-real.mjs   # prints PASS/FAIL per scenario, then a tally
+node tests/e2e-real.mjs   # prints PASS/FAIL per scenario, then a tally
 ```
 
 ## Codex CLI Smoke Tests

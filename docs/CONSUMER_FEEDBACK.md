@@ -221,7 +221,7 @@
 
 ## v0.8.1 · MCP「看似断连」+ 僵尸 server 堆积 的根因修复(2026-06-10)
 
-用户报"启动多个 Claude Code 时,只有最新的 agent-bridge MCP 能用,启动别的客户端就把当前的弄断了"。第一性原理排查(代码审计 + 受控复现,不打补丁),定位到**两个互相叠加、各自独立的根因**——完整调查见 [docs/INVESTIGATION-mcp-disconnect-2026-06-10.md](INVESTIGATION-mcp-disconnect-2026-06-10.md),复现脚本随仓库提交于 [docs/repro-mcp-hang/](repro-mcp-hang/)。
+用户报"启动多个 Claude Code 时,只有最新的 agent-bridge MCP 能用,启动别的客户端就把当前的弄断了"。第一性原理排查(代码审计 + 受控复现,不打补丁),定位到**两个互相叠加、各自独立的根因**——完整调查见 [docs/INVESTIGATION-mcp-disconnect-2026-06-10.md](INVESTIGATION-mcp-disconnect-2026-06-10.md),复现脚本随仓库提交于 [tests/](../tests/)。
 
 **根因 1(外部一次性,非本程序 bug):** 那次 `Connection closed @ 12:01:10` 是用户当时安装 `node-v24.16.0-x64.msi`,MSI 的 Restart Manager 在 12:01:06–12:01:10 关停了所有 `node.exe`(Windows 事件日志逐秒吻合)——每个 agent-bridge server 都是 node 进程,被一锅端;CC +7s 自动重连重试,会话在已死 server 内存里 → `Unknown session`。顺带证伪了旧假设:同会话内 4m52s/5m13s 长 `wait` 均正常完成,CC 对长调用并不在 ~60s 杀。
 
@@ -237,7 +237,7 @@
 
 **版本与兼容性**:纯**内部健壮性修复**,不增删/改任何 MCP 工具的入参/出参形状,既有调用零破坏 → 标 **0.8.0 → 0.8.1**(patch)。新增可选 env 旋钮 `AGENT_BRIDGE_OMP_RPC_TIMEOUT_MS`(默认 10000)。
 
-**实测(Windows,随仓库提交的 `docs/repro-mcp-hang/` harness;`fake-omp` 不发 prompt,零模型消耗)**:
+**实测(Windows,随仓库提交的 `tests/` harness;`fake-omp` 不发 prompt,零模型消耗)**:
 - `repro-kill`:`wait` 期间 SIGKILL 后端 ×3 → 修前每次永久挂死;修后 3/3 即时返回 `status:"failed"`,且 harness 关 stdin 后 server ≤5s 干净退出(P2 自检通过)。
 - `repro-pipebreak`:后端保活但断开 stdin 读端 → 修前永久挂死;修后 `wait` 按 `timeout_ms` 准时返回 `timedOut`+`pendingSnapshots`。
 - e2e 回归:真实 omp `open→status→close_session` → 活后端被正常击杀(P4 未误伤正常路径),server 干净退出,`cleanup` 无残留可收。
@@ -256,13 +256,13 @@ v0.8.1 的 P2 只在 **stdin EOF** 时回收 server。但 server 可能被孤立
 
 **版本与兼容性**:纯**加性的内部健壮性**改进(新增 env `AGENT_BRIDGE_PARENT_WATCHDOG_MS` 默认 15000、`AGENT_BRIDGE_PARENT_PID` 覆盖被监视 pid),无工具入参/出参变化、平台中立 → **0.8.1 → 0.8.2**(patch)。
 
-**实测(Windows)**:新增 `docs/repro-mcp-hang/repro-parent-death.mjs` —— **PASS**:harness 全程**不关 server 的 stdin**、只杀一个被 `AGENT_BRIDGE_PARENT_PID` 指向的替身进程,server 仍 `code=0` 自退、后端被回收(证明是看门狗而非 stdin 路径触发)。同时回归 `repro-kill`(3/3 不挂死、P2 自检通过)、`repro-pipebreak`(按时 `timedOut`)均不受看门狗干扰。
+**实测(Windows)**:新增 `tests/repro-parent-death.mjs` —— **PASS**:harness 全程**不关 server 的 stdin**、只杀一个被 `AGENT_BRIDGE_PARENT_PID` 指向的替身进程,server 仍 `code=0` 自退、后端被回收(证明是看门狗而非 stdin 路径触发)。同时回归 `repro-kill`(3/3 不挂死、P2 自检通过)、`repro-pipebreak`(按时 `timedOut`)均不受看门狗干扰。
 
 ---
 
 ## v0.8.3 · 交叉审核收口 + turn 时钟一致性(2026-06-10)
 
-把 v0.8.1/0.8.2 的修复给 **codex / deepseek-v4-pro / minimax / xiaomi-mimo** 四家交叉审核(minimax 产出事实性错误、mimo 工具死循环,均已证伪/记录),codex 与 deepseek 一致挑出几条**真问题**;连同另一条独立记录的 [turn 时钟自相矛盾 bug](BUG-omp-turn-state-inconsistency-2026-06-10.md),一并收进本次 patch。每条都配了**确定性复现**(`docs/repro-mcp-hang/`)。
+把 v0.8.1/0.8.2 的修复给 **codex / deepseek-v4-pro / minimax / xiaomi-mimo** 四家交叉审核(minimax 产出事实性错误、mimo 工具死循环,均已证伪/记录),codex 与 deepseek 一致挑出几条**真问题**;连同另一条独立记录的 [turn 时钟自相矛盾 bug](BUG-omp-turn-state-inconsistency-2026-06-10.md),一并收进本次 patch。每条都配了**确定性复现**(`tests/`)。
 
 | 修复 | 根因 / 为什么 | 落地 |
 |---|---|---|
@@ -277,7 +277,7 @@ v0.8.1 的 P2 只在 **stdin EOF** 时回收 server。但 server 可能被孤立
 
 **版本与兼容性**:纯**内部健壮性 + 观测一致性**修复,不增删/改任何 MCP 工具的入参/出参形状(`lastTurn` 仅由"自相矛盾"变"一致",无消费方依赖其 `running` 时的 `endedAt`)→ 标 **0.8.2 → 0.8.3**(patch)。新增可选 env 旋钮 `AGENT_BRIDGE_OMP_RPC_TIMEOUT_FAILS`(默认 3)。
 
-**实测(Windows,`docs/repro-mcp-hang/`,均零模型消耗;新增 4 个 harness 全 PASS)**:
+**实测(Windows,`tests/`,均零模型消耗;新增 4 个 harness 全 PASS)**:
 - `repro-turnstate`(F7/F8):后端自行 churn `turn_start→turn_end→turn_start→turn_end` 后,反复 `status` 采样——`status:running` 时 `lastTurn.endedAt` 恒 `null`。**负向对照**:临时回退 F8 后同 harness 立即 FAIL(`running` + `endedAt` 有值、`durationMs:122`),证明用例真能抓 bug。
 - `repro-halfdead`(F4):后端 ack prompt 后对 `get_state` 装死;`wait` 给 60s deadline,实测 **~3.0s** 即返回 `status:"failed"`(非 `timedOut`),远早于 deadline。
 - `repro-reclaim`(F1):合成 state 目录跑真 `cleanup` CLI——目录 mtime 旧、`bridge.log` mtime 新的 crash 现场**被保留**;目录与 log 双旧的 crash 现场、以及 `code=0` 的旧目录**被回收**(证明扫除确实在跑)。
@@ -313,7 +313,7 @@ v0.8.1 的 P2 只在 **stdin EOF** 时回收 server。但 server 可能被孤立
 
 **版本与兼容性**:不增删/改任何 MCP 工具的入参/出参**形状**。R1 是**合同语义修正**:`mode:"any"` 的 `pending` 现在可能包含**已 settle** 的 id(下一轮 wait 立即返回它们;`pendingSnapshots` 如实显示其 `idle`/`failed` 状态)——按文档循环的消费方行为只会变正确,不会变坏 → 标 **0.8.3 → 0.8.4**(patch)。
 
-**实测(Windows,零模型消耗)**:新增 `docs/repro-mcp-hang/repro-waitany.mjs`(fake-omp `turnstate` 模式驱动真 MCP server),**负向对照成立**——修复前同 harness 即 FAIL(`wait#1` 返回 `pending=[]`,B 被丢);修复后 **PASS**:R1 两个同时 settle 的会话经 `completed→pending→completed` 全部取到;R2 fresh 会话 `wait` **46ms** 即返回(修复前吃满超时)。R4 无法确定性构造(需后端把响应与通知打进同一 flush),以代码审查覆盖。既有 7 个 harness 全量回归 **7/7 PASS**(turnstate / halfdead / reclaim / watchdog-disarm / pipebreak / parent-death / kill)。
+**实测(Windows,零模型消耗)**:新增 `tests/repro-waitany.mjs`(fake-omp `turnstate` 模式驱动真 MCP server),**负向对照成立**——修复前同 harness 即 FAIL(`wait#1` 返回 `pending=[]`,B 被丢);修复后 **PASS**:R1 两个同时 settle 的会话经 `completed→pending→completed` 全部取到;R2 fresh 会话 `wait` **46ms** 即返回(修复前吃满超时)。R4 无法确定性构造(需后端把响应与通知打进同一 flush),以代码审查覆盖。既有 7 个 harness 全量回归 **7/7 PASS**(turnstate / halfdead / reclaim / watchdog-disarm / pipebreak / parent-death / kill)。
 
 ### 评审收口(codex + deepseek-v4-pro 交叉复评)+ R2 根治
 
@@ -323,7 +323,7 @@ v0.8.1 的 P2 只在 **stdin EOF** 时回收 server。但 server 可能被孤立
 
 **根治(不打补丁)**:`everPrompted` 这个"一旦置真永不复位"的代理量本身就是根因。改为 **`turnInFlight`**——`send()` 入口**同步**置真(覆盖首次与复用会话的 pre-ack 窗口),在**每个 turn 终止点**复位:`turn_end`/`agent_end`(完成)、`abort()`(取消)、prompt 被拒的 catch(无 turn)。`sessionSettled(omp) = idle && !turnInFlight`,一个谓词同时正确覆盖 fresh / 完成 / 失败 / abort 四态,且**不依赖观测到 `agent_start`**;真正在途的 pre-stream turn 期间标志恒为真,绝不提前 settle(终态 `failed`/`closed` 在更前面短路,无需复位)。`turnStarted` 仍单独服务 `waitIdle` 的内联等待路径,不动。
 
-**实测**:新增 `docs/repro-mcp-hang/repro-waitfail.mjs`(fake-omp 新增 `rejectprompt` 模式:拒绝每个 prompt、保活 idle)。**负向对照成立**——临时去掉 catch 里的 `turnInFlight=false` 即 FAIL(死等满 6068ms 超时);修复后 **PASS**:被拒会话 `wait` **45ms** 即 settle。全量 **9/9 PASS**(waitfail / waitany / turnstate / halfdead / reclaim / watchdog-disarm / pipebreak / parent-death / kill)。按用户决定**本轮不再追加评审一轮**,以负向对照 + 全量回归 + 两家已收敛的共识收口。
+**实测**:新增 `tests/repro-waitfail.mjs`(fake-omp 新增 `rejectprompt` 模式:拒绝每个 prompt、保活 idle)。**负向对照成立**——临时去掉 catch 里的 `turnInFlight=false` 即 FAIL(死等满 6068ms 超时);修复后 **PASS**:被拒会话 `wait` **45ms** 即 settle。全量 **9/9 PASS**(waitfail / waitany / turnstate / halfdead / reclaim / watchdog-disarm / pipebreak / parent-death / kill)。按用户决定**本轮不再追加评审一轮**,以负向对照 + 全量回归 + 两家已收敛的共识收口。
 
 > **schema 文案待办(已知,未计入逻辑缺陷)**:两家都点到 `agent_bridge_wait` 的入参/出参描述仍说 `mode:"any"` 的 `pending`/`pendingSnapshots` 是"still-running ids",与 R1 新语义(可能含同 tick 已 settle 的 id)不一致。属文档措辞,留待后续低成本订正。
 >

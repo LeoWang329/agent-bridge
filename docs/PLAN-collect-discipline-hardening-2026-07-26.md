@@ -16,8 +16,8 @@
 ## 0. 五条施工纪律（先读，避免踩已知的坑）
 
 1. **本文一律用「符号 / 可复现检索串」定位，不写行号。** 编辑过程中行号会漂移；且本仓有过工具行号偏移的实例（主 agent 首轮用检索工具拿到的 `scripts/agent-bridge.mjs` 行号在 ~1200 行之后**系统性少 3**，被复核纠正）。**每次定位都重新 `grep -n`。**
-2. **`docs/repro-mcp-hang/repro-kimi.mjs` 含 NUL 字节**，`grep` 会判定 binary 并跳过。查它必须加 `-a`。（本仓在 NUL 字节上踩过两次。）建议**所有** grep 都带 `-a`。
-3. **`docs/repro-mcp-hang/probe-doctor-timeout.mjs` 是既有的红**，与本次无关。不要修，也不要因此判定自己改坏了。
+2. **`tests/repro-kimi.mjs` 含 NUL 字节**，`grep` 会判定 binary 并跳过。查它必须加 `-a`。（本仓在 NUL 字节上踩过两次。）建议**所有** grep 都带 `-a`。
+3. **`tests/probe-doctor-timeout.mjs` 是既有的红**，与本次无关。不要修，也不要因此判定自己改坏了。
 4. **警惕"唯一 / 全部 / 唯二"这类断言。** v1 说明书在四处这样的断言上出错（唯一漏斗、唯二调用点、五后端同语义、graph 收尾顺序）。本文已改为给**可复现的扫描命令**而不是写死清单——施工时请**重跑那些命令**，不要信任本文的枚举结果。
 5. **本次有两条既有回归测试的合同会被改变**（`repro-cursor` S12、`repro-kimi` S10/S25）。它们不是被你改坏的，是 C6 的必然后果，见 C6。
 
@@ -161,7 +161,7 @@ rg -l -a "agent_bridge_(open_session|send_message|wait|result)" . --glob "*.mjs"
 
 已知结论（v2 复核后）：
 
-- 仓内**没有 `tests/` 目录**；测试主要是 `docs/repro-mcp-hang/*.mjs`，但**不止**——另有 `skills/agent-bridge-loop/viz/test-viz.mjs`（它只解析 transcript event，不消费 MCP 返回，本次**无需跑**）。
+- 仓内**没有 `tests/` 目录**；测试主要是 `tests/*.mjs`，但**不止**——另有 `tests/test-viz-loop.mjs`（它只解析 transcript event，不消费 MCP 返回，本次**无需跑**）。
 - **全量扫描未发现按精确 key 集 / key-count 解析返回的消费方**：repro 系列只断言 `accepted === true` 或个别字段；`repro-wait-shape.mjs` 明确写了 "Subset check on purpose (not exact key-count)"；graph 按字段名读取。
 - 该文件的 `FORBIDDEN` 只禁 `session` 与 `recentEvents` 出现在 wait 顶层（上下文卫生）。新字段必须**轻**。
 - 所有 `additionalProperties:false` 都在**输入** schema；当前工具**没有 `outputSchema`**。
@@ -377,12 +377,12 @@ C6 会**改变两个既有测试的合同**，它们当前明确要求 running-c
 
 | 测试 | 当前合同 | 改法 |
 |---|---|---|
-| `docs/repro-mcp-hang/repro-cursor.mjs` S12 | "close during an in-flight turn → process tree-killed, pid record gone"，直接 `close_session({session_id})` 并要求 pid 被 tree-kill | 加 `force: true`（那正是 force 存在的意义），或改测"默认拒绝 + force 后仍命中原底层路径" |
-| `docs/repro-mcp-hang/repro-kimi.mjs` S10 | 同上（tree-kill + pid 记录清理） | 同上 |
-| `docs/repro-mcp-hang/repro-kimi.mjs` S25 | 用 running-close 命中 send 的 pre-begin close race（"was closed during send"） | 同上——这条尤其要小心，它是**非假绿设计**的证明性测试，改动后必须确认仍真的命中那条分支 |
-| `docs/repro-mcp-hang/repro-turnstate.mjs` 结尾清理 | 会话**故意停在 `status:"running"`**，然后 `close_session({session_id})` + `await waitResp(closeId, 5000)`，**完全不检查响应** → 加了 guard 后会被静默挡住而测试照样 PASS（**假绿**） | 改为 `force: true` **并断言 `closed === true`** |
-| `docs/repro-mcp-hang/e2e-real.mjs` 两处 `finally` 清场 | `if (wId) { try { await call(...) } catch {} }` 与 `if (cwId) { … catch {} }`——职责是"即使前面异常也强制清场"，而 `catch {}` 会吞掉被挡 | 两处都传 `force: true` |
-| `docs/repro-mcp-hang/e2e-real.mjs` 的收尾批量关 | `call("agent_bridge_close_session", {})`——若此时还有 running 会话，C6.1 的原子 preflight 会一个都不关 | 传 `force: true`，或在其前确保全部已收口 |
+| `tests/repro-cursor.mjs` S12 | "close during an in-flight turn → process tree-killed, pid record gone"，直接 `close_session({session_id})` 并要求 pid 被 tree-kill | 加 `force: true`（那正是 force 存在的意义），或改测"默认拒绝 + force 后仍命中原底层路径" |
+| `tests/repro-kimi.mjs` S10 | 同上（tree-kill + pid 记录清理） | 同上 |
+| `tests/repro-kimi.mjs` S25 | 用 running-close 命中 send 的 pre-begin close race（"was closed during send"） | 同上——这条尤其要小心，它是**非假绿设计**的证明性测试，改动后必须确认仍真的命中那条分支 |
+| `tests/repro-turnstate.mjs` 结尾清理 | 会话**故意停在 `status:"running"`**，然后 `close_session({session_id})` + `await waitResp(closeId, 5000)`，**完全不检查响应** → 加了 guard 后会被静默挡住而测试照样 PASS（**假绿**） | 改为 `force: true` **并断言 `closed === true`** |
+| `tests/e2e-real.mjs` 两处 `finally` 清场 | `if (wId) { try { await call(...) } catch {} }` 与 `if (cwId) { … catch {} }`——职责是"即使前面异常也强制清场"，而 `catch {}` 会吞掉被挡 | 两处都传 `force: true` |
+| `tests/e2e-real.mjs` 的收尾批量关 | `call("agent_bridge_close_session", {})`——若此时还有 running 会话，C6.1 的原子 preflight 会一个都不关 | 传 `force: true`，或在其前确保全部已收口 |
 
 #### C6.3 graph 的实际收尾顺序（v1 写得不准）
 
@@ -431,7 +431,7 @@ rg -n -a -i "30 分钟|30-min|1800000|DEFAULT_WAIT_TIMEOUT_MS|always pass.*timeo
 
 - `README.md` 的 "always pass a timeout_ms"
 - `scripts/agent-bridge.mjs` 顶部 OMP 注释里的 "caller's own default 30-min wait deadline"
-- `docs/repro-mcp-hang/repro-waitany.mjs` 注释里的 "default 30-min dead wait"
+- `tests/repro-waitany.mjs` 注释里的 "default 30-min dead wait"
 - `docs/CONSUMER_FEEDBACK.md` / `docs/ARCHITECTURE.md`：这些是**历史记录**，**追加"现版本已改为 X"，不要篡改历史语境**
 - `docs/ARCHITECTURE.md` 变更历史追加本次条目（沿用既有版本条目风格）
 
@@ -473,7 +473,7 @@ MCP `initialize` 当前只返回 `{protocolVersion, capabilities:{tools:{}}, ser
 
 ### 4.1 惯例
 
-- 测试在 `docs/repro-mcp-hang/`，命名 `repro-*.mjs`，`node docs/repro-mcp-hang/<name>.mjs` 直接跑。
+- 测试在 `tests/`，命名 `repro-*.mjs`，`node tests/<name>.mjs` 直接跑。
 - **hermetic = 假后端桩，零真实 token**：`fake-omp.mjs`（`OMP_BIN` + `FAKE_OMP_MODE`）、`fake-codex.*`、`fake-claude.*`、`fake-cursor-index.js`、`fake-kimi.js`、`fake-omp-stubborn.*`、`hang-bin.*`。
 - **模板：`repro-wait-shape.mjs`**——它 spawn `node scripts/agent-bridge.mjs mcp`，手写 JSON-RPC over stdin/stdout，`parse(resp)` 取 `result.content[0].text` 再 `JSON.parse`。**新测试直接照抄其 harness。**
 - 断言风格：`fail(msg)` 打 `>>> FAIL:` 并 `exit(1)`；成功打 `>>> PASS:`。
@@ -575,7 +575,7 @@ probe-claude-abort-fallback   probe-claude-abort-usage-gate
 - **`repro-kill` / `repro-pipebreak`** = C2 唯一影响的两个（省略 mode）。按 C2 钉成显式 `mode:"all"` 后必须仍绿。
 - **`repro-cursor` S12 / `repro-kimi` S10+S25** = **C6 必然要改的合同**，见 C6.2。改完必须确认仍真的命中原底层路径（尤其 S25 的 pre-begin race）。
 - **`repro-graph-node`** = C6 的**弱**守门人：它绿**不能**证明 guard 有效，见 C6.3。
-- **明确排除**：`skills/agent-bridge-loop/viz/test-viz.mjs`（只解析 transcript event，不消费 MCP 返回）。
+- **明确排除**：`tests/test-viz-loop.mjs`（只解析 transcript event，不消费 MCP 返回）。
 
 **已知既有红**：`probe-doctor-timeout.mjs`。不要动。
 
@@ -645,8 +645,8 @@ C7 的其余文档随各批同步——**不要攒到最后**，尤其 C3 会让
 | 现有省略 `mode` 的可执行调用 | `rg -n -a "agent_bridge_wait" . -g "*.mjs" -g "*.js" \| rg -v "mode:"` |
 | C6 会打红的既有合同 | `repro-cursor.mjs` 的 `S12`、`repro-kimi.mjs` 的 `S10` 与 `S25` |
 | 全量消费方扫描 | `rg -l -a "agent_bridge_(open_session\|send_message\|wait\|result)" . -g "*.mjs" -g "*.js"` |
-| stubborn 桩其实会 settle | `rg -n -a -C 4 "agent_end" docs/repro-mcp-hang/fake-omp-stubborn.mjs` |
-| 可用的 OMP 桩模式 | `rg -n -a "MODE ===" docs/repro-mcp-hang/fake-omp.mjs` |
+| stubborn 桩其实会 settle | `rg -n -a -C 4 "agent_end" tests/fake-omp-stubborn.mjs` |
+| 可用的 OMP 桩模式 | `rg -n -a "MODE ===" tests/fake-omp.mjs` |
 
 ---
 

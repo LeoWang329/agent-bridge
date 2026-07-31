@@ -20,7 +20,7 @@
 - **C5 中途快照如实标注。** 新增 `turnSettled`/`inProgress`,语义**严格**限定为"共享判定 `sessionSettled` 此刻是否视为可交付",不表示成功/正文完整/远端已停(`failed`+`turnSettled:true` 合法)。**不用 `complete`/`partial`** —— abort 之后 settled 为真但正文是片段,叫 complete 是新的谎言。structured output 在 running 时 `json:null` + `schemaPending:true`,不再对半截 JSON 产出看似最终失败的 `schemaError`。
 - **C6(破坏性)在途 turn 默认拒绝关闭。** `close_session` 加 `force`;不传时对未终态会话返回 `{blocked:true, runningSessionIds}` 且**什么都不关**,批量形式是**原子 preflight**(任一在跑则一个都不关)。⚠️ 口径:这只拦得住"**未终态**",拦不住"**已终态但结果从未被取走**" —— 真正的未收口需要一个由 `result()`/`waitSessions` 置位的 `collected` 标志,本轮不做,别宣称 R6 已全解。
 
-**测试:** 新增 `docs/repro-mcp-hang/repro-collect-discipline.mjs`(T1–T28,143 断言),配套新增四个桩:`fake-omp` 的 `slowsettle`/`partialslow`、`fake-codex` 的 `sameflush`/`slowstart`/`schemaslowpartial`。同时修掉一处**既有假绿**:`repro-turnstate` 的收尾 close 从不检查响应,加闸门后会被静默挡住而测试照绿。
+**测试:** 新增 `tests/repro-collect-discipline.mjs`(T1–T28,143 断言),配套新增四个桩:`fake-omp` 的 `slowsettle`/`partialslow`、`fake-codex` 的 `sameflush`/`slowstart`/`schemaslowpartial`。同时修掉一处**既有假绿**:`repro-turnstate` 的收尾 close 从不检查响应,加闸门后会被静默挡住而测试照绿。
 
 **施工说明书:** `docs/PLAN-collect-discipline-hardening-2026-07-26.md`(含两轮异引擎复审闭环与全部"不要做什么")。
 
@@ -36,7 +36,7 @@
 
 **为什么:** 前两次(`message_update` 的 O(n²) 重序列化、v0.6.1 的 `get_state`/`get_last_assistant_text`)都是"**发现哪类事件刷量就加一条类型排除**"。这是打地鼠:单行本身**无上限**,每接一个新后端就重新开一个洞。codex 的洞一直敞着——`item/completed` 携带命令全量输出,实测单个会话日志 8.7MB、**最长单行 1,583,143 字节**。类型排除清单治标;`appendLog` 是所有日志写入的唯一漏斗,把上限放在这里才是普适下界,新后端绕不过。同时 codex/omp 由此对齐 claude/cursor/kimi 既有的"正文不逐字落盘"隐私策略(命令本身、exit code、item 类型等骨架保留,诊断价值不丢)——注意那三个后端是按**事件类型**整条跳过,codex/omp 是按**字段**脱敏,两者的覆盖面并不等价(见上面的口径说明)。
 
-**边界:** 只作用于诊断 `.log` / exit-journal。`answerFile` / `textRef` / MCP 返回的 `text` 仍是**完整未截断全文**——产品契约不变。回归见 `docs/repro-mcp-hang/repro-log-bounds.mjs`(74/74)。
+**边界:** 只作用于诊断 `.log` / exit-journal。`answerFile` / `textRef` / MCP 返回的 `text` 仍是**完整未截断全文**——产品契约不变。回归见 `tests/repro-log-bounds.mjs`(74/74)。
 
 **异引擎复审后的收口(同版本内):** `appendLog` **不开任何豁免**——一开豁免就退回打地鼠。由此产生的四处配套修正:(a) exit-journal 记录改为在**序列化前**按写入预算裁剪 `sessions[]` 整个元素并记 `sessionCount`/`sessionsOmitted`,否则字节级截断会写出**不可 `JSON.parse`** 的行(实测 ~45 会话即触发);(b) claude `type==="result"` 的 `result` 字段是答案原文,在 **claude 事件路径**上显式 elide(**不进** `LOG_BODY_KEYS`——裸键 `result` 也是 codex JSON-RPC 信封的结构体,全局 elide 会毁掉骨架);(c) omp stderr 补 `setEncoding("utf8")`——原先逐 chunk `toString("utf8")` 会把跨 chunk 的多字节字符解成两个替换字符(它是最后一条 Buffer 入口);(d) `redactForLog` 深度超限改为返回 `<elided deep object>`(原先返回原对象=未脱敏子树),且 `content`/`displayContent` 仅在**是字符串时**才整体 elide,是结构时递归保留 `type`/`name`/`id` 而只 elide 内部 `text`/`output` 叶子。上限语义同时收紧:marker 从预算内扣除,单次写入**恒 ≤ 上限**。
 

@@ -599,7 +599,7 @@ function ico(n,cls){ return '<svg class="ic '+(cls||'')+'" viewBox="0 0 24 24" f
       于是缓存填上了、页面也重画了，**正文永远出不来**。
       这类 bug 在页面里查不出来：没有任何东西能单独喂它一份"缓存从空到满"的输入。
 
-   ⚠️ **页面不改写快照。** 快照是 writer 的产物、`contract-invariants.mjs` 验的就是它；
+   ⚠️ **页面不改写快照。** 快照是 writer 的产物、`tests/contract-invariants-session.mjs` 验的就是它；
       这里做的是**另建一份展示模型**，两者并存、互不覆盖。 */
 
 var SESSIONS = [];                 /* 展示模型，由 rebuild() 整体重建 */

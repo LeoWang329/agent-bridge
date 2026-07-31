@@ -2,7 +2,7 @@
  * 委托会话史观测台 —— writer 侧。
  *
  * **合同在 `docs/STATE-session-viz.md`，不在这里。** 本文件是那份散文的一个实现；
- * `skills/agent-bridge/viz/contract-invariants.mjs` 是**另一个**实现，两者刻意互不 import、
+ * `tests/contract-invariants-session.mjs` 是**另一个**实现，两者刻意互不 import、
  * 不共用常量表。理由见 docs/STATE-session-viz.md §11：同源的校验器只能证明「我和我自己一致」。
  *
  * 为什么单独一个文件而不是塞进 `agent-bridge.mjs`：

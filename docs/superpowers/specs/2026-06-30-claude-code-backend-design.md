@@ -182,7 +182,7 @@ the session stays reusable rather than wedged at `running`.
 
 ## 9. Testing
 
-- Unit-ish: reuse the repro/e2e harness pattern in `docs/repro-mcp-hang/`. Add a
+- Unit-ish: reuse the repro/e2e harness pattern in `tests/`. Add a
   `claude`-backed real e2e: open → send (read-only) → result → second turn → close,
   asserting the same session lifecycle invariants the OMP/Codex e2e covers.
 - Turn-state: confirm `isSettled()` never reports a settled turn mid-stream and never

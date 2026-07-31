@@ -119,7 +119,7 @@ agent-bridge 适合做，但**不是去重造流程引擎**（那会造出一个
 
 两个 AI 都去翻了源码，各自确认：`scripts/agent-bridge.mjs` 是一整块、**没有对外开放任何可复用的函数接口**（5491 行，跑到最后直接进命令行入口）。所以路线图文档里说的"以后写调度代码可以直接复用桥的内部机制"，**今天还做不到**——今天只能让工具**自己另起一个 agent-bridge 后台进程、通过标准输入输出对话**。
 
-**这个结论不新**：仓库里 `docs/repro-mcp-hang/` 下的 **49 个脚本一直是这么干的**，还带着 **五个假后端**（fake-omp / fake-codex / fake-claude / fake-cursor / fake-kimi）。好处是——**那份最小 MCP 客户端代码可以直接抄，不用从零写**（`repro-waitany.mjs` 里 spawn + 握手 + 调用工具那几十行）。
+**这个结论不新**：仓库里 `tests/` 下的 **49 个脚本一直是这么干的**，还带着 **五个假后端**（fake-omp / fake-codex / fake-claude / fake-cursor / fake-kimi）。好处是——**那份最小 MCP 客户端代码可以直接抄，不用从零写**（`repro-waitany.mjs` 里 spawn + 握手 + 调用工具那几十行）。
 
 ### 两个想法在讨论中被否掉了（包括我自己提的）
 
@@ -457,4 +457,4 @@ await withBridge(async (bridge) => {
 - 项目"从文字手册演化到代码调度"的路线图：`docs/DESIGN-orchestration-evolution-prose-to-code-2026-07-07.md`
 - 桥本身的用法（发消息、等结果、关会话那套）：`skills/agent-bridge/SKILL.md`
 - "把机械动作抽成小工具"的先例（圆桌记账工具）：`skills/agent-bridge-roundtable/tools/`
-- 现成的最小 MCP 客户端和五个假后端（直接抄 + 当测试闸门）：`docs/repro-mcp-hang/`
+- 现成的最小 MCP 客户端和五个假后端（直接抄 + 当测试闸门）：`tests/`

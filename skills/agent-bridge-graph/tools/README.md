@@ -418,6 +418,6 @@ node node-turn.mjs --id <名> --agent <后端> --cwd <目录> \
 ## 回归测试
 
 ```sh
-node docs/repro-mcp-hang/repro-graph-node.mjs     # 假后端,零消耗,推送前必过(61 项断言)
+node tests/repro-graph-node.mjs     # 假后端,零消耗,推送前必过(61 项断言)
 node skills/agent-bridge-graph/examples/hetero-audit.mjs <目录>   # 真后端 e2e
 ```

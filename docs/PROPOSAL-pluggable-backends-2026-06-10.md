@@ -179,7 +179,7 @@ AGENTS.codex.Session = CodexAppServerSession;
 3. 后置绑定 `AGENTS.*.Session`，`openSession` 改注册表驱动。
 4. enum 改 `Object.keys(AGENTS)`；`roleMatchesCommand` / `doctor` 改读注册表。
 5. Codex `result()` 加 `async`；补接口文档注释。
-6. 每步后跑既有复现/端到端：`docs/repro-mcp-hang/`（`repro-kill` / `repro-pipebreak` / `repro-parent-death` / `repro-watchdog-disarm` / `repro-turnstate` / `repro-halfdead` …）+ OMP/Codex smoke。
+6. 每步后跑既有复现/端到端：`tests/`（`repro-kill` / `repro-pipebreak` / `repro-parent-death` / `repro-watchdog-disarm` / `repro-turnstate` / `repro-halfdead` …）+ OMP/Codex smoke。
 7. 真正接新后端时，才新增其 adapter 类 + 一条注册表项 + 一条 role matcher。
 
 **净改动估计**：~40 行改 + ~15 行加（文档注释），0 新文件、0 新依赖、0 新抽象基类。

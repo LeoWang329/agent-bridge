@@ -100,8 +100,8 @@ claude 单次调用真实占用峰值 ≈147k，而 omp 36k、codex 88k——**�
 
 **改动文件：**
 - `scripts/agent-bridge.mjs`：新增 `lastCallContextTokens`（构造器 + `#beginTurn` 每轮重置）；`#handleLine` 的 assistant 分支捕获末次 per-call input 侧；`contextUsage()` 改读它。**捕获受闸门保护**（`this.turn && pendingAbortedResults===0 && !interrupting`）——与 `#handleResult` 的 usage 捕获同一「只取存活且保留的 turn」不变量，使被 abort 的 turn 的迟到 assistant（此时 pending>0）不会泄漏进后续 turn。**删除**了 `ClaudeCodeSession` 中已成只写死状态的 `tokenUsage`/`modelUsage`（原始 result 已 verbatim 落日志）。
-- `docs/repro-mcp-hang/fake-claude.mjs` + `repro-context-usage.mjs`：ctx 桩改吐真实形状（per-call assistant usage）；新增回归护栏（`ctxturn` 断言取末次 41002 而非聚合 100004；新 `ctxlast` 断言 mid-turn 压缩后取末次 45000 而非峰值 60000/和 135000）。新增 `abortusage` 桩模式。
-- `docs/repro-mcp-hang/probe-claude-abort-usage-gate.mjs`（新）：驱动「abort 后迟到 assistant 带 usage（99000）在 pending>0 时到达」这条泄漏路径,断言被闸门跳过 → B 后 `contextUsage` null。已验证去掉闸门该断言即 FAIL（非空测试）。
+- `tests/fake-claude.mjs` + `repro-context-usage.mjs`：ctx 桩改吐真实形状（per-call assistant usage）；新增回归护栏（`ctxturn` 断言取末次 41002 而非聚合 100004；新 `ctxlast` 断言 mid-turn 压缩后取末次 45000 而非峰值 60000/和 135000）。新增 `abortusage` 桩模式。
+- `tests/probe-claude-abort-usage-gate.mjs`（新）：驱动「abort 后迟到 assistant 带 usage（99000）在 pending>0 时到达」这条泄漏路径,断言被闸门跳过 → B 后 `contextUsage` null。已验证去掉闸门该断言即 FAIL（非空测试）。
 - `probe-claude-abort-fallback.mjs` / `e2e-real.mjs`：更新注释与断言口径（不再引用 modelUsage 选取逻辑）。
 
 **评审：** codex（xhigh，引擎≠实施者）独立评审给 NEEDS_FIXES，命中两点：①assistant 捕获未与 result 捕获同受闸门保护（Medium）②`modelUsage`/`tokenUsage` 成死状态（Low）。二者均按根因修复（非打补丁），并补测试；注释口径亦按其 #2 收紧。

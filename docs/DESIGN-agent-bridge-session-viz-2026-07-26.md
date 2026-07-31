@@ -545,7 +545,7 @@ node skills/agent-bridge/viz/serve.mjs <viz-dir> [--port 7346]
 | 6 | 正文落盘：各后端 canonical 源（§6.2；Codex 三级 fallback；**OMP 宽限 + 无 RPC + `partial` 降级**）+ `bodyKind` 判定 + 同步抓串 → 队列写 → 才发事件 | 五后端 | 5 |
 | 7 | 进度 sidecar（400 字尾巴 + `generation` + `seq`，**覆盖写不用 rename**，结算后删除） | 五后端流式回调 | 4 |
 | 8 | `turn:collected`（§5.4 口径）+ `vizDir` 进 `status`/`open_session` 返回值 | `buildSessionResult` 调用方 + 两个工具 | 4 |
-| 9 | **`docs/STATE-session-viz.md`**（v5：唯一 wire 真理源，取代原来的 `EVENTS.md`，含传输章）+ **`contract-invariants.mjs`**（第二实现，不 import 生产端）+ `viz/serve.mjs`（**v5：基线换成 graph 那份**，§9）+ `viz/index.html` + `viz/sample/` + `test-viz.mjs` + SKILL.md 一节 | `skills/agent-bridge/` | 1-8 |
+| 9 | **`docs/STATE-session-viz.md`**（v5：唯一 wire 真理源，取代原来的 `EVENTS.md`，含传输章）+ **`tests/contract-invariants-session.mjs`**（第二实现，不 import 生产端）+ `viz/serve.mjs`（**v5：基线换成 graph 那份**，§9）+ `viz/index.html` + `viz/sample/` + `tests/test-viz-session.mjs` + SKILL.md 一节 | `skills/agent-bridge/` | 1-8 |
 
 **验收：**
 
@@ -558,7 +558,7 @@ node skills/agent-bridge/viz/serve.mjs <viz-dir> [--port 7346]
   真正的机器门禁见 `PLAN §9 S4`：对五个后端**逐一**注入四类写入的 `throw`/`reject`/queue-full/**永不 resolve**，
   断言 MCP 返回值、`outcome`、`status`、后端健康字段、退出码与 `VIZ=off` **逐字段一致**。
 - **进度不骗人**：造一次"`turn:settled` 先到、迟到的 progress 后到"，断言页面**不会**把已完成轮次打回"正在生成"；造一次 sidecar 写失败，断言页面标 degraded 而不是显示"卡住"。
-- **零消耗回归** `test-viz.mjs`：喂样例 transcript → 断言多轮分离、四档存活、`outcome`×`bodyKind` 各组合、未收口标注、空态、`run:gone` 态。
+- **零消耗回归** `tests/test-viz-session.mjs`：喂样例 transcript → 断言多轮分离、四档存活、`outcome`×`bodyKind` 各组合、未收口标注、空态、`run:gone` 态。
 - `AGENT_BRIDGE_VIZ=off`（以及任何认不出的值）后 `tmpdir` 里一个 `agent-bridge-viz-*` 都不产生；
   **未设时必须产生**（07-31 起那才是默认路径）。
 

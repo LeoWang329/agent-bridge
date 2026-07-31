@@ -117,12 +117,12 @@ Fix: capture the spawning parent's pid once at startup (`process.ppid`) and poll
 
 Dedupe the CC registration (user scope vs repo `.mcp.json`); make `winProcessSnapshot` async/cheaper (existing backlog item).
 
-### Verification (repro harness is committed in `docs/repro-mcp-hang/`)
+### Verification (repro harness is committed in `tests/`)
 
 ```sh
-node docs/repro-mcp-hang/repro-kill.mjs           # backend killed mid-wait  (P1/P1b/P2)
-node docs/repro-mcp-hang/repro-pipebreak.mjs      # backend breaks its stdin pipe while alive (P1b)
-node docs/repro-mcp-hang/repro-parent-death.mjs   # client dies while stdin stays open (P6)
+node tests/repro-kill.mjs           # backend killed mid-wait  (P1/P1b/P2)
+node tests/repro-pipebreak.mjs      # backend breaks its stdin pipe while alive (P1b)
+node tests/repro-parent-death.mjs   # client dies while stdin stays open (P6)
 ```
 
 - **Before fixes:** kill/pipebreak print `wait HUNG` (tool call never returns).
@@ -136,6 +136,6 @@ All three repros + the e2e close-regression PASS as of v0.8.2 (Windows).
 
 - CC log, victim session `ece97119` (project `D:\cc\photo_detect\demo`, file `2026-06-09T05-10-11-935Z.jsonl`): healthy long waits for 23h → 3 sessions opened 11:59:14/45/58 → wait 12:00:02 → `still running (60s)` 12:01:02 → **`Connection closed` 12:01:10.370** → respawn 12:01:17 → retry → `Unknown session: omp-mq7jhqvr-13qbkx`.
 - Windows Application event log 12:01:01–12:01:49: MsiInstaller `node-v24.16.0-x64.msi` begin/installed; RestartManager 10002 "Shutting down … Node.js JavaScript Runtime" ×14 at 12:01:10, plus 10006/10010 ("could not be shut down", pid list including 16024).
-- Repro harness: committed as `docs/repro-mcp-hang/` (`repro-kill.mjs`, `repro-pipebreak.mjs`, `fake-omp.*`) — original runs: kill-idle ×4, kill-streaming `/F`, tree-kill `/T /F`: hang every time; no crash, no graceful return. `repro-kill.mjs` also self-checks P2 (server must exit ≤5s after stdin close).
+- Repro harness: committed as `tests/` (`repro-kill.mjs`, `repro-pipebreak.mjs`, `fake-omp.*`) — original runs: kill-idle ×4, kill-streaming `/F`, tree-kill `/T /F`: hang every time; no crash, no graceful return. `repro-kill.mjs` also self-checks P2 (server must exit ≤5s after stdin close).
 - Repro leftovers were reaped afterwards with `node scripts/agent-bridge.mjs cleanup` (worked as designed: 1 record + 1 run dir removed, 0 terminations, live owners untouched).
 - Key code: `request()` 1114–1122 · omp `close` handler 1001–1018 · omp stdin no-error-listener (cf. codex 1338) · `waitSessions` 1957–1982 · `summarize`/`result` 1176–1188, 1939–1953 · `maybeExit` 2209–2213 · `cleanupAndExit` 2289–2310 · `reclaimStaleLogs` 780–820 · `ownerStillRunning` 650–663 · `close()` first-shot 1267–1276 · `winProcessSnapshot` 527–554.

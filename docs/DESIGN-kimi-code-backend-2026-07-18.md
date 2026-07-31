@@ -315,7 +315,7 @@ isReusable() { return this.#canRun(); }         // deriveHealth 钩子调用
 
 ## 8. 验收
 
-- **hermetic fake-kimi 套件**（照 fake-cursor/fake-claude 思路，`docs/repro-mcp-hang/fake-kimi.js` + `repro-kimi.mjs`）：spawn 失败（含 resolveKimiBin 找不到二进制）；多行 assistant 累积；meta 后延迟 exit；**exit0 无 meta → 判失败（§2.1）**；续轮 meta id 不一致 → 判失败且不覆盖 chatId；exit 非零；abort（首轮 meta 前 → 需 reopen）；timeout abort；close 迟到；并发 send 被堵；stale close 不影响新 child；health（fresh idle 无 chatId→healthy、idle+chatId→healthy、failed+lastTurnError→degraded、closed→dead、首轮 abort 后 turnCount=1/chatId=null→dead 且 send 抛）；contextUsage=null 四处；cleanup matcher（argv0 非 kimi.exe 不命中、prompt 含 ` -p `/`--output-format stream-json` 不误伤、真 turn 命中）。
+- **hermetic fake-kimi 套件**（照 fake-cursor/fake-claude 思路，`tests/fake-kimi.js` + `repro-kimi.mjs`）：spawn 失败（含 resolveKimiBin 找不到二进制）；多行 assistant 累积；meta 后延迟 exit；**exit0 无 meta → 判失败（§2.1）**；续轮 meta id 不一致 → 判失败且不覆盖 chatId；exit 非零；abort（首轮 meta 前 → 需 reopen）；timeout abort；close 迟到；并发 send 被堵；stale close 不影响新 child；health（fresh idle 无 chatId→healthy、idle+chatId→healthy、failed+lastTurnError→degraded、closed→dead、首轮 abort 后 turnCount=1/chatId=null→dead 且 send 抛）；contextUsage=null 四处；cleanup matcher（argv0 非 kimi.exe 不命中、prompt 含 ` -p `/`--output-format stream-json` 不误伤、真 turn 命中）。
 - **repro-health 回归**：四旧后端 deriveHealth 行为字节级不变（kimi 零共享改动，应天然过）。
 - **真 doctor**：`kimi: ok … 0.27.0`（且 resolveKimiBin 不依赖 PATH）。
 - **真 e2e（Windows）**：open(read)→"用 shell 读某文件返随机 nonce"→验 stream-json 有 tool_calls(Bash) + 拿到 nonce + **观察 read 策略被遵从且本次未写盘**（[Min2]：证明遵从，不等于证明不可写，文案保留 soft/非安全边界）；open(write)→"建 inside.txt"→验落盘（写档基线）；含 `& % "` 与多行的 prompt 一条（验 §5.5 不损坏）；两轮 resume（-S 记忆延续）；abort（长跑中断 + 无残留，`agent-bridge cleanup` 复核）。

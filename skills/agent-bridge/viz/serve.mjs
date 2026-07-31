@@ -99,7 +99,7 @@ const isBool = (v) => typeof v === "boolean";
 /**
  * §2.1 第 ④ 条：**必填字段全在、类型对**。
  *
- * ⚠️ 这不是把独立校验器搬进 viewer——语义矩阵（§4.9）仍然只归 `contract-invariants.mjs`。
+ * ⚠️ 这不是把独立校验器搬进 viewer——语义矩阵（§4.9）仍然只归 `tests/contract-invariants-session.mjs`。
  *    viewer 这一层要回答的是另一个问题：**手上这坨字节，是不是一份快照。**
  *    早先只判 `run` 真值 + `sessions` 是数组，于是一个 `{run:{},sessions:[]}` 的空壳
  *    只要 generation 更大就能顶掉旁边那份完好的快照，页面当场清空——
