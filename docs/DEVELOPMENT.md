@@ -167,6 +167,38 @@ node tests/test-viz-session.mjs        # 会话页面这一侧：快照 → 页�
 前者验**每一次真跑出来的 transcript**，后者验**冻结样例** ——
 写方与样例任何一侧漂离合同，当场变红。
 
+### `probe-*` 与 `orphan-claude`（此前**一份文档都没提过**）
+
+这批是 claude 后端与 doctor 那条线的回归，跟 `repro-*` 同等份量，只是名字前缀不同。
+**没被任何清单收录过，于是没人跑** —— `probe-doctor-timeout` 就这么红了很久没人发现
+（2026-07-31 修复：加第 4、5 个后端时没同步这份夹具，cursor 去探了真的 CLI）。
+
+零消耗（假后端 / 假二进制，可以随时跑）：
+
+```sh
+node tests/probe-doctor-timeout.mjs          # 五个后端的 --version 探针都被超时挡住 + 不留孤儿孙进程
+node tests/probe-claude-abort-fallback.mjs   # abort 兜底路径 + 迟到结果被吞掉
+node tests/probe-claude-abort-usage-gate.mjs # abort 跨越时 contextUsage 的闸门
+node tests/probe-claude-badbin.mjs           # 坏 CLAUDE_BIN 必须让 open 干净失败,不许先报 idle 再死
+node tests/probe-claude-effort.mjs           # --effort / --model 到底怎么落到命令行上
+```
+
+要**真 claude 在 PATH 上**（会花额度；装不上时自己跳过退 0）：
+
+```sh
+node tests/probe-claude-doctor.mjs   # 只探 --version,近乎免费
+node tests/probe-claude-open.mjs     # read / write 两档会话都能到 idle
+node tests/probe-claude-turn.mjs     # 连发两轮拿结果
+node tests/probe-claude-abort.mjs    # 真中断一轮,会话还能接着用
+node tests/orphan-claude.mjs         # 桥退出后**绝不**留下活着的 claude(优雅退出 + SIGKILL 两条路)
+```
+
+⚠️ `probe-doctor-timeout` 里那份"哪些后端能被造成挂住"的清单要跟着后端数走。
+kimi 是例外且**造不出来**：`resolveKimiBin` 刻意只认真名 `kimi.exe` 的原生文件、拒绝 `.cmd` 壳
+（prompt 走 argv，经 shim 会绕进 cmd.exe，是注入面）——那条拒绝是安全属性，同时也意味着
+不编译一个真 PE 就伪造不出"会挂住的 kimi.exe"。所以它只考到「不可用 + 不拖慢 doctor」，
+文件里如实分了档，而不是把断言放宽到所有后端（那会让另外四个一起失去牙）。
+
 **真浏览器** e2e（零消耗，但要 playwright；改了页面之后跑一次）：
 
 ```sh
