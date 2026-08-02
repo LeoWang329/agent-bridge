@@ -31,7 +31,8 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { withBridge, startBridge, runNode, UsageError, FAILURE_KINDS, classifyFailure, stderrWindow,
-         hasOrphanArtifacts, reconcileOutcome, archiveFailedRun } from "../skills/agent-bridge-graph/tools/node-core.mjs";
+         hasOrphanArtifacts, reconcileOutcome, archiveFailedRun,
+         inferDeps } from "../skills/agent-bridge-graph/tools/node-core.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, "..");
@@ -90,6 +91,56 @@ function sceneHas(r, names) {
     const st = fs.existsSync(p) ? fs.statSync(p) : null;
     return st && st.isFile() && st.size > 0;
   });
+}
+
+/**
+ * T0 依赖推断(纯函数,不起桥、不花钱)。
+ *
+ * ⚠️ **这个函数以前一条测试都没有**,于是下面这条 bug 活了很久:它把绝对路径一律跳过,
+ *    而 `runNode` 回执里的 `artifactPath` 就是绝对路径 —— 「把上一个环节的 artifactPath
+ *    拼进下一个环节的提问」是这套 API 最标准的串联写法(`examples/hetero-audit.mjs` 就这么写),
+ *    结果推断边恒为 0 条,页面据此把图视图整个禁用。功能在它的头号用法上失效,而没有一条断言会红。
+ */
+function t0_infer_deps() {
+  console.log("\n[T0] 依赖推断(纯函数)");
+  const D = (text, self = "me") => inferDeps(text, self).deps;
+
+  ok("T0 相对路径认得出", JSON.stringify(D("看 nodes/audit.md")) === '["audit"]');
+  ok("T0 反斜杠也认", JSON.stringify(D("看 nodes\\audit.md")) === '["audit"]');
+
+  // 这四种绝对形式都是真实会出现的:Windows 长名/短名、POSIX、file:// URL。
+  ok("T0 ★ Windows 绝对路径认得出(这正是 artifactPath 的样子)",
+    JSON.stringify(D("读 C:\\Users\\me\\run\\nodes\\audit.md")) === '["audit"]');
+  ok("T0 ★ Windows 短名绝对路径也认(LEO~1.WAN 这种)",
+    JSON.stringify(D("读 C:\\Users\\LEO~1.WAN\\run\\nodes\\audit.md")) === '["audit"]');
+  ok("T0 ★ POSIX 绝对路径认得出",
+    JSON.stringify(D("读 /home/me/run/nodes/audit.md")) === '["audit"]');
+  ok("T0 ★ 正斜杠写的 Windows 绝对路径也认",
+    JSON.stringify(D("读 C:/Users/me/run/nodes/audit.md")) === '["audit"]');
+
+  ok("T0 多条按首次出现顺序、去重",
+    JSON.stringify(D("nodes/b.md nodes/a.md nodes/b.md")) === '["b","a"]');
+  ok("T0 去掉自依赖", JSON.stringify(D("nodes/me.md nodes/a.md", "me")) === '["a"]');
+  ok("T0 不是 .md 的不算", JSON.stringify(D("nodes/audit.txt nodes/x.diff")) === "[]");
+  ok("T0 没有 nodes/ 前缀的不算", JSON.stringify(D("看 audit.md")) === "[]");
+  ok("T0 空正文给空数组(不是 null)", JSON.stringify(D("")) === "[]");
+
+  // 截断必须说出来 —— 静默截断等价于"伪装成本来就没有"。
+  const many = Array.from({ length: 250 }, (_, i) => `nodes/n${i}.md`).join(" ");
+  const r = inferDeps(many, "me");
+  ok("T0 超过 200 项取前 200", r.deps.length === 200, String(r.deps.length));
+  ok("T0 ★ 而且把截断这件事说出来", r.truncated === true);
+
+  // 一次真实形状的复现:汇总环节的提问里拼三个 artifactPath。
+  const realistic =
+    "下面几个文件是别的 agent 刚写的答案，自己去读：\n" +
+    "  C:\\Users\\LEO~1.WAN\\AppData\\Local\\Temp\\flow-run\\nodes\\count-repro.md\n" +
+    "  C:\\Users\\LEO~1.WAN\\AppData\\Local\\Temp\\flow-run\\nodes\\read-version.md\n" +
+    "  C:\\Users\\LEO~1.WAN\\AppData\\Local\\Temp\\flow-run\\nodes\\list-skills.md\n";
+  ok("T0 ★★ 真实形状:汇总环节拼三个 artifactPath ⇒ 推断出三条边(改之前这里是 0 条)",
+    JSON.stringify(inferDeps(realistic, "summary").deps)
+      === '["count-repro","read-version","list-skills"]',
+    JSON.stringify(inferDeps(realistic, "summary").deps));
 }
 
 async function t1_success() {
@@ -1656,6 +1707,7 @@ async function main() {
   console.log(`[harness] 运行目录 ${RUN_ROOT}`);
   console.log(`[harness] 假后端 ${FAKE_OMP}`);
   console.log(`[harness] 隔离 state dir ${STATE_DIR}`);
+  t0_infer_deps();
   await t1_success();
   await t2_contract();
   await t3_timeout();

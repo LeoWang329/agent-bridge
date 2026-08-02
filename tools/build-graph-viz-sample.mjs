@@ -105,6 +105,45 @@ const reusableOf = (status) =>
 /** 任务单指纹是 **hex32**(SHA-256 取前 32 个 hex),不是 hex64(§0.2)。 */
 const specHash = (s) => crypto.createHash("sha256").update(s).digest("hex").slice(0, 32);
 
+/** `node:settled.status` 的**封闭**取值集。多一个少一个都该响亮地炸,不该悄悄漏掉。 */
+const SETTLED_BUCKETS = new Set(
+  ["ok", "contract_error", "backend_failed", "timeout", "unknown", "callback_error"]);
+
+/**
+ * `run:final.counts` —— **从这盘带子自己发出去的事件里数出来**,不手填。
+ *
+ * ⚠️ 这跟本文件开头那条「sha256 与 byteCount 都从正文真算,不许手填」是同一条规矩,
+ *    只是当初漏在了 counts 上。代价实测过:手写的那份写着「完成 10、说不清 1」,
+ *    而它自己发的 21 条节点事件数出来是「完成 8、说不清 3」——
+ *    **两个 `unknown` 的环节在汇总里被记成了完成**。方向还偏偏是往好里报:
+ *    「说不清」的规矩是停下等人,并进「完成」就等于把两个该拦下的当成功放过去。
+ *
+ * ⚠️ 它躲过了唯一那条检查,因为那条只验**总和**(总数 = 各档相加):
+ *    ok 多 2、unknown 少 2,和还是 21,照样绿。所以光有恒等式不够,得逐档对账
+ *    (`tests/test-viz-graph.mjs` 已补上)。
+ *
+ * ⚠️ 别写成 `payload.status in c` —— `observed`/`rejected`/`reused` 也是 c 的键,
+ *    真出现同名的 status 就会加错桶。用封闭集判,不认识就抛。
+ */
+function countsFrom(tp) {
+  const c = { observed: 0, rejected: 0, ok: 0, contract_error: 0,
+              backend_failed: 0, timeout: 0, unknown: 0, callback_error: 0, reused: 0 };
+  for (const line of tp.lines) {
+    const { event, payload } = JSON.parse(line);
+    if (event === "node:observed") c.observed += 1;
+    else if (event === "node:rejected") c.rejected += 1;
+    else if (event === "node:settled") {
+      if (!SETTLED_BUCKETS.has(payload.status)) {
+        throw new Error(`node:settled 出现了 counts 装不下的档:${payload.status}`);
+      }
+      c[payload.status] += 1;
+      // `reused` 是 `ok` 的**子集**,不是并列的桶 —— 所以九项加起来不等于总数。
+      if (payload.execution === "reused") c.reused += 1;
+    }
+  }
+  return c;
+}
+
 
 /**
  * 一个"跑起来过"的节点:observed → (workspace) → 每轮 turn → started → attempt* → turn-settled → settled。
@@ -429,9 +468,7 @@ function buildMain() {
                 errorSummary: "到达 20 分钟的执行上限，被主动打断。它当时还在输出。",
                 attempts: [{ n: 1, status: "failed", chars: 12400 }] }] });
 
-  tp.put("run:final", { result: "failed", durationMs: tp.at() - T0 + 1000,
-    counts: { observed: 21, rejected: 6, ok: 10, contract_error: 1, backend_failed: 1,
-              timeout: 1, unknown: 1, callback_error: 1, reused: 1 } });
+  tp.put("run:final", { result: "failed", durationMs: tp.at() - T0 + 1000, counts: countsFrom(tp) });
   return { graphId, text: tp.text() };
 }
 

@@ -160,12 +160,18 @@ node tests/test-viz-session.mjs        # 会话页面这一侧：快照 → 页�
 ```
 
 ⚠️ `repro-graph-viz` 与 `tests/test-viz-graph.mjs` **都**会跑
-`viz/contract-invariants.mjs` —— 合同里那些**跨字段的等式**
+`tests/contract-invariants-graph.mjs` —— 合同里那些**跨字段的等式**
 （「这两处 sha256 必须相等」「这个字段只在那个字段不是 present 时才许出现」）。
-它**刻意不 import `tools/viz-events.mjs`**：schema 只管单个字段的形状，
+它**刻意不 import `skills/agent-bridge-graph/tools/viz-events.mjs`**：schema 只管单个字段的形状，
 拿写方的 schema 去验写方造的事件，验的只是"我和我自己一致"。
 前者验**每一次真跑出来的 transcript**，后者验**冻结样例** ——
 写方与样例任何一侧漂离合同，当场变红。
+（会话观测台那一侧对应的是 `tests/contract-invariants-session.mjs`。）
+
+⚠️ **等式不等于对账。** `run:final.counts` 那条不变式只验**总和**
+（总数 = 各档相加）。实测踩过：样例里手写的 counts 把两个 `unknown` 记成了 `ok`，
+一档多 2、另一档少 2，**和还是 21**，恒等式全程绿灯。
+汇总数字必须**逐档**跟原始事件对账，光验总和的检查是有洞的。
 
 ### `probe-*` 与 `orphan-claude`（此前**一份文档都没提过**）
 

@@ -322,12 +322,33 @@ async function commonChecks(label, url) {
     (await page.evaluate(() => document.body.innerText.trim().length)) > 60);
 
   // 横向溢出:宽内容该在自己的容器里滚,不该把整页顶横。
-  for (const w of [1600, 1280, 900]) {
+  // ⚠️ 800 是后加的:900 照不出顶栏那行「运行 id · outDir 全路径」——它当时 nowrap 又没有宽度
+  //    上限，800px 窗口下自己就比容器宽，把整页顶到 1145px。宽度阈值选得不够窄，等于没考。
+  for (const w of [1600, 1280, 900, 800]) {
     await page.setViewportSize({ width: w, height: 900 });
     await page.waitForTimeout(600);
     const over = await page.evaluate(() =>
       document.documentElement.scrollWidth - document.documentElement.clientWidth);
     ok(`${label} ★ ${w}px 宽下整页不横向溢出(宽内容该在自己容器里滚)`, over <= 1, `溢出 ${over}px`);
+
+    // ⚠️ 上面这条**照不出顶栏那行长路径**:冻结样例的 outDir 是 `D:\repo\.graph\run-1`，短得
+    //    什么都撑不破。真跑时 outDir 是一长串临时目录路径，那一行当时 nowrap 又没宽度上限，
+    //    自己就比容器宽，把整页顶出横向滚动条。**样例里没有的形状，就得在这里现造。**
+    if (w === 800) {
+      const restored = await page.evaluate(() => {
+        const el = document.getElementById("runId");
+        if (!el) return null;
+        const before = el.textContent;
+        el.textContent = "07f21d48-d5af-41cc-877b-18d52ad24b6e · " +
+          "C:\\Users\\SOMEBODY~1.WIN\\AppData\\Local\\Temp\\claude\\D--cc-agent-bridge\\" +
+          "fb162c52-27a4-4870-9298-42eb682c7d49\\scratchpad\\flow-complex-run";
+        const over2 = document.documentElement.scrollWidth - document.documentElement.clientWidth;
+        el.textContent = before;
+        return over2;
+      });
+      ok(`${label} ★★ 800px 下塞一条长 run-id + 长路径,整页仍然不横向溢出`,
+        restored === null || restored <= 1, `溢出 ${restored}px`);
+    }
   }
   await page.setViewportSize({ width: 1500, height: 950 });
   await page.waitForTimeout(500);
@@ -382,6 +403,34 @@ await commonChecks("session", SESSION_URL);
 console.log("\n[graph] 专有");
 {
   const { page } = await openPage(GRAPH_URL);
+
+  // ── 顶栏那排计数,得跟归档里的汇总**逐档**对得上 ─────────────────────────
+  // 页面**不读** `run:final.counts`,它自己从节点事件重算(`countsOf(sc.nodes)`)。
+  // 两条路算同一件事,就必须给出同一个答案 —— 不然界面上写的和归档里存的是两套数字,
+  // 而看页面的人无从知道该信哪个。
+  // ⚠️ 实测踩过:归档里那份写着「完成 10、说不清 1」,页面重算出来是「完成 8、说不清 3」,
+  //    两个「说不清」的环节在汇总里被记成了完成 —— 页面是对的,归档是错的,没人发现。
+  {
+    const declared = fs.readFileSync(path.join(
+      GRAPH_VIZ, "sample", "nodes", ".runs", "gr-sample-main", "transcript.jsonl"), "utf8")
+      .split("\n").filter(Boolean).map((l) => JSON.parse(l))
+      .find((l) => l.event === "run:final")?.payload?.counts ?? null;
+    const shown = await page.evaluate(() =>
+      document.querySelector("#counts")?.innerText.replace(/\s+/g, " ").trim() || "");
+    // 页面把六个失败档合并显示成「失败」,所以这里按页面的口径折算再比。
+    const want = declared && {
+      环节: declared.observed,
+      完成: declared.ok,
+      失败: declared.contract_error + declared.backend_failed + declared.timeout + declared.callback_error,
+      被拒绝: declared.rejected,
+      说不清: declared.unknown,
+    };
+    const missing = want ? Object.entries(want).filter(([k, v]) => !new RegExp(`${k}\\s*${v}(\\D|$)`).test(shown))
+      .map(([k, v]) => `${k} 应为 ${v}`) : ["没找到 run:final"];
+    ok("graph 前提:顶栏计数确实渲染出来了", shown.length > 6, JSON.stringify(shown));
+    ok("graph ★★ 顶栏计数与归档里的汇总**逐档**一致(页面重算 vs 归档声明,两条路必须同一个答案)",
+      missing.length === 0, `${missing.join(" ; ")} —— 页面上是「${shown}」`);
+  }
 
   // 两个视图都得能渲染、切换不出错。
   const tabOk = await page.locator("#tabGraph").isEnabled();
@@ -467,6 +516,52 @@ console.log("\n[graph] 专有");
   ok("graph ★ 点环节方块出详情(详情面板真的填上了)",
     (await page.evaluate(() => document.getElementById("detail")?.innerText.trim().length || 0)) > 100);
 
+  // ── 详情面板里那些「没有值」的字段，必须说人话，不能留空 ─────────────────
+  // ⚠️ 空白读起来是「加载失败」，而实情往往是「没指定，用默认」。本页每个字段都有兜底，
+  //    唯独「型号」「强度」漏了 —— `esc(null)` 出来是空字符串，整行只剩一个标签。
+  {
+    // ⚠️ **必须逐个环节看，不能只点第一个。** 第一版就是只点了 `.nodebox` 第一个 —— 而样例里
+    //    那个环节的 model/effort 都是有值的，于是这条断言从没碰到过缺陷形状(空白只出现在
+    //    没点名型号的环节上)，把缺陷还原回去它照样全绿。**考不到的断言等于没有。**
+    const nodeCount = await page.locator(".nodebox").count();
+    const allFacts = [];
+    for (let i = 0; i < nodeCount; i++) {
+      await page.locator(".nodebox").nth(i).click().catch(() => {});
+      await page.waitForTimeout(220);
+      const one = await page.evaluate(() =>
+        [...document.querySelectorAll("#detail .fact")].map(f => ({
+          k: f.querySelector(".k")?.innerText.trim() || "",
+          v: (f.querySelector(".v")?.innerText || "").trim() })));
+      allFacts.push({ i, facts: one });
+    }
+    const facts = allFacts.at(-1)?.facts || [];
+    ok("graph 前提:详情面板的字段行渲染出来了", facts.length >= 4, JSON.stringify(facts).slice(0, 200));
+    // 前提:样例里确实有「没点名型号」的环节，否则下面那条又是空考
+    const hasNullModel = allFacts.some(a => a.facts.some(f => f.k === "型号" && /默认|—/.test(f.v)));
+    ok("graph 前提:样例里有没点名型号的环节(否则「不许空白」考不到)", hasNullModel,
+      JSON.stringify(allFacts.map(a => a.facts.find(f => f.k === "型号")?.v)));
+    const blank = allFacts.flatMap(a => a.facts.filter(f => f.v === "").map(f => `#${a.i} ${f.k}`));
+    ok("graph ★★ 每个环节详情里都没有「只有标签、右边一片空白」的字段(空白 = 看起来像加载失败)",
+      blank.length === 0, `空着的:${JSON.stringify(blank)}`);
+
+    // ⚠️ 已经结束的环节说「本次没拿到」是误导:那个数往往就在回执里躺着(实测一次真跑,
+    //    四个环节分别记着 39012 / 22629 / 33285 / 18141 token),而「打开回执」就在同一屏。
+    //    真相是**这一层不带**——token 只走 node:progress,结束事件没有这个字段。
+    const ctx = facts.find(f => f.k === "上下文占用");
+    ok("graph 前提:这个环节确实没测到上下文用量(否则下面那条考不到)",
+      !!ctx && /未知/.test(ctx.v), JSON.stringify(ctx));
+    if (ctx && /未知/.test(ctx.v)) {
+      ok("graph ★★ 已结束的环节不许说「本次没拿到」,要指向回执(那个数就在回执里)",
+        !/本次没拿到/.test(ctx.v) && /回执/.test(ctx.v), `写的是「${ctx.v}」`);
+    }
+    // ⚠️ **把详情面板关掉再走。** 上面逐个点环节会把它打开,而它盖住画布 ——
+    //    后面「点边命中率」那条当场从 100% 掉到 0%。测试之间互相干扰比断言写错更难查。
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(400);
+    ok("graph 前提:详情面板已关闭,不挡住后面的画布交互",
+      await page.evaluate(() => document.getElementById("workspace")?.dataset.detail !== "open"));
+  }
+
   await page.close();
 }
 
@@ -527,6 +622,36 @@ console.log("\n[session] 专有");
     await page.waitForTimeout(1000);
     ok("session ★ 点会话卡片出详情",
       (await page.evaluate(() => document.getElementById("detail")?.innerText.trim().length || 0)) > 60);
+
+    // ── 宽屏下的内容列 ────────────────────────────────────────────────────
+    // 设计交付稿是在 ~1280 宽下截的,那个宽度上右栏 928px < 1000px 的上限,
+    // **上限根本没生效** —— 于是"只封了宽度、没定中轴"这个缺陷在导出件里看不见,
+    // 到 2560 的屏上才现原形:内容贴左边缘,右侧空出 1208px。
+    // 所以这一条**必须在宽视口下考**,1500 宽的默认视口照不出来。
+    await page.setViewportSize({ width: 2400, height: 1000 });
+    await page.waitForTimeout(600);
+    const box = await page.evaluate(() => {
+      const r = s => { const e = document.querySelector(s); if (!e) return null;
+        const b = e.getBoundingClientRect(); return { l: b.left, r: b.right, w: b.width }; };
+      const pane = r(".detailwrap"), dpad = r(".dpad"), ib = r(".ib-r1");
+      if (!pane || !dpad || !ib) return null;
+      const cs = getComputedStyle(document.querySelector(".dpad"));
+      return { pane, dpad, ib, padL: parseFloat(cs.paddingLeft),
+               gapL: dpad.l - pane.l, gapR: pane.r - dpad.r };
+    });
+    ok("session 前提:宽屏下内容列确实被宽度上限封住了(没封住就谈不上居中)",
+      box && box.dpad.w < box.pane.w - 40, JSON.stringify(box?.dpad));
+    if (box) {
+      // 「有留白」不够 —— 全堆在一边也满足。要考的是**两边一样宽**。
+      ok("session ★★ 宽屏下内容列居中(只封 max-width 不给中轴,右边会空出半个屏)",
+        Math.abs(box.gapL - box.gapR) <= 2, `左留白 ${box.gapL} / 右留白 ${box.gapR}`);
+      // 粘性信息条和正文各自算自己的中轴,两处数字一旦不同步就会错开一截。
+      ok("session ★★ 粘性信息条与正文落在同一条中轴上(容器不同,两处各写死一个数就会错开)",
+        Math.abs(box.ib.l - (box.dpad.l + box.padL)) <= 1,
+        `信息条左 ${box.ib.l} / 正文左 ${box.dpad.l + box.padL}`);
+    }
+    await page.setViewportSize({ width: 1500, height: 950 });
+    await page.waitForTimeout(400);
   }
 
   // 搜索框得**真的过滤**,不是个装饰。

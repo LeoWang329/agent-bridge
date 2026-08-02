@@ -77,6 +77,31 @@ html = html.replace(/'\s*\+\s*esc\(slug\(s\)\)\s*\+\s*'/g, "");
   html = html.replace(NONE, `(SESSIONS.length?${PICK}:${NONE})`);
 }
 
+// ── 1d. 内容列居中（设计稿只封了宽度，没定中轴） ───────────────────────────
+//
+// ⚠️ 设计稿给右栏内容设了 `max-width:1000px` 却没有 `margin-inline:auto`。
+//    交付稿是在 ~1280 宽下截的，那个宽度上右栏正好 928px < 1000px，
+//    **上限根本没生效**，所以这个缺陷在导出件里看不见。
+//    到 2560 的屏上就现原形：内容贴着左边缘，右侧空出 1208px（48% 的屏）。
+//    顺手把两个尺寸收成变量：`.dpad` 与信息条 `.ib-*` 的容器不同（信息条自带
+//    padding，dpad 的 padding 算在 max-width 内），两处各写一个数字迟早错开中轴。
+{
+  const A = `.dpad{max-width:1000px;padding:0 26px}`;
+  const B = `.ib-r1{display:flex;align-items:center;gap:10px;flex-wrap:wrap;max-width:1000px}`;
+  const C = `.ib-kv{display:flex;flex-wrap:wrap;gap:5px 20px;margin-top:11px;max-width:1000px}`;
+  const D = `.dpad{padding:0 16px}\n  .infobar{padding:12px 16px 10px}`;
+  for (const [name, s] of [["dpad", A], ["ib-r1", B], ["ib-kv", C], ["窄屏 padding", D]]) {
+    if (!html.includes(s)) throw new Error(`找不到 ${name} 的宽度规则，设计稿结构变了`);
+  }
+  html = html
+    .replace(A, `:root{--col:1000px; --gut:26px}\n.dpad{max-width:var(--col);margin-inline:auto;padding:0 var(--gut)}`)
+    .replace(B, `.ib-r1{display:flex;align-items:center;gap:10px;flex-wrap:wrap;max-width:calc(var(--col) - var(--gut)*2);margin-inline:auto}`)
+    .replace(C, `.ib-kv{display:flex;flex-wrap:wrap;gap:5px 20px;margin-top:11px;max-width:calc(var(--col) - var(--gut)*2);margin-inline:auto}`)
+    .replace(`border-bottom:1px solid var(--line);padding:14px 26px 12px}`,
+             `border-bottom:1px solid var(--line);padding:14px var(--gut) 12px}`)
+    .replace(D, `:root{--gut:16px}\n  .infobar{padding:12px var(--gut) 10px}`);
+}
+
 // ── 2. 转成 module（测试与页面共用 reconcile.mjs 的前提） ───────────────────
 html = html.replace("<script>\n/* ===", `<script type="module">
 /* ⚠️ 这是 module：DOM 已就绪才执行，所以顶部直接取元素是安全的。 */

@@ -432,12 +432,20 @@ export function inferDeps(text, selfId) {
   const re = /nodes[/\\]([A-Za-z0-9._-]+)\.md/g;
   let m;
   while ((m = re.exec(text)) !== null) {
-    // **只认相对形式** —— 绝对路径不是本图的边(它指向另一个 out-dir)。
-    // 判据:往回走到分隔符之前那一段,看它是不是以 `/`、`\` 或盘符开头。
-    const lineStart = text.lastIndexOf("\n", m.index) + 1;
-    const before = text.slice(lineStart, m.index);
-    const token = before.split(/[\s"'`(<\[]/).pop() || "";
-    if (token.startsWith("/") || token.startsWith("\\") || /^[A-Za-z]:[/\\]/.test(token)) continue;
+    // ⚠️ **相对与绝对都认,不看路径前缀。**
+    //    这里曾经把绝对路径一律跳过,理由是"跨 out-dir 的引用不是本图的边"。意图没错,
+    //    但「是不是绝对路径」是个很差的代理:`runNode` 回执里的 `artifactPath` **就是绝对路径**,
+    //    而把它拼进下一个环节的提问正是这套 API 最标准的串联写法(`examples/hetero-audit.mjs`
+    //    就是这么写的)。于是这条规则**恰好把 API 自己给出的东西挡在门外** ——
+    //    实测一次四环节真跑,汇总环节的提问里写着前三个环节产出的完整路径,推断边是 **0 条**,
+    //    页面据此把图视图整个禁用。这个功能在它的头号用法上是失效的。
+    //
+    //    也没有改成"解析出来落在本次 outDir 里才认" —— 那要在 Windows 上比对路径
+    //    (短名 `C:\Users\LEO~1.WAN\…` 对长名、大小写、正反斜杠),**对不上时往关的方向失败**:
+    //    推断边回到 0 条,而"0 条"跟原来的常态长得一模一样,没人会发现。
+    //    一道会悄悄退回原 bug 的闸,比不加更糟。
+    //    真正的防线在下游:页面只有在 `id` 于本 graph 恰好出现 1 次时才画边(EVENTS §10.7),
+    //    所以外来路径要造成误导,得它的 `<id>` 恰好跟本图某个环节重名。
     const id = m[1];
     if (id === selfId) continue;      // 去掉自依赖
     if (seen.has(id)) continue;       // 去重,按首次出现顺序排

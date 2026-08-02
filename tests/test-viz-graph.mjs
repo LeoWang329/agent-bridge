@@ -131,12 +131,38 @@ console.log("\n[S] 冻结样例的自洽性");
     }
   }
   // 主样例的 run:final 恒等式
-  const fin = fs.readFileSync(path.join(SAMPLE, "gr-sample-main", "transcript.jsonl"), "utf8")
-    .split("\n").filter(Boolean).map((l) => JSON.parse(l)).find((l) => l.event === "run:final");
+  const mainLines = fs.readFileSync(path.join(SAMPLE, "gr-sample-main", "transcript.jsonl"), "utf8")
+    .split("\n").filter(Boolean).map((l) => JSON.parse(l));
+  const fin = mainLines.find((l) => l.event === "run:final");
   const c = fin.payload.counts;
   const sum = c.rejected + c.ok + c.contract_error + c.backend_failed + c.timeout + c.unknown + c.callback_error;
   ok("S 主样例 counts 恒等式 observed === rejected+六档", c.observed === sum, `${c.observed} ≠ ${sum}`);
   ok("S 主样例 reused ⊆ ok", c.reused <= c.ok);
+
+  // ⚠️ **光有上面那条恒等式不够,它只验总和。**
+  //    实测:样例里手写的 counts 写着「ok 10、unknown 1」,而它自己发的 21 条节点事件
+  //    数出来是「ok 8、unknown 3」—— 两个 `unknown` 的环节被记成了完成。
+  //    一档多 2、另一档少 2,**和还是 21**,恒等式全程绿灯。
+  //    所以必须逐档跟事件对账:counts 是汇总,节点事件是原始记录,汇总不许自说自话。
+  {
+    const actual = { observed: 0, rejected: 0, ok: 0, contract_error: 0,
+                     backend_failed: 0, timeout: 0, unknown: 0, callback_error: 0, reused: 0 };
+    for (const { event, payload } of mainLines) {
+      if (event === "node:observed") actual.observed += 1;
+      else if (event === "node:rejected") actual.rejected += 1;
+      else if (event === "node:settled") {
+        // 用封闭集判,不用 `in` —— observed/rejected/reused 也是键,同名 status 会加错桶。
+        if (!["ok", "contract_error", "backend_failed", "timeout", "unknown", "callback_error"]
+              .includes(payload.status)) { actual[`未知档:${payload.status}`] = 1; continue; }
+        actual[payload.status] += 1;
+        if (payload.execution === "reused") actual.reused += 1;
+      }
+    }
+    const diff = Object.keys(actual).filter((k) => actual[k] !== c[k])
+      .map((k) => `${k}: 汇总说 ${c[k]}、事件里是 ${actual[k]}`);
+    ok("S ★★ 主样例 counts **逐档**与节点事件对得上(只验总和的话,一增一减照样绿)",
+      diff.length === 0, diff.join(" ; "));
+  }
 }
 
 console.log("\n[I] 合同不变式(§1.3 / §3.1 / §5.8)");
@@ -799,6 +825,64 @@ console.log("\n[J] 复用 / 现场键名 / 推断边并集 / 连不上的依赖 
     ok("J ★ 而且**只**画得出能连上的那两条(typo-id 一条都没变出来)",
       JSON.stringify(into) === JSON.stringify(want), JSON.stringify(into) + " vs " + JSON.stringify(want));
     mustFail("连不上的依赖被静默丢掉", !/连不上/.test(rep.note || ""));
+
+    /* ★ 但这一句**只对声明成立**。推断是我们自己猜的,猜空了就是没猜中 ——
+       页面没有立场为自己的猜测报警。照声明那套处置推断,用户会看到一条
+       **他从没写过的依赖**被报成「连不上」,尤其在他一条 deps 都没声明的时候。 */
+    {
+      const R5 = X.newLiveState();
+      const ev = (seq, event, payload) => X.applyEvent(R5, { v: 1, seq, ts: 1e12 + seq, graphId: "g", event, payload });
+      const obs = (nodeSeq, id, inferred) => ({ nodeSeq, id, agent: "omp", access: "read", cwd: "C:\\w",
+        model: null, effort: null, spec: {state:"not-applicable"}, prompt: {state:"not-applicable"},
+        role: {state:"not-applicable"}, declaredDeps: [], inferredDeps: inferred, inferredDepsTruncated: false });
+      ev(0, "run:started", { outDir: "C:\\w", maxConcurrent: 1 });
+      ev(1, "node:observed", obs(0, "solo", []));
+      // 一条**猜**出来的依赖,指向本图根本没有的 id(扫到了别的 out-dir 的路径就会这样)
+      ev(2, "node:observed", obs(1, "user", ["from-another-run"]));
+      const S5 = X.buildScene(R5);
+      const u = S5.nodes.find((n) => n.id === "user");
+      ok("K ★★ 猜出来的依赖连不上时,页面闭嘴(它从没承诺过这条边有意义)",
+        !/连不上/.test(u?.note || ""), `note = ${JSON.stringify(u?.note || "")}`);
+      ok("K 而且也确实没画出那条边",
+        !S5.edges.some((e) => e.b === u?.seq), JSON.stringify(S5.edges));
+    }
+
+    /* ★ write 环节的工作副本去向:**「这一层不带」不是「记录坏了」**。
+       实测踩过:回执正常归档时 `workspaceSummary` 按合同不出现,而页面把这一档也判成
+       `unlogged` —— 于是每个成功的 write 环节都被指控「记录从某处起不完整」,
+       就印在绿色「已交付」框正下方。看到这句的人会开始怀疑上面所有数字。 */
+    {
+      const mk = (hasWsSummary) => {
+        const R6 = X.newLiveState();
+        const ev = (seq, event, payload) => X.applyEvent(R6, { v: 1, seq, ts: 1e12 + seq, graphId: "g", event, payload });
+        ev(0, "run:started", { outDir: "C:\\w", maxConcurrent: 1 });
+        ev(1, "node:observed", { nodeSeq: 0, id: "fix", agent: "claude", access: "write", cwd: "C:\\w",
+          model: null, effort: null, spec: {state:"not-applicable"}, prompt: {state:"not-applicable"},
+          role: {state:"not-applicable"}, declaredDeps: [], inferredDeps: [], inferredDepsTruncated: false });
+        ev(2, "node:workspace-intent",  { nodeSeq: 0, path: "C:\\w\\.graph\\wt\\r\\fix", branch: "graph/r/fix", baseCommit: "abc1234" });
+        ev(3, "node:workspace-created", { nodeSeq: 0, path: "C:\\w\\.graph\\wt\\r\\fix", branch: "graph/r/fix", baseCommit: "abc1234" });
+        ev(4, "node:started", { nodeSeq: 0 });
+        const settled = { nodeSeq: 0, status: "ok", execution: "fresh", durationMs: 1000, outcome: "delivered",
+          receipt: {state:"present", ref:"nodes/.runs/g/0-fix/receipt.json", sha256:"a".repeat(64), byteCount: 10},
+          artifact: {state:"not-applicable"}, diff: {state:"present", ref:"nodes/.runs/g/0-fix/change.diff", sha256:"b".repeat(64), byteCount: 200},
+          turns: [] };
+        // 兜底那一层:summary 出现了、却没记下 removed —— 这一档才是真的"没记全"
+        if (hasWsSummary) settled.workspaceSummary = { branch: "graph/r/fix", baseCommit: "abc1234", changesKnown: true };
+        ev(5, "node:settled", settled);
+        return X.buildScene(R6).nodes.find((n) => n.id === "fix");
+      };
+
+      const normal = mk(false);
+      ok("K ★★ 回执正常归档时,工作副本那栏不许说「记录不完整」(那是留给归档真断了的)",
+        normal?.write?.worktree?.state === "in_receipt", JSON.stringify(normal?.write?.worktree));
+      ok("K ★★ 而分支名要从 workspace 事件里取出来显示(页面手上有,别说没有)",
+        normal?.write?.branch === "graph/r/fix", JSON.stringify(normal?.write));
+      ok("K ★ 基线同理", normal?.write?.base === "abc1234", JSON.stringify(normal?.write?.base));
+
+      const degraded = mk(true);
+      ok("K ★ 但兜底 summary 真的缺 removed 时,照旧如实报「状态未记录」",
+        degraded?.write?.worktree?.state === "unlogged", JSON.stringify(degraded?.write?.worktree));
+    }
 
     /* ★ 重复 id:合同说**恰好出现 1 次才连**,0 次或 ≥2 次都不画,改标一句。
        样例里没有重复 id 的场景(它会改变 counts),所以这里现造一条最小事件流。 */

@@ -229,20 +229,27 @@ details.legend[open] summary .chev{transform:rotate(90deg)}
 .legend-row .lw{color:var(--faint);font-size:11.5px}
 
 /* ---------- 右栏 ---------- */
+/* 内容列的两个尺寸只在这里写一次:列宽上限 + 左右留白。
+   `.dpad` 与信息条里的 `.ib-*` 必须落在**同一条中轴**上,而它们的容器不同
+   (信息条自己带 padding,dpad 的 padding 算在 max-width 里)——用一个变量算出来,
+   比两处各写一个数字靠谱:后者只要有人动其中一个,粘性头就会和正文错开。
+   ⚠️ 早先这里只有 max-width、没有 margin-inline —— 1000px 的列贴着左边缘,
+      2560 宽的屏上右侧空出 1208px(48% 的屏),看着像布局塌了。 */
+:root{--col:1000px; --gut:26px}
 .detailwrap{position:relative;min-width:0;min-height:0;display:flex;flex-direction:column}
 .detail{flex:1 1 auto;overflow-y:auto;padding:0 0 90px;scroll-behavior:auto}
-.dpad{max-width:1000px;padding:0 26px}
+.dpad{max-width:var(--col);margin-inline:auto;padding:0 var(--gut)}
 
 /* 会话信息条 */
 .infobar{position:sticky;top:0;z-index:12;background:color-mix(in oklab,var(--surface) 94%,transparent);
-  backdrop-filter:saturate(1.4) blur(10px);border-bottom:1px solid var(--line);padding:14px 26px 12px}
-.ib-r1{display:flex;align-items:center;gap:10px;flex-wrap:wrap;max-width:1000px}
+  backdrop-filter:saturate(1.4) blur(10px);border-bottom:1px solid var(--line);padding:14px var(--gut) 12px}
+.ib-r1{display:flex;align-items:center;gap:10px;flex-wrap:wrap;max-width:calc(var(--col) - var(--gut)*2);margin-inline:auto}
 .ib-name{font-size:17px;font-weight:650;letter-spacing:.01em}
 .ib-id{font:11.5px/1 var(--mono);color:var(--faint);background:var(--surface-2);border:1px solid var(--line);
   border-radius:6px;padding:4px 7px}
 .ib-state{display:inline-flex;align-items:center;gap:7px;font:12px/1 var(--sans);font-weight:650;
   padding:5px 11px;border-radius:999px;border:1px solid var(--line);background:var(--surface-2)}
-.ib-kv{display:flex;flex-wrap:wrap;gap:5px 20px;margin-top:11px;max-width:1000px}
+.ib-kv{display:flex;flex-wrap:wrap;gap:5px 20px;margin-top:11px;max-width:calc(var(--col) - var(--gut)*2);margin-inline:auto}
 .kv{display:flex;flex-direction:column;gap:3px;min-width:0}
 .kv .k{font:10px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--faint)}
 .kv .v{font:12.5px/1.35 var(--mono);color:var(--ink-soft);overflow-wrap:anywhere}
@@ -431,12 +438,13 @@ body.run-ended .shell{display:none}
 
 /* 窄窗口：左右退化为上下 */
 @media (max-width:1080px){
+  /* 窄屏收紧留白。改这一个变量,dpad 与信息条一起跟着走 —— 不用再分别改两处数字。 */
+  :root{--gut:16px}
   .shell{grid-template-columns:1fr;grid-template-rows:minmax(190px,34vh) 1fr}
   .sidebar{border-right:none;border-bottom:1px solid var(--line)}
   .shell.collapsed{grid-template-rows:0 1fr}
   .runmeta,.deeplink{display:none}
-  .dpad{padding:0 16px}
-  .infobar{padding:12px 16px 10px}
+  .infobar{padding:12px var(--gut) 10px}
   .live,.settled{margin-left:11px;margin-right:11px}
 }
 </style>

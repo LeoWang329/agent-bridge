@@ -115,7 +115,12 @@ button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:poin
   background:linear-gradient(150deg,var(--e-codex),var(--accent));box-shadow:inset 0 0 0 1px rgba(255,255,255,.15);
 }
 .brand .glyph svg{width:15px;height:15px}
-.runid{font:11.5px/1 var(--mono);color:var(--faint);border-left:1px solid var(--line-2);padding-left:11px;white-space:nowrap}
+/* ⚠️ 这一行是「运行 id · outDir 全路径」，而路径要多长有多长。
+      早先只有 `white-space:nowrap`、没有宽度上限 —— 窗口拉到 800px 时它自己就比容器宽，
+      把**整页**顶出横向滚动条（实测 800px 窗口 → 页面 1145px）。
+      截断 + `title` 看全文：宽度不够时少看几个字，总好过整页横着滚。 */
+.runid{font:11.5px/1 var(--mono);color:var(--faint);border-left:1px solid var(--line-2);padding-left:11px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;max-width:min(60ch,42vw)}
 .tb-sp{flex:1 1 auto}
 
 .runpill{
@@ -1923,8 +1928,17 @@ function writeOf(n, status){
           所以这条路上给不出改动清单，页面必须说清"要看清单去回执"，不能默默显示成零项。 */
     const w = s.workspaceSummary || {};
     const hasWs = !!s.workspaceSummary;
+    /* ⚠️ 分支名与基线**不是只有 `workspaceSummary` 才有** —— `node:workspace-intent` /
+          `node:workspace-created` 这两条事件本来就带着它们（§10.3 还明写「页面凡是要用
+          工作副本路径的地方，一律取最后一条 intent」）。
+          早先这条路只认 `workspaceSummary`，而它按合同**只在回执没归档成功时才出现**，
+          于是**正常交付的 write 环节一律显示不出分支名** —— 页面手上明明有。
+          更糟的是下面那句「改动已提交，进了下面这个分支」还指着一片空白。
+          `intent` 每次重试会被覆盖成最新那条，正是合同要的「最后一条」。 */
+    const wsEv = n.ws.created || n.ws.intent || {};
     return {
-      outcome: s.outcome, branch: w.branch || null, base: w.baseCommit || null,
+      outcome: s.outcome, branch: w.branch || wsEv.branch || null,
+      base: w.baseCommit || wsEv.baseCommit || null,
       /* null = 「这一层拿不到清单」，与 []（确知零项）不是一回事。 */
       files: null,
       changesKnown: typeof w.changesKnown === 'boolean' ? w.changesKnown : null,
@@ -1945,9 +1959,19 @@ function writeOf(n, status){
             可能没删、也可能删了但没确认，**推不出「这个目录现在还在磁盘上」**。
             说"还在"会让人去核对一个可能不存在的目录；说"未确认"，人才知道去看一眼、
             也知道看不到并不代表出了错。 */
+      /* ⚠️ 最后一档**曾经写成 `hasWs ? 'unlogged' : 'unlogged'`** —— 三元两边同一个值，
+            作者显然想分两种情况，写着写着塌成了一个。后果不是少显示点东西，是**页面对着
+            一次完整的记录喊「记录从某处起不完整」**：`unlogged` 这个词在本页是留给
+            "归档真的断了"的（页面专门有一条横幅解释那种情况），而回执正常归档时
+            `workspaceSummary` 按合同本来就不出现（§5.8）——那是"这一层不带"，不是"记录坏了"。
+            于是**每一个成功的 write 环节**都会被指控归档损坏，就印在绿色「已交付」框正下方。
+            ⚠️ 而且它跟上面 25 行那句注释自己写的「不是"丢了"」**正好相反**。
+         判据就是 `hasWs`：
+           有 summary 却没有 `removed` ⇒ 兜底那一层真的没记全 ⇒ `unlogged`（如实报）
+           没有 summary          ⇒ 合同规定的正常形态 ⇒ `in_receipt`（指路，不报警） */
       worktree: {state: w.removed === true ? 'cleaned'
                       : w.removed === false ? 'unconfirmed'
-                      : hasWs ? 'unlogged' : 'unlogged',
+                      : hasWs ? 'unlogged' : 'in_receipt',
                  path: w.path || null},
       diff: mapAsset(s.diff, s.outcome === 'no-changes' ? '没有可交付的改动' : undefined),
     };
@@ -2087,10 +2111,15 @@ function buildScene(R){
     /* ⚠️ 连不上的依赖**必须说出来**：一条 id 打错的 deps 静默消失，用户看到的是
           「我明明写了依赖，图上却没有」，且没有任何线索可查。重复 id 同理 ——
           猜一个"最近的"等于凭空发明一条因果。 */
+    /* ⚠️ 但「连不上要说出来」**只对声明成立，推断必须闭嘴**：声明是用户写下的一句话，
+          连不上多半是 id 打错了；推断是我们自己猜的，猜空了就是没猜中——页面没有立场
+          为自己的猜测报警。照声明那套处置推断，用户会看到一条**他从没写过的依赖**被报成
+          「连不上」，尤其在他一条 deps 都没声明的时候，那句话无从理解。 */
     const link = (id, kind, extra) => {
       const r = resolveDep(R, id);
-      if (r.missing){ bad.push('<code>'+esc(id)+'</code>（本图里没有这个 id）'); return; }
-      if (r.ambiguous){ bad.push('<code>'+esc(id)+'</code>（本图里有 '+r.ambiguous+' 个同名节点，指哪个无从判断）'); return; }
+      const say = (msg) => { if (kind === 'declared') bad.push(msg); };
+      if (r.missing){ say('<code>'+esc(id)+'</code>（本图里没有这个 id）'); return; }
+      if (r.ambiguous){ say('<code>'+esc(id)+'</code>（本图里有 '+r.ambiguous+' 个同名节点，指哪个无从判断）'); return; }
       if (edges.some(e => e.a===r.seq && e.b===seq)) return;  // 已经有一条了就不重画
       edges.push(Object.assign({a:r.seq, b:seq, kind}, extra));
     };
@@ -2319,7 +2348,10 @@ function countsOf(nodes){
 
 function renderTop(sc){
   const rs = RUNSTATE[sc.run.state] || RUNSTATE.waiting;
-  $('#runId').textContent = sc.run.id ? sc.run.id + ' · ' + sc.run.dir : '尚未收到任何运行';
+  /* 截断之后要能看到全文 —— 否则窄窗口下 outDir 就彻底看不见了。 */
+  const runIdTxt = sc.run.id ? sc.run.id + ' · ' + sc.run.dir : '尚未收到任何运行';
+  $('#runId').textContent = runIdTxt;
+  $('#runId').title = runIdTxt;
   $('#runPill').setAttribute('data-r', rs.r);
   $('#runPillText').textContent = rs.t + (sc.run.state==='running' && sc.run.elapsed!=null ? ' · 已跑 '+fmtDur(sc.run.elapsed) : '')
     + (sc.run.state==='ended' && sc.run.elapsed!=null ? ' · 用时 '+fmtDur(sc.run.elapsed) : '');
@@ -2625,8 +2657,13 @@ let ATT = {seq:null, turn:null, idx:0, raw:false};
 
 function factsHTML(n){
   const f = [];
-  f.push(['型号', esc(n.model)]);
-  f.push(['强度', esc(n.effort)]);
+  /* ⚠️ 没点名型号/强度时这两个字段是 `null`，`esc(null)` 出来是**空字符串** —— 整行只剩
+        标签、右边一片空白，读起来像"加载失败"，而实情是"没指定，用引擎自己的默认"。
+        本页每个字段都有兜底（`—`、`未知`、`不适用`），唯独这两行漏了。 */
+  const orDefault = (v) => (v == null || v === '')
+    ? '<span class="unknownv">默认</span> <span class="u">没点名，用引擎自己的</span>' : esc(v);
+  f.push(['型号', orDefault(n.model)]);
+  f.push(['强度', orDefault(n.effort)]);
   const qd = (n.t.q[0]==null) ? '—' : fmtDur((n.t.q[1]==null ? SC.run.now : n.t.q[1]) - n.t.q[0]);
   f.push(['排队时长', qd + (n.t.q[1]==null && n.t.q[0]!=null ? ' <span class="u">仍在排队</span>' : '')]);
   if (n.reused){
@@ -2647,8 +2684,14 @@ function factsHTML(n){
   /* ⚠️ 这是**绝对 token 数**,不是百分比 —— 上下文腐化跟绝对长度走,不跟"占窗口多少"走。
         各后端窗口普遍 1M,换算成比例会把腐化低估掉。所以这里不显示窗口、不显示百分比。
         ⚠️ null **不等于 0**:cursor / kimi 恒为 null,把它当 0 会让它们永远看起来最新鲜。 */
+  /* ⚠️ 「本次没拿到」对**已经结束**的环节是句误导：那个数往往就在回执里躺着（实测一次真跑，
+        四个环节分别记着 39012 / 22629 / 33285 / 18141 token），而「打开回执」的链接就在同一屏。
+        真相是**这一层不带**：token 只走 `node:progress`，结束事件里没有这个字段。
+        所以按"还在跑 / 已经结束"分开说 —— 前者才是真的还没拿到。 */
   f.push(['上下文占用', n.ctx==null
-    ? '<span class="unknownv">未知</span> <span class="u">'+(n.engine==='cursor'||n.engine==='kimi'?'该引擎不提供':'本次没拿到')+'</span>'
+    ? '<span class="unknownv">未知</span> <span class="u">'+(
+        (n.engine==='cursor'||n.engine==='kimi') ? '该引擎不提供'
+        : n.status==='running' ? '还没拿到' : '这一层不带 · 去回执看')+'</span>'
     : fmtN(n.ctx)+' <span class="u">token'+(n.ctx>=400000 ? ' · 已过重开线' : n.ctx>=300000 ? ' · 已过关注线' : '')+'</span>']);
   const modeTxt = n.mode==='write'
     ? '<b>write 模式 · 独立工作副本</b><div class="u" style="margin-top:3px;line-height:1.5">明确授权改文件，且改动有隔离。</div>'
@@ -2770,6 +2813,9 @@ const WT = {
   failed:           ['建不起来', '创建失败；常见原因是上次残留清不掉，那东西可能还在。'],
   pending:          ['正在建', '这个环节还在跑。'],
   unlogged:         ['状态未记录', '记录从某处起不完整，这一栏的状态未知。'],
+  /* 回执正常归档时事件里**按合同就没有**工作副本去向（§5.8）。这不是故障，别用
+     `unlogged` 那套"记录坏了"的话去说它 —— 指个路就行。 */
+  in_receipt:       ['见回执', '这一层不带工作副本去向；回执里记着（上面「打开回执」）。'],
 };
 
 /**
@@ -2826,7 +2872,9 @@ function writeBlock(n){
     o.push(box('ok', ICO.info, zero ? '已交付，但这次提交没有净改动' : '已交付',
       zero ? '<p style="margin:0">分支往前走了，但净改动是空的。'+
              '<b>这不是「无改动」</b>：分支上确实有这次提交。</p>'
-           : '<p style="margin:0">改动已提交，进了下面这个分支。</p>'+
+           /* ⚠️ 「进了**下面这个**分支」是一句指向下文的话 —— 下面没有分支名时它就是空口承诺。
+                 拿不到分支名的时候换一句不指向下文的说法。 */
+           : '<p style="margin:0">改动已提交'+(w.branch ? '，进了下面这个分支。' : '到一条分支上（分支名见回执）。')+'</p>'+
              (n.status!=='ok' ? '<p style="margin:7px 0 0"><b>这次执行不合格，但改动是可用的</b> —— 分支照常给出。</p>' : '')));
     o.push(wsFields(w));
     o.push(changeList(w));
