@@ -451,7 +451,10 @@
 
 ⚠️ **`prompt` 是唯一一个"这一层可能压根没有这个概念"的槽**:`conversation()` 的 `prompt`/`promptFile`/`timeoutMs`/`schema`/`outputShape`/`reask` **全是逐轮参数,写在顶层任务单上直接 `UsageError`**。所以对话节点在 `node:observed` 这一刻**确实还没有任何提问**——第一句话要到 `node:turn` 才出现。⚠️ 页面**不许**把这种 `not-applicable` 显示成"提问丢了";它与"单轮节点的 prompt 归档失败(`unavailable`)"是两件事。
 
-⚠️ **两档 deps 的可靠性完全不同,页面不许画成一样**:`declaredDeps` 是**调用方的声明,系统既不校验也不执行**(执行路径上没有任何代码读它,所以它也**不进 `specHash`**);`inferredDeps` 是启发式,会漏也会多。
+⚠️ **两档 deps 的可靠性完全不同,页面不许画成一样**:`declaredDeps` 是**调用方的声明**,系统**不校验它指向的环节存不存在、也不拿它排执行次序**(没有依赖解析、没有调度器);`inferredDeps` 是启发式,会漏也会多。
+
+⚠️ **但 `declaredDeps` 不是纯注解 —— 它进复用闸。** 本节早先写的是「执行路径上没有任何代码读它」,那句话现在**不成立**。复用时会拿它去查「上游从我上次跑完到现在变了没有」(判据是回执上的 `depsState` 字段 —— 那是回执的内容,不是事件流的一部分,所以本文不收它的形状,定义在 `node-core.mjs` 的 `blankReceipt` 上)。它仍然**不进 `specHash`** —— 声明本身不改变执行结局,变的是**上游的内容**,而那个由 `depsState` 单独记、单独比。
+> 为什么非有这道闸不可:`specHash` 只算本环节自己的输入,而组合纪律 6 要求「结果靠文件路径传」,于是**上游内容整个换掉、下游的提问一个字不变,两次的指纹一模一样**,`reuseIfSame` 直接命中,把上一版上游的汇总当成这一版端出去 —— 页面、回执、退出码全都显示正常。这是"静默给出错误答案",不是"跑挂了"。
 
 #### `nodeSeq` 的分配时机(**它同时定死了磁盘布局**)
 
@@ -1571,7 +1574,7 @@ Cache-Control: no-store
 
 | 档 | 来源 | 画法 |
 |---|---|---|
-| **A 显式声明(未执行验证)** | `node:observed.declaredDeps` | 实线箭头 + tooltip「仅展示,不影响调度」 |
+| **A 显式声明(未执行验证)** | `node:observed.declaredDeps` | 实线箭头 + tooltip「不影响调度;但会参与复用判定」 |
 | **B 推断** | **三处取并集**:`node:observed.inferredDeps` ∪ 该节点每一条 `node:turn.inferredDeps` ∪ `node:settled.turns[].inferredDeps` | **虚线**箭头 + 悬浮标"推断" |
 | **C 兜底** | 只有时间先后与并行关系 | 泳道时间轴,**不画箭头** |
 

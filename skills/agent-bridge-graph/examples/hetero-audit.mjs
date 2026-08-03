@@ -126,6 +126,9 @@ const result = await withBridge(async (bridge) => {
     agent: SUMMARIZER,
     cwd: TARGET,
     outDir: OUT_DIR,
+    // ⚠️ 传的是**路径**不是正文,所以某份审计重跑、内容整个换掉之后,这里的提问一个字都不会变。
+    //    声明出来,复用闸才查得到「上游变了没有」;不声明,它就只能照旧端出上一版的汇总。
+    deps: ok.map((a) => a.id),
     timeoutMs: PER_NODE_TIMEOUT_MS,
     prompt:
       `只读任务(**不要修改任何文件**)。下面几份文件是几个不同引擎对同一个仓库的独立审计结果,` +

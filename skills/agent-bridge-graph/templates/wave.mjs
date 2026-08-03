@@ -67,8 +67,14 @@ const result = await withBridge(async (bridge) => {
   if (ok.length === 0) return { halt: "第 1 波全挂了,没东西可汇总" };
 
   // 第 2 波:换引擎汇总。**传路径不传正文**(大家在同一个 cwd,让它自己读)。
+  //
+  // ⚠️ `deps` **不能省**。传的是路径不是正文,所以某个探针重跑、内容整个换掉之后,
+  //    这里的提问**一个字都不会变** —— 指纹一样 ⇒ `reuseIfSame` 命中 ⇒ 端出来的是照着
+  //    **上一版探针**写的汇总,而且状态、页面、退出码全都显示正常。声明了 deps,
+  //    这一波就会当场报错叫你决定要不要 force;不声明,这道闸对这个环节根本不存在。
   const synth = await bridge.runNode({
     id: "synthesis", agent: SYNTH_AGENT, cwd: CWD, outDir: OUT_DIR,
+    deps: ok.map((p) => p.id),
     access: "read", timeoutMs: TIMEOUT_MS, reuseIfSame: true,
     prompt:
       `只读任务(不要改文件)。下面几份是不同引擎对同一问题的独立调查结果,**请自己读这些文件**:\n` +

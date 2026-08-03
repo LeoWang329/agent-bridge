@@ -3239,7 +3239,7 @@ function showEdgePop(i, ev){
   if (!pop){ pop = document.createElement('div'); pop.id = 'edgePop'; pop.className = 'edgepop'; wrap.appendChild(pop); }
   const body = e.kind === 'inferred'
     ? '<b>推断的依赖 · 可能猜错，也可能漏掉</b>'+e.why+'<div style="margin-top:6px;color:var(--faint)">系统发现后一个环节的输入里提到了前一个环节的产出文件，据此猜了一条边。</div>'
-    : '<b>显式声明（未经验证）</b>用户自己写了这条依赖。<div style="margin-top:6px;color:var(--faint)"><b>仅展示，不影响执行顺序</b> —— 系统既不校验也不据此调度。</div>';
+    : '<b>显式声明（未经验证）</b>用户自己写了这条依赖。<div style="margin-top:6px;color:var(--faint)"><b>不影响执行顺序</b> —— 系统不检查这个环节存不存在，也不据此排先后。<br>但它<b>会参与复用判定</b>：下一次想直接拿旧结果时，会先看上游从那时到现在变了没有。</div>';
   const warn = e.warn ? '<div style="margin-top:8px;padding:7px 9px;border-radius:6px;background:color-mix(in oklab,var(--c-timeout) 13%,var(--surface));border:1px solid color-mix(in oklab,var(--c-timeout) 42%,var(--line));color:var(--ink)"><b>一致性提示</b> · '+e.warn+'</div>' : '';
   pop.innerHTML = '<button type="button" class="x" id="popX" aria-label="关闭说明"><span aria-hidden="true">✕</span></button>'+body+warn;
   const x = Math.min(Math.max(8, ev.clientX - r.left + wrap.scrollLeft + 12), wrap.scrollLeft + wrap.clientWidth - 320);

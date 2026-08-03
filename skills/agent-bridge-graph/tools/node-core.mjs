@@ -360,7 +360,11 @@ export function normalizeSpec(raw, { kind = "node" } = {}) {
   // 范围界定。**必须早于 computeSpecHash** —— 它会被拼进冻结的正文里。
   s.scope = normalizeScope(s.scope);
 
-  // A 档拓扑:调用方声明的依赖。**系统既不校验也不执行** —— 执行路径上没有任何代码读它。
+  // A 档拓扑:调用方声明的依赖。**系统不校验它指向的环节存不存在,也不拿它排执行次序**
+  // (没有依赖解析、没有调度器)。但它**不再是纯注解**:复用闸会拿它去查
+  // 「上游从我上次跑完到现在变了没有」(见 `blankReceipt.depsState`)。
+  // 所以它进不进 `specHash` 是另一回事 —— 它**不进**(声明本身不改变执行结局),
+  // 变的是上游内容,而那个由 `depsState` 单独记、单独比。
   s.declaredDeps = normalizeDeps(s.deps);
   delete s.deps;
 
@@ -401,8 +405,15 @@ function normalizeDeps(raw) {
   const seen = new Set();
   for (const d of raw) {
     if (typeof d !== "string" || d === "") throw new UsageError(`deps 每项必须是非空字符串,拿到 ${JSON.stringify(d)}`);
-    if (!/^[A-Za-z0-9._-]+$/.test(d)) {
-      throw new UsageError(`deps 每项只能用字母数字和 . _ -(与 id 同一字符集),拿到:${JSON.stringify(d)}`);
+    // ⚠️ 必须与 `id` **逐字符相同**的字符集(见上面 `id` 那道闸:点号是产物名的分隔符)。
+    //    这里曾经多放了一个点号,而错误信息还写着"与 id 同一字符集" —— 一句自己打自己脸的话。
+    //    以前只是句空话(带点的 dep 指向一个永远不可能存在的环节),但 deps 现在是**承重的**
+    //    (进复用闸),那种 dep 会变成一条恒为 `absent` 的记录:**看着像一道闸,永远不会响**。
+    if (!/^[A-Za-z0-9_-]+$/.test(d)) {
+      throw new UsageError(
+        `deps 每项只能用字母数字和 _ -(与 id 同一字符集),拿到:${JSON.stringify(d)}` +
+        (d.includes(".") ? "\n  (点号是产物名的分隔符,环节 id 里就不许有,所以也不可能有这样一个上游。)" : ""),
+      );
     }
     if (seen.has(d)) continue; // 去重后**保持声明顺序**
     seen.add(d);
@@ -1704,11 +1715,18 @@ export async function prepareRun(bridge, rawSpec, { kind = "node", hold = null }
     throw Object.assign(new UsageError(`无法创建环节锁文件 ${lockPath}:${e.message}`), { phase: "lock" });
   }
 
+  /* 声明依赖此刻的内容态。**必须算在幂等闸之前** —— 闸门要拿它跟回执里记的那份比对。
+     **只算一次,既当判据又进回执**:两处用同一个值,它的含义才只有一个
+     ——「决定这一次要不要复用的那一刻,上游长什么样」。分两处各算一次就是两个时钟,
+     而两个时钟混用是本仓栽过的老坑。 */
+  run.depsState = computeDepsState(nodesDir, spec.declaredDeps);
+
   run.receipt = blankReceipt({
     id: spec.id, specHash: spec.specHash, agent: spec.agent,
     model: spec.model ?? null, effort: spec.effort ?? null,
     access: spec.access, startedAt: run.startedAt,
   });
+  run.receipt.depsState = run.depsState;
   if (isConv) {
     run.receipt.kind = "conversation";
     run.receipt.turns = [];
@@ -2131,6 +2149,42 @@ export function archiveFailedRun(nodesDir, id, prevStatus) {
            files: moved.map(([, to]) => to) };
 }
 
+/** 一个**上游环节**此刻的产出摘要 —— 用来回答「它跟我上次跑的时候相比,变了没有」。
+ *
+ *  判据取自上游**自己的那张回执**:它每真跑一次就被整张重写,所以"上游又跑了一遍、
+ *  产出换了"必然让这个摘要变。回执读不出来(还没跑 / 被删 / 不是合法 JSON)一律记 `absent`
+ *  —— 那也是一种确定的状态,下次还是 `absent` 就说明"上游到现在也还是没有产出",
+ *  没变就是没变,不该因此拒掉复用。
+ *
+ *  ⚠️ 它**认不出**「有人绕过回执直接改了上游那个 .md」。那件事归上游自己的复用闸
+ *  (下面 `artifactSha256` 那道)管,在上游下一次被声明时兜住。别把这个摘要当防篡改用。
+ *
+ *  ⚠️ `JSON.parse("null")` 是**成功**的(本仓踩过),所以下面必须显式判 `!r`,
+ *  不能只靠 try/catch。 */
+function depContentDigest(nodesDir, depId) {
+  let r = null;
+  try { r = JSON.parse(fs.readFileSync(path.join(nodesDir, `${depId}.receipt.json`), "utf8")); }
+  catch { return "absent"; }
+  if (!r || typeof r !== "object" || Array.isArray(r)) return "absent";
+  // 只取**内容**相关的几样,不取时长/时间戳 —— 否则上游重跑出一模一样的文字也会把
+  // 下游判成"变了",白烧一次钱。write 环节的交付物不只是那段文字,diff 也算。
+  const desc = {
+    v: r.receiptVersion ?? null,
+    status: r.status ?? null,
+    sha: r.artifactSha256 ?? null,
+    turns: Array.isArray(r.turns) ? r.turns.map((t) => [t?.key ?? null, t?.artifactSha256 ?? null]) : null,
+    diff: r.workspace?.diffSha256 ?? null,
+  };
+  return sha256Text(stableStringify(desc)).slice(0, 32);
+}
+
+/** 声明依赖此刻的内容态。**只认 `declaredDeps`,不认 `inferredDeps`** ——
+ *  推断是启发式(会漏也会多),拿它当闸门的话,一次多猜就能把一条本来干净的复用判死,
+ *  而给出的理由是"某条**我们自己猜**出来的边变了"。用户没法反驳,也没法修。 */
+function computeDepsState(nodesDir, declaredDeps) {
+  return declaredDeps.map((id) => [id, depContentDigest(nodesDir, id)]);
+}
+
 /** 幂等闸:上一张回执还能不能当成这一次的结果。
  *  ⚠️ **每一条不匹配都是 `throw new UsageError`,没有一条回退去重跑** —— 静默重跑会把
  *  "上一版任务的结果"和"这一版"混在一起,是最难查的一类错。要重跑请显式加 `force`。 */
@@ -2163,6 +2217,39 @@ async function checkReuse(run) {
   // 只有成功的回执才值得复用 —— 复用一张失败回执等于把上次的失败凭空延续下去
   if (prev.status !== "ok") {
     throw new UsageError(`回执存在但上次是 ${prev.status}(不是 ok),不复用失败结果。要重跑请加 force。`);
+  }
+  /* 上游变没变。**指纹管不住这件事** —— `specHash` 只算本环节自己的输入,而纪律 6 要求
+     结果靠文件路径传,于是上游内容整个换掉、本环节的提问一个字不变,指纹一模一样。
+     不查这一条,复用出来的就是**上一版上游**的答案,而且一声不吭(见 `blankReceipt.depsState`)。
+
+     ⚠️ 逐条按**现在声明的**那几个依赖去查,不是拿两张清单整体比:
+       · 现在声明了、回执里没记 ⇒ 无从确认,拒(新加的声明、或修复之前写下的旧回执都落这儿)
+       · 现在不声明了 ⇒ 不查(不再声称依赖它,它变不变与本环节无关)
+     ⚠️ 这道闸**不许写成 `if (prev.depsState)`**:那会让"回执里没这个字段"静默跳过校验,
+        而没有这个字段的回执恰恰全是修复之前写下的、也就是最该被拦住的那一批。
+        (「字段缺失 = 跳过校验」这一族缺陷本仓已经踩到第三次。) */
+  if (spec.declaredDeps.length) {
+    const rec = new Map(Array.isArray(prev.depsState) ? prev.depsState.map((e) => [e?.[0], e?.[1]]) : []);
+    const unknown = [], changed = [];
+    for (const [id, now] of run.depsState) {
+      if (!rec.has(id)) unknown.push(id);
+      else if (rec.get(id) !== now) changed.push(`${id}(当时 ${rec.get(id)} → 现在 ${now})`);
+    }
+    if (unknown.length) {
+      throw new UsageError(
+        `这个环节声明依赖 ${unknown.join("、")},但回执里没记下当时它们的产出长什么样:${receiptPath}\n` +
+        `  两种可能:①这几条依赖是这次新声明的 ②这张回执是"上游变了下游不吭声"那个 bug 修好之前写下的。\n` +
+        `  两种情况下都无从确认上游没变过 —— 复用可能把上一版上游的结果当成这一版。要重跑请加 force。`,
+      );
+    }
+    if (changed.length) {
+      throw new UsageError(
+        `回执可复用,但它依赖的上游变了:${changed.join("、")}(${receiptPath})\n` +
+        `  上次那个答案是照着**旧的**上游产出写的,复用等于把过期的结论当成本次结果。\n` +
+        `  处置:确认要照新上游重做就加 force(会覆盖上次那次执行的产出);\n` +
+        `        若这个环节其实不该依赖它们,就把 deps 里那几项去掉。`,
+      );
+    }
   }
   if (run.isConv) {
     // ⚠️ **`kind` 这道闸只属于 conversation()。** `runNode` 的复用闸绝不能开始查它 ——
@@ -2331,6 +2418,17 @@ function blankReceipt({ id, specHash = null, agent = null, model = null, effort 
     // 留在**回执里**而不是只留在磁盘上:回执是这个环节唯一的对外记录。
     retriedFrom: null,
     inferredDeps: [], inferredDepsTruncated: false,
+    /** 跑这一次的时候,**声明依赖**的那几个环节各自的产出长什么样:`[[depId, digest], …]`,
+     *  按声明顺序;没声明依赖时是 `[]`。
+     *
+     *  为什么要有它:`specHash` 只算这个环节**自己**的输入,而组合纪律 6 又要求
+     *  「结果靠文件路径传,别把正文贴进下一个提问」—— 两条凑一起就漏了:上游重跑一遍、
+     *  内容整个换掉,下游的提问一个字没变,指纹一模一样,`reuseIfSame` 直接命中,
+     *  把**上一版上游**的汇总当成这一版端出去,页面上和回执里全都显示正常。
+     *  这属于"静默给出错误答案",本仓最贵的那一类。
+     *
+     *  ⚠️ **对话也有这个字段**(对话同样能声明依赖),所以它不在上面那串 delete 里。 */
+    depsState: [],
     startedAt, endedAt: null, diagnostics: [], error: null, scene: null,
     sessionId: null, abortConfirmed: null, closeConfirmed: null, artifactSha256: null,
     // v2:**每次尝试各自一条**。第一次的产出不再被第二次覆盖(见 attemptArtifactPathFor)。

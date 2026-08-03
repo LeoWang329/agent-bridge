@@ -88,6 +88,7 @@ const run = async () => {
     const branch = fix.workspace.branch;
     const review = await bridge.runNode({
       id: `review-r${ROUND}`, agent: REVIEW_AGENT, access: "read",
+      deps: [`fix-r${ROUND}`],   // ← 复审的结论只在**这一轮修订**之上成立,声明出来复用闸才管得住
       cwd: REPO, outDir: OUT, effort: "xhigh", timeoutMs: REVIEW_MS,
       prompt: `对抗性复审。**只读,不要改任何文件。**
 

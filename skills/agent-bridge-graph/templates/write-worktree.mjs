@@ -75,6 +75,7 @@ const result = await withBridge(async (bridge) => {
   // ── 复核:read 档 + 换引擎。**传 diff 路径,不贴 diff 正文**。
   const review = await bridge.runNode({
     id: "review", agent: REVIEWER, cwd: REPO, outDir: OUT_DIR,
+    deps: [impl.id],           // ← 复核的结论只在**这一版实施**之上成立,声明出来复用闸才管得住
     access: "read", timeoutMs: TIMEOUT_MS,
     prompt:
       `只读复核(**不要修改任何文件**)。有人在分支 ${ws.branch} 上做了一处改动。\n` +

@@ -877,6 +877,136 @@ async function t13_defect_fixes() {
       String(rejected?.message).slice(0, 140));
   }
 
+  // ── D8:上游变了,下游不许静默复用 ────────────────────────────────────────
+  // 这一族是**静默给出错误答案**,不是"跑挂了" —— 页面、回执、退出码全都显示正常,
+  // 端出来的却是照着**上一版上游**写的结论。所以每一条都要考到"它有没有响",
+  // 光考"能跑通"等于没考。
+  {
+    const outDir = path.join(RUN_ROOT, "t14-deps");
+    const nodesDir = path.join(outDir, "nodes");
+    const E = { ...BASE_ENV, FAKE_OMP_MODE: "echoturn" };   // echoturn:产出 = 收到的提问,内容可控
+    const upPath = path.join(nodesDir, "up.md");
+    // 下游的提问**恒定不变**,只写上游产物的路径 —— 这正是组合纪律 6 要求的写法,
+    // 也正是让 specHash 看不见上游变化的那个原因。
+    const downSpec = { id: "down", agent: "omp", cwd: REPO, timeoutMs: 30000, outDir,
+                       deps: ["up"], prompt: `读 ${upPath} 然后汇总` };
+    const settle = (p) => p.then((r) => ({ r }), (e) => ({ e }));
+
+    let first;
+    await withBridge(async (b) => {
+      await b.runNode({ id: "up", agent: "omp", cwd: REPO, prompt: "UPSTREAM_V1", timeoutMs: 30000, outDir });
+      first = await b.runNode(downSpec);
+    }, { env: E });
+    ok("D8 前提:上游与下游都跑成功了", first.status === "ok", first.status);
+    ok("D8 ★ 回执里记下了「跑的时候上游长什么样」(没有它,这道闸无从比对)",
+      Array.isArray(first.depsState) && first.depsState.length === 1
+        && first.depsState[0][0] === "up" && /^[0-9a-f]{32}$/.test(first.depsState[0][1]),
+      JSON.stringify(first.depsState));
+
+    // ① 上游内容真的换了 → 下游必须被拦
+    let changed;
+    await withBridge(async (b) => {
+      await b.runNode({ id: "up", agent: "omp", cwd: REPO, prompt: "UPSTREAM_V2_TOTALLY_DIFFERENT",
+                        timeoutMs: 30000, outDir, force: true });
+      changed = await settle(b.runNode({ ...downSpec, reuseIfSame: true }));
+    }, { env: E });
+    ok("D8 前提:上游产出确实变了(不然这一条考不到东西)",
+      fs.readFileSync(upPath, "utf8").includes("UPSTREAM_V2_TOTALLY_DIFFERENT"),
+      fs.readFileSync(upPath, "utf8").slice(0, 80));
+    ok("D8 ★★ 上游重跑换了内容 ⇒ 下游复用被拒(旧行为:静默端出上一版的汇总)",
+      changed.e instanceof UsageError && /依赖的上游变了/.test(changed.e.message),
+      changed.e ? String(changed.e.message).slice(0, 160) : `没报错,拿到 status=${changed.r?.status} reused=${changed.r?.reused}`);
+    ok("D8 ★ 报错要指名道姓说是哪个上游变的(不然人不知道该 force 谁)",
+      /\bup\b/.test(String(changed.e?.message)), String(changed.e?.message).slice(0, 200));
+
+    // ② 上游**真的又跑了一遍**、但产出内容一模一样 ⇒ 不许误伤。
+    //    误伤的代价不只是白烧一次钱,更在于给出的理由(「上游变了」)本身是假的。
+    //    ⚠️ 次序要紧:下游先对齐 → **上游再跑一遍** → 最后才试复用。
+    //    少了中间那次上游重跑,这一条什么都没考到 —— 变异验牙当场逮到过这个假绿。
+    let same, upBefore, upAfter;
+    const upRec = path.join(nodesDir, "up.receipt.json");
+    await withBridge(async (b) => {
+      const upSpec = { id: "up", agent: "omp", cwd: REPO, prompt: "UPSTREAM_V2_TOTALLY_DIFFERENT",
+                       timeoutMs: 30000, outDir, force: true };
+      await b.runNode(upSpec);
+      await settle(b.runNode({ ...downSpec, force: true }));   // 下游对齐到当前上游
+      upBefore = fs.readFileSync(upRec, "utf8");
+      await b.runNode(upSpec);                                 // ★ 上游又真跑一遍,产出一模一样
+      upAfter = fs.readFileSync(upRec, "utf8");
+      same = await settle(b.runNode({ ...downSpec, reuseIfSame: true }));
+    }, { env: E });
+    ok("D8 前提:上游确实又真跑了一次(整张回执被重写),而产出内容没变",
+      upBefore !== upAfter && JSON.parse(upBefore).artifactSha256 === JSON.parse(upAfter).artifactSha256,
+      `回执有没有变=${upBefore !== upAfter} sha=${JSON.parse(upBefore).artifactSha256?.slice(0, 10)}/${JSON.parse(upAfter).artifactSha256?.slice(0, 10)}`);
+    ok("D8 ★★ 上游重跑但内容没变 ⇒ 照常复用(判据是内容,不是「它又跑了一次」)",
+      same.r?.status === "ok" && same.r?.reused === true,
+      same.e ? String(same.e.message).slice(0, 160) : JSON.stringify({ s: same.r?.status, reused: same.r?.reused }));
+
+    // ③ 修复之前写下的回执(没有 depsState)⇒ 无从确认,必须响亮拒掉。
+    //    ⚠️ 这一条是"字段缺失 = 静默跳过校验"那一族的第四次 —— 写成 `if (prev.depsState)`
+    //    就会让**最该被拦的那批回执**(正好全是修复前写的)一路绿灯通过。
+    let legacy;
+    {
+      const rp = path.join(nodesDir, "down.receipt.json");
+      const orig = fs.readFileSync(rp);                       // ⚠️ 原始字节,验完必须还回去
+      const rec = JSON.parse(orig.toString("utf8"));
+      delete rec.depsState;
+      fs.writeFileSync(rp, JSON.stringify(rec));
+      await withBridge(async (b) => { legacy = await settle(b.runNode({ ...downSpec, reuseIfSame: true })); },
+        { env: E });
+      // ★ 还原。不还原的话,下面第 ⑤ 条比的就是**这张被我改坏的回执** —— 它照样会"通过",
+      //   但通过的理由是假的(prev.depsState 压根不存在,闸门什么都没比)。变异验牙逮到过这个。
+      fs.writeFileSync(rp, orig);
+    }
+    ok("D8 ★★ 回执里没有 depsState(修复之前写的)⇒ 拒绝复用,不静默放行",
+      legacy.e instanceof UsageError && /没记下当时它们的产出长什么样/.test(legacy.e.message),
+      legacy.e ? String(legacy.e.message).slice(0, 160) : `没报错:status=${legacy.r?.status}`);
+
+    // ④ 这次**新加**的依赖声明 ⇒ 当时没记过它,同样无从确认。
+    //    注意 deps 不进 specHash,所以这一条**只能**由这道闸拦 —— 指纹闸看不见它。
+    let added;
+    await withBridge(async (b) => {
+      await b.runNode({ id: "solo", agent: "omp", cwd: REPO, prompt: "NO_DEPS", timeoutMs: 30000, outDir });
+      added = await settle(b.runNode({ id: "solo", agent: "omp", cwd: REPO, prompt: "NO_DEPS",
+                                       timeoutMs: 30000, outDir, deps: ["up"], reuseIfSame: true }));
+    }, { env: E });
+    ok("D8 ★ 新加的依赖声明 ⇒ 拒绝复用(deps 不进 specHash,指纹闸看不见这件事)",
+      added.e instanceof UsageError && /没记下当时它们的产出长什么样/.test(added.e.message),
+      added.e ? String(added.e.message).slice(0, 160) : `没报错:status=${added.r?.status} reused=${added.r?.reused}`);
+
+    // ⑤ 反过来:**不再声明**它了 ⇒ 不查。不再声称依赖,它变不变就与本环节无关。
+    let dropped;
+    await withBridge(async (b) => {
+      dropped = await settle(b.runNode({ id: "down", agent: "omp", cwd: REPO, timeoutMs: 30000, outDir,
+                                         prompt: `读 ${upPath} 然后汇总`, reuseIfSame: true }));
+    }, { env: E });
+    ok("D8 ★ 去掉 deps 之后照常复用(闸门按**现在声明的**逐条查,不是两张清单整体比)",
+      dropped.r?.status === "ok" && dropped.r?.reused === true,
+      dropped.e ? String(dropped.e.message).slice(0, 160) : JSON.stringify({ s: dropped.r?.status, reused: dropped.r?.reused }));
+
+    // ⑥ 没声明依赖的环节完全不受影响(这道闸的爆炸半径必须只有"声明了依赖的那些")
+    let plain;
+    await withBridge(async (b) => {
+      await b.runNode({ id: "lonely", agent: "omp", cwd: REPO, prompt: "P", timeoutMs: 30000, outDir });
+      plain = await settle(b.runNode({ id: "lonely", agent: "omp", cwd: REPO, prompt: "P",
+                                       timeoutMs: 30000, outDir, reuseIfSame: true }));
+    }, { env: E });
+    ok("D8 ★ 没声明依赖的环节复用照旧(爆炸半径只有声明了依赖的那些)",
+      plain.r?.status === "ok" && plain.r?.reused === true,
+      plain.e ? String(plain.e.message).slice(0, 160) : JSON.stringify({ s: plain.r?.status, reused: plain.r?.reused }));
+
+    // ⑦ 带点号的 dep 要当场拒:它指向一个**永远不可能存在**的环节(id 里不许有点号),
+    //    放进来就是一条恒为 absent 的记录 —— 看着像一道闸,永远不会响。
+    let dotted;
+    await withBridge(async (b) => {
+      dotted = await settle(b.runNode({ id: "dotted", agent: "omp", cwd: REPO, prompt: "P",
+                                        timeoutMs: 30000, outDir, deps: ["a.b"] }));
+    }, { env: E });
+    ok("D8 ★ 带点号的 dep 当场拒(错误信息说的「与 id 同一字符集」必须为真)",
+      dotted.e instanceof UsageError && /与 id 同一字符集/.test(dotted.e.message),
+      dotted.e ? String(dotted.e.message).slice(0, 160) : "没报错");
+  }
+
   // ── 命令行入口也得有这两个开关 ────────────────────────────────────────────
   // 为什么单独考:CLI 早就有**销毁式**的 `--force`,却没有**留档式**的重试 ——
   // 只给危险的不给安全的,人就只能用危险那个。光在 JS 那层修完,CLI 用户照样撞 D3。
