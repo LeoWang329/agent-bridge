@@ -67,8 +67,20 @@ function bodyOf(ref, opts = {}) {
   if (leaf.endsWith(".patch") || leaf.endsWith(".diff"))
     return `diff --git a/sample b/sample\n(样例占位:${ref})\n`;
   if (leaf.endsWith(".log")) return `[sample] ${ref}\n(会话日志占位)\n`;
+  /* ⚠️ 下面这两段围栏代码块**不是装饰,是覆盖率**。
+     页面把 markdown 里的围栏渲染成 `.codefold` 折叠块,而样例里长期**一个围栏都没有**
+     ⇒ 那条渲染路径从来没被任何回归走到过。结果:折叠三角的尺寸规则只挂在 `.fold` 上、
+     `.codefold` 里那个够不到,SVG 只有 viewBox 没有宽高,在 flex 里**撑成 263×263** ——
+     一个本该 11px 的小三角变成占满整个代码块的巨型箭头。
+     是真跑一次 graph、拿 Playwright 翻产出时当场看见的,离线回归一条都碰不到。
+     **短的那段行数 ≤10 ⇒ 渲染成展开态;长的那段 >10 ⇒ 收起态**,页面对这两支的处置不同,
+     两边都得有样例(见 index.html 的 `md()`:`n<=10 ? ' open' : ''`)。 */
+  const longBlock = Array.from({ length: 14 }, (_, i) => `const line${i + 1} = ${i + 1};`).join("\n");
   return `# 样例内容\n\n这是 \`${ref}\` 的占位正文,供页面离线开发与回归使用。\n\n` +
-         `真实运行里这里是那一步的完整产出,**字节直传、未截断**。\n`;
+         `真实运行里这里是那一步的完整产出,**字节直传、未截断**。\n\n` +
+         "```sh\nnode tests/repro-graph-node.mjs\n```\n\n" +
+         `下面这段够长,页面会渲染成**收起**的折叠块:\n\n` +
+         "```js\n" + longBlock + "\n```\n";
 }
 const ARCHIVE = new Map();          // ref → 正文(落盘时照抄,保证与 sha256 一致)
 

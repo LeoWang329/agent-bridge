@@ -471,8 +471,14 @@ button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:poin
 .fold{border:1px solid var(--line);border-radius:9px;margin-bottom:9px;background:var(--surface);overflow:hidden}
 .fold>summary{list-style:none;cursor:pointer;padding:9px 11px;display:flex;align-items:center;gap:8px;font-size:12.5px;font-weight:650;color:var(--ink)}
 .fold>summary::-webkit-details-marker{display:none}
-.fold>summary .caret{width:11px;height:11px;flex:0 0 auto;color:var(--faint);transition:transform .15s}
-.fold[open]>summary .caret{transform:rotate(90deg)}
+/* ⚠️ 尺寸写在**图标自己**身上,不写在某一个容器上。
+   原先是 `.fold>summary .caret{…}` —— 而同一个 `ICO.caret` 还被 `.codefold`(渲染 markdown
+   里的代码块折叠)用着,那条选择器够不到它。SVG 只有 viewBox、没有宽高,放进 flex 的 summary 里
+   就**撑满整行**:实测 263×263 —— 一个本该 11px 的小三角,变成占满代码块的巨型箭头。
+   (真跑一次 graph、用 Playwright 翻产出时当场看见的。)
+   规则挂在容器上,第二处用同一个图标的地方就什么都拿不到 —— 挂在图标上,第三处也不会再犯。 */
+.caret{width:11px;height:11px;flex:0 0 auto;color:var(--faint);transition:transform .15s}
+details[open]>summary .caret{transform:rotate(90deg)}
 .fold>summary .sm{margin-left:auto;font:10.5px/1 var(--mono);color:var(--faint);font-weight:400}
 .fold-body{padding:0 11px 11px;border-top:1px solid var(--line);padding-top:10px}
 

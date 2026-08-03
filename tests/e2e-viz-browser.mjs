@@ -554,6 +554,35 @@ console.log("\n[graph] 专有");
       ok("graph ★★ 已结束的环节不许说「本次没拿到」,要指向回执(那个数就在回执里)",
         !/本次没拿到/.test(ctx.v) && /回执/.test(ctx.v), `写的是「${ctx.v}」`);
     }
+    // ── 折叠三角的尺寸 ─────────────────────────────────────────────────
+    // ⚠️ 真跑一次 graph、拿 Playwright 翻产出时当场看见的:markdown 里的代码块折叠
+    //    (`.codefold`)里那个三角被撑成 **263×263** —— 尺寸规则只写在 `.fold>summary .caret` 上,
+    //    同一个 `ICO.caret` 在 `.codefold` 里够不到,而 SVG 只有 viewBox 没有宽高,
+    //    放进 flex 的 summary 就撑满整行。**离线回归一条都碰不到它**,因为样例里
+    //    长期一个围栏代码块都没有(已在 build-graph-viz-sample.mjs 里补上)。
+    //
+    // ⚠️ 断言查的是**渲染出来的尺寸**,不是"这个元素在不在" —— 元素一直都在,
+    //    它只是大了 24 倍。「非空」型断言对这类缺陷完全没有牙。
+    {
+      const carets = await page.evaluate(() => [...document.querySelectorAll(".caret")].map((e) => {
+        const r = e.getBoundingClientRect();
+        const host = e.closest("details");
+        return { w: Math.round(r.width), h: Math.round(r.height),
+                 kind: host ? host.className : "(不在 details 里)", open: !!host?.open,
+                 deg: getComputedStyle(e).transform };
+      }));
+      ok("graph 前提:详情里**确实渲染出了代码块折叠**(样例没有围栏的话,下面全是空考)",
+        carets.some((c) => c.kind.includes("codefold")),
+        JSON.stringify(carets.map((c) => c.kind)));
+      const fat = carets.filter((c) => c.w > 20 || c.h > 20);
+      ok("graph ★★ 每一个折叠三角都是小图标(尺寸挂在图标上,不挂在某一个容器上)",
+        fat.length === 0, `撑大的:${JSON.stringify(fat)}`);
+      // 展开态必须转 90° —— 不转的话箭头指着右边,等于对着一个已经打开的块说"我是收起来的"
+      const openNotTurned = carets.filter((c) => c.open && (c.deg === "none" || /^matrix\(1,\s*0,\s*0,\s*1/.test(c.deg)));
+      ok("graph ★ 展开着的折叠块,三角要转过来(不转 = 页面在说一句假话)",
+        openNotTurned.length === 0, JSON.stringify(openNotTurned));
+    }
+
     // ⚠️ **把详情面板关掉再走。** 上面逐个点环节会把它打开,而它盖住画布 ——
     //    后面「点边命中率」那条当场从 100% 掉到 0%。测试之间互相干扰比断言写错更难查。
     await page.keyboard.press("Escape");
