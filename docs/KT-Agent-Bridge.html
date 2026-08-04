@@ -168,7 +168,7 @@
 
     <section class="summary">
       <strong>核心理解：</strong>Agent Bridge 不是另一个聊天窗口，而是一套“让当前 Agent 调度其他独立 Agent”的能力。
-      使用者不需要操作底层会话工具，只要明确说出要使用 Agent Bridge、希望完成的任务、是否允许改文件，以及是否需要独立复核、并行调查、圆桌讨论或无人值守闭环。
+      使用者不需要操作底层会话工具，只要明确说出要使用 Agent Bridge、希望完成的任务、是否允许改文件，以及需要的是哪一种协作：独立复核、并行调查、圆桌讨论、无人值守闭环，还是把整条流程写成可重跑的脚本。
     </section>
 
     <h2>先选场景</h2>
@@ -181,6 +181,7 @@
         <tr><td>实现功能、评审代码、设计方案或定位复杂 Bug</td><td><strong>开发工作流 Dev</strong></td><td>实现、独立评审、修复和验证闭环</td></tr>
         <tr><td>至少需要三个不同视角，对高风险问题作裁决或全面探索</td><td><strong>圆桌 Roundtable</strong></td><td>匿名多轮审议记录和主席综合结论</td></tr>
         <tr><td>任务很大，希望从需求合同一直自动跑到黑盒验收通过</td><td><strong>自动交付 Loop</strong></td><td>验收合同、逐 Goal 迭代证据、整支评审和交付报告</td></tr>
+        <tr><td>要多个不同引擎分头干活或互相挑刺，而且环节多、要循环、要按结果分岔</td><td><strong>编排脚本 Graph</strong></td><td>一段可重跑的流程、每个环节的完整产出与回执，外加一块能看全过程的观测台</td></tr>
       </tbody>
     </table>
 
@@ -197,9 +198,25 @@
       <ul>
         <li>你希望另一个模型独立复核当前结论，避免“自己评自己”。</li>
         <li>一个问题可以拆成多个互不依赖的方向，希望同时调查。</li>
-        <li>你指定要用 OMP、Codex、Claude，或经 OMP 调用某个模型。</li>
+        <li>你指定要用某一个引擎（现在有五个：OMP、Codex、Claude、Cursor、Kimi），或经 OMP 调用某个模型。</li>
         <li>任务需要连续追问，希望同一个委托 Agent 保留这条任务线的上下文。</li>
       </ul>
+
+      <h3>可以点名哪些 Agent</h3>
+      <table>
+        <thead><tr><th>引擎</th><th>你该知道的</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Codex</strong></td><td><strong>只有它的“只读”是真只读</strong>——系统层面拦住写盘。要硬保证不动你的文件，点名它。</td></tr>
+          <tr><td><strong>OMP</strong></td><td>可以经它调用多种模型。点名模型时要用 <code>厂商/模型名</code> 的完整写法，只写别名可能被路由到别家。</td></tr>
+          <tr><td><strong>Claude</strong></td><td>一个上下文全新的独立 Claude 工作实例，适合做独立复核。</td></tr>
+          <tr><td><strong>Cursor</strong></td><td>⚠️ <strong>内容会进 Cursor 云端而且删不掉</strong>；同一个目录下先后开的会话之间<strong>不隔离</strong>，别拿它当“独立第二意见”。</td></tr>
+          <tr><td><strong>Kimi</strong></td><td>⚠️ 会话状态在本地，但<strong>推理仍走 Moonshot 云端</strong>——内容照样出境。</td></tr>
+        </tbody>
+      </table>
+      <aside class="note">
+        <strong>“只读”不等于“动不了你的文件”。</strong>除 Codex 外，其余四家的只读是<strong>靠约定压着</strong>的，不是系统拦的——它们能跑命令，而命令就能写盘。
+        真正需要“一个字都不许改”的场合，请明确点名 Codex；或者反过来，直接给写权限 + 一个用完就丢的隔离工作区。
+      </aside>
 
       <h3>你需要怎么说</h3>
       <p>必须明确说出“使用 Agent Bridge”或“找其他独立 Agent”。建议同时给出任务范围、工作目录、是否允许改文件和完成标准。</p>
@@ -341,6 +358,84 @@
       <p>验收合同、假设账本、每个 Goal 每轮的生成与验证记录、验证资产、整支评审结论和最终交付报告。无人值守模式还会给出独立分支名，不会直接占用或污染用户正在工作的主树。</p>
     </section>
 
+    <h2>场景五：把流程写成脚本</h2>
+    <section class="scenario">
+      <div class="eyebrow">Agent Bridge Graph</div>
+      <span class="tag">不同引擎混编</span><span class="tag">循环与分岔用代码</span><span class="tag">中间产出不占上下文</span><span class="tag">可重跑、可存下来复用</span>
+
+      <h3>什么时候用</h3>
+      <p><strong>一句话判据：这件事的价值，是不是来自“这些 AI 不是同一个脑子”。</strong>是，才值得考虑这个场景。</p>
+      <p>在此基础上，命中任意一条就该写成脚本，否则老实用基础委托：</p>
+      <ul>
+        <li><strong>环节数超过五六个</strong>——再多，光靠主 Agent 记“谁跑完了、谁还没跑”就开始出错。</li>
+        <li><strong>要循环</strong>（不确定几轮）<strong>或要按结果分岔</strong>（这一步的结果决定下一步找谁）。</li>
+        <li><strong>中间产出大</strong>（每个环节几千字）——手工驱动会把这些正文全灌进主 Agent 的上下文，把它挤爆。</li>
+        <li><strong>这个流程你要跑不止一次。</strong></li>
+      </ul>
+
+      <aside class="avoid">
+        <strong>两种常见的误判：</strong>
+        <br>① “分头查再汇总”“一个干一个挑刺”这些<strong>形状</strong>，光用基础委托也摆得出来。切换线不是形状，是<strong>流程复杂到手工驱动会漏</strong>。
+        <br>② 活儿<strong>全能由 Claude 一家干完</strong>、根本不需要不同引擎时，用 Claude Code 自带的工作流工具更成熟，别为了用工具而用工具。
+      </aside>
+
+      <h3>你需要怎么说</h3>
+      <pre><code>使用 agent-bridge-graph 编排一个流程：
+让 codex、claude、omp 各写一版“批量导入”的实现，彼此看不到对方的东西；
+写完互相匿名挑刺，选一个最稳的，让它自己按意见修一轮；
+最后换一个全程没下场的引擎独立验收。打开观测台，我要看过程。</code></pre>
+      <pre><code>使用 agent-bridge-graph：三个不同引擎分头审 src/auth、src/api、src/db，
+范围各自划死、不许越界；然后换一个没参与的引擎汇总共同问题和分歧。</code></pre>
+
+      <h3>实际会怎么运行</h3>
+      <div class="flow">主 Agent 写一段 JS → 脚本自己把整个流程跑完 → 只把一小坨摘要交回来</div>
+      <ul>
+        <li><strong>循环、分岔、过滤、计票用普通代码写，不叫 AI 判断。</strong>代码不会被提示词说服跳过，主 Agent 的“自觉”会。</li>
+        <li><strong>中间产出落在磁盘上，主 Agent 一个字都不看</strong>——所以几十个环节、每个几千字也不会挤爆它。</li>
+        <li>改代码的环节各自跑在<strong>隔离的 Git 工作副本</strong>里，各出一条分支和一份 diff，同时开几个也不会互相踩。</li>
+        <li>⚠️ <strong>脚本一旦启动，主 Agent 就出局了</strong>，没有“跑到一半回来问你”这回事。要中途拍板，就把决策点切在两波之间：跑一波 → 回来给你看 → 你决定 → 再跑一波（已经跑完的环节不会重跑、不再花钱）。</li>
+      </ul>
+
+      <h3>你最终会拿到什么</h3>
+      <p>每个环节一份<strong>完整产出</strong>（原样不截断）和一份<strong>回执</strong>（用的哪个引擎、跑了多久、失败的话是哪一类失败）；改过代码的环节还有各自的分支和 diff。</p>
+      <p><strong>Graph 不替你合并分支</strong>——合哪一条、怎么合是你的决定，它只负责把改动干净地放在那儿等你审。委托 Agent 说“改好了”不算数，主 Agent 仍会自己看 diff、跑测试再向你汇报。</p>
+      <p>如果某次调出来的流程好用，<strong>可以存下来下次复用</strong>——前提是它至少真跑通过一次。以后你说一句“用某某流程做这件事”就行。</p>
+    </section>
+
+    <h2>看过程：两块观测台</h2>
+    <section class="scenario">
+      <div class="eyebrow">只读页面 · 本机</div>
+      <span class="tag">委托会话观测台</span><span class="tag">编排流程观测台</span>
+
+      <table>
+        <thead><tr><th>哪一块</th><th>看什么</th><th>怎么打开</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><strong>委托会话观测台</strong></td>
+            <td>凡是通过 Agent Bridge 派出去的活都在这儿：每个会话、每一轮的提问和回答。排查“卡在哪了 / 那一轮到底说了什么”。</td>
+            <td><strong>默认就开着，你什么都不用做。</strong>想看的时候让主 Agent 帮你打开页面即可。</td>
+          </tr>
+          <tr>
+            <td><strong>编排流程观测台</strong></td>
+            <td>把整个流程画出来：哪些环节在并行、谁依赖谁、每个环节的输入与产出、每一次重试、改代码的那些环节的分支和 diff。</td>
+            <td>跑场景五的脚本时打开。⚠️ <strong>它是起脚本那一刻的开关，事后补不上</strong>——所以任何你可能想看的运行，起的时候就打开（代价只是一个本地页面）。</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <ul>
+        <li><strong>只能看，一个操作按钮都没有</strong>——没有暂停、重跑、改参数、合分支。看不看它，任务照跑。</li>
+        <li>只在你自己的机器上，外网访问不到。</li>
+        <li>⚠️ <strong>流程图是“长出来的”，不是跑之前就摆好的。</strong>每个环节要等真的开始跑，才会出现在图上——因为流程里有分岔（比如“评审选了谁，才决定下一步找谁”），跑之前它长什么样确实还不确定。</li>
+      </ul>
+
+      <aside class="note">
+        <strong>一个要提前知道的代价：</strong>观测台开着，等于<strong>你本机磁盘上存着全部委托内容的原文</strong>。
+        平时的运行日志是刻意不记提问全文的，观测台会记；运行期间本机上的其它程序也读得到。
+        <br><strong>这次要跑的内容敏感，就提前说一声</strong>，让主 Agent 帮你关掉再开工。委托会话那一块的记录会随本次运行结束一起删除。
+      </aside>
+    </section>
+
     <h2>权限与交互怎么表达</h2>
     <table>
       <thead><tr><th>你的意图</th><th>建议在请求里明确写</th></tr></thead>
@@ -361,14 +456,18 @@
       <li><span class="no">错误：</span>让实现者用同一会话评审自己。<br><span class="yes">正确：</span>使用不同引擎或模型的新 Reviewer 会话。</li>
       <li><span class="no">错误：</span>两个写 Agent 并行修改同一批文件。<br><span class="yes">正确：</span>拆成不重叠范围、使用隔离工作区，或改为串行。</li>
       <li><span class="no">错误：</span>把“单元测试绿”当成 Loop 的完整验收。<br><span class="yes">正确：</span>从用户可观察边界增加独立黑盒验证。</li>
+      <li><span class="no">错误：</span>五六个环节的流程，靠主 Agent 一个个手工派、自己记谁跑完了。<br><span class="yes">正确：</span>环节多、要循环或要按结果分岔时，用 Graph 写成脚本——手工驱动会漏，中间产出还会把主 Agent 的上下文挤爆。</li>
+      <li><span class="no">错误：</span>活儿全能由 Claude 一家干完，却为了“用上工具”去开 Graph。<br><span class="yes">正确：</span>不需要不同引擎时，用 Claude Code 自带的工作流工具，更成熟。</li>
+      <li><span class="no">错误：</span>以为“只读”就等于文件绝对动不了。<br><span class="yes">正确：</span>只有 Codex 是系统层面拦住的；其余四家靠约定，要硬保证就点名 Codex。</li>
     </ul>
 
     <aside class="note">
-      <strong>最简单的使用口诀：</strong>只要第二意见，用基础委托；要做开发闭环，用 Dev；要三个以上视角审议，用 Roundtable；要从验收合同自动跑到全绿，用 Loop。
+      <strong>最简单的使用口诀：</strong>只要第二意见，用基础委托；要做开发闭环，用 Dev；要三个以上视角审议，用 Roundtable；要从验收合同自动跑到全绿，用 Loop；<strong>环节多、要循环分岔、还得混用不同引擎，用 Graph</strong>。
     </aside>
 
     <footer>
-      本文从使用层面整理自项目中的 <code>agent-bridge</code>、<code>agent-bridge-dev</code>、<code>agent-bridge-roundtable</code> 和 <code>agent-bridge-loop</code> 四份 Skill 说明，不包含安装与注册步骤。
+      本文从使用层面整理自项目中的 <code>agent-bridge</code>、<code>agent-bridge-dev</code>、<code>agent-bridge-roundtable</code>、<code>agent-bridge-loop</code> 和 <code>agent-bridge-graph</code> 五份 Skill 说明，不包含安装与注册步骤。
+      <br>最近更新：2026-08-03（补入 Graph 编排脚本、两块观测台、Cursor 与 Kimi 两个引擎及其数据边界）。
     </footer>
   </main>
 </body>
