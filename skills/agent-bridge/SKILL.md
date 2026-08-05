@@ -28,7 +28,7 @@ close_session(session_id)                  →  用完必须关
 
 - 会话**活在 MCP server 进程内**：你所在的客户端启动了一个 `agent-bridge mcp` 进程，它直接 spawn 并持有你 open 的 OMP/Codex/Claude 后端（**cursor / kimi 例外**：只持有逻辑会话，进程按轮短驻）。**没有共享 daemon、没有 UI、不跨客户端共享**；客户端退出，这些会话随之被清理。
 - ⚠️ **桥没有任何主动通知 / 唤醒机制。** 一轮委托跑完不会通知任何人；**只有你自己调 `agent_bridge_wait` 才能拿到结果**。宿主把在飞的长工具调用转后台、跑完再通知你，那是**宿主**行为，前提是**有一个 `wait` 正在飞**——没 `wait` 就没通知。你的回合一结束，那轮产出就无人接收。（这条最容易踩，因为"长调用会自己回来找我"在别处是对的。）
-- CLI 只剩三条：`mcp`（由 MCP 客户端拉起，你一般不手动跑）、`doctor`（查后端可用性）、`cleanup`（回收被 kill 的 server 残留的子进程）。**没有 CLI 会话命令，也没有 daemon/ui 命令**。
+- CLI 只剩三条：`mcp`（由 MCP 客户端拉起，你一般不手动跑）、`doctor`（查后端可用性，顺带报观测台开没开、记录在哪）、`cleanup`（回收被 kill 的 server 残留的子进程）。**没有 CLI 会话命令，也没有 daemon/ui 命令**。
 
 ## 观测台（**默认开着**，不用配置）
 
@@ -37,9 +37,10 @@ close_session(session_id)                  →  用完必须关
 
 - 用户问起观测台、或要看页面 → **先读 `<本 skill 目录>/viz/USAGE.md`**（找目录、起 viewer、
   隐私代价、怎么关、排查全在那儿），别凭印象答。
-- 一句话版：在临时目录里找 `agent-bridge-viz-*`（挑最新的那个），
-  `node <本 skill 目录>/viz/serve.mjs "<那个目录>"`，打开它打印的地址。
-  ⚠️ **桥不会告诉你目录在哪**（不打日志、doctor 不报、没有工具能查），只能自己去 tmpdir 找。
+- 一句话版：调 `agent_bridge_doctor`，`Viz:` 那行就是记录目录（**当成 MCP 工具调时报的就是本客户端自己那份**，
+  不用去 tmpdir 猜）；再 `node <本 skill 目录>/viz/serve.mjs "<那个目录>"`，打开它打印的地址。
+  ⚠️ 从命令行跑 `agent-bridge doctor` 是另一回事：那个进程不是任何人的 server，只会列出机器上还活着的 run，
+  且**不报 on/off**（它无从得知别的进程启动时读到了什么）。
 - ⚠️ 代价：开着等于「本机磁盘上存在全部委托原文」——桥平时的日志刻意不落 prompt 全文，它会落，
   运行期间本机任何进程都读得到。**用户说这次内容敏感，就提醒他关**：给 server 进程加
   `AGENT_BRIDGE_VIZ=off` 再重启客户端（怎么加看客户端，USAGE.md 里有三条路）。

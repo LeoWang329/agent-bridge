@@ -8,7 +8,7 @@ import path from "node:path";
 import readline from "node:readline";
 // ⚠️ **零副作用 import**:viz-writer 模块顶层什么都不做,只有 `createVizRun()` 被调用才建目录。
 //    这是它能被 `doctor` / `cleanup` / 测试 import 的前提(docs/STATE-session-viz.md §7)。
-import { createVizRun, vizCleanup } from "./viz-writer.mjs";
+import { createVizRun, vizCleanup, vizList } from "./viz-writer.mjs";
 // 同样零副作用:`createVizInbox()` 只建对象,`.start()` 才碰文件系统。
 import { createVizInbox } from "./viz-inbox.mjs";
 
@@ -6763,12 +6763,69 @@ async function doctor() {
     node: process.version,
     stateRoot: STATE_ROOT,
     logDir: RUN_LOG_DIR,
+    viz: vizReport(),
     agents,
   };
 }
 
+/**
+ * doctor 的观测台那一段。**桥此前没有任何途径告诉人观测记录在哪**——不打日志行、
+ * doctor 不报、也没有工具能查，只能自己去 tmpdir 里扫、按时间戳猜（同机多开几个客户端就会挑错）。
+ * doctor 本来就是"这台机器现在什么状况"的出口，这件事归它。
+ *
+ * 两种立场，**绝不能混**：
+ * - `scope:"self"` —— 本进程就是那个 MCP server，`viz` 就在手边，
+ *   `enabled` / `dir` 是**本次运行的事实**，不用扫不用猜。
+ * - `scope:"scan"` —— 本进程不是 server（命令行跑 `doctor`），它自己没有观测记录。
+ *   ⚠️ 这时**绝不能报 `enabled`**:开关是 server 进程**启动那一刻**读**它自己**的环境读到的,
+ *   而命令行这个 shell 的 `AGENT_BRIDGE_VIZ` 跟那个进程毫无关系 —— 报了就是**撒谎**,
+ *   而且撒的正是隐私开关的谎（"显示 on 其实没记" / "显示 off 其实全程在记"）。
+ *   能诚实说的只有扫出来的事实:机器上现在有哪几个 run 在记。
+ */
+function vizReport() {
+  // viz === null 有两种来路,都走 scan:①命令行路径(压根没调过 createVizRun);
+  // ②serveMcp 里 createVizRun 抛异常的罕见故障(它内部已兜住所有 IO 错误,只会返回
+  //   disabledReason:"init_failed" 的 recorder,所以真抛出来是模块级问题)。
+  //   后者走 scan 也不撒谎:那时自己确实没有目录,扫出来的列表里也不会有自己。
+  if (!viz) {
+    let runs = [];
+    try { runs = vizList(); } catch {}
+    return { scope: "scan", enabled: null, dir: null, runId: null, disabledReason: null, runs };
+  }
+  return {
+    scope: "self",
+    enabled: viz.enabled === true,
+    dir: viz.dir ?? null,
+    runId: viz.runId ?? null,
+    disabledReason: viz.disabledReason ?? null,
+    runs: null,
+  };
+}
+
+/**
+ * ⚠️ **"关掉了"与"起不来"必须分开说。** 合成一行 `off` 会把故障伪装成用户的选择:
+ * 人以为是自己设了 `AGENT_BRIDGE_VIZ=off`,实际是建目录失败(磁盘满/权限),
+ * 于是去查开关查不出所以然。一个是意图,一个是故障。
+ */
+function renderVizLines(v) {
+  if (!v) return [];   // 返回值来自旧版本/被裁剪过:不猜,什么都不说
+  if (v.scope === "self") {
+    if (v.enabled) return [`Viz: on   ${v.dir}`];
+    return v.disabledReason === "init_failed"
+      ? ["Viz: unavailable (recording dir could not be created)"]
+      : ["Viz: off (AGENT_BRIDGE_VIZ)"];
+  }
+  const runs = Array.isArray(v.runs) ? v.runs : [];
+  // 措辞刻意点明"本进程不是 MCP server":否则 `no live recording dirs` 会被读成"观测台关着"。
+  if (!runs.length) return ["Viz: no live recording dirs (this process is not an MCP server)"];
+  const out = [`Viz: ${runs.length} live recording dir(s) (this process is not an MCP server):`];
+  for (const r of runs) out.push(`  ${r.dir}  pid ${r.pid}`);
+  return out;
+}
+
 function renderDoctor(value) {
-  const lines = [`Agent Bridge ${value.bridgeVersion}`, `Node: ${value.node}`, `State: ${value.stateRoot}`, ""];
+  const lines = [`Agent Bridge ${value.bridgeVersion}`, `Node: ${value.node}`, `State: ${value.stateRoot}`];
+  lines.push(...renderVizLines(value.viz), "");
   for (const row of value.agents) {
     lines.push(`${row.agent}: ${row.available ? "ok" : "missing"} (${row.bin})${row.version ? ` ${row.version}` : ""}`);
     if (row.error) lines.push(`  ${row.error}`);

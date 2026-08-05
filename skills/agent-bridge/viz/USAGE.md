@@ -24,10 +24,36 @@
 
 ## 一、怎么打开页面
 
-⚠️ **桥不会告诉你目录在哪**——它不打日志行、`doctor` 不报、也没有 MCP 工具能查到。
-得自己去临时目录里找。这是目前的实情，不是你哪一步做漏了。
+**第 1 步：找目录。** 问 `doctor`——它会直接说开没开、记在哪：
 
-**第 1 步：找目录。** 每个活着的 MCP server 进程对应一个：
+```
+agent_bridge_doctor          # 当成 MCP 工具调（推荐）
+```
+
+```
+Agent Bridge 0.11.0
+Node: v24.16.0
+State: C:\Users\<u>\.agent-bridge
+Viz: on   C:\Users\<u>\AppData\Local\Temp\agent-bridge-viz-Xk9mQ2
+```
+
+**当成 MCP 工具调的那一次，报的就是这个客户端自己的目录**——doctor 跑在同一个 server 进程里，
+不用扫不用猜。同机开着几个客户端也不会串。
+
+从命令行跑 `agent-bridge doctor` 是另一回事：那个进程不是任何人的 server，自己没有记录，
+所以它列的是「这台机器上**还活着**的 run」，让你自己认：
+
+```
+Viz: 2 live recording dir(s) (this process is not an MCP server):
+  C:\...\Temp\agent-bridge-viz-Xk9mQ2  pid 59884
+  C:\...\Temp\agent-bridge-viz-w1h90D  pid 62224
+```
+
+⚠️ 这种形态下它**不报 on/off**——开关是各个 server 启动那一刻读**它自己**的环境读到的，
+跟你这个 shell 的 `AGENT_BRIDGE_VIZ` 毫无关系，报了就是撒谎。要知道某个客户端开没开，
+在那个客户端里调 `agent_bridge_doctor`。
+
+**兜底：自己扫。** doctor 也够不着的时候（server 已经退了、或你手边没有客户端）：
 
 ```sh
 # Windows（PowerShell）
@@ -37,7 +63,8 @@ Get-ChildItem $env:TEMP -Directory -Filter 'agent-bridge-viz-*' | Sort-Object La
 ls -dt "${TMPDIR:-/tmp}"/agent-bridge-viz-*
 ```
 
-开了多个客户端就会有多个，按修改时间挑最新的那个；拿不准就看目录里 `meta.json` 的 `pid`。
+⚠️ **按时间挑最新的那个会挑错**——开了多个客户端就有多个目录，而它们的修改时间只反映
+「哪个 run 最近有动静」，不是「哪个是你要的」。认准是谁的，看目录里 `meta.json` 的 `pid`。
 
 **第 2 步：起 viewer**（只读，不往那个目录写一个字节）：
 
@@ -103,8 +130,12 @@ session-viz  http://127.0.0.1:53211/   run=mcp-a7c319
 
 **改完必须重启客户端**——开关只在 server 启动那一刻读一次，当场改环境变量对已经跑着的 server 没用。
 
-**关掉是真的一步都不走**：连临时目录都不建。所以**确认关掉了**就看 tmpdir 里还有没有
-`agent-bridge-viz-*` 新目录冒出来。
+**关掉是真的一步都不走**：连临时目录都不建。重启客户端之后调一次 `agent_bridge_doctor`
+就能确认——那一行会变成 `Viz: off (AGENT_BRIDGE_VIZ)`。
+
+⚠️ 要是它说的是 `Viz: unavailable (recording dir could not be created)`，那**不是你关掉了**，
+是建目录失败（磁盘满 / 权限 / TMPDIR 指向不存在的地方）。这两句话是分开的，就是为了让你
+一眼分清「我关的」和「它坏了」。
 
 > 判定规则刻意**不对称**：未设 / 空串 / `on` / `1` / `true` / `yes` 是开，**其余任何值都是关**。
 > 就是说 `off` 打错成 `offf` 也会关掉，而不是悄悄照录——一个隐私开关拼错的两个方向代价不一样。
@@ -130,7 +161,8 @@ session-viz  http://127.0.0.1:53211/   run=mcp-a7c319
 
 | 现象 | 多半是 |
 |---|---|
-| tmpdir 里一个 `agent-bridge-viz-*` 都没有 | 被关掉了：查 `AGENT_BRIDGE_VIZ` 是不是被设成了非 on 的值（**任何认不出的值都当关**），改完要重启客户端 |
+| `doctor` 说 `Viz: off (AGENT_BRIDGE_VIZ)` | 被关掉了：查 `AGENT_BRIDGE_VIZ` 是不是被设成了非 on 的值（**任何认不出的值都当关**），改完要重启客户端 |
+| `doctor` 说 `Viz: unavailable (…could not be created)` | 不是关掉，是**建不出目录**：磁盘满 / 权限 / `TMPDIR` 指到了不存在或不是目录的地方 |
 | 目录在，但 viewer 起不来说「读不到 meta.json」 | 目录传错了（传成了上级目录，或传到了端口位上） |
 | 页面显示「该运行已结束」 | 那个 run 的 owner 进程已经没了（客户端退了）——换最新那个目录 |
 | 页面显示「未观测到正常收尾」 | 那次运行是被强行终止的，来不及写下结局。工作副本、日志往往都还在 |

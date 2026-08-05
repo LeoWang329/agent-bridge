@@ -1405,6 +1405,46 @@ class VizRecorder {
  * 那不会因为号码回收而发生。
  * 代价如实记：pid 恰好被回收的孤儿目录**收不掉**，会一直躺在 tmpdir 里。
  */
+/**
+ * 扫 tmpdir 下的 `agent-bridge-viz-*`，列出 **owner 还活着** 的记录目录。
+ *
+ * ⚠️ **只读：一个字节都不写、一个目录都不删。** 回收是 `vizCleanup()` 的事，这里只看。
+ *    读不出 `owner` 的残缺目录在这里**跳过**（不是"删掉"）——同一份残缺，
+ *    回收路径的正确处置是删、观测路径的正确处置是不报，两边都对，别把行为混过来。
+ *
+ * ⚠️ **判据必须与 `vizCleanup()` 是同一条：owner 里的 pid 还活着吗。**
+ *    两处一旦漂开，就会出现 `cleanup` 删掉了 `doctor` 上一秒刚说还活着的目录。
+ *
+ * 给 `doctor` 用：从 MCP server **外面**（命令行）跑 doctor 时，本进程没有自己的观测目录，
+ * 唯一能诚实回答的就是"这台机器上现在有哪几个 run 在记"。
+ */
+export function vizList({ tmpRoot = os.tmpdir(), isAlive = null } = {}) {
+  const alive = isAlive || ((pid) => { try { process.kill(pid, 0); return true; } catch { return false; } });
+  const runs = [];
+  let names = [];
+  try { names = fs.readdirSync(tmpRoot); } catch { return runs; }
+  for (const n of names) {
+    if (!n.startsWith(VIZ_DIR_PREFIX)) continue;
+    const dir = path.join(tmpRoot, n);
+    try {
+      // ⚠️ `JSON.parse("null")` 是**成功**的,返回 null —— 所以这里靠 `?.` + `isSafeInteger` 把关,
+      //    不能只 try/catch 了事(一个内容为 `null` 的 owner 文件会一路走到 `alive(undefined)`)。
+      const owner = JSON.parse(fs.readFileSync(path.join(dir, "owner"), "utf8"));
+      if (!Number.isSafeInteger(owner?.pid) || !alive(owner.pid)) continue;
+      let meta = null;
+      try { meta = JSON.parse(fs.readFileSync(path.join(dir, "meta.json"), "utf8")); } catch {}
+      runs.push({
+        dir,
+        pid: owner.pid,
+        runId: meta?.runId ?? null,
+        bridgeVersion: meta?.bridgeVersion ?? null,
+        startedAt: owner?.processStartedAt ?? null,
+      });
+    } catch { /* 残缺目录:`cleanup` 的事,观测这边不报 */ }
+  }
+  return runs;
+}
+
 export function vizCleanup({ tmpRoot = os.tmpdir(), isAlive = null } = {}) {
   const alive = isAlive || ((pid) => { try { process.kill(pid, 0); return true; } catch { return false; } });
   const removed = [], kept = [];
