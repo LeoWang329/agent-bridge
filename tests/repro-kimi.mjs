@@ -598,7 +598,7 @@ async function main() {
   {
     const s = makeServer("ok"); await s.init();
     const sess = (await openKimi(s))?.session;
-    const nul = await s.call("agent_bridge_send_message", { session_id: sess.id, message: "bad prompt" });
+    const nul = await s.call("agent_bridge_send_message", { session_id: sess.id, message: "bad\u0000prompt" });
     if (!nul?.__error || !/NUL/i.test(nul.__error)) return fail(`S20: a prompt containing NUL should be rejected, got ${JSON.stringify(nul)}`);
     const huge = await s.call("agent_bridge_send_message", { session_id: sess.id, message: "x".repeat(40000) });
     if (!huge?.__error || !/too long/i.test(huge.__error)) return fail(`S20: an over-limit prompt should be rejected, got ${JSON.stringify(huge)}`);

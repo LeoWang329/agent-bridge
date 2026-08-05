@@ -407,8 +407,10 @@ async function main() {
     ? fs.readFileSync(rec11.artifactPath, "utf8") : "";
   ok("★ 故障确实注进去了(后端自报 BREAK_OK)", /BREAK_OK/.test(a11), a11.slice(0, 160));
   ok("状态降级为 unknown(不是 ok)", rec11.status === "unknown", String(rec11.status));
+  // ⚠️ 回退值是 **永远匹配不上的哨兵**，不是 `""`：path 缺失时 `includes("")` 恒真 ⇒ 空绿，
+  //    而 `includes("\u0000")` 恒假 ⇒ 当场变红。写成转义而不是字面 NUL，否则 rg 会把整个文件当 binary 跳过。
   ok("error 说清了交付物没能确认落到分支上,并指出工作区留在哪",
-    /没能确认落到分支上/.test(rec11.error || "") && (rec11.error || "").includes(rec11.workspace?.path || " "),
+    /没能确认落到分支上/.test(rec11.error || "") && (rec11.error || "").includes(rec11.workspace?.path || "\u0000"),
     (rec11.error || "").slice(0, 160));
   ok("changesKnown=false(如实承认不知道)", rec11.workspace?.changesKnown === false, String(rec11.workspace?.changesKnown));
   ok("removed=false(没删)", rec11.workspace?.removed === false, String(rec11.workspace?.removed));
