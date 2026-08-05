@@ -5,6 +5,9 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Agent Bridge · 委托会话观察台</title>
+<!--VIZ_TOKEN_INJECT: serve.mjs 响应 GET / 时把这行替换成 <script>window.__VIZ_TOKEN__="…";</script>。
+     凭证不放 URL(会进浏览器历史、经 Referer 泄漏),改成随页面注入——暴露面跟现有只读路由
+     完全一样(见 docs/DESIGN-session-viz-send-lock-2026-08-04.md §3)。-->
 <style>
 /* ============================================================
    Agent Bridge · 委托会话史 只读观察台
@@ -273,6 +276,30 @@ details.legend[open] summary .chev{transform:rotate(90deg)}
 .sbar.red{color:color-mix(in oklab,var(--danger) 82%,var(--ink));
   background:color-mix(in oklab,var(--danger) 10%,var(--surface));
   border:1px solid color-mix(in oklab,var(--danger) 30%,var(--line))}
+
+/* 追问输入框——只对已经闲下来、没有未取结果的会话开放,见 docs/DESIGN-session-viz-send-lock-2026-08-04.md */
+.compose{margin-top:18px;border:1px solid var(--line);border-radius:var(--radius);background:var(--surface);
+  box-shadow:var(--shadow);overflow:hidden}
+.compose-head{padding:10px 15px;border-bottom:1px solid var(--line);background:var(--surface-2);
+  font:11px/1 var(--mono);letter-spacing:.09em;text-transform:uppercase;color:var(--faint);font-weight:600}
+.compose-body{padding:13px 15px;display:flex;flex-direction:column;gap:9px}
+.compose textarea{width:100%;min-height:64px;resize:vertical;font:13px/1.55 var(--sans);color:var(--ink);
+  background:var(--canvas);border:1px solid var(--line-2);border-radius:9px;padding:9px 11px}
+.compose textarea:disabled{color:var(--faint);background:var(--surface-3);cursor:not-allowed}
+.compose-row{display:flex;align-items:center;gap:10px}
+.compose-reason{flex:1 1 auto;font:12px/1.5 var(--sans);color:var(--faint)}
+.compose-send{flex:0 0 auto;display:inline-flex;align-items:center;gap:6px;font:600 12.5px/1 var(--sans);
+  color:#fff;background:var(--accent);border:none;border-radius:8px;padding:8px 15px}
+.compose-send:disabled{background:var(--line-2);color:var(--faint);cursor:not-allowed}
+.compose-send svg{width:13px;height:13px}
+.compose-note{font:12px/1.5 var(--sans);padding:8px 11px;border-radius:8px}
+.compose-note.err{color:color-mix(in oklab,var(--danger) 82%,var(--ink));
+  background:color-mix(in oklab,var(--danger) 10%,var(--surface));border:1px solid color-mix(in oklab,var(--danger) 30%,var(--line))}
+.compose-note.ok{color:color-mix(in oklab,var(--st-run) 82%,var(--ink));
+  background:color-mix(in oklab,var(--st-run) 10%,var(--surface));border:1px solid color-mix(in oklab,var(--st-run) 32%,var(--line))}
+.src-badge{display:inline-flex;align-items:center;gap:4px;font:10.5px/1 var(--mono);padding:4px 7px;border-radius:5px;
+  color:var(--accent);background:color-mix(in oklab,var(--accent) 10%,var(--surface));
+  border:1px solid color-mix(in oklab,var(--accent) 30%,var(--line))}
 
 /* 轮次 */
 .turns{padding-top:14px}
@@ -778,7 +805,10 @@ var UI = {
   raw:{},
   tick:0,
   atBottom:true,
-  settledFlash:{}
+  settledFlash:{},
+  /* 追问输入框的状态，按会话 id 存。**不进 SESSIONS/rebuild()**——那是从快照纯派生的展示模型，
+     这里是页面本地的、用户正在打字这件事本身，两者不能混在一起。 */
+  send:{}               /* key: sessionId -> {text, sending, pendingReqId, note:{ok,text}|null} */
 };
 var elSlist=document.getElementById('slist');
 var elDetail=document.getElementById('detail');
@@ -879,6 +909,137 @@ function cardHTML(s,k){
 function tailOf(t,n){ t=t.replace(/\n+/g,' '); return t.length>n? '…'+t.slice(-n) : t; }
 
 /* ============================================================
+   5.5 追问输入框
+   ============================================================
+   见 docs/DESIGN-session-viz-send-lock-2026-08-04.md。**这里只做 UI 判断，是给用户体验用的
+   提前置灰**——真正拦截（会话忙 / 有未取结果）在桥进程的 `sendFollowupFromViz` 里权威地判一遍，
+   页面看到的快照有轮询延迟，不能当作唯一依据。 */
+function composeState(s){
+  if(!UI.send[s.id]) UI.send[s.id]={text:'',sending:false,pendingReqId:null,note:null};
+  return UI.send[s.id];
+}
+function composeDisabledReason(s){
+  if(!window.__VIZ_TOKEN__) return '凭证没有正确加载，刷新页面再试。';
+  if(s.startupError) return '这个会话生下来就死了，没法追问。';
+  var k=statusOf(s);
+  if(k==='end') return '会话已经结束，没法再追问。';
+  if(k==='run') return '会话正忙着，等它跑完这一轮再问。';
+  /* 一轮都还没跑过的会话，桥那边的闸门也是拒的（"没有可追问的上文，而且主 agent 可能正要发首轮"）。
+     这里跟着置灰，免得让人打完一整段字才被回绝。 */
+  if(!s.turns.length) return '这个会话还没跑过任何一轮，等主 agent 先把活派下去。';
+  if(hasPending(s)) return '有结果还没被主 agent 取走——现在发送会把它盖掉，先等主 agent 取完。';
+  return null;
+}
+function sendBoxHTML(s){
+  var cs=composeState(s);
+  var reason=composeDisabledReason(s);
+  var disabled = !!reason || cs.sending;
+  var noteHTML = cs.note ? '<div class="compose-note '+(cs.note.ok?'ok':'err')+'">'+esc(cs.note.text)+'</div>' : '';
+  return '<div class="compose">'+
+    '<div class="compose-head">'+ico('inbox')+' 追问这个会话</div>'+
+    '<div class="compose-body">'+
+      '<textarea data-compose-text placeholder="基于它已经知道的上下文继续问……"'+(disabled?' disabled':'')+'>'+esc(cs.text)+'</textarea>'+
+      noteHTML+
+      '<div class="compose-row">'+
+        '<span class="compose-reason">'+(reason?esc(reason):'回答会同样交给主 agent；归档里会标出这一问是你提的。')+'</span>'+
+        '<button class="compose-send" data-compose-send'+(disabled?' disabled':'')+'>'+
+          (cs.sending?'发送中…':(ico('write')+'发送'))+
+        '</button>'+
+      '</div>'+
+    '</div>'+
+  '</div>';
+}
+/* 已经收到、但当时还没有人认领的回执（reqId -> data）。
+   ⚠️ 这个缓冲不是优化，是修一个**必然发生**的竞态：回执走的是 SSE + 服务端轮询，
+      而 `pendingReqId` 要等 `fetch` 的 Promise 回调才写得上。桥那边处理得快的时候，
+      `send-result` 完全可能**先于** 202 的回调到达 —— 那时按 reqId 匹配必然落空，
+      于是这一帧被丢掉，输入框永远停在"发送中"。 */
+var SEND_RESULT_BUFFER = new Map();
+/* ⚠️ **键必须是 (sessionId, reqId) 这一对,不能只用 reqId。** 回执的身份是「哪个会话的哪一发」——
+      reqId 由服务端每次随机生成、单看不保证跨会话唯一,而这个缓冲是**全页面共享**的:
+      只按 reqId 存的话，会话 B 的回执会盖掉会话 A 正在等的同 reqId 那条，A 的 202 回调随后
+      把 B 的成败当成自己的（甚至把 A 正在打的字清掉）。 */
+function bufKey(sessionId, reqId){ return sessionId + ':' + reqId; }
+/* 多久没等到回执就认输。**不是重试**，只是不再假装还在进行中。 */
+var SEND_RESULT_TIMEOUT_MS = 30000;
+
+/** 把一份回执落到某个会话的输入框状态上。返回是否真的被认领了。
+ *  ⚠️ 身份是 **(sessionId, reqId) 这一对**,两个都得对上才认领 —— 调用方从缓冲里取出来的那条
+ *     不一定就是这个会话的(见 `bufKey` 的说明),所以这里必须自己再验一次 `data.sessionId`,
+ *     不能因为"调用方传了 sessionId"就当它已经核对过。 */
+function applySendResult(sessionId, data){
+  if(!data || data.sessionId !== sessionId) return false;
+  var cs = UI.send[sessionId];
+  if(!cs || !cs.pendingReqId || cs.pendingReqId !== data.reqId) return false;
+  cs.sending=false;
+  cs.pendingReqId=null;
+  if(cs.timeoutTimer){ clearTimeout(cs.timeoutTimer); cs.timeoutTimer=null; }
+  if(data.ok){
+    cs.text='';
+    cs.note={ok:true, text:'已发送。回答会出现在下面的轮次里，主 agent 也看得到。'};
+  }else{
+    cs.note={ok:false, text:data.error || '发送被拒绝。'};
+  }
+  if(UI.selected===sessionId) renderDetail();
+  return true;
+}
+
+function doSend(s){
+  var cs=composeState(s);
+  if(cs.sending) return;
+  var text=(cs.text||'').trim();
+  if(!text) return;
+  var token=window.__VIZ_TOKEN__;
+  if(!token){ cs.note={ok:false,text:'凭证没有正确加载，刷新页面再试。'}; renderDetail(); return; }
+  cs.sending=true; cs.note=null;
+  renderDetail();
+  fetch('/send', {
+    method:'POST',
+    headers:{ 'Content-Type':'application/json', 'X-Viz-Token':token },
+    body: JSON.stringify({ sessionId:s.id, message:text })
+  }).then(function(r){
+    return r.json().catch(function(){ return null; }).then(function(body){ return {status:r.status, body:body}; });
+  }).then(function(res){
+    if(res.status===202 && res.body && res.body.reqId){
+      /* 还在 sending 状态——202 只代表"已经排上队"，真正算数的是 send-result 那一帧。 */
+      cs.pendingReqId = res.body.reqId;
+      /* 回执可能**已经**到过了（见 SEND_RESULT_BUFFER 的说明）——先认领一次缓冲。 */
+      var bk = bufKey(s.id, res.body.reqId);
+      var buffered = SEND_RESULT_BUFFER.get(bk);
+      if(buffered){
+        SEND_RESULT_BUFFER.delete(bk);
+        applySendResult(s.id, buffered);
+        return;
+      }
+      /* ⚠️ 有界等待。断线重连期间到达的回执会被彻底错过（服务端读完即删），
+            没有兜底的话输入框就**永久**停在"发送中"，只能靠刷新。
+            超时后的话术只说"不知道"，**绝不能**说"没发出去/可以重发"——
+            这条请求很可能已经真的送到了 agent 那儿，劝人重发就是劝人发两遍。 */
+      cs.timeoutTimer = setTimeout(function(){
+        if(!cs.sending || cs.pendingReqId !== res.body.reqId) return;
+        cs.sending=false; cs.pendingReqId=null; cs.timeoutTimer=null;
+        cs.note={ok:false, text:'没等到这次追问的回执，结果未知——它可能已经发出去了。'+
+          '先看下面的轮次里有没有多出这一问，再决定要不要重发，不要直接重试。'};
+        if(UI.selected===s.id) renderDetail();
+      }, SEND_RESULT_TIMEOUT_MS);
+    }else{
+      cs.sending=false;
+      cs.note={ok:false, text:(res.body&&res.body.error)||('发送失败（HTTP '+res.status+'）')};
+    }
+    renderDetail();
+  }).catch(function(e){
+    /* ⚠️ 这里**不能说"发送失败"**。fetch 抛异常只说明"我没收到回应"，不说明请求没送到——
+          请求体很可能已经原子落进 inbox 了，只是 202 没回来。说死"失败"，用户就会直接重发，
+          于是同一句话问两遍。跟上面 30 秒没等到回执用同一套保守话术。 */
+    cs.sending=false; cs.pendingReqId=null;
+    if(cs.timeoutTimer){ clearTimeout(cs.timeoutTimer); cs.timeoutTimer=null; }
+    cs.note={ok:false, text:'没收到服务端的回应（'+String((e&&e.message)||e)+'），结果未知——'+
+      '它可能已经发出去了。先看下面的轮次里有没有多出这一问，再决定要不要重发，不要直接重试。'};
+    renderDetail();
+  });
+}
+
+/* ============================================================
    6. 右栏渲染
    ============================================================ */
 function renderDetail(){
@@ -945,8 +1106,23 @@ function renderDetail(){
     body='<div class="turns">'+s.turns.map(function(t){return turnHTML(s,t);}).join('')+'</div>';
   }
 
-  elDetail.innerHTML=head+'<div class="dpad">'+bars+body+'</div>';
+  /* ⚠️ 保住追问框当前的焦点与光标位置。`elDetail` 每次都是整段 innerHTML 重建——
+        不做这一步的话，后台任何一次跟这个会话无关的 SSE 状态更新，都会在用户打字打到一半时
+        把输入框整个换掉，焦点丢失、光标归零，等于打断输入本身（左侧搜索框不在这个问题里，
+        是因为它是页面静态外壳的一部分，从来不会被 innerHTML 重建碰到）。 */
+  var prevFocus = document.activeElement;
+  var restoreSel = null;
+  if(prevFocus && prevFocus.hasAttribute && prevFocus.hasAttribute('data-compose-text') && elDetail.contains(prevFocus)){
+    restoreSel = { start:prevFocus.selectionStart, end:prevFocus.selectionEnd };
+  }
+
+  elDetail.innerHTML=head+'<div class="dpad">'+bars+body+sendBoxHTML(s)+'</div>';
   bindDetail(s);
+
+  if(restoreSel){
+    var ta=elDetail.querySelector('[data-compose-text]');
+    if(ta){ ta.focus(); try{ ta.setSelectionRange(restoreSel.start, restoreSel.end); }catch(e){} }
+  }
 }
 function kv(k,v,na){ return '<div class="kv"><span class="k">'+k+'</span><span class="v'+(na?' na':'')+'">'+esc(v)+'</span></div>'; }
 
@@ -964,6 +1140,9 @@ function turnHTML(s,t){
     '<span class="rbadge '+res.cls+'">'+ico(res.icon)+esc(res.label)+'</span>'+
     (running?'':'<span class="bbadge '+bb.cls+'">'+esc(bb.label)+'</span>')+
     (t.unfetched?'<span class="flag f-pending">'+ico('alert')+'未取结果</span>':'')+
+    /* 只有「用户追问」值得挂标签——另外两档（首轮 / 主 agent 发的）是默认情形，
+       挂了反而是噪音，见 docs/STATE-session-viz.md §4.5 的三档说明。 */
+    (t.source==='user_followup'?'<span class="src-badge" title="这一问是在观测台页面上追的，不是主 agent 发的">'+ico('inbox')+'用户追问</span>':'')+
   '</div>';
 
   /* 输入 */
@@ -1044,6 +1223,20 @@ function liveHTML(t){
 
 /* ---- 右栏事件绑定 ---- */
 function bindDetail(s){
+  var composeText = elDetail.querySelector('[data-compose-text]');
+  if(composeText){
+    /* 只更新状态，**不在这里 renderDetail()**——每敲一下键都整段重建 DOM 会把光标弹飞，
+       跟 renderDetail() 顶部那段焦点保护针对的是同一个问题的两面。 */
+    composeText.addEventListener('input', function(e){ composeState(s).text = e.target.value; });
+    composeText.addEventListener('keydown', function(e){
+      if(e.key==='Enter' && (e.metaKey||e.ctrlKey)){ e.preventDefault(); doSend(s); }
+    });
+  }
+  var sendBtn = elDetail.querySelector('[data-compose-send]');
+  if(sendBtn){
+    sendBtn.addEventListener('click', function(e){ e.preventDefault(); doSend(s); });
+  }
+
   /* ⚠️ **按方向各判各的。** data-copy 的键是 `会话|轮次|in|out`，
         第三段就是方向——原来只取第二段（轮次号）拿一个轮次级布尔量一起禁，
         于是"输出还在路上"会连累已经验过的输入，而"输入压根没落盘"反倒放行。
@@ -1239,6 +1432,24 @@ function connect(){
   });
 
   es.addEventListener("viz:overflow", function(){ /* 合并掉的代次，不必打扰用户 */ });
+
+  es.addEventListener("send-result", function(ev){
+    var data; try{ data=JSON.parse(ev.data); }catch(e){ return; }
+    if(!data || !data.sessionId || !data.reqId) return;
+    /* 认领得掉就直接落地；认领不掉**先存起来**，不要丢。
+       两种认领不掉的情形要分开看：
+         · 这一条是本页面刚发的，但 202 的回调还没跑到、`pendingReqId` 还没写上
+           —— 缓冲住，`doSend` 的回调里会来取（这就是那个必然存在的竞态）。
+         · 这一条是别的标签页发的 —— 也缓冲，代价只是一条永远没人来取的记录，
+           由下面的容量上限兜住；那次追问的结果照样会从 state 快照里作为新一轮出现。 */
+    if(applySendResult(data.sessionId, data)) return;
+    SEND_RESULT_BUFFER.set(bufKey(data.sessionId, data.reqId), data);
+    /* 有界：别让没人认领的回执把内存吃掉（页面可能开着好几个小时）。 */
+    if(SEND_RESULT_BUFFER.size > 32){
+      var oldest = SEND_RESULT_BUFFER.keys().next().value;
+      SEND_RESULT_BUFFER.delete(oldest);
+    }
+  });
 
   es.onerror = function(){
     if(RUN.gone) return;

@@ -16,10 +16,14 @@ import http from "node:http";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
+import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import {
   VIZ_FILE_MAX_BYTES, resolveWithin, sendArchivedFile, sendPlain, sendMethodNotAllowed,
 } from "../../../scripts/viz-http.mjs";
+// 只借三个常量(目录名 + 单条请求上限),不借轮询逻辑——那是桥进程那一侧的事(viz-inbox.mjs
+// 的轮询器活在 agent-bridge.mjs 里)。这里只管把请求写进 inbox、把回执从 outbox 读出来发给页面。
+import { INBOX_DIRNAME, OUTBOX_DIRNAME, REQUEST_MAX_BYTES } from "../../../scripts/viz-inbox.mjs";
 
 /**
  * 起法（**两种都认**，docs/STATE-session-viz.md §1.2）：
@@ -70,12 +74,30 @@ const POLL_MS = 400;
 const PROGRESS_MS = 900;
 /** owner 没了且没有客户端之后的宽限期。 */
 const GRACE_MS = 60000;
+/** 安全 path segment 判据(sessionId / reqId 共用一套)。inbox 写入侧与 outbox 读取侧
+ *  **各自**用它验一遍 —— 见 docs/STATE-session-viz.md §12.1「两侧互不信任」。
+ *  ⚠️ 声明放在这儿而不是靠近路由:`pollOutbox()` 在文件里出现得更早,声明晚于它就是踩 TDZ
+ *  (眼下只因为轮询是异步起的才没炸),这种"能跑但差一点就不能"的写法不留。 */
+const SAFE_SESSION_ID = /^[A-Za-z0-9._-]+$/;
 
 // ── 身份与存活 ──────────────────────────────────────────────────────────────
 
 let META = null;
 try { META = JSON.parse(fs.readFileSync(path.join(VIZ_DIR, "meta.json"), "utf8")); }
 catch { console.error("读不到 meta.json，目录不像一个 viz run"); process.exit(2); }
+
+/**
+ * 「追问」的凭证。docs/DESIGN-session-viz-send-lock-2026-08-04.md §5 第 2 条：
+ * 不是要人记的密码，是这个进程随机生成、只活在内存里的一串长字符——进程一关就作废，
+ * 不写文件、不写死在代码里。**「一次性」指「每次起一次服务重新生成一次」，不是用一次就失效的
+ * 验证码语义。** 页面加载时被注入进 HTML(见 `sendIndexHtml`），不拼进 URL——
+ * URL 里的东西会进浏览器历史、会经 Referer 头泄漏，注入进响应体不会,因为能拿到这个凭证的人
+ * 本来就已经能读到这次运行的全部委托内容(今天所有 GET 路由都没有鉴权)。
+ */
+const VIZ_TOKEN = crypto.randomBytes(32).toString("hex");
+
+/** `server.listen(0, ...)` 之后才知道真实端口，Origin 校验要用它。 */
+let ACTUAL_PORT = null;
 
 /**
  * owner 还在不在。
@@ -189,6 +211,7 @@ function makeClient(res) {
     pendingState: null,                  // string | null —— 合并槽
     pendingProgress: new Map(),          // vizTurnId → string
     pendingControl: [],
+    pendingSendResult: [],               // 追问回执:跟 control 同类,各说各的一件事,不合并
     dropped: 0,
     pumping: false,
   };
@@ -227,6 +250,17 @@ function pushControl(c, dataStr) {
   pump(c);
 }
 
+function pushSendResult(c, dataStr) {
+  if (!c.writable) return;
+  c.pendingSendResult.push(dataStr);
+  pump(c);
+}
+
+/** 广播给**所有**连着的客户端,不只是发起追问的那个标签页——开着两个标签页时两边都该看到。 */
+function broadcastSendResult(dataStr) {
+  for (const c of clients) pushSendResult(c, dataStr);
+}
+
 /** 遵守 `res.write()` 的背压：返回 false 就等 `drain`，**不无限缓冲**。 */
 async function pump(c) {
   if (c.pumping || !c.writable) return;
@@ -236,6 +270,8 @@ async function pump(c) {
       let chunk = null;
       if (c.pendingControl.length) {
         chunk = frame("control", c.pendingControl.shift());
+      } else if (c.pendingSendResult.length) {
+        chunk = frame("send-result", c.pendingSendResult.shift());
       } else if (c.pendingState !== null) {
         const s = c.pendingState; c.pendingState = null;
         if (c.dropped > 0) {
@@ -404,8 +440,65 @@ async function doPollProgress() {
   }
 }
 
+/**
+ * 追问回执的轮询。**跟 `pollState` 同量级间隔**——见
+ * docs/DESIGN-session-viz-send-lock-2026-08-04.md §5 第 3 条,不引入 `fs.watch`。
+ *
+ * serve.mjs 是 `outbox/` 的唯一读者(桥进程只写),读完立刻删——不删的话同一条回执会
+ * 每一拍重发一次。**没有任何客户端在听时也照删**:那条回执对应的发送动作已经真的执行了
+ * (桥那边先删 inbox 请求、再调用真正的发送逻辑),这里只是「通知」这一层，
+ * 丢一次通知不等于丢一次发送——观测台正常的状态快照轮询里迟早会看到那一轮出现。
+ */
+async function pollOutbox() {
+  const outboxRoot = path.join(VIZ_DIR, OUTBOX_DIRNAME);
+  let sessionDirs;
+  try { sessionDirs = await fsp.readdir(outboxRoot, { withFileTypes: true }); }
+  catch { return; } // 目录还没建(还没有过一条回执)——正常
+  for (const sEnt of sessionDirs) {
+    if (!sEnt.isDirectory?.()) continue;
+    const sessionId = sEnt.name;
+    // 目录名也要自己验一遍字符集(§12.1「两侧各自校验」)。写方验过不代表读方可以不验——
+    // 这条目录是文件系统给的,不是桥递过来的:任何进程都能在 outbox 底下建一个带空格/控制符
+    // 的目录名。放它过去,那些帧会带着非法 sessionId 进到页面的缓冲里。
+    if (!SAFE_SESSION_ID.test(sessionId) || sessionId === "." || sessionId === "..") continue;
+    const dir = path.join(outboxRoot, sessionId);
+    let files;
+    try { files = await fsp.readdir(dir); } catch { continue; }
+    for (const name of files) {
+      const m = /^resp-(.+)\.json$/.exec(name);
+      if (!m) continue;
+      const fileReqId = m[1];
+      if (!SAFE_SESSION_ID.test(fileReqId)) continue;   // reqId 同理:同一套安全 segment 判据
+      const fp = path.join(dir, name);
+      let raw;
+      try { raw = await fsp.readFile(fp, "utf8"); } catch { continue; }
+      try { await fsp.unlink(fp); } catch {}
+      let body;
+      try { body = JSON.parse(raw); } catch { continue; } // 撕裂读概率极小,跳过=丢一次通知,不致命(见上)
+      /* ⚠️ **两侧互不信任**(docs/STATE-session-viz.md §12.1):这一层要自己把回执校验一遍,
+            不能因为"写的人是桥"就把正文当可信输入。第一版写的是 `{ sessionId, ...body }` ——
+            展开在后,**正文里的 `sessionId` 会盖掉目录来源**,一份 `outbox/A/resp-r.json`
+            只要正文写 `{"sessionId":"B"}` 就会被广播成 B 的回执,落到别的会话的输入框上。
+            所以:字段逐个校验,`sessionId` **只认目录名**,`reqId` 还要跟文件名对得上
+            (对不上说明这份文件跟它的名字不是一回事,整份丢掉比按错的 reqId 认领安全)。 */
+      if (!body || typeof body !== "object" || Array.isArray(body)) continue;
+      if (body.reqId !== fileReqId) continue;
+      if (typeof body.ok !== "boolean") continue;
+      broadcastSendResult(JSON.stringify({
+        sessionId,                       // 目录来源,不取正文
+        reqId: fileReqId,
+        ok: body.ok,
+        error: typeof body.error === "string" ? body.error : null,
+        result: body.result ?? null,
+        respondedAt: typeof body.respondedAt === "string" ? body.respondedAt : null,
+      }));
+    }
+  }
+}
+
 const statePoll = setInterval(() => { pollState().catch(() => {}); }, POLL_MS);
 const progPoll = setInterval(() => { pollProgress().catch(() => {}); }, PROGRESS_MS);
+const outboxPoll = setInterval(() => { pollOutbox().catch(() => {}); }, POLL_MS);
 const hb = setInterval(() => {
   for (const c of clients) { if (c.writable) { try { c.res.write(":hb\n\n"); } catch { kill(c); } } }
 }, 15000);
@@ -431,7 +524,7 @@ function armGraceIfIdle() {
 }
 
 function shutdown(code) {
-  clearInterval(statePoll); clearInterval(progPoll); clearInterval(hb);
+  clearInterval(statePoll); clearInterval(progPoll); clearInterval(hb); clearInterval(outboxPoll);
   for (const c of clients) { try { c.res.end(); } catch {} }
   try { server.close(); } catch {}
   process.exit(code);
@@ -472,6 +565,113 @@ async function handleEvents(req, res) {
   replayFor(c);
 }
 
+// ── 追问:装锁 + 写 inbox ────────────────────────────────────────────────────
+
+
+/**
+ * 校验来源。**这不是唯一那道锁**——浏览器对带自定义头的跨站 POST 会先发一次 OPTIONS 预检,
+ * 这里从不回放行别的来源的 CORS 头,预检不过浏览器根本不会把真正的 POST 发出来;
+ * 这里的检查防的是**不遵守 CORS 的非浏览器客户端**(docs/DESIGN-session-viz-send-lock-2026-08-04.md §3)。
+ */
+function originOk(req) {
+  const origin = req.headers.origin;
+  if (!origin || ACTUAL_PORT == null) return false;
+  return origin === `http://127.0.0.1:${ACTUAL_PORT}`;
+}
+
+/** 定长比较,避免时序侧信道——虽然本机单用户场景下这条攻击成本本来就很高，但做起来不贵。
+ *
+ *  ⚠️ **先比字节长度,不能比 `String.length`。** 后者是 UTF-16 码元数:一个 64 个非 ASCII 字符的
+ *     token 头能跟 64 字符的真 token 长度相等,但 UTF-8 buffer 长度不同,`timingSafeEqual` 会
+ *     直接抛 `ERR_CRYPTO_TIMING_SAFE_EQUAL_LENGTH` —— 那就不是"拒绝"而是"路由抛异常"了。 */
+function tokenOk(req) {
+  const got = req.headers["x-viz-token"];
+  if (typeof got !== "string") return false;
+  const a = Buffer.from(got, "utf8");
+  const b = Buffer.from(VIZ_TOKEN, "utf8");
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+/**
+ * 读请求体，超过上限就不再往内存里攒——但**照样把流排空到 `end`，不 `destroy()`**。
+ *
+ * ⚠️ 早先这里超限就 `req.destroy()`，客户端收到的是 `ECONNRESET`（socket hang up），
+ *    永远看不到 413，也看不到「消息太长」这句人话——只有一个网络层的报错，
+ *    分不清是自己写岔了还是页面本身坏了。本机单用户场景下，排空一份超大 body
+ *    的代价可以接受，换来的是**响应总能正常发出去**。
+ */
+function readBodyCapped(req, maxBytes) {
+  return new Promise((resolve, reject) => {
+    let total = 0;
+    let overLimit = false;
+    const chunks = [];
+    req.on("data", (chunk) => {
+      total += chunk.length;
+      if (total > maxBytes) { overLimit = true; return; } // 继续排空，只是不再攒进内存
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      if (overLimit) reject(Object.assign(new Error("request body too large"), { code: "too_large" }));
+      else resolve(Buffer.concat(chunks));
+    });
+    req.on("error", reject);
+  });
+}
+
+/**
+ * `POST /send`——三道锁按顺序过(方法 → 来源 → 凭证),再限内容类型与体积,
+ * 通过之后**只做一件事**:把 `{message}` 原子写进 `inbox/<sessionId>/req-<reqId>.json`,
+ * 回 202 + reqId。**真正的发送逻辑不在这里**——那是桥进程里 `sendFollowupFromViz` 的事,
+ * 这条路由只管把请求安全地递过去。
+ */
+async function handleSend(req, res) {
+  // ⚠️ **这里不能用共用的 `sendMethodNotAllowed()`** —— 它回的是 `text/plain`(给 `/events`
+  //    和 `/file` 那两个本来就是文本的端点用的),而 §12.6 说死了 `/send` 的**所有**响应都是 JSON。
+  //    照着合同写的客户端会对每个响应调 `response.json()`,碰上 text/plain 就直接抛。
+  if (req.method !== "POST") return sendJson(res, 405, { error: "method not allowed" }, { Allow: "POST" });
+  if (!originOk(req)) return sendJson(res, 403, { error: "origin not allowed" });
+  if (!tokenOk(req)) return sendJson(res, 401, { error: "missing or wrong token" });
+  const ct = String(req.headers["content-type"] || "");
+  if (!/^application\/json\b/i.test(ct)) return sendJson(res, 415, { error: "expected application/json" });
+
+  let raw;
+  try { raw = await readBodyCapped(req, REQUEST_MAX_BYTES); }
+  catch (e) {
+    if (e?.code === "too_large") return sendJson(res, 413, { error: "request body too large" });
+    return sendJson(res, 400, { error: "failed to read request body" });
+  }
+
+  let body;
+  try { body = JSON.parse(raw.toString("utf8")); }
+  catch { return sendJson(res, 400, { error: "body is not valid JSON" }); }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return sendJson(res, 400, { error: "body must be an object" });
+  }
+  const sessionId = body.sessionId;
+  const message = body.message;
+  if (typeof sessionId !== "string" || sessionId === "." || sessionId === ".." || !SAFE_SESSION_ID.test(sessionId)) {
+    return sendJson(res, 400, { error: "sessionId is missing or malformed" });
+  }
+  if (typeof message !== "string" || !message.trim()) {
+    return sendJson(res, 400, { error: "message is required" });
+  }
+
+  const reqId = crypto.randomUUID();
+  const dir = path.join(VIZ_DIR, INBOX_DIRNAME, sessionId);
+  const finalPath = path.join(dir, `req-${reqId}.json`);
+  const tmpPath = path.join(dir, `.tmp-${reqId}-${crypto.randomBytes(4).toString("hex")}`);
+  try {
+    await fsp.mkdir(dir, { recursive: true });
+    await fsp.writeFile(tmpPath, Buffer.from(JSON.stringify({ message }), "utf8"));
+    await fsp.rename(tmpPath, finalPath);
+  } catch {
+    try { await fsp.unlink(tmpPath); } catch {}
+    return sendJson(res, 500, { error: "failed to queue the message" });
+  }
+  sendJson(res, 202, { reqId });
+}
+
 function handleFile(req, res, url) {
   if (req.method !== "GET" && req.method !== "HEAD") return sendMethodNotAllowed(res);
   // 放行范围就是这个 run 的目录。ref 只可能指向 `turns/<sid>/…`——
@@ -491,20 +691,72 @@ function sendLocal(res, file, type) {
   res.end(bytes);
 }
 
+/**
+ * index.html 单独一份发法：**读文件 + 替换占位符**,不是纯静态转发——把凭证注入进去。
+ * 占位符是 HTML 注释,页面自身不受影响;找不到占位符（文件被换过）时**不吞错**，
+ * 直接照原样发但记一行 stderr——总比悄悄发一份没有凭证、页面永远发不出追问的版本更好排查。
+ */
+function sendIndexHtml(res) {
+  let html;
+  try { html = fs.readFileSync(INDEX_HTML, "utf8"); } catch { return sendPlain(res, 500, "页面文件缺失"); }
+  const marker = "<!--VIZ_TOKEN_INJECT:";
+  const idx = html.indexOf(marker);
+  if (idx === -1) {
+    console.error("index.html 里找不到 VIZ_TOKEN_INJECT 占位符——凭证没注入，页面发不出追问");
+  } else {
+    const end = html.indexOf("-->", idx);
+    if (end !== -1) {
+      html = html.slice(0, idx) + `<script>window.__VIZ_TOKEN__=${JSON.stringify(VIZ_TOKEN)};</script>` + html.slice(end + 3);
+    }
+  }
+  const bytes = Buffer.from(html, "utf8");
+  res.writeHead(200, {
+    "Content-Type": "text/html; charset=utf-8", "Content-Length": bytes.length,
+    "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+    // ⚠️ **禁止被别的站点套进 iframe。** 三道锁(方法/来源/凭证)挡的是"别的站点**自己**发请求"——
+    //    但只要这个页面能被嵌进去,被嵌的仍然是 `127.0.0.1` 这个 origin:它读得到注入的凭证、
+    //    它自己发的 fetch 也天然满足 Origin 检查。攻击者不需要绕过任何一道锁,
+    //    只要把真实的输入框透明地盖在诱饵按钮下面,骗用户**亲手**打字并点发送即可(clickjacking)。
+    //    两个头一起给:CSP 是现代浏览器的正解,X-Frame-Options 兜住老实现。
+    "Content-Security-Policy": "frame-ancestors 'none'",
+    "X-Frame-Options": "DENY",
+  });
+  res.end(bytes);
+}
+
+function sendJson(res, code, obj, extraHeaders = null) {
+  const bytes = Buffer.from(JSON.stringify(obj), "utf8");
+  res.writeHead(code, {
+    "Content-Type": "application/json; charset=utf-8", "Content-Length": bytes.length,
+    "Cache-Control": "no-store",
+    ...(extraHeaders || {}),
+  });
+  res.end(bytes);
+}
+
 const server = http.createServer((req, res) => {
   let url;
   try { url = new URL(req.url, "http://localhost"); } catch { return sendPlain(res, 400, "坏请求"); }
   if (url.pathname === "/events") return void handleEvents(req, res).catch(() => {});
   if (url.pathname === "/file") return handleFile(req, res, url);
+  /* ⚠️ 吞掉异常但**必须还是回一个响应**。原来是 `.catch(() => {})` ——`handleSend` 里任何
+        一处意外抛出,客户端就等到天荒地老(页面那边只会看到 fetch 一直挂着,连"失败"都不算),
+        而这条链路上正好有过一个会抛的分支(token 长度不等时的 `timingSafeEqual`)。 */
+  if (url.pathname === "/send") {
+    return void handleSend(req, res).catch(() => {
+      try { if (!res.headersSent) sendJson(res, 500, { error: "internal error" }); else res.end(); } catch {}
+    });
+  }
   if (url.pathname === "/reconcile.mjs") return sendLocal(res, RECONCILE_MJS, "text/javascript; charset=utf-8");
   if (url.pathname === "/" || url.pathname === "/index.html") {
-    return sendLocal(res, INDEX_HTML, "text/html; charset=utf-8");
+    return sendIndexHtml(res);
   }
   sendPlain(res, 404, "没有这个地址");
 });
 
 server.listen(port, "127.0.0.1", () => {
   const a = server.address();
+  ACTUAL_PORT = a.port;
   console.log(`session-viz  http://127.0.0.1:${a.port}/   run=${META.runId}`);
 });
 

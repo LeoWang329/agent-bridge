@@ -40,6 +40,13 @@
 //   ctxslow   — like slowturn (stays running ~2.5s) with the SAME contextUsage in get_state, so a
 //               short-timeout wait times out with the session still running and the OMP reading is LIVE
 //               in pendingSnapshots[].contextUsage (mid-wait watch of a long session). [repro-context-usage]
+//   ackless   — 第 1 次 prompt 跟 okturn 一样正常;第 2 次**故意一个字都不回**(吞掉那条 ack 的
+//               response),但那一轮**照跑**:agent_start + 正文 + turn_end + agent_end 全都发。
+//               这就是真 OMP 的 "RPC ACK 超时" 现场,桥自己在代码里写着「不证明后端没收下那条
+//               prompt」——它会把 turnInFlight 清掉、status 放回 idle,而且因为 lastTurnId 是在
+//               ack 成功之后才铸的,**这一轮永远拿不到自己的 id**,末轮 id 停在上一轮上。
+//               于是"上一轮的已取走证明"会跟"正在跑的这一轮"对上号。
+//               [repro-viz-followup-gate T5 -> sendEpoch:只比 turn id 挡不住这条路]
 // Launched via fake-omp.cmd (Windows) or fake-omp.sh (POSIX) through OMP_BIN; env is inherited.
 import fs from "node:fs";
 import path from "node:path";
@@ -48,6 +55,23 @@ import { execFileSync } from "node:child_process";
 const MODE = process.env.FAKE_OMP_MODE || "pipebreak";
 /** reaskturn 用:同一个后端进程里第几次收到 prompt(第 1 次故意答不合格)。 */
 let reaskSeen = 0;
+/** ackless 用:第几次收到 prompt(第 2 次开始吞掉 ack 的 response,但轮次照跑)。 */
+let acklessSeen = 0;
+
+/** **收到过多少条 prompt** —— 只增不减,写进 `FAKE_OMP_COUNTER_FILE`(给了才写)。
+ *
+ *  ⚠️ 这是为了让「那个动作根本没发生过」可以被**直接**断言。之前的负向用例只能靠正文标记
+ *     间接推断(「答案里没出现 _ANSWER_3」),而那种断言在两种情况下天生偏弱:
+ *       · 后端每轮吐**一样**的正文时(如 turnstate 模式),覆盖了也看不出来;
+ *       · 「真发出去了、但在吐正文之前被中止」的变异,正文标记同样照不出来。
+ *     计数器直接量的是**后端收到了几条 prompt**,这两种都盖得住。 */
+let promptsSeen = 0;
+function notePrompt() {
+  promptsSeen++;
+  const f = process.env.FAKE_OMP_COUNTER_FILE;
+  if (!f) return;
+  try { fs.writeFileSync(f, String(promptsSeen)); } catch {}
+}
 
 /** 所有"往 cwd 里写文件"的模式。写完之后各自还会再干点别的(自己提交 / 切走 HEAD / 弄坏 git 链接)。 */
 const WRITE_MODES = [
@@ -118,7 +142,7 @@ process.stdin.on("data", d => {
           ? slowsettleStreaming
           : (MODE === "multiturn" || MODE === "multiturn-fast")
           ? multiturnStreaming
-          : !(MODE === "okturn" || MODE === "okturn-exit" || MODE === "errturn" || MODE === "errecho" || MODE === "quotaturn" || MODE === "roleecho" || MODE === "echoturn" || MODE === "reaskturn" || MODE === "fenceturn" || WRITE_MODES.includes(MODE) || MODE === "ctxturn" || MODE === "logstress" || MODE === "badline" || MODE === "toolturns" || MODE === "agentenderr" || MODE === "hugeturn");
+          : !(MODE === "okturn" || MODE === "okturn-exit" || MODE === "errturn" || MODE === "errecho" || MODE === "quotaturn" || MODE === "roleecho" || MODE === "echoturn" || MODE === "reaskturn" || MODE === "fenceturn" || WRITE_MODES.includes(MODE) || MODE === "ctxturn" || MODE === "logstress" || MODE === "badline" || MODE === "toolturns" || MODE === "agentenderr" || MODE === "hugeturn" || MODE === "ackless" || MODE === "ackless-slow" || MODE === "slowtext-ackless" || MODE === "slowtext-ok");
         const data = { isStreaming, queuedMessageCount: 0, sessionId: "fake", messageCount: 1 };
         // ctx* modes: real omp reports current-context occupancy in get_state.data (contextUsage sub-object
         // + isCompacting/autoCompactionEnabled siblings — see the probe dump). The bridge normalizes this to
@@ -130,11 +154,83 @@ process.stdin.on("data", d => {
         }
         say({ type: "response", id: msg.id, command: "get_state", success: true, data });
       } else if (msg.type === "prompt") {
+        notePrompt();   // ⚠️ 必须在**所有**分支之前:被拒的、吞 ack 的,都算"后端收到了"
         if (MODE === "rejectprompt") {
           // Refuse the prompt; no turn ever starts. The bridge's send() rejects and returns the
           // session to idle. A correct sessionSettled must then settle wait() (turnInFlight cleared
           // in send()'s catch), not dead-wait. Pre-turnInFlight (everPrompted) this dead-waited.
           say({ type: "response", id: msg.id, success: false, error: "fake-omp: prompt refused" });
+          continue;
+        }
+        if (MODE === "slowtext-ok") {
+          // `slowtext-ackless` 的**镜像**:同样把第 1 发钉在 `get_last_assistant_text` 上 4 秒,
+          // 但第 2 发**一切正常**——正常 ack、正常铸出自己的 turn id。
+          // 考的是漏斗对这个窗口的处置:第二发必须**在漏斗层就被拒**——后端一个字都收不到。
+          // 放它进去就已经错了:它会被真的派给后端,可能顶掉先来那一轮还没被取走的产出。
+          // 同时考"拒了之后不许被永久锁死":收走第 1 轮之后追问必须能正常发。
+          // [repro-viz-followup-gate T8]
+          acklessSeen++;
+          const n = acklessSeen;
+          say({ type: "response", id: msg.id, success: true });
+          say({ type: "agent_start" });
+          setTimeout(() => {
+            say({ type: "message_update", message: { type: "text_delta", delta: `SLOWTEXTOK_ANSWER_${n}` } });
+            say({ type: "turn_end" });
+            say({ type: "agent_end" });
+          }, 60);
+          continue;
+        }
+        if (MODE === "slowtext-ackless") {
+          // 第 1 发正常跑完(agent_end 一到,桥就把 turnInFlight 清掉了),但
+          // `get_last_assistant_text` 要 4 秒才回 —— 于是 `wait:true` 的那一发**卡在 result() 里**,
+          // 它的 sendTurn 还没走到 finally。这段窗口里第二发能进来(busy 闸拦不住,它早被清了),
+          // 而第二发的 ack 被吞 ⇒ 又是一次"可能已送达、没铸 id"。
+          // 考的是:先进来的那一发在 finally 里**不许**把后一发的代际当成自己的。
+          // [repro-viz-followup-gate T7 -> 漏斗的并发所有权]
+          acklessSeen++;
+          const n = acklessSeen;
+          if (n === 1) {
+            say({ type: "response", id: msg.id, success: true });
+            say({ type: "agent_start" });
+            setTimeout(() => {
+              say({ type: "message_update", message: { type: "text_delta", delta: "SLOWTEXT_ANSWER_1" } });
+              say({ type: "turn_end" });
+              say({ type: "agent_end" });
+            }, 60);
+          }
+          // n >= 2:一个字都不回(ack 被吞),也不发轮次事件 —— 纯粹的"下落不明"
+          continue;
+        }
+        if (MODE === "ackless-slow") {
+          // ackless 的**慢版**:第 2 发同样不回 ack,但正文拖到 ACK 超时**之后**才吐。
+          // 这样就造出一段真空:ACK 已经超时(桥清了 turnInFlight、status 回 idle、没铸 id),
+          // 而后端**还在跑**。这段真空里主 agent 中途取一次结果,拿到的是带**旧 id** 的快照——
+          // 「交付」这个动作于是有机会把 discharge 证明洗成当前代际。
+          // [repro-viz-followup-gate T6 -> 代际的两侧操作数都必须是会话字段,不能来自交付那一刻]
+          acklessSeen++;
+          const n = acklessSeen;
+          if (n === 1) say({ type: "response", id: msg.id, success: true });
+          say({ type: "agent_start" });
+          setTimeout(() => {
+            say({ type: "message_update", message: { type: "text_delta", delta: `ACKLESS_SLOW_ANSWER_${n}` } });
+            say({ type: "turn_end" });
+            say({ type: "agent_end" });
+          }, n === 1 ? 60 : 3000);
+          continue;
+        }
+        if (MODE === "ackless") {
+          // ⚠️ 关键在于 **ack 和 turn 的分离**:第 2 发起,response 一个字都不回(桥那边就是
+          //    RPC 超时 ⇒ ambiguous ⇒ 清掉 turnInFlight、放回 idle、**不铸 turn id**),
+          //    但轮次本身照常跑完并产出正文。真 OMP 在管道半死/后端卡一下时就是这个形状。
+          acklessSeen++;
+          const n = acklessSeen;
+          if (n === 1) say({ type: "response", id: msg.id, success: true }); // 第 1 发正常
+          say({ type: "agent_start" });
+          setTimeout(() => {
+            say({ type: "message_update", message: { type: "text_delta", delta: `ACKLESS_ANSWER_${n}` } });
+            say({ type: "turn_end" });
+            say({ type: "agent_end" });
+          }, 60);
           continue;
         }
         say({ type: "response", id: msg.id, success: true });
@@ -504,6 +600,12 @@ process.stdin.on("data", d => {
         } else {
           say({ type: "agent_start" });
         }
+      } else if ((MODE === "slowtext-ackless" || MODE === "slowtext-ok") && msg.type === "get_last_assistant_text") {
+        // 4 秒才回 —— 把 `wait:true` 那一发钉在 result() 里,给第二发让出并发窗口(见上)。
+        setTimeout(() => {
+          say({ type: "response", id: msg.id, command: "get_last_assistant_text",
+                success: true, data: { text: MODE === "slowtext-ok" ? "SLOWTEXTOK_ANSWER_1" : "SLOWTEXT_ANSWER_1" } });
+        }, 4000);
       } else if (MODE === "multiturn-fast" && msg.type === "get_last_assistant_text") {
         // ★★ 比 multiturn **更毒**的形状,专门打「只复核 settled、不复核 generation」这个洞:
         //    后端在**同一次 RPC 之内**把整整一轮跑完 —— turn_start → 新正文 → turn_end 一次性发完,

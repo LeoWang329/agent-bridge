@@ -247,6 +247,10 @@ function adaptTurn(t, c) {
     dur: Math.round((t.durationMs || 0) / 1000),
     elapsed: running ? secsSince(t.dispatchedAt, c.now) : 0,
     unfetched: isUncollected(t) && !synthesized,
+    // docs/STATE-session-viz.md §4.5 的三档：initial_prompt / send_message / user_followup。
+    // 页面只用它来判断要不要挂「用户追问」这个标签，不参与任何闸门判断——
+    // 闸门（能不能发追问）永远在桥进程那一侧做，见 sendFollowupFromViz。
+    source: t.source || null,
     error: t.error || null,
     vizTurnId: t.vizTurnId,
     input: {

@@ -322,7 +322,7 @@ sidecar（§5）在结算那一刻就被删掉，后端又已经死了，观测�
   "dispatchedAt": "…",              // **公开/认领时刻**
   "settledAt": null,
   "firstBackendEventAt": null,      // 诊断用,**不作轮次出现的门槛**;允许早于 dispatchedAt
-  "source": "send_message",         // initial_prompt | send_message
+  "source": "send_message",         // initial_prompt | send_message | user_followup
   "blocking": false,
   "hasSchema": false,
   "input":  { /* §4.7 */ },
@@ -335,6 +335,16 @@ sidecar（§5）在结算那一刻就被删掉，后端又已经死了，观测�
   "durationMs": null
 }
 ```
+
+**`source` 的三档**：`initial_prompt`（开会话时的首轮）、`send_message`（主 agent 通过
+`agent_bridge_send_message` 发的）、`user_followup`（用户在观测台页面上对一个已经闲下来的会话
+追问的——见 `docs/DESIGN-session-viz-send-lock-2026-08-04.md`）。
+
+⚠️ `initial_prompt` 曾经在生产里**长期空缺**：开会话那条路没走 `sendTurn()` 这个漏斗，
+首轮全落到默认值 `send_message` 上，而校验器只管"值在不在枚举里"，查不出"有一档从来没出现过"。
+现已改为一律走漏斗（见 §12.7 那条纪律）。
+`user_followup` 只能由桥内部的 `sendFollowupFromViz` 产生，不对任何 MCP 工具暴露，
+调用方无法自己声称自己是 `user_followup`。
 
 **`turns` 按 `turnNo` 升序。**
 
@@ -525,9 +535,9 @@ viewer 收到 `settled` 立即停止轮询该 sidecar。
 
 | 项 | 内容 |
 |---|---|
-| 端点 | `GET /events`（SSE）· `GET /file?ref=`（资产）· `GET /`（页面）。**没有第四个** |
+| 端点 | 读：`GET /events`（SSE）· `GET /file?ref=`（资产）· `GET /`（页面）。写：**只有** `POST /send`（追问，合同见 §12.6）。**没有第五个** |
 | 响应头 | `text/event-stream` · `Cache-Control: no-cache` · `Connection: keep-alive` · `X-Accel-Buffering: no` |
-| 帧类型 | `hello` · `state` · `progress` · `control` · `viz:overflow` |
+| 帧类型 | `hello` · `state` · `progress` · `control` · `viz:overflow` · `send-result`（§12） |
 | 边界 | `\n\n`；每帧 `event:` + `data:` 两行 |
 | 心跳 | 定期注释行（`:hb\n\n`），防中间件掐死空闲连接。**不计入背压预算** |
 | 背压 | **每客户端只保留一份可合并的最新 `state`**（新的覆盖旧的，**不排队**），并遵守 `write()` 的 `drain` |
@@ -542,6 +552,7 @@ viewer 收到 `settled` 立即停止轮询该 sidecar。
 | `progress` | `{ "sessionId": "…", …§5 sidecar 的全部字段 }` |
 | `control` | `{ "kind": "run-gone" }` 或 `{ "kind": "history-read-failure" }` |
 | `viz:overflow` | `{ "droppedFrames": N }` —— 背压合并掉了几代 |
+| `send-result` | 追问的回执，**§12**。`{ "sessionId": "…", "reqId": "…", "ok": bool, "result"?: {…}, "error"?: "…", "respondedAt": "…" }` |
 
 ### ⚠️ viewer 是搬运工，不是第二个 writer
 
@@ -554,6 +565,11 @@ viewer 收到 `settled` 立即停止轮询该 sidecar。
 
 所以实时预览走**独立的 `progress` 帧**，**由页面在渲染时合并**，
 并且必须当场执行 §5 的四条前提（尤其「快照里该 turn 仍是 `dispatched`」这一条）。
+
+> **这条纪律管的是 `state`，不是整个 `VIZ_DIR`。** §12 的追问功能让 viewer 往
+> `inbox/` 写文件——那是**另一个命名空间的另一种东西（请求，不是状态）**，
+> 两边的写者各自唯一，不构成"第二个 writer"。判据是：**viewer 永远不写 `state.*.json`、
+> 不写 `turns/`、不改任何快照字节**。写请求 ≠ 改状态。
 
 ### 6.1 `degraded` 只有一个真理源
 
@@ -710,3 +726,246 @@ run 存活期间 tmpdir 里就是一份全量明文，本机任何进程可读�
    录出来的样例只会把 writer 当时的 bug 一起冻住。
 4. 独立不变量**同时**跑在冻结样例与**真实桥运行**产出的快照上。
    只跑前者证明不了生产路径。
+
+---
+
+## 12. 追问信箱（`inbox/` · `outbox/`）—— viewer → 桥的唯一写通道
+
+设计背景与取舍见 `docs/DESIGN-session-viz-send-lock-2026-08-04.md`；**wire 以本节为准。**
+
+用户在观测台页面上对一个**已经闲下来**的委托会话继续追问。页面（`viz/serve.mjs`）与真正拥有
+发送能力的桥进程是**两个独立的系统进程**，中间靠 `VIZ_DIR` 下这两个目录传递。
+
+### 12.1 目录布局与所有权
+
+```
+VIZ_DIR/
+  inbox/<sessionId>/req-<reqId>.json          ← serve.mjs 写；桥读并认领
+  inbox/<sessionId>/.claimed-req-<reqId>.json ← 桥认领后的中间态（见 12.3）
+  outbox/<sessionId>/resp-<reqId>.json        ← 桥写；serve.mjs 读完即删
+```
+
+**每个目录单写者单读者**，不会撞车：
+
+| 目录 | 谁写 | 谁读 | 谁删 |
+|---|---|---|---|
+| `inbox/` | `viz/serve.mjs` | 桥（`scripts/viz-inbox.mjs`） | 桥 |
+| `outbox/` | 桥 | `viz/serve.mjs` | `viz/serve.mjs` |
+
+- `<sessionId>` 与 `<reqId>` 必须满足 `^[A-Za-z0-9._-]+$` 且不得为 `.` / `..`（两侧各自校验，**不互相信任**）。
+- 两侧落盘一律 **写临时文件 + rename**，消费者永远读不到半截 JSON。
+  临时文件用 `.` 前缀，天然落在 `req-*.json` / `resp-*.json` 的扫描范围之外。
+- **`.claimed-` 前缀的文件不得被当成新请求**——扫描器只认 `^req-(.+)\.json$`。
+
+### 12.2 报文
+
+**请求**（`req-<reqId>.json`），≤ **64 KiB**：
+
+```jsonc
+{ "message": "用户打的那句话" }   // 必填、非空白；其余键一律忽略
+```
+
+请求正文里 `reqId` **只在文件名里**，不进正文——两处各存一份就会漂。
+
+**64 KiB 量的是 UTF-8 字节数**，不是 `String.length`（那是 UTF-16 码元数，中文会低估约三倍）。
+HTTP 那一层（`readBodyCapped`）本来就按字节量，两侧口径必须一致，否则同一个上限在两条路上是两个值。
+
+**回执**（`resp-<reqId>.json`）：
+
+```jsonc
+{ "reqId": "…", "ok": true,  "result": { "accepted": true, "turnId": "…" }, "respondedAt": "ISO" }
+{ "reqId": "…", "ok": false, "error": "人话原因",                            "respondedAt": "ISO" }
+```
+
+`reqId`（必填）必须**等于文件名里那个**；`ok` 必填且是布尔。
+
+`serve.mjs` 转成 SSE `send-result` 帧时按 §12.1「两侧互不信任」**逐字段重新构造**，不是展开透传：
+
+- **目录名与文件名里的 `reqId` 都要自己验一遍安全 segment**（`^[A-Za-z0-9._-]+$`，且不是 `.` / `..`）。
+  写方验过不代表读方可以不验：这两个值是**文件系统**给的，不是桥递过来的；
+- `sessionId` **只认目录名**，正文里就算带了也不采信；
+- `reqId` 跟文件名对不上 ⇒ **整份丢掉**（这份文件跟它的名字不是一回事，按错的 reqId 认领更糟）；
+- `ok` **必须是布尔**（判据是类型，不是"字段在不在"——字符串 `"false"` 是 truthy）⇒ 否则丢掉；
+  `error` / `respondedAt` 非字符串则填 `null`。
+
+**回执的身份是 `(sessionId, reqId)` 这一对，不是 `reqId` 单独一个。** 页面缓冲早到回执时必须按这一对
+做键，认领时两个都要核对——否则会话 B 的回执会顶掉会话 A 正在等的同 reqId 那条，
+A 随后把 B 的成败当成自己的，还会把 A 正在打的字清掉。
+
+⚠️ 写成 `{ sessionId, ...body }` 是**错的**：展开在后，正文里的 `sessionId` 会盖掉目录来源，
+一份 `outbox/A/resp-r.json` 只要正文写 `{"sessionId":"B"}` 就会被广播成 B 的回执。
+
+### 12.3 至多一次：认领靠 rename，且认领失败一次都不许执行
+
+⚠️ **这是本节最要紧的一条。** 追问是一条能让 agent 去改文件的指令，
+「偶尔执行两次」不可接受。
+
+```
+rename(req-X.json → .claimed-req-X.json)
+  ├─ 成功 ⇒ 独占：原名已不在扫描范围，绝不会被重读 → 执行 handler → 写回执 → 删认领件
+  └─ 失败 ⇒ 没拿到（被锁 / 被抢 / IO 错）→ **立刻返回，一个字都不执行**，留待下一拍
+```
+
+**不许用「删除 + 吞掉失败」当认领**：Windows 上 Defender 扫一下就能让删除失败，
+而文件还躺在原地——下一拍再读到、**再执行一遍**；持续失败就是每 400ms 重放一次。
+（这条是被真实变异测试逼出来的：把认领改回删除版，端到端用例当场重放 3 次。）
+
+**失败方向必须倒向「这次不办」，而不是「可能办两次」。**
+
+### 12.4 故障语义（都要如实说，不许猜）
+
+| 情形 | 后果 | 谁负责说出来 |
+|---|---|---|
+| 认领失败 | 什么都没发生，请求留在 `inbox/` 等下一拍 | 无（对用户不可见，下一拍会成功） |
+| 桥在认领后、写回执前崩了 | 磁盘上留下 `.claimed-*`，即「接下了但不知道办没办完」的现场 | 人工排查 |
+| 回执写出但无人在听 | `serve.mjs` 读完即删，**通知丢失**；但那一轮照样会作为新 turn 出现在快照里 | 页面超时兜底 |
+| 页面等不到回执 | **有界超时后必须说「结果未知，可能已经发出去了」** | 页面 |
+
+⚠️ **页面超时的话术不许说「没发出去」或「可以重试」**——那条请求很可能已经真的送达 agent，
+劝人重发就是劝人发两遍。正确说法是「先看轮次里有没有多出这一问，再决定」。
+
+#### ⚠️ `ok:false` 只说明「没建立起成功结果」，**不说明 prompt 没送达**
+
+真实路径：OMP 已经收下了 prompt，但 ACK 超时 ⇒ handler 抛错 ⇒ 信箱写 `{ok:false}`。
+所以 `ok:false` 与「页面等不到回执」属于**同一类不确定**，客户端要按同样的保守方式处理，
+不许据此断定「没发出去、可以重发」。（没有结构化的 certainty 字段，就一律按不确定对待。）
+
+这条对**测试**同样成立，而且是被反复实测出来的：
+**「追问被拒绝」这类回执断言，在「先真的发出去、再抛出预期的拒绝错误」的变异下永远是绿的。**
+所以负向用例里回执断言只能当辅助，真正钉死「那个动作没发生」的判据必须是
+**后端被派了几次活**（本仓由 fake-omp 的单调 prompt 计数提供）。
+同理，「被保护的答案还在」也偏弱——后端每轮吐一样的正文、或正文是累加而非覆盖时，它照样成立。
+
+### 12.5 桥侧的权威闸门
+
+**页面上的置灰只是提前告知，不是拦截。** 真正的判据在桥进程里（`sendFollowupFromViz`），
+因为页面看到的快照有轮询延迟。
+
+判据的**默认方向必须是拒绝**——必须能证明「没有东西会被毁」才放行：
+
+| 状态 | 处置 |
+|---|---|
+| 从来没有过轮次 | **拒**（这不是"追问"，而且可能抢在主 agent 首轮之前） |
+| 末轮已被取走（`DISCHARGED` 匹配末轮 id），**且末轮之后没有再发生过「可能送达」的尝试**（`lastTurnEpoch === sendEpoch`） | 放行 |
+| 其余一切（含说不清） | **拒** |
+| 桥没把这一发接受成一轮（`accepted !== true`） | **当失败上报**，不许写成 `ok:true` |
+
+#### 代际（`sendEpoch`）—— 只比 turn id 挡不住的那条路
+
+`lastTurnId` **只在后端确认收下 prompt 之后才铸**。而「可能已经送达、却没铸出 id」是一个**真实存在**
+的状态，至少两条路径能到：
+
+- **OMP 的 RPC ACK 超时** —— 桥自己在代码里写着「不证明后端没收下那条 prompt」，随后却把
+  `turnInFlight` 清掉、status 放回 `idle`；
+- **codex 的 `#beginTurn(turnId)`** —— `turnId` 为空时只标 `begun`，**不动** `lastTurnId`。
+
+两条都留下同一个局面：**后端很可能正跑着一轮真的轮次，而 `lastTurnId` 还是上一轮的 id**，
+于是它跟上一轮的 discharge 证明严丝合缝地对上——只比 `turnId` 的话闸门会放行，那一轮的答案被覆盖。
+
+所以设两个计数器，都由 `sendTurn()` 那个唯一漏斗维护（不下沉到五个后端）：
+
+| 计数器 | 什么时候动 |
+|---|---|
+| `sendEpoch` | **每一次**进入 `send()` 之前 +1 —— 判据是「**可能**送达」 |
+| `lastTurnEpoch` | 只在**真的铸出了新 `lastTurnId`** 时追平 `sendEpoch` |
+
+两者不等 ⇒ 「末轮之后还有一发下落不明」⇒ 拒。
+
+⚠️ **两侧操作数都必须是会话自己的状态，绝不能有一侧来自「交付那一刻」。**
+第一版把代际记进了 `DISCHARGED`（交付时读当时的 `sendEpoch`），看着也是"比了代际"，
+实际上是同一个洞的更深一层：歧义轮次**正跑着**的时候，主 agent 中途取一次结果
+（`result` 允许中途取快照，拿到的还是旧 id），记账就会写出 `{turnId: 旧id, epoch: 当前代}`——
+**证明被洗成当前代际**，闸门当场重新打开。现在交付这个动作碰不到这两个计数器中的任何一个。
+
+- 判据是「**可能**送达」而不是「确实送达」：ACK 超时那类状态的全部意义就是分不清，
+  而分不清必须算作送过了——往另一边算就是那个洞本身。
+- **代价是方向刻意偏保守**：一次"后端明确拒绝了 prompt"同样会让两个计数器岔开，
+  于是追问被拒到**下一轮真的被接受**为止（不是取一次结果就恢复）。
+  多拒一次的代价是用户等一会儿，多放一次的代价是那份答案没了。
+- **欠账台账（`uncollectedTurns`）必须用同一个判据函数**（`dischargeProofValid`）。
+  两边误判的代价落在同一侧且都不可逆：闸门误放行 = 当场覆盖一份答案；
+  台账误报「不欠了」= 用户关客户端时把它丢掉。分两套写迟早漂开。
+
+**`source` 也同理**：不能往会话上覆盖一个 `lastTurnSource` 字段，必须跟 turn id **配成对**存
+（`{id, source}`），读的时候 id 对不上就返回 `null`，不拿别的轮次的 source 顶上。
+记晚了 `wait:true` 的 inline 结果读不到（它在 `send()` 内部就构造好了），
+记早了则在「已进 send、还没铸 id」那段窗口里把新 source 配到旧 id 上。
+
+⚠️ **绝不能写成「确认已结算了才去查有没有取走」。** OMP 有一个已知的状态形状
+（`FAKE_OMP_MODE=turnstate`）：一轮真跑完之后 `get_state` 仍报 `isStreaming:true`，
+status 被翻回 `running`，于是「已结算」判为假、整道闸被跳过；而发送那一侧只看
+`turnInFlight`（早已清掉）**照样放行**——未取走的答案当场被覆盖。
+这不是理论风险，是变异测试实测出来的：闸门退回该写法后，被保护的答案立刻变成 `null`。
+
+「还在跑」与「跑完没人取」**故意不区分**：本来就分不可靠，而两者的正确处置都是拒绝，
+所以拒绝文案必须对两种情况**同时**成立。
+
+### 12.6 `POST /send` —— 唯一的写端点
+
+**这是完整合同**：照着这一节就能独立实现一个客户端，不必读实现。
+
+**请求**：
+
+```
+POST /send
+Origin: http://127.0.0.1:<实际端口>
+X-Viz-Token: <注入在 HTML 里的那个>
+Content-Type: application/json
+
+{ "sessionId": "…", "message": "用户打的那句话" }
+```
+
+`sessionId` 必须匹配 `^[A-Za-z0-9._-]+$` 且不是 `.` / `..`；`message` 必填、非空白。
+其余键一律忽略。**请求体上限 64 KiB，量的是字节**。
+
+**响应**（一律 `application/json`）：
+
+| 码 | 正文 | 含义 |
+|---|---|---|
+| `202` | `{ "reqId": "…" }` | **只表示已排上队**，不表示发出去了。真正算数的是随后那帧 `send-result` |
+| `400` | `{ "error": "…" }` | JSON 坏 / 不是对象 / `sessionId` 缺失或不合法 / `message` 缺失或空白 / 读体失败 |
+| `401` | `{ "error": "…" }` | 凭证缺失或不对 |
+| `403` | `{ "error": "…" }` | `Origin` 不是本机那个精确值（含缺 `Origin`） |
+| `405` | `{ "error": "…" }` | 不是 `POST`（带 `Allow: POST`） |
+| `413` | `{ "error": "…" }` | 超 64 KiB。**注意必须把流排空再回 413**，不许 `destroy()`——否则客户端只看到 `ECONNRESET`，看不到这句人话 |
+| `415` | `{ "error": "…" }` | `Content-Type` 不是 `application/json` |
+| `500` | `{ "error": "…" }` | 落盘失败，或处理时抛了意外异常 |
+
+⚠️ **异常路径也必须回一个响应。** 只 `catch(() => {})` 会让客户端永远挂着——页面那边连"失败"
+都算不上，只是 fetch 一直不回。
+
+⚠️ 页面拿到 `202` **不能**当成成功；fetch 抛异常也**不能**当成失败（请求可能已经落进
+`inbox/` 了，只是回应没收到），话术按 §12.4 走。
+
+**协议版本仍是 `1`**：`POST /send` 与 `send-result` 帧是 v1 的**兼容扩展**——
+老客户端不发也不听，行为不变，所以不动 `protocolVersion`。
+
+**三道锁（缺一不可）**：
+
+| 锁 | 做法 | 挡住什么 |
+|---|---|---|
+| 凭证 | 启动时 `randomBytes(32)`，**只注入 HTML、不进 URL**；定长比较（**先比 UTF-8 字节长度**再 `timingSafeEqual`，否则非 ASCII 头会让它抛异常而不是拒绝） | 别的站点猜不出 |
+| 来源 | `Origin` 必须精确等于 `http://127.0.0.1:<实际端口>` | 凭证泄漏后的伪造来源、不守 CORS 的非浏览器客户端 |
+| 请求形状 | 只认 `POST` + `application/json` + 体积上限 | 简单请求偷跑 |
+
+**凭证不进 URL** 是刻意的：URL 会进浏览器历史、会经 `Referer` 泄漏。
+
+**外加**：HTML 响应必须带 `Content-Security-Policy: frame-ancestors 'none'` 与
+`X-Frame-Options: DENY`。否则页面能被别的站点套进 iframe——被嵌的仍是 `127.0.0.1` origin，
+读得到凭证、自己发的请求也天然满足 Origin 检查，攻击者**一道锁都不用绕**，
+只要把真实输入框透明地盖在诱饵下面骗用户亲手点（clickjacking）。
+
+### 12.7 `source` 的三档必须都真的被产出
+
+`initial_prompt`（开会话首轮）/ `send_message`（调用方发的）/ `user_followup`（页面追问的）。
+
+⚠️ **「值合不合法」的校验查不出「有一档从来没出现过」。** `initial_prompt` 就这么
+在生产里空缺了很久——开会话那条路漏传 `source`，全落到默认值上，而校验器只管值在不在枚举里。
+**新增枚举值必须配一条真跑的用例证明它真的会被产出**，否则等于把同一个毛病复制一遍。
+
+`user_followup` **只能**由 `sendFollowupFromViz` 产生，不对任何 MCP 工具暴露，
+调用方无法自称是它。
+
+它同时必须**沿主 agent 那条路透出去**（`lastTurn.source`，以及欠账台账的每一条）：
+用户的追问会永久留在该会话上下文里，主 agent 看不见的话，
+就会看到委托 agent 突然改主意却无法解释——**在按一个自己看不见的东西做判断**。

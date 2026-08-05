@@ -9,6 +9,8 @@ import readline from "node:readline";
 // ⚠️ **零副作用 import**:viz-writer 模块顶层什么都不做,只有 `createVizRun()` 被调用才建目录。
 //    这是它能被 `doctor` / `cleanup` / 测试 import 的前提(docs/STATE-session-viz.md §7)。
 import { createVizRun, vizCleanup } from "./viz-writer.mjs";
+// 同样零副作用:`createVizInbox()` 只建对象,`.start()` 才碰文件系统。
+import { createVizInbox } from "./viz-inbox.mjs";
 
 const IS_WINDOWS = process.platform === "win32";
 
@@ -1262,7 +1264,30 @@ function lastTurnOf(session) {
   const settled = session.status !== "running" && session.status !== "starting";
   const endedAt = settled ? session.turnEndedAt || null : null;
   const durationMs = startedAt && endedAt ? new Date(endedAt) - new Date(startedAt) : null;
-  return { id: session.lastTurnId || null, startedAt, endedAt, durationMs };
+  // `source` 说的是**这一轮是谁发起的**:`initial_prompt`(开会话时的首轮)/ `send_message`
+  // (调用方自己发的)/ `user_followup`(**用户在观测台页面上追问的**)。
+  // ⚠️ 最后一档是这个字段存在的理由:用户的追问会**永久留在这个会话的上下文里**,之后每一轮
+  //    它都带着。调用方看不见这件事的话,会看到委托 agent 突然改主意却完全无法解释——
+  //    **它在按一个自己看不见的东西做判断**,而这是最难查的一类问题。
+  //
+  // ⚠️ **只认配得上号的那一份,绝不返回"最近记过的那个值"。** source 由 `sendTurn()` 单点写入,
+  //    跟 turn id **配成对**存;这里两条依次问:
+  //      ① 已提交的 `turnSource` 是不是就说的这一轮(`id` 相等)?
+  //      ② 有一发正在途中,而末轮 id 已经跟"发之前那个"不同了 —— 那当前末轮就是它铸的,
+  //         它的 source 立刻算数(`wait:true` 的结果在 `send()` 内部就构造好了,等不到提交)。
+  //    都不成立就是 `null`(不知道),**不拿别的轮次的 source 顶上**。
+  const ts = session.turnSource;
+  const pending = session.pendingTurnSource;
+  const lastId = session.lastTurnId || null;
+  const source =
+    ts && ts.id === lastId ? ts.source
+    : pending && lastId !== (pending.beforeId ?? null) ? pending.source
+    : null;
+  return {
+    id: lastId,
+    startedAt, endedAt, durationMs,
+    source,
+  };
 }
 
 // A coarse, actionable triage signal derived from CURRENT liveness + the LAST turn's outcome — never
@@ -1396,6 +1421,10 @@ const DELIVERED_TURN = Symbol("agent-bridge.deliveredTurn");
 //    所以所有插桩一律走 `vz()`,不许在别处直接碰 `viz`。
 let viz = null;
 
+/** 追问信箱轮询器。**只在 `viz.enabled` 时起**——没有 VIZ_DIR 就没有 inbox/outbox 可言,
+ *  这功能天然依附于观测台开着这件事,不单独做一个开关(见 docs/DESIGN-session-viz-send-lock-2026-08-04.md §4)。 */
+let vizInbox = null;
+
 /** 观测侧的诊断行。**只进内存,不落盘**——理由见 `createVizRun` 的 `onDiagnostic`。
  *  退出时随 shutdown 那一行一起写出去;满了丢新的(先发生的更接近根因)。 */
 const VIZ_DIAG_MAX = 16;
@@ -1459,10 +1488,59 @@ function vizInjectionMode(agent) {
   return "system";                                                  // omp / claude:真 system prompt
 }
 
-/** 记一笔"这一轮不欠了"。两个来源:真的交付了、或调用方显式 abort 放弃了。 */
+/** 记一笔"这一轮不欠了"。两个来源:真的交付了、或调用方显式 abort 放弃了。
+ *
+ *  ⚠️ **这里只记 turnId,不记任何代际。** 曾经在这儿记过"交付时的当前 sendEpoch",那是错的:
+ *     交付这个动作发生在**收取的那一刻**,它证明不了"被交付的东西属于哪一代"。歧义轮次跑着的
+ *     时候中途取一次结果(`result` 允许中途取快照),就会把证明**洗成当前代际**,闸门重新打开。
+ *     代际的判据改放在 `dischargeProofValid()` 里、只读会话自己的两个计数器 —— 交付动作碰不到
+ *     它们,也就洗不了。 */
 function dischargeTurn(sessionId, turnId, how) {
   if (!sessionId || !turnId) return;
   DISCHARGED.set(sessionId, { turnId, how });
+}
+
+/**
+ * 「此刻这个会话手上没有任何还救得回来的产出」—— 台账与观测台追问闸门**共用的唯一判据**。
+ *
+ * 两条**同时**成立才算数:
+ *   ① **末轮已被交付**:证明说的就是此刻的末轮(`turnId` 配得上);
+ *   ② **末轮之后没有再发生过「可能送达后端」的尝试**:`lastTurnEpoch === sendEpoch`。
+ *
+ * ⚠️ **第二条是在堵一个真实的洞,不是防御性冗余。** `lastTurnId` 只在后端**确认收下 prompt 之后**
+ *    才铸(见各后端 `send()` 里 "stamp the turn now" 那段),而「可能已经送达、却没铸出 id」是一个
+ *    **真实存在**的状态,至少两条路径能到达:
+ *      · OMP 的 RPC ACK 超时 —— 桥自己在那儿写着「**不证明后端没收下那条 prompt**」,
+ *        随后却把 `turnInFlight` 清掉、status 放回 idle;
+ *      · codex 的 `#beginTurn(turnId)` —— `turnId` 为空时只标 `begun`,**不动** `lastTurnId`。
+ *    两条都会留下同一个局面:**后端很可能正跑着一轮真的轮次,而 `lastTurnId` 还是上一轮的 id**,
+ *    于是它跟上一轮的 discharge 证明严丝合缝地对上 —— 只比 `turnId` 的话闸门就会放行,
+ *    那一轮的答案被下一发覆盖掉。这正是本功能唯一不能破的那条不变量。
+ *
+ * ⚠️⚠️ **两个计数器都必须是会话自己的状态,绝不能有一侧来自「交付那一刻」。**
+ *    第一版把代际记进了 `DISCHARGED`(交付时读当时的 `sendEpoch`),看着也是"比了代际",
+ *    实际上留了同一个洞的更深一层:歧义轮次正跑着的时候,主 agent 中途取一次结果
+ *    (`result` **允许**中途取快照,拿到的还是旧 id),`collectDeliveries()` 就会写出
+ *    `{turnId: 旧id, epoch: 当前代}` —— **证明被洗成当前代际**,闸门当场重新打开。
+ *    现在两侧操作数都是会话字段:`lastTurnEpoch` 只在**真的铸出新 turn id** 时才前进,
+ *    `sendEpoch` 每次尝试都前进。**交付这个动作碰不到它们中的任何一个**,所以洗不了。
+ *
+ * ⚠️ **代价:方向刻意偏保守。** 一次"后端明确拒绝了 prompt"也会让 `sendEpoch` 前进而
+ *    `lastTurnEpoch` 不动,于是追问被拒到**下一轮真的被接受**为止(不是取一次结果就恢复)。
+ *    这是有意的:漏斗分不清"明确拒绝"和"说不清",而分不清必须算作送过了——
+ *    往另一边算就是那个洞本身。多拒一次的代价是用户等一会儿,多放一次的代价是那份答案没了。
+ *
+ * ⚠️ **台账和闸门共用这一个函数,不是顺手复用。** 它俩的失败代价落在同一侧:闸门误放行 = 当场
+ *    覆盖掉一份答案;台账误报「不欠了」= 用户关客户端时把它丢掉 —— 都是不可逆的。分成两套判据
+ *    就会出现"闸门说有风险、台账说没欠"这种谁也解释不了的状态,而这个仓库在"两个真理源"上栽过。
+ */
+function dischargeProofValid(session, lt = null) {
+  if (!session) return false;
+  const turn = lt || lastTurnOf(session);
+  if (!turn?.id) return false;
+  const d = DISCHARGED.get(session.id);
+  if (!d || d.turnId !== turn.id) return false;
+  return (session.lastTurnEpoch ?? 0) === (session.sendEpoch ?? 0);
 }
 
 /** 在**真正返回给调用方之前**把这次交付记进台账。
@@ -1524,10 +1602,16 @@ function uncollectedTurns() {
     if (!sessionSettled(session)) continue;
     const lt = lastTurnOf(session);
     if (!lt || !lt.id) continue; // 从未 prompt 过
-    const d = DISCHARGED.get(session.id);
-    if (d && d.turnId === lt.id) continue; // 已交付,或已被显式 abort 放弃
+    // 已交付,或已被显式 abort 放弃。**判据跟观测台追问闸门是同一个函数**——两边误判的代价
+    // 都落在"不可逆地丢掉一份答案"这一侧,分两套写迟早漂开(见 `dischargeProofValid()`)。
+    if (dischargeProofValid(session, lt)) continue;
     if (out.length >= UNCOLLECTED_MAX) { more++; continue; }
-    out.push({ sessionId: session.id, name: session.name ?? null, turnId: lt.id, settledAt: lt.endedAt ?? null });
+    // `source` 一并带上:欠着的这一轮**可能是用户在观测台上追问的**,而不是调用方自己派的活。
+    // 台账是调用方最先看到这笔债的地方,在这里就说清它的来历,免得它按"这是我自己派的"去理解。
+    out.push({
+      sessionId: session.id, name: session.name ?? null, turnId: lt.id,
+      settledAt: lt.endedAt ?? null, source: lt.source ?? null,
+    });
   }
   return { list: out, more };
 }
@@ -6049,10 +6133,17 @@ async function openSession(params) {
   if (params.initial_prompt) {
     try {
       // initialSchema was validated pre-spawn (codex-only); apply it to the first turn.
-      initial = await session.send(params.initial_prompt, {
+      // ⚠️ `source` 必须显式传。漏了它,这一轮就落到 send() 的默认值 `"send_message"` 上——
+      //    于是 docs/STATE-session-viz.md §4.5 里 `initial_prompt` 这一档**在生产里从未出现过**,
+      //    归档里没有任何办法把「开会话时的首轮」和「后续追加的消息」分开。
+      //    这个漏传是既有缺陷(docs/BACKLOG-2026-08-03.md 一 点名要顺手修):
+      //    枚举值定义了却没有任何调用点产出它,而既有校验只查「值合不合法」,
+      //    查不出「有一档从来没被写出来过」——所以它能一直躺在那儿没人发现。
+      initial = await sendTurn(session, params.initial_prompt, {
         wait: Boolean(params.wait),
         timeout_ms: params.timeout_ms,
         schema: initialSchema,
+        source: "initial_prompt",
       });
     } catch (err) {
       // The session started but the first turn failed (a wait:true timeout aborts the turn; the
@@ -6133,7 +6224,7 @@ async function sendMessage(params) {
   if (schema && session.agent !== "codex") {
     throw new Error(`schema (structured output) is not supported for backend "${session.agent}" yet; only codex.`);
   }
-  const ack = await session.send(message, {
+  const ack = await sendTurn(session, message, {
     wait: Boolean(params.wait),
     timeout_ms: params.timeout_ms,
     maxChars: params.max_chars,
@@ -6143,6 +6234,137 @@ async function sendMessage(params) {
   // codex 的 send 里有一条 abort/close 抢跑的分支,那轮压根没被接受,没有东西可收。
   if (!params.wait && ack?.accepted === true) return decorateUncollectedAck(ack, [session.id]);
   return ack;
+}
+
+/**
+ * 观测台"追问"的唯一入口。**不走 MCP 工具 schema,不对外部调用方暴露**——只有
+ * `viz-inbox.mjs` 的轮询器会调它。`source:"user_followup"` 这个值就是这条内部通道专属的标记
+ * (docs/STATE-session-viz.md 的 `source` 枚举第三档),用来在归档里区分"这一问是主 agent 提的
+ * 还是用户在页面上提的"。
+ *
+ * ⚠️ **权威闸门在这里,不在页面**:页面看到的快照有轮询延迟,存在竞态窗口,只能做提前置灰的
+ *    用户体验,不能当拦截依据。
+ *
+ * ⚠️⚠️ **判据的默认方向必须是"拒绝",不是"放行"。**
+ *    第一版写成 `if (有末轮 && sessionSettled(session)) { 查 DISCHARGED }` —— 也就是
+ *    **"说不清算没结算"时整道闸直接跳过**。这在 OMP 一个**已知的**状态形状上会当场破功:
+ *    `state()` 会因为陈旧的 `isStreaming:true` 把 status 写回 `running`(见同文件 `state()`),
+ *    而 OMP 的 `isSettled()` 是 `status === "idle" && !turnInFlight` —— status 一旦是 running
+ *    它就返回 false,于是 `sessionSettled()` 为假、闸门被跳过;可 `send()` 那一侧只看
+ *    `turnInFlight`(`agent_end` 早清了),照样接受 —— **未取走的答案就被这一发覆盖掉了**,
+ *    而这正是本功能唯一必须守住的东西。
+ *
+ *    所以判据反过来写:**必须"证明得了没有东西会被毁"才放行**。
+ *      · 从来没有过轮次        → 这不是"追问",而且主 agent 可能正要发首轮 → 拒
+ *      · 末轮已 DISCHARGED     → 已交付或已被显式放弃,没有东西会丢 → 放行
+ *      · 其余一切(含说不清)  → 拒
+ *    「还在跑」与「跑完了没人取」在这里**故意不去区分**——本来就分不可靠,而两者的正确处置
+ *    都是拒绝,所以文案要同时对这两种情况都成立(说死其中一种就必然在另一种上撒谎)。
+ *
+ * ⚠️ **busy 闸不在这里重复判**:`session.send()` 自己已经有 `turnInFlight` 检查,重复写一遍
+ *    就是两处判据、迟早漂开。上面这道闸拦不住的忙会话会在 `send()` 里被拒,错误原样透传。
+ */
+async function sendFollowupFromViz(sessionId, message) {
+  const session = getSession(sessionId);
+  const lt = lastTurnOf(session);
+  if (!lt?.id) {
+    throw new Error(
+      "This session has never run a turn, so there is nothing to follow up on. " +
+      "Wait until the primary agent has sent it a task and collected the answer.",
+    );
+  }
+  if (!dischargeProofValid(session, lt)) {
+    throw new Error(
+      "This session may still be holding an answer that the primary agent has not collected — it could " +
+      "still be running, it could have finished with nobody picking the answer up, or a send may have " +
+      "reached the backend without the bridge learning that turn's id. In every one of those cases " +
+      "sending now would destroy that answer. Wait until the primary agent has collected it.",
+    );
+  }
+  const ack = await sendTurn(session, message, { wait: false, source: "user_followup" });
+  // ⚠️ **`accepted:false` 是拒绝,不是成功。** codex 有一条合法路径会这么返回(abort/close 抢在
+  //    turn 真正开始之前把它截了),而 Promise 正常 resolve —— 只看"没抛异常"就会把它当成发出去了,
+  //    信箱那一层再包成 `ok:true`,页面于是显示"已发送",实际上没有这一轮。
+  if (ack?.accepted !== true) {
+    throw new Error(
+      "The backend did not accept this follow-up as a turn (it was aborted or superseded before it " +
+      "started). Check the turns below before retrying — this does not guarantee the backend never " +
+      "saw it.",
+    );
+  }
+  return { accepted: true, turnId: ack.turnId ?? null };
+}
+
+/**
+ * 起一轮 turn 的**唯一漏斗**——桥核心里三个调用点(开会话首轮 / `agent_bridge_send_message` /
+ * 观测台追问)全都走这里,好让「这一轮是谁发起的」只有一处记录。
+ *
+ * 它管两件事,都**只能**在这一处做,而且都以**「有没有铸出新的 turn id」**为唯一事实判据 ——
+ * 那才是"这一轮真的存在"的凭据(codex 的 `accepted:false` 就是不抛异常、也没铸 id 的那种;
+ * OMP 的 ACK 超时则是抛了异常、但后端可能照样在跑的那种)。
+ *
+ * ① **两个代际计数器**:`sendEpoch` 在 `send()` **之前** +1(判据是「**可能**送达后端」——
+ *    ACK 超时那类状态的全部意义就是分不清,而分不清必须算作送过了);`lastTurnEpoch` 只在
+ *    **真的铸出新 id** 时才追平。两者不等 ⇒ 「末轮之后还有一发下落不明」。见 `dischargeProofValid()`。
+ *
+ * ② **这一轮是谁发起的(`source`)**,跟 turn id **配成对**存进 `session.turnSource`。
+ *    ⚠️ 不能只往会话上覆盖一个 `lastTurnSource` 字段,两条路都会翻车:
+ *      · **记晚了**(等 `send()` 返回再记):`wait:true` 的返回是在 `send()` **内部**构造的
+ *        (各后端 `if (options.wait)` 那段直接 `return await this.result(...)`),那份 inline
+ *        结果会拿到**上一轮的 source**,首轮则是 `null`。
+ *      · **记早了**(进 `send()` 之前就覆盖):从进 send 到后端铸出 id 之间有一段窗口,
+ *        此刻末轮**还是上一轮**,并发的 `status`/`result` 会读到「旧 id + 新 source」这个错对。
+ *    配对存就同时解决两边:读的时候只有 `id` 对得上才采信(见 `lastTurnOf()`),
+ *    而在途那一发用 `beforeId` 判定 —— `lastTurnId` 一旦不等于 `beforeId`,就说明当前末轮
+ *    正是这一发铸出来的,它的 source 立刻生效,**不必等 `send()` 返回**。
+ *
+ * ⚠️ 两件事都不下沉到五个后端各写一遍:那正是本仓反复栽过的「五处纪律迟早漏一处」。
+ */
+async function sendTurn(session, message, options = {}) {
+  /* ⚠️ **槽被占着 ⇒ 当场拒,而且拒在 `sendEpoch` 动之前、`send()` 之前。**
+     占着 = 同一会话上还有一发**没从 `session.send()` 返回**。最长也最要紧的那个窗口是
+     `wait:true`(它把「等轮次结束 + 读最终正文」整个包在 `send()` 里),但不止它:OMP 的
+     非阻塞发送在等 ACK 的那一小段、cursor/kimi 还在拉起进程的那一段,同样占着。
+     那几段短窗口里第二发也会在这里被拒,而不是走到后端的 busy 闸 —— 安全方向一致。
+
+     为什么必须拒,而不是"放它进去、`finally` 里小心点":**后端自己的 busy 闸拦不住这个窗口**
+     (它看的是 `turnInFlight`,而 OMP 在 `agent_end` 就把它清了,可 owner 还卡在读正文)。
+     放进去的话第二发**真的会被派给后端**,而这正是要防的事——它可能顶掉 owner 那一轮还没被
+     取走的产出;若它又恰好"送达了但没铸 id",还会在代际上留下一个说不清的缺口。
+     ⚠️ **拒的时候一个字都不能动**:什么都没尝试过,代际前进就是撒谎(会平白锁住闸门)。
+
+     ⚠️ 代价说清楚:万一某个后端的 `send()` **永远不返回**,这个会话就会一直拒绝后续发送。
+     这是刻意的——自动释放等于把上面那个并发窗口重新打开。恢复手段是 `close_session`
+     (必要时 `force:true`)再重开,不是让锁自己过期。 */
+  if (session.pendingTurnSource) {
+    throw new Error(
+      `Session ${session.id} already has a send in flight; wait for it to finish before sending again.`,
+    );
+  }
+  const beforeId = session.lastTurnId ?? null;
+  const source = options.source ?? "send_message";
+  const myEpoch = (session.sendEpoch = (session.sendEpoch ?? 0) + 1);
+  const attempt = { source, beforeId, epoch: myEpoch };
+
+  session.pendingTurnSource = attempt;
+  try {
+    return await session.send(message, options);
+  } finally {
+    /* 归属校验。上面那道「占着就拒」已经保证了此刻槽里就是自己那份,所以正常路径下这个判断恒真。
+       留着它是**故障时的方向选择**:万一将来有人拆掉那道拒绝,让两发同时在途,这里的行为是
+       「谁占着槽谁提交,另一发一个字都不写」—— 结果是某一发的 source 变成 `null`(未知)、
+       代际不前进(闸门保持关闭),而不是两发互相覆盖对方的记账。
+       判据用「有没有铸出新的 turn id」,因为那才是"这一轮真的存在"的凭据:codex 的
+       `accepted:false` 不抛异常也没铸 id;OMP 的 ACK 超时抛了异常,但后端可能照样在跑。 */
+    if (session.pendingTurnSource === attempt) {
+      const afterId = session.lastTurnId ?? null;
+      if (afterId !== beforeId) {
+        session.turnSource = { id: afterId, source };   // 铸出来了 ⇒ 跟这一轮绑定
+        session.lastTurnEpoch = myEpoch;                // 代际追平:**这一发**有着落了
+      }
+      session.pendingTurnSource = null;
+    }
+  }
 }
 
 async function result(sessionId, options = {}) {
@@ -6824,6 +7046,21 @@ function serveMcp() {
       },
     });
   } catch { viz = null; }
+  // 追问信箱:只在观测台真的开着时起。轮询间隔跟 `viz/serve.mjs` 的 `POLL_MS` 同量级——
+  // 见 docs/DESIGN-session-viz-send-lock-2026-08-04.md §5 第 3 条。
+  if (viz?.enabled) {
+    try {
+      vizInbox = createVizInbox({
+        dir: viz.dir,
+        handler: sendFollowupFromViz,
+        onDiagnostic: (code, err) => {
+          if (vizDiagnostics.length >= VIZ_DIAG_MAX) return;
+          vizDiagnostics.push(`${nowIso()} [inbox] ${code}: ${err instanceof Error ? err.message : String(err ?? "")}`.slice(0, 300));
+        },
+      });
+      vizInbox.start();
+    } catch { vizInbox = null; }
+  }
   installProcessHandlers();
   // Periodic prune of THIS run's logs while the server is long-lived (the per-file/total caps
   // matter most for chatty OMP sessions), plus a sweep of other servers' abandoned run dirs.
@@ -7057,6 +7294,9 @@ function cleanupAndExit(code = 0, reason = "shutdown", error = null) {
   // startup's cleanupStalePidRecords reap it (see docs/DEVELOPMENT.md). A child that does die
   // removes its own record via its proc "exit" handler.
   cleanupSessions({ removePidRecord: false });
+  // 先停信箱轮询,再封观测台账——避免退出过程中 inbox 那一拍还在跑,对着正在被清空的
+  // sessions 表调 `sendFollowupFromViz`。O(1),无 IO,不影响退出时序。
+  try { vizInbox?.stop(); } catch {}
   // 观测台封账。**顺序不能反**:先 cleanupSessions,让每个 close 钩子把 ledger 收干净,
   // 再 seal;反过来的话 sessionClosed / finalizeSession 全被封账挡在门外。
   // ⚠️ **只做 O(1) 的封账 + 停止接收新任务,不同步写大快照**(docs/STATE-session-viz.md §9)。

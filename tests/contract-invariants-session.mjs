@@ -31,7 +31,7 @@ const TURN_BOUNDARIES = new Set([
   'os_spawned',
   'terminal_adopted',
 ]);
-const TURN_SOURCES = new Set(['initial_prompt', 'send_message']);
+const TURN_SOURCES = new Set(['initial_prompt', 'send_message', 'user_followup']);
 const TURN_OUTCOMES = new Set(['completed', 'failed', 'aborted', 'abandoned']);
 const BODY_KINDS = new Set(['final', 'partial', 'none']);
 const FILE_STATES = new Set(['pending', 'ready', 'missing']);
