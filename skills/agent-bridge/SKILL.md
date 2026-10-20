@@ -146,6 +146,7 @@ close_session(session_id)                  →  用完必须关
 - **模型是会话级参数**：在 `open_session` 用 `model` 指定，整个会话固定；`send_message` 不能逐条切模型，换模型就新开 session。`model` 原样传后端 `--model`（**DSH 例外**：经 ACP `session/set_config_option` 下发，不走 argv）。
 - ⚠️ **OMP 的 `model` 必须用 `provider/模型名` 全限定形式，不要传裸别名**——OMP 是多 provider 路由，裸名可能被路由到非预期的 provider，拿到的不是你要的模型；全限定 ID 以 `omp models <关键字>` 的输出为准。**Codex/Claude 传各自后端认的模型名即可**（不用 `provider/` 前缀）。**DSH 传友好名或 `provider/model` 均可**（桥按该会话公布的目录映射，非法值当场失败）。
 - **`effort`（可选，推理强度）**：OMP 映射为 `--thinking`（`minimal|low|medium|high|xhigh`）；Codex 作为该轮 effort（`none|minimal|low|medium|high|xhigh`，其中 `none`/`minimal`/`low` 用于简单改动的评审，实施任务不建议）；DSH 映射到 ACP `reasoning_effort`（`minimal→off, low→low, medium→high, high→high, xhigh→max`）。不传则用后端默认；Claude 映射到 --effort，默认 xhigh。
+- **dsh 看图（`read_image`）**：委托 dsh 做图像任务时，**桥不传图片字节**（桥只发文本 prompt，DSH ACP 的 `promptCapabilities.image` 实测为 `false`）。正确姿势：把**图片文件路径**写进 prompt，让 dsh 用自带的 `read_image` 工具去读——PNG/JPEG/WebP/GIF、单图 ≤20 MiB，读取会落成持久附件并按该路由的图像预算缩放。⚠️ 会话模型**必须声明图像输入**（以该会话 `configOptions` 里的模型目录为准，例如目录中的 `deepseek-flash` 是文本+图像条目）；纯文本路由会明确报 `model "…" does not declare image input; switch to an image-capable model to read images`——此时用图像模型重开新会话即可；想免去每次指定可改 ACP profile 的默认路由（见 `docs/INSTALLATION.md` §6.5）。
 
 `open_session` 必传 `agent` + `cwd`；`access` / `model` / `effort` 按需。
 

@@ -338,6 +338,34 @@ dsh: ok (dsh) 0.2.1-rc.2
 - **已知坑（2026-10-20 实测，v0.12.0 已修）**：在**含 `.mcp.json`** 的目录里作为委托 cwd 打开 `omp` 会话，OMP 会自动挂载嵌套的 agent-bridge MCP；旧版桥的 owner 存活判定只认 `node` 开头的进程（`scripts/agent-bridge.mjs` 的 `ownerStillRunning`），Electron 宿主（DSH 桌面版）下会把外层桥误判为已死，嵌套桥的启动清理把 OMP 杀掉（约 5–6 s 后 `OMP RPC exited with code 1`）。**v0.12.0 起**判定改为「owner 命令含 `agent-bridge.mjs` + `mcp` 即视为存活」（比原来更保守：宁可少清理，不可误杀），不再需要绕开 `.mcp.json` 目录；回归测试 `tests/repro-owner-electron-argv0.mjs`。老版本升级前仍建议避开。
 - DSH 升级后 `cordis.patch.yml` 可能被 app 的 profile 自愈逻辑或 Plugin Manager 备份重命名，升级前留一份副本。
 
+### 6.5 委托方向：让 dsh 看图片（`read_image`）
+
+`agent_bridge_open_session({ agent: "dsh" })` 的会话**收不到图片字节**：桥只发文本 prompt，DSH ACP 的 `promptCapabilities.image` 实测为 `false`（0.2.1-rc.2）。但 dsh 自带 `read_image` 工具（`dsh-tool-fs`，依赖持久附件存储，`dsh-base` 默认挂载），所以图像任务的正确姿势是**把图片文件路径写进 prompt**，让被委托的 dsh 自己读：
+
+```text
+用 read_image 读取 D:\shots\mock.png，然后回答：这个页面的主导航有几项？
+```
+
+- 支持 PNG / JPEG / WebP / GIF，单图 ≤20 MiB（`dsh-attachment-local` 默认限制）；读取会落成持久附件、按该路由的图像预算缩放后作为 image content 交给模型。
+- ⚠️ **会话模型必须声明图像输入**。2026-10-20 实测：不传 `model` 时默认路由是 bundle 里写死的 `deepseek-official/deepseek-v4-flash`（一个**不在模型目录里的透传纯文本 id**），`read_image` 直接失败并给出稳定错误：
+  `model "deepseek-v4-flash" does not declare image input; switch to an image-capable model to read images`
+  传 `model: "deepseek-flash"`（模型目录里文本+图像的条目，展示名 DeepSeek-V4.1-Flash）后，工具调用完成，2 s 内正确答出测试图（左红右蓝）的左右颜色。
+- 两种用法：
+  1. **按会话指定**（不改配置、单次生效）：`open_session({ agent: "dsh", model: "deepseek-flash", ... })`；
+  2. **改默认路由**（本机所有 `dsh --profile acp` 生效，含所有桥委托会话；下次新开会话即生效，**不用重启 DSH**）：在 `%USERPROFILE%\.dsh\profiles\acp\cordis.patch.yml` 顶层加：
+
+```yaml
+- id: acp
+  name: '@deepseek-ai/dsh-acp'
+  config:
+    provider: deepseek-official
+    model: deepseek-flash
+```
+
+  bundle 默认只在 `dsh-acp-app/cordis.patch.yml` 里写死；profile 用户 patch 层在 bundle 之后应用，可按 id 覆盖。想恢复原默认就删掉这段。注意桌面版 GUI 的默认模型是另一处 `agent-default-model`（本项与它无关），GUI 默认模型本身已支持图像。
+- 图片路径要在 dsh 会话可读范围内（`access:"read"` 仍可读文件系统）；图片引用会留在会话持久历史里，后续轮次可继续追问。
+- `read_image` 只读文件 + 写 DSH 自己的附件存储，不改工作区，`read` 档即可用。
+
 ## 7. 使用方式
 
 会话**只能**通过 MCP 工具管理。会话活在你这个客户端启动的 `agent-bridge mcp` 进程内：该进程直接 spawn 并持有你打开的 OMP/Codex/Claude/DSH 后端（**cursor / kimi 例外**：只持有逻辑会话——cursor 是云端 `chatId`、kimi 是本地 session id，两者进程都按轮短驻）。没有共享后台 daemon，也没有 Web UI——客户端退出，这个 MCP 进程随之退出，它持有的所有后端进程被一并清理（cursor 的云端 chat 因无 delete-chat 不受影响、仍留存；kimi 无云端 chat 存储，但已发出的 prompt 仍到过 Moonshot 云端）（v0.7.0，详见 [docs/ARCHITECTURE.md](ARCHITECTURE.md)）。
