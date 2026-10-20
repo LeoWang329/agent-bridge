@@ -29,9 +29,10 @@
   --st-warn:#a8540a;     /* 有问题 */
   --st-end:#5b6b7d;      /* 已结束 */
 
-  /* 三档权限（§4.1）——「只读（约定）」刻意不用绿色 */
+  /* 四档权限（§4.1）——「只读（约定）」刻意不用绿色 */
   --pm-write:#7b52d1;
   --pm-hard:#0f875b;
+  --pm-tool:#0e7c86;
   --pm-soft:#8d6510;
 
   --danger:#c23b3b;
@@ -49,7 +50,7 @@
   --line:#232d3a; --line-2:#313d4d;
   --accent:#6e97f7;
   --st-run:#42cf95; --st-idle:#7c8b9d; --st-idle-ink:#93a2b4; --st-warn:#f0953f; --st-end:#8496aa;
-  --pm-write:#a98cf0; --pm-hard:#42cf95; --pm-soft:#d8a83f;
+  --pm-write:#a98cf0; --pm-hard:#42cf95; --pm-tool:#5cc9d6; --pm-soft:#d8a83f;
   --danger:#ef7676;
   --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 22px -14px rgba(0,0,0,.7);
   --shadow-lift:0 2px 6px rgba(0,0,0,.5), 0 18px 40px -20px rgba(0,0,0,.8);
@@ -202,6 +203,8 @@ button{font:inherit;color:inherit;background:none;border:none;padding:0;cursor:p
   background:color-mix(in oklab,var(--pm-write) 11%,var(--surface))}
 .perm.p-hard{color:var(--pm-hard);border-color:color-mix(in oklab,var(--pm-hard) 38%,var(--line));
   background:color-mix(in oklab,var(--pm-hard) 11%,var(--surface))}
+.perm.p-tool{color:var(--pm-tool);border-color:color-mix(in oklab,var(--pm-tool) 45%,var(--line));
+  background:color-mix(in oklab,var(--pm-tool) 11%,var(--surface))}
 .perm.p-soft{color:var(--pm-soft);border-style:dashed;border-color:color-mix(in oklab,var(--pm-soft) 45%,var(--line-2));
   background:var(--surface-2)}
 .sc-meta{font:10.5px/1 var(--mono);color:var(--faint);white-space:nowrap}
@@ -554,9 +557,10 @@ body.run-ended .shell{display:none}
           <div class="legend-row"><i class="dot d-idle"></i><b class="st-idle">空闲</b><span class="lw">idle + healthy，随时可继续</span></div>
           <div class="legend-row"><i class="dot d-warn"></i><b class="st-warn">有问题</b><span class="lw">degraded，或上一轮失败但可复用</span></div>
           <div class="legend-row"><i class="dot d-end"></i><b class="st-end">已结束</b><span class="lw">closed / dead，降级但不隐藏</span></div>
-          <h4>三档权限</h4>
+          <h4>四档权限</h4>
           <div class="legend-row"><span class="perm p-write"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>可写</span><span class="lw">明确授权改文件</span></div>
           <div class="legend-row"><span class="perm p-hard"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v6c0 4.4-3 8.3-7 9-4-.7-7-4.6-7-9V6z"/><path d="M9 12l2 2 4-4"/></svg>只读（强制）</span><span class="lw">系统级沙箱，真的写不了盘（仅 Codex）</span></div>
+          <div class="legend-row"><span class="perm p-tool"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v6c0 4.4-3 8.3-7 9-4-.7-7-4.6-7-9V6z"/><path d="M9 12l2 2 4-4"/></svg>只读（工具面拦）</span><span class="lw">文件工具被沙箱拦住；shell 仅部分受限（DSH）</span></div>
           <div class="legend-row"><span class="perm p-soft"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v6c0 4.4-3 8.3-7 9-4-.7-7-4.6-7-9V6z" stroke-dasharray="3 2.4"/><path d="M9.5 12.5l5-5M14.5 12.5l-5-5"/></svg>只读（约定）</span><span class="lw">它仍有能力写盘，只是被要求不要写</span></div>
         </div>
       </details>
@@ -738,6 +742,7 @@ var ST_ORDER={run:0,warn:1,idle:2,end:3};
 var PERM={
   write:{cls:'p-write',label:'可写',icon:'write',title:'明确授权改文件'},
   hard :{cls:'p-hard', label:'只读（强制）',icon:'shield',title:'操作系统级沙箱拦截，真的写不了盘'},
+  tool :{cls:'p-tool', label:'只读（工具面拦）',icon:'shield',title:'文件工具被 DSH 文件系统沙箱拦住；shell 仅部分受限（低完整度 ACL）——比约定强，但不是内核沙箱'},
   soft :{cls:'p-soft', label:'只读（约定）',icon:'shieldSoft',title:'它仍有能力写盘，只是被要求不要写——这不是一道墙'}
 };
 var RES={

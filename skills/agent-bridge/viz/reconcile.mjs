@@ -38,27 +38,29 @@ export const STATUS_LABEL = { run: "进行中", idle: "空闲", warn: "有问题
 /** 排序权重：正在跑 → 有异常 → 空闲 → 已关闭。 */
 const STATUS_ORDER = { run: 0, warn: 1, idle: 2, end: 3 };
 
-// ── 三档权限（UIREQ §4.1） ──────────────────────────────────────────────────
+// ── 四档权限（UIREQ §4.1） ──────────────────────────────────────────────────
 
 /**
  * 「只读」不能当安全承诺。
  *
- * ⚠️ 六个后端里**只有 codex 的 read 是 OS 沙箱硬拦**；dsh 的 read 是工具面强拦
- *    （文件工具被文件系统沙箱拦、shell 仅 `partial` ACL，非内核沙箱）；omp / claude /
- *    cursor / kimi 的 read 只是一句约束，它跑的 shell 命令照样能写盘。
- *    页面上只写「只读」会制造错误的安全感。⚠️ 已知展示口径缺口：`permKind()` 只把
- *    codex 判成 `hard`，所以 **dsh 的 read 目前也落在 `soft`**（比实际更宽）——要细分
- *    得先改 `docs/STATE-session-viz.md` 的三档合同与页面。
+ * ⚠️ 六个后端里**只有 codex 的 read 是 OS 沙箱硬拦**；dsh 的 read 是**工具面强拦**
+ *    （文件工具被 DSH 文件系统沙箱拦住、shell 仅受 `partial` ACL 限制，非内核沙箱）；
+ *    omp / claude / cursor / kimi 的 read 只是一句约束，它跑的 shell 命令照样能写盘。
+ *    页面上只写「只读」会制造错误的安全感，所以这里按强弱拆成四档：
+ *    `hard`（OS 沙箱）> `tool`（工具面强拦）> `soft`（纯约定）。
  */
 export function permKind(s) {
   if (s.access === "write") return "write";
-  return s.agent === "codex" ? "hard" : "soft";
+  if (s.agent === "codex") return "hard";
+  if (s.agent === "dsh") return "tool";
+  return "soft";
 }
 
-export const PERM_LABEL = { write: "可写", hard: "只读（强制）", soft: "只读（约定）" };
+export const PERM_LABEL = { write: "可写", hard: "只读（强制）", tool: "只读（工具面拦）", soft: "只读（约定）" };
 export const PERM_HINT = {
   write: "明确授权改文件",
   hard: "操作系统级沙箱拦截，真的写不了盘",
+  tool: "文件工具被 DSH 文件系统沙箱拦住；shell 仅部分受限（低完整度 ACL）——比约定强，但不是内核沙箱",
   soft: "它仍然有能力写盘，只是被要求不要写",
 };
 

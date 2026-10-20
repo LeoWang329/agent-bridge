@@ -299,11 +299,12 @@ async function runDisplayMappingTests() {
   const permissionTable = {
     omp: 'soft',
     codex: 'hard',
+    dsh: 'tool',
     claude: 'soft',
     cursor: 'soft',
     kimi: 'soft',
   };
-  // 五家逐一钉住 read 的安全含义；笼统测一个 read 会把“只有 codex 是硬沙箱”稀释掉。
+  // 逐一钉住 read 的安全含义；笼统测一个 read 会把「只有 codex 是 OS 硬沙箱、dsh 是工具面强拦」稀释掉。
   for (const [agent, expected] of Object.entries(permissionTable)) {
     const actual = permKind({ agent, access: 'read' });
     assertCase(`permKind：${agent} read → ${expected}`, actual === expected, `实际 ${actual}`);
