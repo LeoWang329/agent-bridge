@@ -434,7 +434,7 @@
 |---|---|---|---|
 | `nodeSeq` | number | 否 | 本 graph 内的实例序号,**从 `0` 起、步长 `1`**。与 `graphId` 一起构成页面主键,**也是归档子目录名 `<nodeSeq>-<id>/` 的前半段**。分配时机见下 |
 | `id` | string | 否 | 逻辑名(`spec.id`)。**只在这里出现**。字符集受源码约束:`/^[A-Za-z0-9._-]+$/`。≤200 字节 |
-| `agent` | string | 否 | `"omp"` \| `"codex"` \| `"claude"` \| `"cursor"` \| `"kimi"`(封闭枚举,源码 `normalizeSpec` 校验) |
+| `agent` | string | 否 | `"omp"` \| `"codex"` \| `"claude"` \| `"cursor"` \| `"kimi"` \| `"dsh"`(封闭枚举,源码 `normalizeSpec` 校验) |
 | `model` | string \| null | **可 null** | 未显式指定 → `null`(后端用默认模型)。≤200 字节 |
 | `effort` | string \| null | **可 null** | 同上。≤200 字节 |
 | `access` | string | 否 | `"read"` \| `"write"` |
@@ -771,7 +771,7 @@ node:attempt-settled  { nodeSeq, turnKey, n, output, status, rejectedReason?, du
 
 ⚠️ **前四项的可空性是按桥快照的真实形状定的,不许"图省事一律放宽成 null"**:`status` / `charCount` / `tail` 在正常快照里恒有,把它们标成可 null,页面就得为一个**永远不会发生**的分支写文案,而真正会发生的两个(`lastEvent` / `contextUsage`)反倒淹没在里面。
 
-⚠️ **`contextUsage: null` 的意思是「未知」,不是「0」。** cursor 与 kimi 两个后端**恒为 null**。把未知渲染成 0,页面上"没占上下文"与"没测到"长得一模一样——这是本设计的头号敌人(§6.1)。
+⚠️ **`contextUsage: null` 的意思是「未知」,不是「0」。** cursor 与 kimi 两个后端**恒为 null**(dsh 在最近一轮有 `usage_update` 时给出上一轮快照,`live:false`)。把未知渲染成 0,页面上"没占上下文"与"没测到"长得一模一样——这是本设计的头号敌人(§6.1)。
 
 ⚠️ **快照本身取不到时:这条 `node:progress` 干脆不发。** **不许发一条全 `null` 的假进度**——`node:progress` 是唯一允许整条丢的事件(§7),下一条 5 秒后就来,而一条假进度会在时间轴上留下一个"它还活着而且什么都没产出"的错误证据。
 

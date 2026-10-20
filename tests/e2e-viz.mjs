@@ -202,6 +202,7 @@ const EXPECTED_BOUNDARY = {
   omp: ["rpc_ack"],
   codex: ["turn_start_ack", "turn_started_notification"],
   claude: ["pipe_enqueued"],
+  dsh: ["pipe_enqueued"], // ACP has no turn-start ACK: session/prompt only resolves at turn end
   cursor: ["os_spawned"],
   kimi: ["os_spawned"],
 };

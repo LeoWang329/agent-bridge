@@ -43,8 +43,12 @@ const STATUS_ORDER = { run: 0, warn: 1, idle: 2, end: 3 };
 /**
  * 「只读」不能当安全承诺。
  *
- * ⚠️ 五个引擎里**只有 codex 的 read 是 OS 沙箱硬拦**；另外四家的 read 只是一句约束，
- *    它跑的 shell 命令照样能写盘。页面上只写「只读」会制造错误的安全感。
+ * ⚠️ 六个后端里**只有 codex 的 read 是 OS 沙箱硬拦**；dsh 的 read 是工具面强拦
+ *    （文件工具被文件系统沙箱拦、shell 仅 `partial` ACL，非内核沙箱）；omp / claude /
+ *    cursor / kimi 的 read 只是一句约束，它跑的 shell 命令照样能写盘。
+ *    页面上只写「只读」会制造错误的安全感。⚠️ 已知展示口径缺口：`permKind()` 只把
+ *    codex 判成 `hard`，所以 **dsh 的 read 目前也落在 `soft`**（比实际更宽）——要细分
+ *    得先改 `docs/STATE-session-viz.md` 的三档合同与页面。
  */
 export function permKind(s) {
   if (s.access === "write") return "write";
@@ -61,7 +65,7 @@ export const PERM_HINT = {
 // ── 上下文占用（UIREQ §6.1） ────────────────────────────────────────────────
 
 /**
- * ⚠️ `null` 是**未知**，不是 0。cursor / kimi 恒为 null。
+ * ⚠️ `null` 是**未知**，不是 0。cursor / kimi 恒为 null（dsh 有上一轮 `usage_update` 快照）。
  *    显示成 0 或空进度条会让人以为「很空闲、很安全」——**是反的**。
  */
 export function contextLevel(cu) {

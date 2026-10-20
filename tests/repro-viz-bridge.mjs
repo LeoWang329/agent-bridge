@@ -430,6 +430,23 @@ sect("V6~V9 证据档必须跟着后端走,不是全局常量");
 }
 
 {
+  // dsh: ACP has NO turn-start ACK (session/prompt resolves only at turn end) → the honest evidence
+  // tier is `pipe_enqueued`, exactly like claude's bare stdin.write.
+  const r = await bridgeRun({
+    tag: "dsh", agent: "dsh",
+    env: {
+      DSH_BIN: path.join(HERE, process.platform === "win32" ? "fake-dsh.cmd" : "fake-dsh.sh"),
+      FAKE_DSH_MODES: "ok",
+    },
+  });
+  ok("V6b dsh 会话开起来了", !!r.sid, String(r.openError).slice(0, 200));
+  ok("V6b ★ dsh 的派发证据只能是 `pipe_enqueued`(ACP 无 turn-start ACK)",
+    r.turn?.boundary === "pipe_enqueued", String(r.turn?.boundary));
+  assertSettledAndValid("V6b", r);
+  await r.stop();
+}
+
+{
   const r = await bridgeRun({
     tag: "codex", agent: "codex",
     env: { CODEX_BIN: path.join(HERE, process.platform === "win32" ? "fake-codex.cmd" : "fake-codex.sh") },

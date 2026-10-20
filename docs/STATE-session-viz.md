@@ -212,7 +212,7 @@ viewer 靠 owner 探测确认死亡后广播，页面据此把仍为 `dispatched
 {
   "sessionId": "codex-mfx8q2-a7c319",
   "name": null,                     // 会话别名,常为 null
-  "agent": "codex",                 // omp | codex | claude | cursor | kimi
+  "agent": "codex",                 // omp | codex | claude | cursor | kimi | dsh
   "model": null,                    // 自由字符串或 null(用引擎默认)
   "effort": "xhigh",                // minimal|low|medium|high|xhigh 或 null
   "access": "read",                 // read | write
@@ -292,7 +292,7 @@ sidecar（§5）在结算那一刻就被删掉，后端又已经死了，观测�
 
 | 值 | 哪些后端 |
 |---|---|
-| `system` | omp / claude（真 system prompt） |
+| `system` | omp / claude / dsh（真 system prompt；dsh 用生成的 `--patch` 写 personaSuffix） |
 | `developer` | codex（thread `developerInstructions`） |
 | `first-turn-user-prefix` | cursor / kimi（软注入，只是首轮用户消息前缀） |
 
@@ -303,9 +303,9 @@ sidecar（§5）在结算那一刻就被删掉，后端又已经死了，观测�
 ```
 
 - `tokens`：**绝对** token 数。**刻意不吐 contextWindow / 百分比**。
-- `live`：`true` = 实时读数（OMP）；`false` = 上一轮结束的快照（codex/claude）。
+- `live`：`true` = 实时读数（OMP）；`false` = 上一轮结束的快照（codex/claude/dsh）。
 - `isCompacting` / `autoCompactionEnabled`：**仅 OMP 会给**，其余后端不出现这两个键。
-- **`null` 表示未知，不表示 0。** cursor / kimi **恒为 `null`**。
+- **`null` 表示未知，不表示 0。** cursor / kimi **恒为 `null`**；dsh 在首轮 `usage_update` 之前也是 `null`（之后为上一轮快照）。
   页面必须显示成「未知 / 不适用」，**绝不能显示成 0 或空进度条**。
 
 ### 4.5 turn 对象
@@ -355,7 +355,7 @@ sidecar（§5）在结算那一刻就被删掉，后端又已经死了，观测�
 | `rpc_ack` | **协议级** | OMP：RPC response 成功分支 |
 | `turn_start_ack` | **协议级** | Codex：`turn/start` 的成功 response |
 | `turn_started_notification` | **协议级** | Codex：`turn/started` 通知 |
-| `pipe_enqueued` | **仅 transport** | Claude：裸 `stdin.write`，只证明进了 Node/OS 管道 |
+| `pipe_enqueued` | **仅 transport** | Claude / DSH：裸 `stdin.write`，只证明进了 Node/OS 管道 |
 | `os_spawned` | **仅 transport** | Cursor / Kimi：child 的 `"spawn"` 事件，只证明进程起来了 |
 | `terminal_adopted` | **无 ACK** | 歧义 attempt 被后到的终结事件认领 |
 

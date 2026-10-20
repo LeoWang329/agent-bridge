@@ -194,7 +194,7 @@ export const EVENT_SCHEMAS = {
   "node:observed": OBJ({
     nodeSeq: NUM("uint"),
     id: S(200),
-    agent: ENUM("omp", "codex", "claude", "cursor", "kimi"),
+    agent: ENUM("omp", "codex", "claude", "cursor", "kimi", "dsh"),
     access: ENUM("read", "write"),
     cwd: S(512),
     // 未显式指定 → **null**(后端用默认模型)。必需键、可 null。

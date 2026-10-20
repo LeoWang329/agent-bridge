@@ -37,6 +37,7 @@ There are no npm dependencies. The runtime uses Node built-ins plus external CLI
 - `claude`
 - `cursor` (the `agent` CLI; **Windows-only**)
 - `kimi` (the native `kimi.exe`; **Windows-only**)
+- `dsh` (DeepSeek Harness **0.2.x**; its CLI ships an ACP profile that the backend drives with `dsh --profile acp`; Windows / macOS / Linux)
 
 ## Architecture
 
@@ -44,18 +45,19 @@ Backends come in two process shapes. **Shape A** holds one persistent child for 
 
 ```mermaid
 flowchart LR
-  Client["MCP client (Codex / Claude Code)"] --> Bridge["agent-bridge MCP server (stdio)"]
+  Client["MCP client (Codex / Claude Code / DSH)"] --> Bridge["agent-bridge MCP server (stdio)"]
   Bridge --> Sessions["in-memory session map"]
   Sessions --> ShapeA["Shape A: one persistent process per session"]
   Sessions --> ShapeB["Shape B: short-lived process per turn, resumed by id"]
   ShapeA --> OMP["OMP: omp --mode rpc (JSONL stdio)"]
   ShapeA --> CDX["Codex: codex app-server (JSON-RPC stdio)"]
   ShapeA --> CLA["Claude: claude --print (stream-json stdio)"]
+  ShapeA --> DSH["DSH: dsh --profile acp (NDJSON JSON-RPC / ACP v1)"]
   ShapeB --> CUR["Cursor: --resume cloud chatId (stream-json)"]
   ShapeB --> KIM["Kimi: -S local session id (stream-json)"]
 ```
 
-The Shape B split matters downstream: a Shape B session is `healthy` and idle with **no pid at all** between turns, so liveness cannot be derived from "is the child alive?" the way it is for Shape A. Cursor's resume id is a **cloud** `chatId` (minted by a create-chat round-trip); Kimi's is a **local** session id that the CLI itself mints on the first turn (no create-chat).
+The Shape B split matters downstream: a Shape B session is `healthy` and idle with **no pid at all** between turns, so liveness cannot be derived from "is the child alive?" the way it is for Shape A. Cursor's resume id is a **cloud** `chatId` (minted by a create-chat round-trip); Kimi's is a **local** session id that the CLI itself mints on the first turn (no create-chat). DSH is Shape A: one persistent ACP process per bridge session, a **local** ACP `sessionId` inside it, and no turn-start ACK (`session/prompt` resolves only at turn end — see [DSH Backend](#dsh-backend)).
 
 Agent Bridge exposes a small MCP tool surface:
 
@@ -69,7 +71,7 @@ Agent Bridge exposes a small MCP tool surface:
 
 Each `agent-bridge mcp` process keeps its own in-memory session map for its own lifetime; one MCP client equals one MCP process equals one session map. A session is not persisted by Agent Bridge itself, and sessions are never shared across clients.
 
-The MCP server owns its sessions directly: `callTool` invokes `openSession`/`sendMessage`/… in-process and spawns the backends as children of the MCP process — OMP/Codex/Claude as persistent processes held for the session's lifetime, Cursor/Kimi as short-lived per-turn processes (see Architecture: Shape A vs Shape B). There is no background daemon, no Unix socket, and no `requestDaemon` proxy. The bridge speaks MCP over stdio only and opens no network listener of any kind. As of v0.7.0 the entire HTTP/SSE Web UI stack was removed (see [ARCHITECTURE.md](ARCHITECTURE.md)); `session.events` is still buffered to back `recentEvents` in `status`/`result`, but it is no longer broadcast anywhere.
+The MCP server owns its sessions directly: `callTool` invokes `openSession`/`sendMessage`/… in-process and spawns the backends as children of the MCP process — OMP/Codex/Claude/DSH as persistent processes held for the session's lifetime, Cursor/Kimi as short-lived per-turn processes (see Architecture: Shape A vs Shape B). There is no background daemon, no Unix socket, and no `requestDaemon` proxy. The bridge speaks MCP over stdio only and opens no network listener of any kind. As of v0.7.0 the entire HTTP/SSE Web UI stack was removed (see [ARCHITECTURE.md](ARCHITECTURE.md)); `session.events` is still buffered to back `recentEvents` in `status`/`result`, but it is no longer broadcast anywhere.
 
 Sessions are managed exclusively through the MCP tools. The CLI exposes only `mcp` (the server entrypoint) plus `doctor` and `cleanup` helpers.
 
@@ -87,7 +89,9 @@ Normal `agent_bridge_close_session` calls remove the pid record immediately. Pro
 
 `close_session` refuses by default when the session's turn is still running (`{blocked:true, runningSessionIds}`; the bulk form is an atomic preflight — one running session blocks all of them) — pass `force:true` to close anyway. Once it does close, it is fire-and-forget by design: it SIGTERMs the backend, schedules a 3s force-kill backstop, and returns immediately so a bulk close stays cheap. The backend process tree therefore dies *after* the call returns. On Windows this matters to any caller that deletes the session's `cwd` right after closing: the OMP/Codex backend is a process **tree**, and a child can hold that directory open for a few hundred ms past close — *even after the root process is gone* — so an immediate `rmdir`/`fs.rm` races the teardown and hits `EPERM` (the dir is left in `STATUS_DELETE_PENDING`). Waiting only for the root process to exit is NOT enough: a surviving child still holds the handle (verified — even confirming the root pid is OS-reaped still EPERM'd). The robust contract is to **poll-and-retry the delete itself** — a fresh `fs.rm` after a short async sleep, which lands cleanly once the tree has fully released the directory (~0.5–1s). The real-backend e2e harness (`tests/e2e-real.mjs`, step 7) demonstrates this pattern. POSIX is unaffected — it lets you unlink a directory a process is still `cwd`'d into.
 
-Pid-record cleanup treats only `agent-bridge mcp` as a live owner (the owner-alive check matches `\bmcp\b` in the owning process command). A record whose owning MCP process is still running is skipped so its active OMP/Codex children are never terminated; `cleanup` only reaps orphans whose owning MCP server is gone (SIGTERM followed by a SIGKILL backstop), and also deletes abandoned `logs/<runId>/` dirs from those dead servers.
+Pid-record cleanup treats only a live `agent-bridge mcp` owner as protection (the owner-alive check matches **what the owning process runs**, not its argv0: a command containing `agent-bridge.mjs` plus `\bmcp\b` is alive). A record whose owning MCP process is still running is skipped so its active backend children are never terminated; `cleanup` only reaps orphans whose owning MCP server is gone (SIGTERM followed by a SIGKILL backstop), and also deletes abandoned `logs/<runId>/` dirs from those dead servers.
+
+> ⚠️ **Why the argv0 check was removed (v0.12.0):** DSH Desktop launches the bridge via Electron-as-node, so the owner command is `"…\DeepSeek Harness.exe" … agent-bridge.mjs mcp`, not `node …`. The old `node`-argv0 test declared a live owner dead, and a **nested** bridge (a delegated agent auto-mounting this repo's `.mcp.json`) reaped the outer bridge's live OMP child ~5–6 s after ready. Keying on "what it runs" fixes it; a false "alive" only delays reclamation (the safe direction). Regression: `tests/repro-owner-electron-argv0.mjs`.
 
 This cleanup cannot run after `SIGKILL` (`kill -9`) because no Node.js code can execute in that case, but the pid-record sweep on the next startup is designed to catch leftovers from that kind of hard exit.
 
@@ -112,6 +116,35 @@ In write mode it adds:
 ```
 
 The adapter sends JSONL requests over stdin and reads JSONL responses/events from stdout. It uses OMP RPC commands such as `prompt`, `get_state`, `get_last_assistant_text`, and `abort`.
+
+## DSH Backend
+
+The `dsh` backend drives DeepSeek Harness's **Agent Client Protocol (ACP v1)** profile — newline-delimited JSON-RPC 2.0 over stdio, one persistent process per bridge session:
+
+```sh
+dsh --profile acp [--patch <generated per-session patch>]
+```
+
+Process and protocol specifics:
+
+- **Launcher resolution is lazy.** `DSH_BIN` (must be a path to an existing launcher file: `dsh.cmd`/`dsh.exe`/`dsh` shim) → the standard desktop-install launcher (`%LOCALAPPDATA%\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd` on Windows; app-bundle / `/usr/local/bin` / `~/.local/bin` candidates on macOS-Linux) → `PATH`. Never resolved at module load: an uninstalled backend must surface as `doctor: missing`, not a load crash (same rule as `resolveKimiBin`).
+- **Windows space-path bypass.** The standard install path contains a space (`…\DeepSeek Harness\…`), and `cmd.exe /d /s /c` re-parses a quoted launcher path badly. The standard layout is therefore spawned as **Electron-in-node-mode directly** (`"…\DeepSeek Harness.exe" --expose-internals "…\app.asar\dsh\node_modules\@deepseek-ai\dsh-desktop-host\lib\cli.js" …` with `ELECTRON_RUN_AS_NODE=1`). Only a `DSH_BIN`/`PATH` launcher goes through `spawnPlan`; `summary.agentSpecific.launchVia` records which branch ran (`electron-node` / `launcher`). Prompt text never travels on argv for this backend (ACP carries it over stdin), so there is no cmd-injection surface.
+- **Environment.** The child gets the bridge markers (`AGENT_BRIDGE_SESSION_ID` / `_OWNER_PID` / `_AGENT`) plus `DSH_PERMISSION_MODE=read-only|danger-full-access`. Host DSH run context is scrubbed (`DSH_SESSION_ID`, `DSH_WEB_URL`, `DSH_PROFILE`, `DSH_PROFILE_DIR`, `DSH_SHELL`); `DSH_HOME` is deliberately **kept** so the delegated server sees the same installed runtime and managed credentials as the user's app.
+- **model / effort are per-session ACP config options**, not argv: after `session/new` the bridge reads the advertised `configOptions` and pins them with `session/set_config_option`. The model value is opaque JSON (`["provider","model"]`); the resolver accepts a friendly name, a `provider/model` form, or an exact advertised value and fails `open_session` on a miss (never hardcode ids). Effort maps the bridge vocabulary `minimal/low/medium/high/xhigh` → DSH `off/low/high/high/max`. Timeouts: `AGENT_BRIDGE_DSH_READY_TIMEOUT_MS` (30 s, covers spawn+initialize+session/new), `AGENT_BRIDGE_DSH_ABORT_SETTLE_MS` (8 s), `AGENT_BRIDGE_DSH_CONFIG_TIMEOUT_MS` (10 s).
+- **Turn semantics.** `session/prompt` is a JSON-RPC request whose response arrives only at **turn end** (`{stopReason:"end_turn"|"cancelled"|…}`), so there is **no turn-start ACK**: the bridge mints the turn id itself and the viz dispatch evidence tier is honestly `pipe_enqueued` (bytes on the pipe, backend not yet acknowledging) — the same tier as claude's bare `stdin.write`. `session/update` notifications stream `agent_message_chunk` (text), `agent_thought_chunk` (thinking only), `tool_call`/`tool_call_update`, and `usage_update`. Stray non-JSON stdout lines (e.g. `[llm-deepseek-account] …`) are logged and skipped, never fatal.
+- **Permission requests MUST be answered.** `session/request_permission` is a server→client request with **no server-side timeout** — an ignored request hangs the turn until cancel/close. The responder answers `reject-once` for the `read` tier; `write` uses `danger-full-access` (the server does not ask). A rejected write is reported back to the model, which continues and wraps up.
+- **Appended system prompt via a generated `--patch`.** `append_system_prompt_file` is written to a per-session YAML patch (`<state>/dsh/<session-id>.yml`): `system-prompt.personaPrefix` is **restated** (the patch loader replaces the whole row's config) and `personaSuffix` carries the file text. The patch is removed as soon as `start()` succeeds (also on start failure); content containing `{{…}}` is rejected **before spawn** because DSH interpolates the system prompt as a template (after spawn it would throw or silently substitute).
+- **abort / close.** `abort()` sends `session/cancel` (a notification), awaits the in-flight prompt's `cancelled` settlement (~11 ms measured) and leaves the session reusable. If it does not settle within the settle budget the process is treated as wedged: the turn settles `failed`, the tree is killed, `acpSessionId` is cleared and the session is **not** reusable (never report a wedged process as reusable). `close()` is synchronous by contract: send `session/close`, end stdin, schedule the process-tree teardown with a force-kill backstop, return.
+- **contextUsage** = the last `usage_update.used` of the current turn as `{tokens, live:false}` (absolute tokens only); reset at each turn start so a turn with no usage update reports `null` instead of echoing the previous turn's number.
+- **schema is unsupported** (rejected at open and send, like cursor/kimi) — only codex enforces a wire schema.
+- **Cleanup matcher is a SECURITY BOUNDARY.** `DeepSeek Harness.exe` is also the desktop GUI image, so the matcher requires `--profile acp` **and** an `app.asar` / `dsh-desktop-host…cli.js` / `dsh` launcher token (a `--profile headless`/`web` run never matches). `node scripts/agent-bridge.mjs diag match dsh-acp` runs it over stdin command lines; regression: `tests/repro-dsh.mjs` S17. The pid record carries the `dsh-acp` role.
+
+Hermetic tests use `tests/fake-dsh.mjs` (a wire-level ACP fake; `DSH_BIN` points at `tests/fake-dsh.cmd` / `.sh`) and never touch the real DSH tree, `DSH_HOME`, the Electron host, or a model:
+
+```sh
+node tests/repro-dsh.mjs                    # open/turn/stream/permission/cancel/close/model+effort/patch/contextUsage/matcher/doctor/cleanup/fault injection
+node tests/repro-owner-electron-argv0.mjs   # a live Electron-hosted bridge owner is recognized and its children/pid record are left alone
+```
 
 ## Local Checks
 
@@ -195,7 +228,7 @@ node tests/test-viz-session.mjs        # 会话页面这一侧：快照 → 页�
 零消耗（假后端 / 假二进制，可以随时跑）：
 
 ```sh
-node tests/probe-doctor-timeout.mjs          # 五个后端的 --version 探针都被超时挡住 + 不留孤儿孙进程
+node tests/probe-doctor-timeout.mjs          # 可挂起的后端（omp/codex/claude/cursor/dsh；kimi 造不出可挂的假二进制）的 --version 探针都被超时挡住 + 不留孤儿孙进程
 node tests/probe-claude-abort-fallback.mjs   # abort 兜底路径 + 迟到结果被吞掉
 node tests/probe-claude-abort-usage-gate.mjs # abort 跨越时 contextUsage 的闸门
 node tests/probe-claude-badbin.mjs           # 坏 CLAUDE_BIN 必须让 open 干净失败,不许先报 idle 再死
@@ -238,6 +271,7 @@ PLAYWRIGHT_DIR=<那个目录> node tests/e2e-viz-browser.mjs
 ```sh
 node tests/e2e-graph-viz.mjs           # 真跑 → 观测台上看到的就是磁盘上那份
 node tests/e2e-viz.mjs                 # 会话观测台的真后端一轮
+node tests/e2e-dsh.mjs                 # 真 dsh 后端一轮（open/多轮/abort 后复用/contextUsage/close；无 dsh 时 skip）
 ```
 
 ## End-to-End Test (real backends)
@@ -247,6 +281,8 @@ node tests/e2e-viz.mjs                 # 会话观测台的真后端一轮
 ```sh
 node tests/e2e-real.mjs   # prints PASS/FAIL per scenario, then a tally
 ```
+
+`tests/e2e-dsh.mjs` is the same idea for the DSH backend alone: with a real `dsh` on the machine (and the `--profile acp` entrypoint), it opens a real ACP session, runs small real turns (which spend real tokens), exercises abort + reuse + `contextUsage` + clean close, and SKIPs cleanly (exit 0) when `dsh` or its ACP profile is unavailable. The zero-token wire/edge coverage lives in `tests/repro-dsh.mjs` + `tests/fake-dsh.*`.
 
 ## Codex CLI Smoke Tests
 
@@ -338,16 +374,17 @@ ps -axo pid,ppid,command | rg 'agent-bridge|omp --mode rpc|codex app-server' || 
 - Never commit GitHub tokens, API keys, `.env` files, logs, or local auth files.
 - Keep public repository config portable. Avoid committing machine-specific paths such as `/Users/<name>/...`.
 - Keep `write: false` unless the user explicitly requested delegated edits.
-- Treat `write: true` as high privilege, but note the mapping is per backend and only three of the five have a distinct high-privilege switch:
+- Treat `write: true` as high privilege, but note the mapping is per backend and only four of the six have a distinct high-privilege switch:
   - **OMP** — `--auto-approve --approval-mode yolo`.
   - **Codex** — `sandbox: workspace-write` (on **Windows**, `danger-full-access`; see the apply_patch note in `scripts/agent-bridge.mjs`).
   - **Claude** — `--permission-mode bypassPermissions`.
+  - **DSH** — `DSH_PERMISSION_MODE=danger-full-access` for `write` vs `read-only` for `read` (the `read` fence is DSH's filesystem sandbox for file tools plus a partially-enforced shell ACL token; the ACP permission responder rejects upgrades — it is a tool-level fence, **not** an OS sandbox like codex's).
   - **Cursor / Kimi** — **no separate high-privilege switch.** `read` and `write` share the exact same launch (cursor's `--force`; kimi's single `kimi.exe` invocation); the only difference is that `read` prepends a soft "read-only investigation" instruction which `write` omits. So their `write` is not *more* OS privilege — it is the same privilege with the restraint removed, and their `read` is correspondingly not a hard no-write guarantee.
 - Close sessions when finished.
 
 ## Troubleshooting
 
-If `agent_bridge_doctor` cannot find a backend, set the matching override: `OMP_BIN`, `CODEX_BIN`, `CLAUDE_BIN`, `CURSOR_AGENT_BIN`, or `KIMI_BIN` (which must point at a native `kimi.exe`, never a `.cmd`/`.bat` shim).
+If `agent_bridge_doctor` cannot find a backend, set the matching override: `OMP_BIN`, `CODEX_BIN`, `CLAUDE_BIN`, `CURSOR_AGENT_BIN`, `KIMI_BIN` (which must point at a native `kimi.exe`, never a `.cmd`/`.bat` shim), or `DSH_BIN` (which must be a path to the `dsh` launcher file, not a bare name; the standard desktop install is auto-detected before `PATH`).
 
 If Codex cannot see the MCP server, re-add it (`codex mcp add agent-bridge -- node "<REPO>/scripts/agent-bridge.mjs" mcp`), restart Codex, and check:
 

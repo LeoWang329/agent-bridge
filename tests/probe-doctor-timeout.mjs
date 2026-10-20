@@ -41,9 +41,11 @@ const CURSOR_ROOT = path.join(os.tmpdir(), `hang-cursor-${process.pid}`);
 }
 
 const PROBE_TIMEOUT_MS = 800;
-// Generous ceiling: 5 backends × 800ms serial ≈ 4s of probing + node startup. Pre-fix this would be
-// ~5 × 30000ms (the hang duration) = 150s+. A pass well under BUDGET proves the timeout fires.
-const BUDGET_MS = 8000;
+// Generous ceiling: 6 backends × 800ms serial ≈ 4.8s of probing + per-probe process spawn/kill overhead
+// (a .cmd probe pays a cmd.exe hop) + node startup. Pre-fix this would be ~6 × 30000ms (the hang
+// duration) = 180s+. A pass well under BUDGET proves the timeout fires. When a backend is added, add its
+// env override to the fixture below and re-measure this budget.
+const BUDGET_MS = 15000;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 function fail(msg) { console.log(`[harness] >>> FAIL: ${msg}`); process.exit(1); }
@@ -55,7 +57,7 @@ const child = spawn("node", [BRIDGE, "doctor", "--json"], {
 //    于是「所有后端都必须被超时挡住」这条断言当场红 —— 而红的不是产品,是这份夹具没跟上。
 //    (cursor 与 kimi 就是这么让它红了很久:v1 写的时候只有三个后端。)
   env: { ...process.env, OMP_BIN: HANG, CODEX_BIN: HANG, CLAUDE_BIN: HANG,
-         CURSOR_AGENT_BIN: CURSOR_ROOT, KIMI_BIN: HANG, HANG_PID_FILE: PID_FILE, AGENT_BRIDGE_DOCTOR_PROBE_TIMEOUT_MS: String(PROBE_TIMEOUT_MS) },
+         CURSOR_AGENT_BIN: CURSOR_ROOT, KIMI_BIN: HANG, DSH_BIN: HANG, HANG_PID_FILE: PID_FILE, AGENT_BRIDGE_DOCTOR_PROBE_TIMEOUT_MS: String(PROBE_TIMEOUT_MS) },
 });
 let out = "";
 let err = "";
@@ -85,7 +87,8 @@ child.on("close", async code => {
   //    而它同时意味着:不编译一个真的 PE,就造不出「会挂住的 kimi.exe」。
   //    把 node.exe 改名顶上也不行 —— 它对 `--version` 秒答,那考的是"没挂",不是"挂了被挡住"。
   //    所以这里如实分档,而不是把断言放宽到所有后端(那会让另外四个也失去牙)。
-  const HANGABLE = new Set(["omp", "codex", "claude", "cursor"]);
+  //    (dsh 走 DSH_BIN 覆盖 → 普通 launcher 分支,所以它考得到"探针被超时挡住";分档见上。)
+  const HANGABLE = new Set(["omp", "codex", "claude", "cursor", "dsh"]);
   for (const a of agents) {
     if (a.available !== false) return fail(`agent ${a.agent} should be unavailable (hung probe), got available=${a.available}`);
     if (HANGABLE.has(a.agent) && !/timed out/i.test(a.error || "")) {

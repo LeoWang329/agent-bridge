@@ -1,6 +1,6 @@
 ---
 name: agent-bridge-graph
-description: 用 agent-bridge 把「一个环节 = 一个 AI 干一件事」做成可靠的执行原语,并支持为某次任务临时写一段 JS 来编排流程(循环/分支/过滤用普通代码,判断才叫 AI),节点可以是 codex / omp / claude / cursor / kimi 的任意组合。仅当用户明确要求「多个不同引擎的 AI 分头干再汇总 / 一个 AI 挑另一个的刺 / 几个 AI 抢答同一题」,或流程复杂到主 agent 手工驱动会出错(环节多、要循环、要按结果分支、中间产出大)时使用。普通并行委托直接用 agent-bridge 本体;多轮讨论收敛用 agent-bridge-roundtable;合同驱动的交付闭环用 agent-bridge-loop。**不要因为出现「工作流 / workflow / 图 / graph」这类词就触发**——Claude Code 自带的 Workflow 是另一回事。
+description: 用 agent-bridge 把「一个环节 = 一个 AI 干一件事」做成可靠的执行原语,并支持为某次任务临时写一段 JS 来编排流程(循环/分支/过滤用普通代码,判断才叫 AI),节点可以是 codex / omp / claude / cursor / kimi / dsh 的任意组合。仅当用户明确要求「多个不同引擎的 AI 分头干再汇总 / 一个 AI 挑另一个的刺 / 几个 AI 抢答同一题」,或流程复杂到主 agent 手工驱动会出错(环节多、要循环、要按结果分支、中间产出大)时使用。普通并行委托直接用 agent-bridge 本体;多轮讨论收敛用 agent-bridge-roundtable;合同驱动的交付闭环用 agent-bridge-loop。**不要因为出现「工作流 / workflow / 图 / graph」这类词就触发**——Claude Code 自带的 Workflow 是另一回事。
 ---
 
 # Agent Bridge Graph
@@ -294,7 +294,7 @@ bridge.runNode({ id: "implement", agent: "claude", cwd: REPO, outDir,
 这两条是实践里量过有效的形状(session-viz 那次的独立第二实现就是这么排的),
 写在这里是因为它**不是**某个人的偏好:一旦"独立"只靠提示词维持,它就迟早不成立。
 
-## 五个后端的脾气(排任务单前先看)
+## 六个后端的脾气(排任务单前先看)
 
 | 后端 | 能力边界 | 派活前先确认 |
 |---|---|---|
@@ -303,20 +303,23 @@ bridge.runNode({ id: "implement", agent: "claude", cwd: REPO, outDir,
 | **Claude** | 同 OMP | — |
 | **Cursor** | 软只读(原生写工具还在);**看不到上下文用量**;**内容进 Cursor 云端且删不掉**;⚠️ **同一 `cwd` 下的会话之间不隔离**(见下) | 型号要带档位后缀(如 `gpt-5.3-codex-high`) |
 | **Kimi** | 软只读(原生写工具还在);看不到上下文用量;**推理走 Moonshot 云端**,敏感内容照样出境 | 型号用 `kimi-code/…`;**effort 会被忽略** |
+| **DSH** | 持久 ACP 进程(一节点一进程,≈250 MB);**真 system prompt**(角色设定长程更稳);**能看上下文用量**(上一轮 `usage_update` 快照,非 null);`read` = DSH 文件系统沙箱写围栏 + shell 仅 `partial` ACL(工具面强拦,非 OS 沙箱);不能强制格式 | 一节点一进程,**并发排少点**(≈250 MB/节点);`model` 用友好名或 `provider/model`;**`schema` 不支持** |
 
 - **`access` 两档:`read`(默认)与 `write`**(= git worktree,见上一节)。⚠️ `read` **不等于**"不可能改文件"
-  ——只有 codex 是硬拦(OS 沙箱),另外四家是软的:shell 能写盘,cursor/kimi 连原生写工具都还在。
-  **要硬保证不写盘的环节,就点名 codex。**
+  ——只有 codex 是硬拦(OS 沙箱);dsh 是工具面强拦(文件工具写不出去、shell 只部分受限);
+  另外四家是软的:shell 能写盘,cursor/kimi 连原生写工具都还在。
+  **要 OS 级硬保证不写盘的环节,就点名 codex;要工具面强拦可以点名 dsh(写工具出不去,shell 只 `partial`)。**
 - **关键判断环节(挑刺/裁判/汇总)别用 cursor 和 kimi**(每轮短进程,角色设定容易飘);让它们干普通生产环节。
-- ⚠️ **cursor 的会话隔离弱于其余四家(实测)**:同一个 `cwd` 下开的**全新**节点,能读到**先前**节点的内容
+- ⚠️ **cursor 的会话隔离弱于其余后端(实测;dsh 未做过同一实测,别把这条结论套给它)**:同一个 `cwd` 下开的**全新**节点,能读到**先前**节点的内容
   (`tests/e2e-graph-memory.mjs` 用随机口令量过;换个 `cwd` 就读不到 ⇒ 按 **workspace 划界**)。
   编排上的后果:**同一 `cwd` 里先后跑的两个 cursor 环节不构成"互相独立"** ——
   「一个干、另一个挑刺」这种形状**别把两头都排给 cursor**,挑刺那头会看见实施那头的上文
   (纪律 4「汇总/评审/挑刺一定换引擎」在这里是硬要求,不是偏好)。
 - **敏感内容的任务,一开始就别把 cursor / kimi 排进去。**
-- **`schema` 只有 codex 能用**,传给别人会被当场拒绝;其余四家用 `outputShape`(工具做弱检查:
+- **`schema` 只有 codex 能用**,传给别人会被当场拒绝;其余五家用 `outputShape`(工具做弱检查:
   能不能 parse + 顶层必需键在不在)。**弱检查不是完整校验**,别指望它给出 codex 那种保证。
 - 开跑前先 `bridge.doctor()`;但 doctor **只查版本号**,过了也可能起不来(不验登录)。
+- ⚠️ **`dsh` 节点可以排了**(2026-10-20 起 graph 工具白名单已放行:agent 校验、`node-turn`、`viz-events` 的 `node:observed` 枚举都含 `dsh`;更早的版本写 `agent:"dsh"` 会当场 `UsageError`)。三条如实注意:①**一个节点一个 `dsh` 进程、≈250 MB**,大并发先算内存;②`read` 是**工具面**写围栏(DSH 文件系统沙箱 + 仅 `partial` 的 shell ACL),**不是** codex 的 OS 沙箱——要 OS 级硬保证仍点名 codex;③`schema` 不支持,强制格式只能 codex。`write` 节点照常跑在各自的 git worktree 里,无额外约定。
 
 ### 「我要机读输出,但这个活儿该给 claude/omp 干」
 

@@ -1,8 +1,8 @@
 # Agent Bridge 安装与使用
 
-这份文档面向想把 Agent Bridge 装进 Codex 或 Claude Code 并实际调用 OMP/Codex/Claude/Cursor/Kimi 的用户。
+这份文档面向想把 Agent Bridge 装进 Codex、Claude Code 或 DeepSeek Harness（DSH）并实际调用 OMP/Codex/Claude/Cursor/Kimi/DSH 的用户。
 
-Agent Bridge 是一个 session-first 的 MCP 桥接器，注册到 Codex 或 Claude Code 后使用。它不是一次性命令封装，而是让客户端先打开一个持久会话，再向同一个会话连续发送消息，最后显式关闭会话。
+Agent Bridge 是一个 session-first 的 MCP 桥接器，注册到 Codex、Claude Code 或 DSH 后使用。它不是一次性命令封装，而是让客户端先打开一个持久会话，再向同一个会话连续发送消息，最后显式关闭会话。
 
 ## 1. 前置依赖
 
@@ -15,21 +15,23 @@ omp --version
 claude --version   # 如果要委托给 Claude
 agent --version    # 如果要委托给 Cursor（仅 Windows）
 kimi --version     # 如果要委托给 Kimi（仅 Windows）
+dsh --version      # 如果要委托给 DSH（需要 0.2.x，带 --profile acp）
 ```
 
 最低要求：
 
 - Node.js 20 或更高
-- 一个 MCP 客户端：Codex（CLI 或 app）或 Claude Code
+- 一个 MCP 客户端：Codex（CLI 或 app）、Claude Code，或 DeepSeek Harness（DSH）0.2.x（桌面版或 CLI；`dsh -V` 可执行。DSH 不读 `.mcp.json`，需要一行 profile patch，见第 6 节）
 - OMP 已安装，并且 `omp` 在 PATH 中（如果要委托给 OMP）
 - Codex 已安装，并且 `codex` 在 PATH 中（如果要委托给 Codex）
 - Claude Code 已安装，并且 `claude` 在 PATH 中（如果要委托给 Claude）
 - Cursor Agent CLI（`agent`）已安装，**仅 Windows**（如果要委托给 Cursor）
 - Kimi Code CLI（原生 `kimi.exe`）已安装，**仅 Windows**（如果要委托给 Kimi）
+- DeepSeek Harness（DSH）**0.2.x** 已安装，`dsh` 可执行（如果要委托给 DSH；需要该版本自带 `--profile acp`，0.2.1-rc.2 实测可用。Windows / macOS / Linux）
 
-**必须先装好要委托的 coding agent。** Agent Bridge 只是桥接到 OMP / Codex / Claude / Cursor / Kimi（cursor、kimi 仅 Windows），本身不包含也不会自动安装它们。如果对应后端没装，session 根本无法启动。请先把你打算委托的后端装好，再用 `node scripts/agent-bridge.mjs doctor` 确认每个后端都被检测到。
+**必须先装好要委托的 coding agent。** Agent Bridge 只是桥接到 OMP / Codex / Claude / Cursor / Kimi / DSH（cursor、kimi 仅 Windows；DSH 三平台），本身不包含也不会自动安装它们。如果对应后端没装，session 根本无法启动。请先把你打算委托的后端装好，再用 `node scripts/agent-bridge.mjs doctor` 确认每个后端都被检测到。
 
-如果后端不在 PATH 中，可以用环境变量覆盖（omp/codex/claude，POSIX shell）：
+如果后端不在 PATH 中，可以用环境变量覆盖（下面以 omp/codex/claude 的 POSIX shell 写法为例；cursor / kimi / DSH 的覆盖见后）：
 
 ```sh
 export OMP_BIN="$HOME/.local/bin/omp"
@@ -55,6 +57,12 @@ irm https://code.kimi.com/kimi-code/install.ps1 | iex
 $env:KIMI_BIN = "$env:USERPROFILE\.kimi-code\bin\kimi.exe"
 ```
 
+DSH（Windows / macOS / Linux）按 `DSH_BIN` → 标准桌面安装的 launcher（Windows 是 `…\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd`）→ PATH 的顺序**懒解析**，装的是官方桌面版通常无需配置。装在别处才需要覆盖（**必须指向 launcher 文件路径，不能是裸名字**）：
+
+```powershell
+$env:DSH_BIN = "$env:LOCALAPPDATA\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd"
+```
+
 ## 2. 获取项目
 
 ```sh
@@ -75,7 +83,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | nod
 `doctor` 里应该看到类似：
 
 ```text
-Agent Bridge 0.7.0
+Agent Bridge 0.12.0
 omp: ok (...) omp/15.9.1
 codex: ok (...) codex-cli 0.137.0
 ```
@@ -99,15 +107,16 @@ Agent Bridge「直接从 clone 运行」——MCP server 与 skill 软链都指�
 Agent Bridge 两块东西，**适配范围不同**：
 
 - **MCP server（工具）= 通用**：任何支持 stdio MCP 的客户端都能注册 `node <REPO>/scripts/agent-bridge.mjs mcp`，拿到全部 `agent_bridge_*` 工具。
-- **skills（使用指引）= 仅 Claude Code / Codex**：`skills/*/SKILL.md` 是这两家的 skill 约定，别的客户端不会自动加载（工具照用，只是少了「何时该委托」的判断指引——可把 SKILL.md 当普通文档喂给它）。
+- **skills（使用指引）**：`skills/*/SKILL.md` 是 Claude Code / Codex 的 skill 约定，**DSH 的文件系统 skill 机制也兼容**（frontmatter 只要求 `name`+`description`，5 个 skill 已实测可直接加载，见第 6 节）；其它客户端不会自动加载（工具照用，只是少了「何时该委托」的判断指引——可把 SKILL.md 当普通文档喂给它）。
 
 | agent | 注册 MCP（工具） | skill 目录 | 工具命名空间 | 生效 |
 |---|---|---|---|---|
 | **Claude Code** | `claude mcp add agent-bridge --scope user -- node "<MJS>" mcp`（写入用户配置） | `~/.claude/skills/<name>/`（软链，裸名、无命名空间） | `mcp__agent-bridge__agent_bridge_*` | 重启客户端 |
 | **Codex** | `codex mcp add agent-bridge -- node "<MJS>" mcp`（写入 `~/.codex/config.toml`） | `~/.codex/skills/<name>/`（软链） | `agent_bridge_*`（裸名） | 重启 Codex |
+| **DeepSeek Harness（DSH）** | 在 DSH profile 的**用户 patch 层**插一行 `@deepseek-ai/dsh-mcp-client`：桌面版改 `~/.dsh/profiles/desktop/cordis.patch.yml`；headless 用 `--patch` overlay（见第 6 节） | `~/.dsh/skills/<name>/`（junction/软链，DSH 自动发现，所有 profile 生效） | `mcp__agent-bridge__agent_bridge_*` | 桌面版 HMR 在线生效（重启为兜底）；headless 每次运行读新配置 |
 | **其它 MCP 客户端**（Cursor / Cline / Windsurf …） | 在该客户端 MCP 配置里加一个 stdio server：命令 `node`、参数 `["<MJS>","mcp"]` | 无自动 skill 机制——按需把 `skills/agent-bridge/SKILL.md` 作为文档提供 | 由该客户端定（多为 `agent_bridge_*`） | 按该客户端方式重载 |
 
-`<MJS>` = `<REPO>/scripts/agent-bridge.mjs` 的**绝对路径**（维护者填**稳定安装 clone**，见上一节）。后端（omp/codex/claude/cursor/kimi）是否可用以 `node "<MJS>" doctor` 为准。一律用**绝对路径**，别用 `$PWD`——agent 的 shell 通常不在仓库根。
+`<MJS>` = `<REPO>/scripts/agent-bridge.mjs` 的**绝对路径**（维护者填**稳定安装 clone**，见上一节）。后端（omp/codex/claude/cursor/kimi/dsh）是否可用以 `node "<MJS>" doctor` 为准。一律用**绝对路径**，别用 `$PWD`——agent 的 shell 通常不在仓库根。
 
 ## 3. 安装到 Codex
 
@@ -201,9 +210,137 @@ ln -sfn "$PWD/skills/agent-bridge-graph"      ~/.claude/skills/agent-bridge-grap
 
 不装 skill 也能直接调用 MCP 工具，skill 只是补充「何时该委托」的判断指引。会话流程（open → send → status/result → 复用 → close）以及写权限、清理规则都与 Codex 完全一致。
 
-## 6. 使用方式
+## 6. 安装到 DeepSeek Harness（DSH）
 
-会话**只能**通过 MCP 工具管理。会话活在你这个客户端启动的 `agent-bridge mcp` 进程内：该进程直接 spawn 并持有你打开的 OMP/Codex/Claude 后端（**cursor / kimi 例外**：只持有逻辑会话——cursor 是云端 `chatId`、kimi 是本地 session id，两者进程都按轮短驻）。没有共享后台 daemon，也没有 Web UI——客户端退出，这个 MCP 进程随之退出，它持有的所有后端进程被一并清理（cursor 的云端 chat 因无 delete-chat 不受影响、仍留存；kimi 无云端 chat 存储，但已发出的 prompt 仍到过 Moonshot 云端）（v0.7.0，详见 [docs/ARCHITECTURE.md](ARCHITECTURE.md)）。
+DSH 也是 stdio MCP 客户端，但它的 MCP **没有设置页、没有设置文件，也不读 `.mcp.json`**：MCP server 是 DSH profile 的一行 Loader 配置（`@deepseek-ai/dsh-mcp-client`，DSH 自带但这个客户端默认不挂任何 MCP server）。所以接入方式与 Codex / Claude Code 不同——要往 DSH 的 **profile 用户 patch 层**插一行；skills 则与 DSH 的文件系统 skill 约定天然兼容。实测环境：DSH 0.2.1-rc.2（Windows 桌面版 + CLI）。
+
+> **同一个 DSH 安装也可以被桥委托（方向 A，v0.12.0 起）。** 本节讲的是「DSH 当客户端」；反过来 `agent_bridge_open_session({ agent: "dsh" })` 驱动的是本机 DSH 的 `--profile acp` 后端，两个方向互不冲突、可以同时启用（DSH 既能指挥桥，也能被桥指挥）。后端要求见第 1 节，`doctor` 里的同一行 `dsh: ok (...)` 即代表两边都可用——注意 `--profile acp` 是委托方向必需的能力，DSH 版本太低时 `open_session` 会明确报错。
+
+### 6.1 注册 MCP server（工具）
+
+先确认 `dsh` 可执行（桌面安装会写用户 PATH；长期运行的旧进程可能持有过期 PATH，新开 shell 再试）：
+
+```powershell
+dsh -V   # 应输出 0.2.x
+```
+
+**桌面版 GUI**（日常主 agent 跑在 DSH 桌面 App 里）：把下面这段**追加**到 `%USERPROFILE%\.dsh\profiles\desktop\cordis.patch.yml`（这是你的用户 patch 层，不是 `cordis.yml`；建议先备份一份）。桌面版开着 HMR，保存后新会话即可看到工具，不生效再重启 App：
+
+```yaml
+# DSH profile 用户 patch 层：追加这段（顶层 - insert:）
+- insert:
+    - id: mcp-agent-bridge
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: agent-bridge          # 工具名 → mcp__agent-bridge__agent_bridge_*
+        transport: stdio
+        command: !!js process.execPath    # 桌面 App 里 process.execPath 是 Electron 二进制
+        args:
+          - '<REPO>\scripts\agent-bridge.mjs'
+          - mcp
+        env:
+          ELECTRON_RUN_AS_NODE: '1'       # 让 Electron 二进制以 Node 模式跑 MCP server
+        cwd: '<REPO>'
+        toolCallTimeoutMs: 900000         # 必须 ≥ 桥 wait 的 10 分钟默认值（DSH 默认只有 60s）
+        failOnStartupError: false
+```
+
+**headless / 其他 CLI 运行**（不经过 GUI）：把 `- insert:` 块存成仓库外的 overlay 文件（如 `%USERPROFILE%\.dsh\agent-bridge.mcp.yml`），用 `--patch` 传入；纯 CLI/headless 下把 `command` 换成 `node`、删掉 `env:` 块（这是已实测的写法）。headless 默认还禁用了 GUI 保存的凭据，如果你要让它沿用已保存的 DSH 登录/API key，再在同一个文件顶部加三行（后端都用自己的登录时可省略）：
+
+```yaml
+- id: credentials
+  disabled: false
+- id: authorization
+  disabled: false
+- id: deepseek-account
+  disabled: false
+```
+
+```powershell
+dsh --profile headless --patch "$env:USERPROFILE\.dsh\agent-bridge.mcp.yml" "用 agent-bridge 的 doctor 检查后端"
+```
+
+> 两种 `command` 的选择：**桌面 App 宿主**用 `!!js process.execPath` + `ELECTRON_RUN_AS_NODE: '1'`（与 DSH 自带的 OpenViking 插件同形；**2026-10-20 已在 DSH 桌面版真机启用并验证**：HMR 热加载后工具进入运行中的会话，`agent_bridge_doctor` 正常）；**CLI/headless** 用 `command: node`（Windows 实测跑通：`agent_bridge_doctor` 五项全 ok，`mcp__agent-bridge__agent_bridge_doctor` 可被模型正常调用）。
+
+必须知道的点：
+
+- **`toolCallTimeoutMs` 一定 ≥ 600000（建议 900000）**：DSH 的 MCP 调用默认 60 s 超时，而 `agent_bridge_wait` 默认等 10 分钟——不改的话长任务会被 DSH 端掐断。
+- DSH 会**清洗** MCP 子进程环境：名字命中 `/KEY|PASSWORD|SECRET|TOKEN/i` 以及所有 `DSH_*` 的变量会被剥掉（`PATH` 保留）。靠环境变量传 key 的后端要在 `env:` 里显式重述。
+- 不要把 `~/.dsh/cordis.patch.yml` 建成空文件或只有注释——DSH 会 boot 失败。要 home 级生效就写完整 patch 内容。
+- `<REPO>` 用**绝对路径**；YAML 里 Windows 路径用**单引号**（双引号中 `\c` 是非法转义）。
+- **作用域**：插在顶层 `- insert:` 是 host plane，所有 DSH 会话（含 DSH 自己的 subagent）都会看到这 8 个工具。只想让部分会话用：把这一行加进 desktop patch 里各个 agent preset 的 plugins 列表（改动只对**新建会话**生效）。
+- 想只验证配置组装、不发模型请求：`dsh --profile headless --patch <overlay 文件> --dump-config`，输出里应能看到 `mcp-agent-bridge` 这一行。
+
+### 6.2 安装 skills（使用指引）
+
+DSH 自带文件系统 skill 机制，`skills/*/SKILL.md` 的 frontmatter（`name` + `description`）与 DSH 的契约兼容，**5 个 skill 全部可直接用**，不需要改文件（frontmatter 兼容性与目录发现已实测：DSH 会话的 skill 目录里能列出这 5 个名字）。用户级目录 `~/.dsh/skills/` 会被所有 DSH profile 扫描，无需配置、无需重启：
+
+```powershell
+# Windows — junction（免管理员；不要拷贝，这样 git pull 即更新）
+$root = Join-Path $env:USERPROFILE '.dsh\skills'
+New-Item -ItemType Directory -Force -Path $root | Out-Null
+$repo = '<REPO>\skills'
+foreach ($n in 'agent-bridge','agent-bridge-dev','agent-bridge-roundtable','agent-bridge-loop','agent-bridge-graph') {
+  $link = Join-Path $root $n
+  if (Test-Path $link) { Remove-Item $link -Force -Recurse }
+  New-Item -ItemType Junction -Path $link -Target (Join-Path $repo $n) | Out-Null
+}
+Get-ChildItem $root | Select-Object Name   # 应看到 5 个 junction
+```
+
+```sh
+# macOS / Linux
+mkdir -p ~/.dsh/skills
+ln -sfn "<REPO>/skills/agent-bridge"            ~/.dsh/skills/agent-bridge
+ln -sfn "<REPO>/skills/agent-bridge-dev"        ~/.dsh/skills/agent-bridge-dev
+ln -sfn "<REPO>/skills/agent-bridge-roundtable" ~/.dsh/skills/agent-bridge-roundtable
+ln -sfn "<REPO>/skills/agent-bridge-loop"       ~/.dsh/skills/agent-bridge-loop
+ln -sfn "<REPO>/skills/agent-bridge-graph"      ~/.dsh/skills/agent-bridge-graph
+```
+
+装完在新会话里可直接 `/agent-bridge` 显式调用（或说「用 agent-bridge 的 skill」）。**非 desktop 的 profile** 也可用配置方式（`- id: skill-filesystem` / `config: {customSkillDirs: ['<REPO>/skills']}`），但 desktop 的 host 行被 DSH 的 web bundle 禁用了、由各 agent preset 自己管，所以桌面版请用上面的 junction（**2026-10-20 真机验证**：建好 junction 后，正在运行的 DSH 桌面会话的 skill 目录当场更新并列出这 5 个 skill，无需重启）。
+
+### 6.3 验证
+
+在 DSH 里新开一个会话（或按 6.1 用 headless 跑一次），发送：
+
+```text
+这是 agent-bridge 的只读 smoke test。请调用 mcp__agent-bridge__agent_bridge_doctor，把原始输出原样贴出来；不要发送任何实际任务 prompt。
+```
+
+预期输出类似（后端清单随本机安装变化）：
+
+```text
+Agent Bridge 0.12.0
+Node: v24.16.0
+State: C:\Users\<you>\.agent-bridge
+Viz: on   ...\Temp\agent-bridge-viz-...
+
+omp: ok (omp) omp/18.2.6
+codex: ok (codex) codex-cli 0.161.0
+claude: ok (claude) 2.1.280 (Claude Code)
+cursor: ok (agent) 2026.07.23-e383d2b
+kimi: ok (kimi.exe) 0.32.0
+dsh: ok (dsh) 0.2.1-rc.2
+```
+
+**回滚**：删掉 6.1 追加的 `- insert:` 块（有备份就恢复），删掉 6.2 的 5 个 junction，重启 DSH。
+
+> 2026-10-20 本机（DSH 桌面版 0.2.1-rc.2）实测记录：HMR 热加载后工具直接进入运行中的会话 → `agent_bridge_doctor` 五项 ok → 打开 `omp` 只读会话、发一条消息，1.3 s 内拿回 `DSH-BRIDGE-OK`；5 个 skill 同时上线。也就是说上面两条（工具 + skills）都已经在桌面版真机跑通。
+
+### 6.4 已知摩擦
+
+- **工具名带命名空间**：DSH 里是 `mcp__agent-bridge__agent_bridge_*`（与 Claude Code 同形）；skill 正文里的裸 `agent_bridge_*` 需要模型自行对应（Claude Code 已有先例，实际可行）。
+- **`.mcp.json` 在 DSH 里完全无效**（DSH 全树没有 `.mcp.json` 读取器）；仓库自带的 `.mcp.json` 只服务 Claude Code 的项目级安装。
+- **DSH 里没有「只读桥」或按工具裁剪**：8 个工具 schema 会常驻每次请求（占一点 context）。这是 DSH MCP 客户端的现状。
+- **skill 正文较长（9–22 KB）**：desktop 默认的 tool-result-pruner 阈值是 8192 字符，压缩压力下 skill 正文中间可能被剪；在意的话调高该 preset 的 `thresholdChars`。
+- **作用域/递归**：host-plane 注册会让 DSH 自己的 subagent 也看到这 8 个工具。DSH 侧没有「桥→DSH」直接环（DSH 目前不是桥的后端），但桥委派的 Claude Code 若在含 `.mcp.json` 的仓库里运行会再注册桥（这是既有风险，与 DSH 无关）。
+- **已知坑（2026-10-20 实测，v0.12.0 已修）**：在**含 `.mcp.json`** 的目录里作为委托 cwd 打开 `omp` 会话，OMP 会自动挂载嵌套的 agent-bridge MCP；旧版桥的 owner 存活判定只认 `node` 开头的进程（`scripts/agent-bridge.mjs` 的 `ownerStillRunning`），Electron 宿主（DSH 桌面版）下会把外层桥误判为已死，嵌套桥的启动清理把 OMP 杀掉（约 5–6 s 后 `OMP RPC exited with code 1`）。**v0.12.0 起**判定改为「owner 命令含 `agent-bridge.mjs` + `mcp` 即视为存活」（比原来更保守：宁可少清理，不可误杀），不再需要绕开 `.mcp.json` 目录；回归测试 `tests/repro-owner-electron-argv0.mjs`。老版本升级前仍建议避开。
+- DSH 升级后 `cordis.patch.yml` 可能被 app 的 profile 自愈逻辑或 Plugin Manager 备份重命名，升级前留一份副本。
+
+## 7. 使用方式
+
+会话**只能**通过 MCP 工具管理。会话活在你这个客户端启动的 `agent-bridge mcp` 进程内：该进程直接 spawn 并持有你打开的 OMP/Codex/Claude/DSH 后端（**cursor / kimi 例外**：只持有逻辑会话——cursor 是云端 `chatId`、kimi 是本地 session id，两者进程都按轮短驻）。没有共享后台 daemon，也没有 Web UI——客户端退出，这个 MCP 进程随之退出，它持有的所有后端进程被一并清理（cursor 的云端 chat 因无 delete-chat 不受影响、仍留存；kimi 无云端 chat 存储，但已发出的 prompt 仍到过 Moonshot 云端）（v0.7.0，详见 [docs/ARCHITECTURE.md](ARCHITECTURE.md)）。
 
 Codex 使用 Agent Bridge 时应该遵循这个流程：
 
@@ -277,7 +414,19 @@ Codex 使用 Agent Bridge 时应该遵循这个流程：
 }
 ```
 
-可以在**打开会话时**指定模型与推理强度。模型是会话级参数：在 `agent_bridge_open_session` 时用 `model` 指定，整个会话内固定，`agent_bridge_send_message` 不能逐条切换；想换模型就新开一个 session。`model` 会原样传给后端的 `--model`，取值格式由后端决定。OMP 尤其可以通过 `omp --model <name>` 触达多种模型（如 `deepseek-v4-pro`、`minimax-m3`、`claude`、`gpt`）。可选的 `effort` 在 OMP 映射为 `--thinking`（`minimal|low|medium|high|xhigh`），在 Codex 作为该轮的 effort（`none|minimal|low|medium|high|xhigh`）传入，在 Claude 映射为 `--effort`（默认 `xhigh`）；**Cursor 的 `model` 必须是带档位后缀的 selector**（用 `agent --list-models` 活查），其 `effort` 被接受但忽略、`contextUsage` 恒 `null`；**Kimi 的 `model` 是 `kimi-code/…` 别名**（用 `kimi provider list --json` 活查（**要 `--json`**：裸 `kimi provider list` 只报 provider 摘要与默认模型，不列别名），默认 `kimi-code/k3`），其 `effort` 同样被接受但忽略、`contextUsage` 也恒 `null`。不传 `model` / `effort` 时使用后端默认值。
+需要 DSH 时，把 `agent` 换成 `dsh`（DeepSeek Harness 0.2.x 的 **ACP profile**，一个会话一个持久进程；Windows / macOS / Linux）。几处后端特有约束：`model` 用**友好名**（如 `deepseek-v4-pro`，或 `deepseek-official/deepseek-v4-pro`；桥按该会话 `session/new` 实际公布的 `configOptions` 映射，**不硬编码 id**，非法值在 `open_session` 当场失败而不是回落到默认）；`effort` 映射 `minimal→off, low→low, medium→high, high→high, xhigh→max`；`append_system_prompt_file` 是**真 system prompt**（桥生成临时 `--patch` 注入 `system-prompt.personaSuffix`，档位与 omp/claude 同级，优于 cursor/kimi 的首轮软前缀；内容含 `{{…}}` 会在 open 时被拒——DSH 会把它当模板表达式）；`contextUsage` **非 null**（取上一轮 `usage_update`，`live:false` 快照）；`schema` 不支持（同 cursor/kimi）；`read` 档 = DSH `read-only`（文件工具由文件系统沙箱硬拦、shell 走 ACL 受限令牌且 enforcement 为 `partial`，是**工具面**写围栏，**不是** codex 那种 OS 沙箱），`write` 档 = `danger-full-access`；一个会话约 **250 MB** 内存（大并发要收敛 dsh 会话数），且会话会出现在你本机 DSH 的会话列表里（`~/.dsh`）：
+
+```json
+{
+  "agent": "dsh",
+  "cwd": "/absolute/path/to/workspace",
+  "access": "read",
+  "model": "deepseek-v4-pro",
+  "effort": "high"
+}
+```
+
+可以在**打开会话时**指定模型与推理强度。模型是会话级参数：在 `agent_bridge_open_session` 时用 `model` 指定，整个会话内固定，`agent_bridge_send_message` 不能逐条切换；想换模型就新开一个 session。`model` 会原样传给后端的 `--model`（**DSH 例外**：它经 ACP `session/set_config_option` 下发，不走 argv），取值格式由后端决定。OMP 尤其可以通过 `omp --model <name>` 触达多种模型（如 `deepseek-v4-pro`、`minimax-m3`、`claude`、`gpt`）。可选的 `effort` 在 OMP 映射为 `--thinking`（`minimal|low|medium|high|xhigh`），在 Codex 作为该轮的 effort（`none|minimal|low|medium|high|xhigh`）传入，在 Claude 映射为 `--effort`（默认 `xhigh`）；**Cursor 的 `model` 必须是带档位后缀的 selector**（用 `agent --list-models` 活查），其 `effort` 被接受但忽略、`contextUsage` 恒 `null`；**Kimi 的 `model` 是 `kimi-code/…` 别名**（用 `kimi provider list --json` 活查（**要 `--json`**：裸 `kimi provider list` 只报 provider 摘要与默认模型，不列别名），默认 `kimi-code/k3`），其 `effort` 同样被接受但忽略、`contextUsage` 也恒 `null`；**DSH 的 `model` 用友好名**（`deepseek-v4-pro`，或 `deepseek-official/deepseek-v4-pro` 这类 `provider/model` 形式；桥按该会话 `configOptions` 映射，不是硬编码目录），其 `effort` 按 `minimal→off, low→low, medium→high, high→high, xhigh→max` 映射到 ACP `reasoning_effort`，`contextUsage` 非 null（上一轮 `usage_update` 快照，`live:false`）。不传 `model` / `effort` 时使用后端默认值。
 
 ```json
 {
@@ -289,14 +438,14 @@ Codex 使用 Agent Bridge 时应该遵循这个流程：
 }
 ```
 
-## 7. CLI
+## 8. CLI
 
 会话只能通过 MCP 工具管理；CLI 只剩三条命令：server 入口加两个运维辅助命令。**没有任何会话命令（`open`/`send`/`status`/…），也没有 daemon/UI 命令**——它们在 v0.7.0 随会话搬进 MCP 进程后被移除。
 
 ```sh
 node scripts/agent-bridge.mjs mcp        # 运行 MCP server（stdio）——会话活在这个进程里
-node scripts/agent-bridge.mjs doctor     # 报告后端可用性（omp/codex/claude/cursor/kimi）
-node scripts/agent-bridge.mjs cleanup    # 回收被 kill 的 MCP server 残留的孤儿子进程（omp/codex/claude 长驻进程、cursor 的 create-chat / 活跃轮短进程、kimi 的活跃轮短进程）
+node scripts/agent-bridge.mjs doctor     # 报告后端可用性（omp/codex/claude/cursor/kimi/dsh）
+node scripts/agent-bridge.mjs cleanup    # 回收被 kill 的 MCP server 残留的孤儿子进程（omp/codex/claude/dsh 长驻进程、cursor 的 create-chat / 活跃轮短进程、kimi 的活跃轮短进程）
 ```
 
 `mcp` 由 MCP 客户端自动拉起，不用手动跑。`cleanup` 是安全网：只终止那些「owning MCP server 已经不在了」（例如被 `kill -9`）的后端子进程，并清理它们的 pid record；仍由活着的 `agent-bridge mcp` 进程持有的子进程不会被动到。
@@ -305,7 +454,7 @@ node scripts/agent-bridge.mjs cleanup    # 回收被 kill 的 MCP server 残留�
 node scripts/agent-bridge.mjs cleanup --json
 ```
 
-## 8. 写权限模式
+## 9. 写权限模式
 
 默认使用 `write: false`。适合：
 
@@ -322,16 +471,17 @@ node scripts/agent-bridge.mjs cleanup --json
 }
 ```
 
-写权限模式的映射**逐后端不同**，五个后端里只有三个有独立的高权限开关：
+写权限模式的映射**逐后端不同**，六个后端里四个有独立的高权限开关：
 
 - OMP：`--auto-approve --approval-mode yolo`
 - Codex：`sandbox: workspace-write`（Windows 上为 `danger-full-access`，见上）（`approvalPolicy: never`）
 - Claude：`--permission-mode bypassPermissions`
+- DSH：`DSH_PERMISSION_MODE=danger-full-access`（写档）vs `read-only`（读档）。读档不是提示词约束：文件工具由 DSH 文件系统沙箱拦写、shell 走 ACL 受限令牌（enforcement 报 `partial`），并由桥的权限应答器拒绝升级请求——属**工具面**写围栏，**不是** codex 那种 OS 沙箱。
 - Cursor / Kimi：**没有独立的高权限开关**——`read` 与 `write` 用的是**完全相同的一条启动**（cursor 同 `--force`；kimi 同一条 `kimi.exe` 调用），差别只在 `read` 档会前置一句「仅只读调查」的**软提示**、`write` 档去掉它。所以这两者的 `write` **不是更高的 OS 权限**，只是把那句约束撤掉；反过来说，它们的 `read` 也**不是**硬性的不可写保证（详见 README §Backends 与桥 skill 的对应条目）。
 
 让委托代理改完后，Codex 自己仍然应该检查 git diff、运行测试，再向用户报告。
 
-## 9. 会话和进程清理
+## 10. 会话和进程清理
 
 正常关闭会话：
 
@@ -346,23 +496,24 @@ node scripts/agent-bridge.mjs cleanup --json
 - OMP 的 `omp --mode rpc` 会退出
 - Codex 的 `codex app-server` 会退出
 - Claude 的 headless 进程会退出
+- DSH 的 `dsh --profile acp` 进程会退出（形状 A：每个桥会话一个持久 ACP 进程；close 先 `session/close`、再拆进程树，3 s 强杀兜底）
 - Cursor 无长驻进程可退（形状 B：进程按轮短驻）——**在途轮的 `close` 默认被拒**（返回 `{blocked:true, runningSessionIds}`，什么都不关）；传 `force:true` 才会整树终止那个活跃的 create-chat / turn 短进程，再忘掉云端 `chatId`；**因 cursor 无 delete-chat，云端 chat 及其读入的仓库内容仍留在 Cursor 的留存边界，删不掉**
 - Kimi 同样无长驻进程可退（形状 B）——同样**在途轮默认拒绝关**，`force:true` 才会整树终止那个活跃的轮短进程，再忘掉本地 session id；kimi 无云端 chat 存储可删，但**已发出的 prompt 早已到过 Moonshot 云端 API**，close 追不回来
 
-MCP server 进程**直接持有**它打开的会话（不再代理给任何 daemon）。当它退出时（客户端退出 / stdin 关闭 / `SIGTERM`、`SIGINT`、`SIGHUP` / stdout `EPIPE` / 未捕获异常），会清理自己持有的所有后端子进程（omp/codex/claude 长驻，及 cursor 活跃轮 / create-chat 短进程、kimi 活跃轮短进程）。stdin 关闭时它会先等 pending MCP 响应写完再退出。优雅退出（code 0）还会删除本次 run 的日志目录 `~/.agent-bridge/logs/<runId>/`；崩溃（code≠0）保留以便排查。仍然建议在任务完成后显式调用 `agent_bridge_close_session`。
+MCP server 进程**直接持有**它打开的会话（不再代理给任何 daemon）。当它退出时（客户端退出 / stdin 关闭 / `SIGTERM`、`SIGINT`、`SIGHUP` / stdout `EPIPE` / 未捕获异常），会清理自己持有的所有后端子进程（omp/codex/claude/dsh 长驻，及 cursor 活跃轮 / create-chat 短进程、kimi 活跃轮短进程）。stdin 关闭时它会先等 pending MCP 响应写完再退出。优雅退出（code 0）还会删除本次 run 的日志目录 `~/.agent-bridge/logs/<runId>/`；崩溃（code≠0）保留以便排查。仍然建议在任务完成后显式调用 `agent_bridge_close_session`。
 
-如果 Agent Bridge 被 `kill -9` 硬杀，清理逻辑来不及执行。此时它会依赖 `~/.agent-bridge/pids/` 里的 pid record，在下一次 MCP server 启动（或手动 `cleanup`）时回收上次残留的后端子进程（五后端同理）。
+如果 Agent Bridge 被 `kill -9` 硬杀，清理逻辑来不及执行。此时它会依赖 `~/.agent-bridge/pids/` 里的 pid record，在下一次 MCP server 启动（或手动 `cleanup`）时回收上次残留的后端子进程（六后端同理）。
 
-只有活着的 `agent-bridge mcp` 进程会被识别为 pid record owner，`cleanup` 不会误杀它仍在使用的后端子进程；只回收 owner 已经死掉的孤儿子进程。
+只有活着的 `agent-bridge mcp` 进程会被识别为 pid record owner（判据是**它在跑什么**：命令含 `agent-bridge.mjs` + `mcp`，不看 argv0 —— Electron 宿主如 DSH 桌面版下 argv0 是 `DeepSeek Harness.exe` 而非 `node`），`cleanup` 不会误杀它仍在使用的后端子进程；只回收 owner 已经死掉的孤儿子进程。
 
 检查是否有残留：
 
 ```sh
-ps -axo pid,ppid,command | rg 'agent-bridge|omp --mode rpc|codex app-server' || true
+ps -axo pid,ppid,command | rg 'agent-bridge|omp --mode rpc|codex app-server|--profile acp' || true
 find "$HOME/.agent-bridge/pids" -type f -maxdepth 1 -print 2>/dev/null || true
 ```
 
-## 10. 升级
+## 11. 升级
 
 MCP server 和 skill 都直接指向这个 clone，`git pull` 即完成升级，无需重装（**维护者**：在**稳定安装 clone** 里 `git pull`——那才是日常 agent 消费的副本；开发 clone 的未提交改动不该经此上线，见「两种安装身份」）：
 
@@ -380,7 +531,9 @@ node scripts/agent-bridge.mjs cleanup
 codex mcp list | rg agent-bridge   # 或 claude mcp list
 ```
 
-## 11. 卸载
+DSH 也一样：MCP 那一行指向的是 `<REPO>` 绝对路径，`git pull` 即更新；桌面版 HMR 会重载 patch 文件，但正在运行的 MCP 子进程要等下一次会话 / 重启 App 才重连——在 DSH 里新开一个会话，让 `mcp__agent-bridge__agent_bridge_doctor` 输出新的版本号即可确认。skills 的 junction 指向仓库，正文每次加载都重读，`git pull` 后立即生效。
+
+## 12. 卸载
 
 注销 MCP server，并删除 skill 软链：
 
@@ -390,13 +543,21 @@ rm -f ~/.codex/skills/agent-bridge  ~/.codex/skills/agent-bridge-dev  ~/.codex/s
 rm -f ~/.claude/skills/agent-bridge ~/.claude/skills/agent-bridge-dev ~/.claude/skills/agent-bridge-roundtable ~/.claude/skills/agent-bridge-loop ~/.claude/skills/agent-bridge-graph
 ```
 
+DSH：删掉第 6.1 节追加的 `- insert:` 块（有备份就恢复；若用了 home 级 `~/.dsh/cordis.patch.yml` 则改那里），并删掉第 6.2 节的 5 个 junction：
+
+```powershell
+$root = Join-Path $env:USERPROFILE '.dsh\skills'
+'agent-bridge','agent-bridge-dev','agent-bridge-roundtable','agent-bridge-loop','agent-bridge-graph' |
+  ForEach-Object { Remove-Item (Join-Path $root $_) -Force -Recurse -ErrorAction SilentlyContinue }
+```
+
 如果不再使用 Agent Bridge，也可以删除本地状态目录：
 
 ```sh
 rm -rf "$HOME/.agent-bridge"
 ```
 
-## 12. 常见问题
+## 13. 常见问题
 
 ### `agent_bridge_doctor` 找不到 OMP
 
@@ -418,6 +579,16 @@ export CODEX_BIN="$(command -v codex)"
 
 然后重启 Codex。
 
+### `agent_bridge_doctor` 找不到 DSH
+
+先确认 `dsh --version` 能跑（桌面版安装会把它写进用户 PATH；长期运行的旧进程可能持过期 PATH，新开 shell 再试）。`doctor` 的解析顺序是 `DSH_BIN` → 标准桌面安装路径 → PATH；装在别处才需要覆盖（**必须是 launcher 文件路径，不能是裸名字**）：
+
+```powershell
+$env:DSH_BIN = "$env:LOCALAPPDATA\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd"
+```
+
+`doctor` 有 `dsh: ok` 但 `open_session({agent:"dsh"})` 报错，常见两种：①DSH 版本太老/该安装没有 `--profile acp`（用 0.2.x；`dsh --profile acp --help` 应 exit 0）；②`model` / `effort` 不在该会话公布的 `configOptions` 里（错误里会列出可用值；`model` 用友好名或 `provider/model` 形式，别猜不存在的 id）。
+
 ### Codex 看不到 `agent-bridge`
 
 重新注册 MCP server 并重启 Codex，然后检查：
@@ -436,3 +607,27 @@ agent_bridge_close_session
 ```
 
 如果 Codex 已经退出，下一次 Agent Bridge MCP server 启动会清理上次记录的残留进程。
+
+### DSH 里看不到 `agent_bridge_*` 工具
+
+按顺序排查：
+
+1. `dsh -V` 是否为 0.2.x（更老版本没有 `dsh-mcp-client` 这一行，需升级 DSH）；
+2. 行插对没有：桌面版改的是 `%USERPROFILE%\.dsh\profiles\desktop\cordis.patch.yml`（**不是** `cordis.yml`），顶层是 `- insert:`，不要嵌进别的键；Windows 路径用**单引号**；
+3. 只验证组装、不发模型请求：`dsh --profile headless --patch <overlay 文件> --dump-config`，输出里应出现 `mcp-agent-bridge`；报 YAML 错误就先修格式；
+4. 先确认桥自己能跑：`node "<REPO>/scripts/agent-bridge.mjs" doctor`；
+5. 工具名是**带命名空间**的 `mcp__agent-bridge__agent_bridge_*`（不是裸 `agent_bridge_*`），让模型按前者找；
+6. `failOnStartupError: false` 会让 MCP 启动失败**静默**（工具直接不出现）；排查时先临时改成 `true` 让 DSH 在启动时报错，定位后再改回；
+7. 桌面版保存后**新开一个会话**（host-plane 改动对新会话生效），仍不行再重启 App；若 patch 文件被 app 自愈重命名（目录里出现 `.bak-*`），把你的块重新加回去。
+
+### DSH 里 `agent_bridge_wait` 提前超时
+
+DSH 的 MCP 客户端默认每次调用 60 s 超时，而 `agent_bridge_wait` 默认要等 10 分钟。确认第 6.1 节的 `toolCallTimeoutMs: 900000` 在行里；改完让新会话生效（或在 headless 下重新运行）。这个超时是 DSH 侧的调用超时，不是桥的问题——桥的 `wait` 超时是非破坏性的，但 DSH 侧掐断后这一轮结果就不会回到模型上下文里。
+
+### DSH 里委托 OMP 到含 `.mcp.json` 的目录会秒退
+
+症状：`open_session({agent:"omp", cwd:<含 .mcp.json 的目录>})` 打开后约 5–6 s 变成 `failed`，`lastError: OMP RPC exited with code 1`。
+
+原因（已定位，**v0.12.0 已修**）：OMP 会读取 cwd 的 `.mcp.json` 并把 agent-bridge 作为嵌套 MCP 挂载；嵌套桥启动时跑清理逻辑，而旧版桥的 owner 存活判定只认 `node` 开头的进程（Electron 宿主下是 `DeepSeek Harness.exe`），于是把外层 OMP 误判成孤儿并杀掉。
+
+处置：升级到 v0.12.0 即可，委托 `cwd` 不必再避开 `.mcp.json`（另外这也验证了 owner 判活的新口径：命令含 `agent-bridge.mjs` + `mcp` 即视为存活）。回归测试：`node tests/repro-owner-electron-argv0.mjs`。

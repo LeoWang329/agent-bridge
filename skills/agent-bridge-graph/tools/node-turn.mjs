@@ -66,7 +66,7 @@ function parseArgs(argv) {
   return out;
 }
 
-const USAGE = `用法:node node-turn.mjs --id <名> --agent <omp|codex|claude|cursor|kimi> --cwd <目录> \\
+const USAGE = `用法:node node-turn.mjs --id <名> --agent <omp|codex|claude|cursor|kimi|dsh> --cwd <目录> \\
   (--prompt <文本> | --prompt-file <文件>) --timeout-ms <毫秒> --out-dir <目录> [可选项]
 
 可选:--model --effort --role-file --require-keys a,b --schema-file <文件> --scope-file <文件>

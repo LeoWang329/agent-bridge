@@ -31,7 +31,7 @@ agent_bridge_doctor          # 当成 MCP 工具调（推荐）
 ```
 
 ```
-Agent Bridge 0.11.0
+Agent Bridge 0.12.0
 Node: v24.16.0
 State: C:\Users\<u>\.agent-bridge
 Viz: on   C:\Users\<u>\AppData\Local\Temp\agent-bridge-viz-Xk9mQ2

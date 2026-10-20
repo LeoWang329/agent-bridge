@@ -108,14 +108,14 @@ const receipt = await bridge.conversation(
 | 字段 | 必填 | 说明 |
 |---|---|---|
 | `id` | ✅ | 环节编号,只能用 `[A-Za-z0-9_-]`(要拿来做文件名);同 `outDir` 内唯一。**点号不行** —— 产物平铺在同一个目录里、靠 `<id>.` 前缀认归属,id 自己带点的话 `a` 和 `a.b` 的产物就分不开(重试 `a` 会搬走 `a.b` 的东西,连它的锁一起) |
-| `agent` | ✅ | `omp` / `codex` / `claude` / `cursor` / `kimi` |
+| `agent` | ✅ | `omp` / `codex` / `claude` / `cursor` / `kimi` / `dsh` |
 | `cwd` | ✅ | 委托 agent 的工作目录(绝对路径,必须存在) |
 | `outDir` | ✅ | 产出与回执落盘的目录 |
 | `timeoutMs` | ✅ | **这一个环节的总上限**。内核内部按 ≤5 分钟切片反复 `wait`,不是单次请求就等这么久 |
 | `prompt` / `promptFile` | ✅ 二选一 | 提问正文,或一个文件路径 |
-| `model` | | 后端认的型号名(omp 要 `provider/名` 全限定;cursor 要带档位后缀) |
-| `effort` | | 思考强度(**kimi/cursor 会忽略**) |
-| `roleFile` | | 角色设定文件(注入为追加 system;cursor/kimi 是软注入,首轮用户前缀) |
+| `model` | | 后端认的型号名(omp 要 `provider/名` 全限定;cursor 要带档位后缀;dsh 用友好名或 `provider/model`) |
+| `effort` | | 思考强度(**kimi/cursor 会忽略**;dsh 会映射到 ACP `reasoning_effort`) |
+| `roleFile` | | 角色设定文件(注入为追加 system;cursor/kimi 是软注入、首轮用户前缀;dsh 是每会话 `--patch` 注入的**真 system prompt**) |
 | `access` | | `"read"`(默认)或 `"write"`。**`write` 恒定跑在自己的 git worktree 里**,`cwd` 传仓库根目录即可 |
 | `baseRef` | | **仅 write**(默认 `"HEAD"`):worktree 基于哪个提交。read 环节传它当场报错 |
 | `allowDirtyBase` | | **仅 write**(默认 `false`):主树有未提交改动时是否放行。默认拒绝并列出节点看不到哪些文件 |
@@ -226,7 +226,7 @@ await withBridge(async (bridge) => { … }, { viz: true, outDir });   // ← 给
   // ok 时恒为 null。封闭枚举:quota|rate_limited|auth|backend_crash|protocol|internal|unknown
   "failureKind": null,
   // 凭什么这么判(在哪份证据里命中了什么 + 上下文)。⚠️ 这是**按错文做的启发式**,
-  // 不是协议级保证 —— 桥与五个后端都没有机读的失败码。所以它给的是**可复核的判断**,
+  // 不是协议级保证 —— 桥与它的六个后端都没有机读的失败码。所以它给的是**可复核的判断**,
   // 不是不容置疑的标签;拿不准就自己看 `failureEvidence` 指的那段。
   //
   // 判定的三条口径(都是被真跑揪出来之后钉死的):
@@ -243,7 +243,7 @@ await withBridge(async (bridge) => { … }, { viz: true, outDir });   // ← 给
   "dispatchError": null,                        // runAll 里派发/收尾自己抛了才有(见 runAll 那节)
   "artifactPath": "<outDir>/nodes/audit-auth.md",
   "charCount": 1234, "byteCount": 1400,
-  "contextUsage": { "tokens": 51234 },          // cursor/kimi 恒 null(是"未知",不是 0)
+  "contextUsage": { "tokens": 51234 },          // cursor/kimi 恒 null(是"未知",不是 0);dsh 有上一轮轮末快照
   "artifactSha256": "e3b0c…",                   // 产出内容指纹:复用前比对,防"文件被换过"
   "reaskCount": 0, "durationMs": 84000,
   "startedAt": "…", "endedAt": "…",

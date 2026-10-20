@@ -1,7 +1,7 @@
 // Agent Bridge Graph — 内核(零依赖,仅 Node 内建)
 //
 // 这是本 skill 的**主角**:一个可被 `import` 的模块,让你为某次任务临时写几十行 JS 编排,
-// 节点可以是 codex / omp / claude / cursor / kimi 任意组合(异构 = 原生 Workflow 给不了的东西)。
+// 节点可以是 codex / omp / claude / cursor / kimi / dsh 任意组合(异构 = 原生 Workflow 给不了的东西)。
 //
 //   import { withBridge } from ".../node-core.mjs";
 //   await withBridge(async (bridge) => {
@@ -235,8 +235,8 @@ export function normalizeSpec(raw, { kind = "node" } = {}) {
       : "(拿来做文件名)";
     throw new UsageError(`id 只能用字母数字和 _ -${why}:${s.id}`);
   }
-  if (!["omp", "codex", "claude", "cursor", "kimi"].includes(s.agent)) {
-    throw new UsageError(`agent 必须是 omp|codex|claude|cursor|kimi,拿到:${s.agent}`);
+  if (!["omp", "codex", "claude", "cursor", "kimi", "dsh"].includes(s.agent)) {
+    throw new UsageError(`agent 必须是 omp|codex|claude|cursor|kimi|dsh,拿到:${s.agent}`);
   }
 
   if (!isConv) {
@@ -265,8 +265,9 @@ export function normalizeSpec(raw, { kind = "node" } = {}) {
   const outStat = statSafe(s.outDir);
   if (outStat && !outStat.isDirectory()) throw new UsageError(`outDir 已存在但不是目录:${s.outDir}`);
 
-  // ⚠️ 只有 codex 的 read 是 OS 沙箱硬只读,另外四家是软的(shell 能写盘,
-  // cursor/kimi 连原生写工具都还在)—— 要硬保证不写盘就点名 codex。
+  // ⚠️ 只有 codex 的 read 是 OS 沙箱硬只读;dsh 是工具面强拦(文件工具被 DSH fs 沙箱挡住,
+  // shell 仅部分受限);其余四家是软的(shell 能写盘,cursor/kimi 连原生写工具都还在)
+  // —— 要 OS 级硬保证不写盘就点名 codex,要工具面强拦可点名 dsh。
   s.access = s.access ?? "read";
   if (!["read", "write"].includes(s.access)) {
     throw new UsageError(`access 只能是 "read" 或 "write",拿到:${JSON.stringify(s.access)}`);
@@ -2503,7 +2504,7 @@ const FAILURE_EVIDENCE_TAIL_BYTES = 64 * 1024;
 /**
  * 从"最接近后端的那点证据"里判失败类型。
  *
- * ⚠️ **这是按错文做的启发式判定,不是协议级保证。** 桥与五个后端都没有机读的失败码,
+ * ⚠️ **这是按错文做的启发式判定,不是协议级保证。** 桥与它的六个后端都没有机读的失败码,
  *    所以真相只存在于后端吐出来的那句话里。把它做成工具的一部分,换来的是三件事:
  *    ①**只做一次**(原先每个编排脚本各抄一遍同样的 markers 表);
  *    ②**可审计**(`failureEvidence` 说清凭哪一段判的,不是给你一个不容置疑的标签);

@@ -7,6 +7,30 @@
 
 ---
 
+## v0.12.0 — 新增 `dsh` 后端 + 修复 Electron 宿主 owner 存活判定(2026-10-20)
+
+**变更:** (1) 新增第六个后端 `dsh`(DeepSeek Harness 0.2.x,走它自带的 ACP profile `dsh --profile acp`),一个桥会话一个持久 ACP 进程;实现落在 `DshAcpSession`(`scripts/agent-bridge.mjs`)+ `AGENTS.dsh` 注册(env `DSH_BIN`、role `dsh-acp`、versionArgs `--version`、清理 matcher)+ 懒解析的 `resolveDshBin()`/`resolveDshLaunch()` + `doctor()` 的 dsh 分支;(2) 修掉 `ownerStillRunning()` 只认 `node` argv0 的误杀 —— DSH 桌面版用 Electron-as-node 宿主桥时,嵌套桥的启动清理会把外层桥**活着**的子进程当孤儿杀掉(方向 B 真机启用时暴露,见 FEASIBILITY R12)。
+
+**为什么加 dsh。** 加 dsh 之前没有任何一个后端同时具备「持久会话 + 每会话独立模型/推理强度 + 真 system prompt + 流式正文/思考/工具/上下文用量 + 可复用的取消」。DSH 的 ACP profile 原生全有,所以五个消费方(直接委托 / dev / roundtable / loop / graph)不需要改调用方就多一个**异构引擎**——最直接的用途是第二意见、异构评审和图节点。选 ACP 而不是 `--profile headless` 的理由见 [DESIGN-dsh-backend-2026-10-20.md](DESIGN-dsh-backend-2026-10-20.md) §1.3/§2.6:headless 每轮新进程、没有 cancel/close、默认不加载桌面凭据。
+
+**设计要点(实现契约):**
+
+- **一类一会话进程(process-per-session)。** persona(system prompt)、权限模式、静态 MCP 行都是**进程级**组合,而一条 ACP 连接本身能安全多路复用多个会话;v1 故意一桥会话一 ACP 进程,换取「每会话独立的真 system prompt + 读写档 + 模型」。代价是 ≈250 MB/进程,graph 大并发要收敛 dsh 节点数(共享进程的多路复用留作后续优化)。
+- **权限请求必须应答。** `session/request_permission` 在服务端**没有超时**,无人应答会一直挂到 cancel/close。read 档一律 `reject-once`;write 档用 `danger-full-access`(服务端不发起请求,或 allow-once)。
+- **`access` 档 = 进程级 env + 应答器。** `DSH_PERMISSION_MODE=read-only | danger-full-access`;read 档的写边界是**工具面**的 —— 文件工具由 `dsh-fs-sandbox` 策略围栏拦下,shell 走 Windows ACL 受限令牌且 enforcement 报 `partial`。比 omp/claude 的软档强,但**不能**写成与 codex 的 OS 沙箱同级。
+- **model / effort 走 ACP config option。** `session/new` 返回的 `configOptions` 值是不透明 JSON 串(模型是 `["provider","model"]`),桥把友好名(`deepseek-v4-pro` 或 `provider/model`)映射到 advertised 值,**绝不硬编码 id**;effort 词汇 `minimal/low/medium/high/xhigh` → `off/low/high/high/max`。非法值在 `start()` 内失败(fail-fast,不留半可用会话)。
+- **真 system prompt 用每会话临时 `--patch`。** patch loader 是**整段 config 覆盖**,所以 `personaPrefix` 要连同 `personaSuffix` 一起重述;patch 写在 `<state>/dsh/<session-id>.yml`,spawn 成功后立即删除(启动失败也删);角色文本含 `{{…}}` 在 spawn 前拒绝 —— DSH 的 system prompt 会把它当模板表达式。
+- **没有 turn-start ACK。** `session/prompt` 要到**轮末**才返回 `{stopReason}`,所以桥自己铸 turn id,viz 派发证据只能用诚实档位 `pipe_enqueued`(第一个 `session/update` 触发 `firstBackendEvent`)。
+- **abort / close 不变量。** abort = `session/cancel`(通知)→ 等 prompt 以 `cancelled` 结算(实测 ≈11 ms)→ **会话可复用**;超时则视为 ACP 进程已 wedged:结算 failed + 杀树 + 清 `acpSessionId`,**不许伪装成可复用**。close 保持**同步语义**:发 `session/close` 后立即返回,进程树后台拆除。`contextUsage` 取最近一条 `usage_update` 的 `used`(上一轮快照,`live:false`,每轮开始重置)。
+- **清理匹配器是安全边界。** `DeepSeek Harness.exe` 同时是桌面 GUI 的进程名,所以 matcher 必须同时要求 `--profile acp` **且**命中 `app.asar` / `dsh-desktop-host…cli.js` / `dsh` launcher token;`diag match dsh-acp` 用「假 GUI 形状」做负例(`tests/repro-dsh.mjs` S17)。`--profile headless/web` 的运行天然不匹配。
+- **Windows 启动器带空格路径。** 标准安装的 `dsh.cmd` 位于带空格的目录,`cmd.exe /d /s /c` 的再解析不可靠 ⇒ 标准布局直接以 Electron-in-node-mode 起 `"…\DeepSeek Harness.exe" --expose-internals "…\app.asar\…\cli.js"`(summary 里 `agentSpecific.launchVia === "electron-node"`);只有 `DSH_BIN` / PATH 的非标准 launcher 才走 `spawnPlan`。
+- **R12 修复:owner 判活按「它在跑什么」而不是 argv0。** `ownerStillRunning()` 原按 owner 命令是否像 `node` 判定;Electron 宿主下 owner 是 `DeepSeek Harness.exe … agent-bridge.mjs mcp`,于是被判已死,嵌套桥启动清理把外层桥的活 OMP 杀掉(约 5–6 s 后 `OMP RPC exited with code 1`)。现在命令含 `agent-bridge.mjs` + `\bmcp\b` 即视为存活 —— 假「活着」只会延迟回收(安全方向),假「死了」会杀掉正在干活的进程。
+- **子进程环境。** 保留 `DSH_HOME`(被委托服务器要看到同一套已安装运行时与托管凭据),剥掉宿主的 `DSH_SESSION_ID` / `DSH_WEB_URL` / `DSH_PROFILE` / `DSH_PROFILE_DIR` / `DSH_SHELL` —— 桥本身若跑在 DSH 会话里,被委托的 ACP 进程必须启动自己的一套 profile,而不是继承宿主会话。
+
+**测试:** `tests/repro-dsh.mjs` 94 项(fake ACP wire 驱动真桥:握手 / 会话 / 流式 / 权限 / 取消后复用 / close / 模型与 effort / patch 注入 / contextUsage / matcher / doctor / cleanup / 故障注入)· `tests/repro-owner-electron-argv0.mjs` 7 项(Electron argv0 的活 owner 不被收割)· 真机 e2e `tests/e2e-dsh.mjs`(有真 DSH 才跑,否则 skip)。⚠️ 既有夹具同步:`contract-invariants-session` 的 AGENTS 闭集与 `dsh: "system"` 注入档、`e2e-viz` / `repro-viz-bridge` 的 `pipe_enqueued` 边界、`probe-doctor-timeout` 的可挂起后端清单(`dsh` 走 `DSH_BIN` 覆盖所以考得到)。
+
+---
+
 ## v0.11.0 — 委托会话观测台默认开(2026-07-31,**默认行为翻转**)
 
 **变更:** `AGENT_BRIDGE_VIZ` 从「默认关、`=on` 显式开」翻成「**默认开**、`=off` 关」。

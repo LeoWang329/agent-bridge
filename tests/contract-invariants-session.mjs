@@ -14,7 +14,7 @@ const RECORDING_ERROR_CODES = new Set([
   'write_failed',
   'snapshot_write_failed',
 ]);
-const AGENTS = new Set(['omp', 'codex', 'claude', 'cursor', 'kimi']);
+const AGENTS = new Set(['omp', 'codex', 'claude', 'cursor', 'kimi', 'dsh']);
 const EFFORTS = new Set(['minimal', 'low', 'medium', 'high', 'xhigh']);
 const ACCESS_MODES = new Set(['read', 'write']);
 const RETURN_MODES = new Set(['full', 'ref']);
@@ -410,6 +410,7 @@ function validateAppendSystemPrompt(session, label, violations) {
   const expectedByAgent = {
     omp: 'system',
     claude: 'system',
+    dsh: 'system',
     codex: 'developer',
     cursor: 'first-turn-user-prefix',
     kimi: 'first-turn-user-prefix',
@@ -439,7 +440,7 @@ function validateContextUsage(session, label, violations) {
   if (session.agent === 'omp' && usage.live !== true) {
     violations.push(label + '.contextUsage.live 对 omp 必须是 true');
   }
-  if ((session.agent === 'codex' || session.agent === 'claude') && usage.live !== false) {
+  if ((session.agent === 'codex' || session.agent === 'claude' || session.agent === 'dsh') && usage.live !== false) {
     violations.push(label + '.contextUsage.live 对 ' + session.agent + ' 必须是 false');
   }
 

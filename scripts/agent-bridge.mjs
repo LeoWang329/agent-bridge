@@ -77,9 +77,9 @@ function envByteCap(name, fallback, min) {
 // 从此每个 MCP server 起来就把这次运行的全部委托原文写进临时目录。见 docs/ARCHITECTURE.md 的 v0.11.0 节。
 // 0.10.0:收口纪律加固。含两处破坏性变更 —— wait 的默认 mode(all→any,连带默认返回形状)与
 // close_session 的在途闸门(默认拒绝关未终态会话)。见 docs/ARCHITECTURE.md 的 v0.10.0 节。
-const BRIDGE_VERSION = "0.11.0";
+const BRIDGE_VERSION = "0.12.0";
 const MCP_PROTOCOL_VERSION = "2025-06-18";
-// The INLINE clock: how long a wait:true send/open blocks before giving up. Read by all five backends'
+// The INLINE clock: how long a wait:true send/open blocks before giving up. Read by all backends'
 // send(). Timing out here is DESTRUCTIVE (see DEFAULT_JOIN_TIMEOUT_MS below for why that matters).
 const DEFAULT_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 
@@ -226,6 +226,17 @@ const KIMI_ABORT_SETTLE_MS = envNum("AGENT_BRIDGE_KIMI_ABORT_SETTLE_MS", 8000);
 // with a clear error rather than letting the OS truncate/fail opaquely. Mirrors CURSOR_CMDLINE_MAX_UNITS.
 const KIMI_CMDLINE_MAX_UNITS = envNum("AGENT_BRIDGE_KIMI_CMDLINE_MAX", 24_000);
 
+// ── DSH (DeepSeek Harness) ACP backend timeouts ────────────────────────────────────────────────
+// The ACP profile boots a fresh process per bridge session: `dsh --profile acp [--patch <tmp>]`.
+// Measured 2026-10-20 on DSH 0.2.1-rc.2 / Windows: process spawn+initialize ≈ 2.2–3.3 s, session/new
+// ≈ 0.26–0.43 s, so 30 s is a generous ready budget that still fails fast on a wedged install.
+const DSH_READY_TIMEOUT_MS = envNum("AGENT_BRIDGE_DSH_READY_TIMEOUT_MS", 30_000);
+// How long abort() waits for the in-flight `session/prompt` to come back after `session/cancel`
+// (measured 11 ms in the happy path; the budget only matters when the backend is wedged).
+const DSH_ABORT_SETTLE_MS = envNum("AGENT_BRIDGE_DSH_ABORT_SETTLE_MS", 8_000);
+// Per-request deadline for session/set_config_option (model/effort pinning) during start().
+const DSH_CONFIG_TIMEOUT_MS = envNum("AGENT_BRIDGE_DSH_CONFIG_TIMEOUT_MS", 10_000);
+
 // Split a Windows command line into argv following CommandLineToArgvW's quoting rules (double-quote
 // grouping + backslash-before-quote escaping). Used by the kimi cleanup matcher — a SECURITY BOUNDARY —
 // so a `-p` (or `--output-format stream-json`) sitting INSIDE a quoted argument is never mistaken for a
@@ -363,6 +374,29 @@ const AGENTS = {
       return false;
     },
   },
+  dsh: {
+    label: "DeepSeek Harness",
+    env: "DSH_BIN",
+    bin: "dsh", // NOMINAL only (display/logs). The real launcher is resolved LAZILY by resolveDshBin():
+    role: "dsh-acp", // DSH_BIN → %LOCALAPPDATA%\Programs\DeepSeek Harness\...\dsh.cmd → PATH. Never at registry init.
+    versionArgs: ["--version"], // `dsh --version` → "0.2.1-rc.2"; measured ~238 ms (fast enough for doctor's 10 s probe).
+    // A bridge-spawned ACP server is a PERSISTENT process per bridge session:
+    //   cmd.exe /d /s /c <…\dsh.cmd> --profile acp --patch <tmp.yml>          (Windows launcher shim)
+    //   → "…\DeepSeek Harness.exe" --expose-internals "…\app.asar\dsh\node_modules\@deepseek-ai\dsh-desktop-host\lib\cli.js" --profile acp --patch <tmp.yml>
+    // SECURITY BOUNDARY: `DeepSeek Harness.exe` alone is ALSO the desktop GUI process, so never match the
+    // bare image name. Require the ACP invocation token `--profile acp` AND one of the real entry shapes
+    // (the .cmd shim we spawn, the app.asar/cli.js re-exec, or a POSIX dsh launcher token). A `--profile
+    // headless` / `web` / `sdk` run never carries `--profile acp`, so it can't be swept by mistake.
+    matchesCommand: cmd => {
+      const s = String(cmd);
+      if (!/(?:^|\s)--profile\s+acp(?:\s|$)/.test(s)) return false;
+      return (
+        /app\.asar[\\/]/i.test(s) ||
+        /dsh-desktop-host[\\/]+lib[\\/]+cli\.js/i.test(s) ||
+        /(?:^|[\\/"\s])dsh(?:\.cmd|\.exe)?(?:\s|"|$)/i.test(s)
+      );
+    },
+  },
 };
 
 const sessions = new Map();
@@ -380,7 +414,7 @@ const TOOLS = [
   {
     name: "agent_bridge_open_session",
     description:
-      "Open a persistent delegated-agent session. OMP uses its JSONL RPC mode; Codex drives a persistent codex app-server over JSON-RPC; Claude runs a fresh-context Claude Code worker; Cursor drives the cursor-agent CLI (Windows-only in v1; per-turn cloud chat, so read/write are both soft, contextUsage is always null, and schema/effort are unsupported; append_system_prompt_file is injected as a SOFT first-turn user-prefix — model-dependent, not a true system prompt). Kimi drives the native Kimi Code CLI (Windows-only in v1; a per-turn short-lived process with a LOCAL resume id — no cloud chat — so read/write are both soft, contextUsage is always null, and schema/effort are unsupported; append_system_prompt_file is injected as a SOFT first-turn user-prefix — model-dependent, not a true system prompt; inference still runs on Moonshot's cloud API). Use this before sending messages. If you pass initial_prompt WITHOUT wait:true, that first turn runs asynchronously: the returned `initial` is only an ack, not the answer, and you must collect it with agent_bridge_wait — the bridge never delivers a result on its own.",
+      "Open a persistent delegated-agent session. OMP uses its JSONL RPC mode; Codex drives a persistent codex app-server over JSON-RPC; Claude runs a fresh-context Claude Code worker; Cursor drives the cursor-agent CLI (Windows-only in v1; per-turn cloud chat, so read/write are both soft, contextUsage is always null, and schema/effort are unsupported; append_system_prompt_file is injected as a SOFT first-turn user-prefix — model-dependent, not a true system prompt). Kimi drives the native Kimi Code CLI (Windows-only in v1; a per-turn short-lived process with a LOCAL resume id — no cloud chat — so read/write are both soft, contextUsage is always null, and schema/effort are unsupported; append_system_prompt_file is injected as a SOFT first-turn user-prefix — model-dependent, not a true system prompt; inference still runs on Moonshot's cloud API). DSH drives DeepSeek Harness's ACP profile (`dsh --profile acp`, Windows/macOS/Linux): one persistent process per bridge session, per-session model + reasoning effort, streaming text/thinking/tool/context-usage updates, graceful cancel (the session stays reusable), and a true appended system prompt via a generated profile patch; read tier is a tool-level hard write fence (DSH filesystem sandbox + partial shell policy) and `schema` is unsupported. Use this before sending messages. If you pass initial_prompt WITHOUT wait:true, that first turn runs asynchronously: the returned `initial` is only an ack, not the answer, and you must collect it with agent_bridge_wait — the bridge never delivers a result on its own.",
     inputSchema: {
       type: "object",
       properties: {
@@ -394,7 +428,7 @@ const TOOLS = [
           type: "string",
           enum: ["read", "write"],
           description:
-            "Capability tier for the delegated agent (default read). read = read + EXECUTE: file reads, search, AND run shell commands for investigation (run tests/probes) — but NOT meant to edit files, so no Edit/Write tools. The write-boundary of read's shell varies by backend: codex hard-blocks disk writes via its read-only OS sandbox; omp/claude/cursor/kimi allow shell that CAN write (SOFT — a tool-level allow + role discipline, not an OS sandbox; cursor/kimi have no headless read-only mode, so read is a prompt-level policy prefix), so a `read` session on omp/claude/cursor/kimi is NOT a hard read-only. write = full edit/write autonomy in cwd — a HARD OS-sandbox boundary for codex (workspace-write) on mac/Linux, but on Windows codex's write tier drops to danger-full-access (a SOFT boundary like omp/claude) because codex's Windows sandbox breaks apply_patch; see the thread/start `sandbox` comment. Prefer this over the legacy `write` boolean; the two must agree if both are passed.",
+            "Capability tier for the delegated agent (default read). read = read + EXECUTE: file reads, search, AND run shell commands for investigation (run tests/probes) — but NOT meant to edit files, so no Edit/Write tools. The write-boundary of read's shell varies by backend: codex hard-blocks disk writes via its read-only OS sandbox; dsh hard-blocks its FILE tools via its filesystem sandbox and restricts its shell with a low-integrity ACL token (partial enforcement) — a real tool-level write fence, not just role discipline; omp/claude/cursor/kimi allow shell that CAN write (SOFT — a tool-level allow + role discipline, not an OS sandbox; cursor/kimi have no headless read-only mode, so read is a prompt-level policy prefix), so a `read` session on omp/claude/cursor/kimi is NOT a hard read-only. write = full edit/write autonomy in cwd — a HARD OS-sandbox boundary for codex (workspace-write) on mac/Linux, but on Windows codex's write tier drops to danger-full-access (a SOFT boundary like omp/claude) because codex's Windows sandbox breaks apply_patch; see the thread/start `sandbox` comment. dsh write tier = DSH `danger-full-access` (parity with claude's bypass mode). Prefer this over the legacy `write` boolean; the two must agree if both are passed.",
         },
         write: {
           type: "boolean",
@@ -419,18 +453,18 @@ const TOOLS = [
         effort: {
           type: "string",
           description:
-            "Optional reasoning effort. OMP maps it to --thinking (minimal|low|medium|high|xhigh). Codex sends it as the turn effort (none|minimal|low|medium|high|xhigh). Claude maps it to --effort (minimal|low|medium|high|xhigh) and defaults to xhigh. Cursor and Kimi have no effort knob (headless has no per-invocation flag) — effort is ignored and echoed back as null.",
+            "Optional reasoning effort. OMP maps it to --thinking (minimal|low|medium|high|xhigh). Codex sends it as the turn effort (none|minimal|low|medium|high|xhigh). Claude maps it to --effort (minimal|low|medium|high|xhigh) and defaults to xhigh. DSH maps it to its ACP reasoning_effort (minimal→off, low→low, medium→high, high→high, xhigh→max). Cursor and Kimi have no effort knob (headless has no per-invocation flag) — effort is ignored and echoed back as null.",
         },
         append_system_prompt_file: {
           type: "string",
           description:
-            "Optional ABSOLUTE path to a markdown/text file whose contents are injected as an APPENDED system prompt for the whole session (persistent per-session role/instructions). Unlike message_file this MAY live outside cwd (a shared prompt library); ≤64 KiB. omp: `--append-system-prompt=<path>`; claude: `--append-system-prompt-file <path>` (both a true appended system prompt); codex: thread developerInstructions; cursor/kimi: prepended to the FIRST turn's message as a soft user-prefix (no native system-prompt flag — model-dependent adherence, NOT a true system prompt, and it shares the ~24K argv budget with the message, so keep it concise). Reflected in the session summary's appendSystemPrompt. Note: omp honors it reliably with a capable model (e.g. deepseek-v4-pro); omp's default model may follow appended instructions only loosely.",
+            "Optional ABSOLUTE path to a markdown/text file whose contents are injected as an APPENDED system prompt for the whole session (persistent per-session role/instructions). Unlike message_file this MAY live outside cwd (a shared prompt library); ≤64 KiB. omp: `--append-system-prompt=<path>`; claude: `--append-system-prompt-file <path>` (both a true appended system prompt); codex: thread developerInstructions; dsh: a generated `--patch` overlay sets the ACP session's system-prompt personaSuffix (a true appended system prompt); cursor/kimi: prepended to the FIRST turn's message as a soft user-prefix (no native system-prompt flag — model-dependent adherence, NOT a true system prompt, and it shares the ~24K argv budget with the message, so keep it concise). Reflected in the session summary's appendSystemPrompt. Note: omp honors it reliably with a capable model (e.g. deepseek-v4-pro); omp's default model may follow appended instructions only loosely.",
         },
         initial_prompt: { type: "string", description: "Optional first message to send after opening." },
         schema: {
           type: "object",
           description:
-            "Optional JSON Schema for structured output on the initial_prompt turn (Codex only; rejected for omp/claude). See agent_bridge_send_message's `schema`: the result carries a parsed top-level `json` (or `schemaError`).",
+            "Optional JSON Schema for structured output on the initial_prompt turn (Codex only; rejected for every other backend). See agent_bridge_send_message's `schema`: the result carries a parsed top-level `json` (or `schemaError`).",
         },
         wait: {
           type: "boolean",
@@ -639,7 +673,7 @@ const TOOLS = [
   },
   {
     name: "agent_bridge_doctor",
-    description: "Check whether OMP, Codex, Claude, Cursor, Kimi, and Node are available for Agent Bridge.",
+    description: "Check whether OMP, Codex, Claude, Cursor, Kimi, DSH, and Node are available for Agent Bridge.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
 ];
@@ -649,7 +683,7 @@ function usage() {
     "Usage:",
     "  agent-bridge mcp                 Run the MCP server (stdio). Sessions live in this process.",
     "  agent-bridge doctor [--json]     Report environment / backend availability.",
-    "  agent-bridge cleanup [--json]    Reap orphaned omp/codex/claude/cursor/kimi children from dead MCP servers.",
+    "  agent-bridge cleanup [--json]    Reap orphaned omp/codex/claude/cursor/kimi/dsh children from dead MCP servers.",
     "  agent-bridge diag <match|health> Read-only diagnostics (stdin/stdout JSON): `match <role>` runs the",
     "                                   cleanup command-line matcher; `health` runs deriveHealth. For tests/debugging.",
     "",
@@ -882,6 +916,74 @@ function resolveKimiBin() {
     "Native kimi.exe not found (checked KIMI_BIN, %USERPROFILE%\\.kimi-code\\bin\\kimi.exe, and PATH). " +
       "Install Kimi Code (`irm https://code.kimi.com/kimi-code/install.ps1 | iex`) or set KIMI_BIN to the kimi.exe path.",
   );
+}
+
+// Resolve the `dsh` CLI launcher LAZILY (never at registry init — an uninstalled backend must surface
+// as doctor "missing", not a module-load crash; same rule as resolveKimiBin). Returns an absolute path:
+//   1. DSH_BIN override (must be a path to an existing launcher file: dsh.cmd/dsh.exe/dsh shim/etc.);
+//   2. the standard desktop-install launcher (absolute — a long-lived MCP client's PATH may predate it);
+//   3. PATH (a real launcher, .cmd/.exe included — spawnPlan routes batch shims through cmd.exe);
+//   4. otherwise throw with an actionable message (doctor reports it, open_session surfaces it).
+// Windows: the launcher is dsh.cmd; spawnPlan wraps it in cmd.exe /d /s /c. That is safe for this
+// backend because the PROMPT never travels on argv — it goes over the ACP JSON-RPC stdin pipe.
+function resolveDshBin() {
+  const asFile = p => { try { const abs = path.resolve(p); return fs.statSync(abs).isFile() ? abs : null; } catch { return null; } };
+  const envBin = process.env.DSH_BIN;
+  if (envBin) {
+    const hasDir = path.isAbsolute(envBin) || envBin.includes("\\") || envBin.includes("/");
+    if (!hasDir) throw new Error(`DSH_BIN must be a path to the dsh launcher, not a bare name (got ${JSON.stringify(envBin)}).`);
+    const f = asFile(envBin);
+    if (!f) throw new Error(`DSH_BIN=${JSON.stringify(envBin)} is not an existing file.`);
+    return f;
+  }
+  if (IS_WINDOWS) {
+    const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
+    const std = path.join(localAppData, "Programs", "DeepSeek Harness", "resources", "runtime", "cli", "bin", "dsh.cmd");
+    const stdFile = asFile(std);
+    if (stdFile) return stdFile;
+  } else {
+    for (const candidate of [
+      "/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh",
+      "/usr/local/bin/dsh",
+      path.join(os.homedir(), ".local", "bin", "dsh"),
+    ]) {
+      const f = asFile(candidate);
+      if (f) return f;
+    }
+  }
+  const names = IS_WINDOWS ? ["dsh.cmd", "dsh.exe", "dsh.bat"] : ["dsh"];
+  for (const dir of (process.env.PATH || "").split(path.delimiter).filter(Boolean)) {
+    for (const name of names) {
+      const f = asFile(path.join(dir, name));
+      if (f) return f;
+    }
+  }
+  throw new Error(
+    "DeepSeek Harness `dsh` CLI not found (checked DSH_BIN, the standard desktop-install path, and PATH). " +
+      "Install DeepSeek Harness 0.2.x (its installer adds runtime\\cli\\bin\\dsh.cmd) or set DSH_BIN to the dsh launcher path.",
+  );
+}
+
+// Resolve HOW to launch the dsh CLI. The standard Windows desktop install's dsh.cmd sits in a path with
+// a SPACE ("…\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd"), and cmd.exe /d /s /c re-parses a quoted
+// launcher path badly — so for the standard layout we bypass the batch shim entirely and spawn the
+// Electron binary directly in Node mode, exactly what dsh.cmd does:
+//   "…\DeepSeek Harness.exe" --expose-internals "…\resources\app.asar\dsh\node_modules\@deepseek-ai\dsh-desktop-host\lib\cli.js" <args…>
+// with ELECTRON_RUN_AS_NODE=1. Any other launcher (DSH_BIN override, a non-standard PATH entry) goes
+// through spawnPlan as usual (absolute no-space paths only, e.g. the hermetic fake-dsh.cmd in tests).
+function resolveDshLaunch(args) {
+  const launcher = resolveDshBin();
+  if (/[\\/]dsh\.cmd$/i.test(launcher)) {
+    const binDir = path.dirname(launcher);                        // …\resources\runtime\cli\bin
+    const resources = path.resolve(binDir, "..", "..", "..");      // …\resources
+    const exe = path.resolve(resources, "..", "DeepSeek Harness.exe");
+    // NOTE: cli.js lives INSIDE app.asar and is not a stat-able file — do not probe it. A wrong/missing
+    // app.asar entry makes Electron exit non-zero and start() fails loudly with the child's stderr.
+    const cli = path.join(resources, "app.asar", "dsh", "node_modules", "@deepseek-ai", "dsh-desktop-host", "lib", "cli.js");
+    try { if (fs.statSync(exe).isFile()) return { command: exe, args: ["--expose-internals", cli, ...args], env: { ELECTRON_RUN_AS_NODE: "1" }, via: "electron-node" }; } catch {}
+  }
+  const plan = spawnPlan(launcher, args);
+  return { command: plan.command, args: plan.args, env: {}, via: "launcher" };
 }
 
 // Reject shell/CLI-hostile characters in pass-through agent arguments (OMP --model / --thinking).
@@ -1450,11 +1552,11 @@ function vz(fn) {
   } catch { return undefined; }
 }
 
-/** 这份正文算不算「完整的最终答复」。**五个后端共用一处,别在结算点各写各的三元式。**
+/** 这份正文算不算「完整的最终答复」。**所有后端共用一处,别在结算点各写各的三元式。**
  *
  *  两件事会让它降级成 partial:
  *  1. **收场本身不是 completed** —— 被打断/失败的那一轮,手上这截按定义就不是最终答复。
- *  2. **正文撞上了 `MAX_TEXT`** —— 五个后端的 `lastAssistantText` 都过 `clampText`,而
+ *  2. **正文撞上了 `MAX_TEXT`** —— 各后端的 `lastAssistantText` 都过 `clampText`,而
  *     `clampText` **砍的是开头**、砍完恰好剩 `MAX_TEXT` 个字符。所以 `length >= MAX_TEXT`
  *     就是「这是个残件」的唯一可判信号。
  *
@@ -1485,7 +1587,7 @@ const VIZ_BACKEND_EVENTS = new Set([
 function vizInjectionMode(agent) {
   if (agent === "codex") return "developer";                       // thread developerInstructions
   if (agent === "cursor" || agent === "kimi") return "first-turn-user-prefix";  // 软注入
-  return "system";                                                  // omp / claude:真 system prompt
+  return "system";                                                  // omp / claude / dsh:真 system prompt
 }
 
 /** 记一笔"这一轮不欠了"。两个来源:真的交付了、或调用方显式 abort 放弃了。
@@ -1664,7 +1766,7 @@ function buildSessionResult(session, fullText, options = {}) {
   // Everything that echoes model text inline — `text` AND schemaError.rawText (T11) — MUST use this so a
   // ref/capped session never leaks the full body through a side field; the full text is always in textRef.
   const displayText = refOmit ? null : (truncated ? text.slice(0, max) : text) || null;
-  // 中途快照现在长得跟终态一模一样(五个后端各自维护实时 buffer,这里从不检查 settled 就包装),
+  // 中途快照现在长得跟终态一模一样(各后端各自维护实时 buffer,这里从不检查 settled 就包装),
   // 于是"跑一半取到的半句"和"最终答案"在返回里不可区分 —— textRef 也一样,running 时它指向片段,
   // 而 schema 与 SKILL.md 都称它"完整未截断全文"。给个诚实的标注,而不是拒绝提供数据。
   //
@@ -2023,12 +2125,15 @@ function ownerStillRunning(record) {
   // A null command means the process probe was unavailable (not that the owner is gone). Assume the
   // owner is still alive so a failed probe can never make us reap pid records or delete live log dirs.
   if (command === null) return true;
-  // Windows command lines carry a full, often-quoted node.exe path ("C:\...\node.exe"); the POSIX
-  // anchored form would never match, so detect node with a separator-aware test there instead.
-  const argv0LooksLikeNode = IS_WINDOWS
-    ? /(?:^|[\\/"\s])node(?:\.exe)?(?:["\s]|$)/i.test(command)
-    : /^(?:\S*\/)?node(?:\s|$)/.test(command);
-  return argv0LooksLikeNode && /agent-bridge\.mjs/.test(command) && /\bmcp\b/.test(command);
+  // The owner is an `agent-bridge.mjs mcp` server. Its argv0 is normally node/node.exe, but an Electron
+  // host (e.g. DSH Desktop: ELECTRON_RUN_AS_NODE + the Electron executable) launches it as
+  // "DeepSeek Harness.exe ...agent-bridge.mjs mcp". Keying on argv0 wrongly declared a LIVE owner dead,
+  // and a second/nested bridge's startup sweep then reaped that owner's live backend children (observed:
+  // a delegated agent mounts this bridge from the workspace `.mcp.json`; the nested bridge killed the
+  // outer bridge's OMP child ~5s after ready). So identify the owner by WHAT it runs, not by argv0:
+  // a false "alive" only delays reclamation (the safe direction — same rationale as the null-probe
+  // branch), while a false "dead" kills live work.
+  return /agent-bridge\.mjs/.test(command) && /\bmcp\b/.test(command);
 }
 
 function terminateProcessTree(pid, signal = "SIGTERM") {
@@ -2909,7 +3014,7 @@ class OmpRpcSession {
       }
       // 观测台:实时预览(docs/STATE-session-viz.md §5 的 sidecar)。
       // ⚠️ 这是**每 token 级**频率。节流不在这里做,在 writer 的合并槽里做——
-      //    五个后端各自自律的话,迟早有一处忘;而它一旦漏进有界队列,
+      //    各后端各自自律的话,迟早有一处忘;而它一旦漏进有界队列,
       //    一个正常跑着的轮次几百毫秒就能把队列打满 → queue_full → 页面挂出
       //    「本次记录不完整」。**观测把被观测者报成了病人。**
       {
@@ -5602,7 +5707,7 @@ class KimiCodeSession {
           this.finalAnswer = (this.finalAnswer || "") + msg.content; // accumulate the full answer (§5.6)
           this.lastAssistantText = clampText(this.finalAnswer);      // clamped tail for the progress view
         // 观测台:kimi 的 assistant 是**逐块流式**,一轮可能几百上千次 —— 节流不在这里做,
-        // 在 writer 的合并槽里做(每路径最小写入间隔)。五个后端各自自律的话迟早有一处忘,
+        // 在 writer 的合并槽里做(每路径最小写入间隔)。各后端各自自律的话迟早有一处忘,
         // 而它一旦漏进有界队列,一个正常跑着的轮次几百毫秒就能把队列打满 → queue_full →
         // 页面挂出「本次记录不完整」。**观测把被观测者报成了病人。**
         if (this.vizAttemptId) {
@@ -5949,6 +6054,780 @@ class KimiCodeSession {
   }
 }
 
+// ── DSH (DeepSeek Harness) ACP backend ───────────────────────────────────────────────────────────
+// `dsh --profile acp` serves an Agent Client Protocol (ACP v1) JSON-RPC 2.0 runtime over stdio:
+// one persistent process can host sessions; the bridge uses exactly ONE ACP session per bridge
+// session so that per-session system prompt (a generated --patch), permission mode (env) and model
+// pinning stay coherent. One-line wire per message (newline-delimited JSON-RPC, NOT Content-Length).
+//
+// Why ACP and not `--profile headless`: ACP is persistent (multi-turn on one process), has a real
+// per-turn result (`session/prompt` → {stopReason}), `session/cancel` (session stays reusable),
+// `session/close`, per-session `session/set_config_option` for model + reasoning_effort, streaming
+// `session/update` (text / thought / tool / usage_update) and `session/request_permission`. The
+// headless one-shot profile loses all of that (new process per turn, no managed credentials).
+//
+// REAL-WORLD CONTRACT (pinned by live spikes 2026-10-20, DSH 0.2.1-rc.2 / Windows; see
+// docs/DESIGN-dsh-backend-2026-10-20.md §2 for the complete table):
+//   • framing = one JSON object per line; stray non-JSON stdout lines exist (`[llm-deepseek-account] …`)
+//     and are tolerated (logged, never parsed, never fatal).
+//   • initialize ≈ 2.2–3.3 s; session/new ≈ 0.26–0.43 s; turns ≈ 1–5 s.
+//   • model option value is an OPAQUE JSON string `["provider","model"]`; the catalog comes from
+//     session/new (never hardcode ids). reasoning_effort ids: off|low|high|max.
+//   • `session/prompt` resolves ONLY at the end of the turn → there is NO turn-start ACK. The bridge
+//     therefore mints its own turn id and the viz dispatch boundary is honestly `pipe_enqueued`.
+//   • `session/cancel` (notification) settles the in-flight prompt with {stopReason:"cancelled"} in
+//     ~11 ms; the session remains usable. That is abort()'s happy path.
+//   • `session/request_permission` MUST be answered: the server side has no timeout, so an ignored
+//     request hangs the turn until cancel/close. read tier → reject-once; write tier → allow-once.
+//   • access tier is process-wide: DSH_PERMISSION_MODE=read-only|danger-full-access. Read-only blocks
+//     the file tools via DSH's filesystem sandbox and restricts the shell via a low-integrity ACL token
+//     (partial enforcement) — a tool-level write fence, not a kernel sandbox.
+//   • credentials: the ACP profile keeps DSH's managed credential store (no DEEPSEEK_API_KEY needed).
+//   • one process ≈ 252 MB RSS; process-per-session is the v1 tradeoff for true per-session
+//     system prompt + tier. Aggressive graph fan-out should prefer fewer concurrent dsh nodes.
+class DshAcpSession {
+  constructor(options) {
+    this.id = makeId("dsh");
+    this.agent = "dsh";
+    this.cwd = assertCwd(options.cwd);
+    this.access = resolveAccess(options); // "read" | "write"
+    this.write = this.access === "write";
+    // Model/effort are NOT command-line args here (ACP carries them over JSON-RPC), but validate the
+    // charset uniformly with the other backends (same fail-fast rule, same error wording).
+    this.model = sanitizeAgentArg(options.model, "model");
+    this.effort = sanitizeAgentArg(options.effort, "effort");
+    this.appendSystemPrompt = options.appendSystemPrompt || null; // validated/read in openSession
+    this.createdAt = nowIso();
+    this.updatedAt = this.createdAt;
+    this.status = "starting";
+    this.isStreaming = false;
+    this.lastAssistantText = "";
+    this.lastError = null;
+    this.lastStderr = null;
+    this.lastTurnError = false;
+    this.lastTurnErrorMessage = null;
+    this.events = [];
+    this.proc = null;
+    this.launch = null; // {command,args,env,via} actually spawned (see resolveDshLaunch)
+    this.patchFile = null;
+    this.pending = new Map(); // JSON-RPC id -> {resolve,reject}
+    this.nextId = 1;
+    this.acpSessionId = null;
+    this.configOptions = [];
+    this.currentTurnId = null;
+    this.lastTurnId = null;
+    this.turnStartedAt = null;
+    this.turnEndedAt = null;
+    this.turn = null; // {resolve,reject,promise,settled}
+    this.turnCount = 0;
+    this.tokenUsage = null; // last usage_update {used,size} of the most recent turn
+    this.logFile = path.join(RUN_LOG_DIR, `${this.id}.log`);
+    this.answerFile = path.join(RUN_LOG_DIR, `${this.id}.answer.txt`);
+    this.pidFile = pidRecordPath(this.id);
+    this._vizSawEvent = false;
+    this._vizDrafts = 0;
+  }
+
+  // Env for the ACP child: bridge diagnostic markers + the process-wide permission mode. Strip the
+  // HOST's per-run DSH context when the bridge itself runs inside a DSH session (DSH is also a client
+  // of this bridge): a delegated ACP server must boot its own profile, not inherit the host's session id
+  // or web URL. DSH_HOME is deliberately KEPT — the delegated server should see the same installed
+  // runtime and managed credentials as the user's desktop app.
+  #childEnv() {
+    const env = {
+      ...childEnv(this),
+      DSH_PERMISSION_MODE: this.access === "write" ? "danger-full-access" : "read-only",
+    };
+    for (const key of ["DSH_SESSION_ID", "DSH_WEB_URL", "DSH_PROFILE", "DSH_PROFILE_DIR", "DSH_SHELL"]) delete env[key];
+    return env;
+  }
+
+  #buildArgs() {
+    const args = ["--profile", "acp"];
+    if (this.patchFile) args.push("--patch", this.patchFile);
+    return args;
+  }
+
+  // Generate the per-session profile patch that carries the appended system prompt. The patch loader
+  // REPLACES the whole `config` of a row, so personaPrefix (the shipped ACP persona) is restated along
+  // with personaSuffix; an empty append prompt needs no patch at all.
+  // Path: <state>/dsh/<session-id>.yml. Removed as soon as start() succeeds (or the start fails).
+  #writeSessionPatch() {
+    if (!this.appendSystemPrompt) return null;
+    // DSH assembles the system prompt through its `{{…}}` template interpolator, so role text containing
+    // `{{` would either throw or silently interpolate at system-prompt build time (after the process
+    // already started). Fail-fast here — before spawn — instead of guessing DSH's escaping rules.
+    if (String(this.appendSystemPrompt.content).includes("{{")) {
+      throw new Error(
+        'append_system_prompt_file content contains "{{…}}", which DSH would treat as a template expression. ' +
+          "Remove or rewrite those braces in the prompt file.",
+      );
+    }
+    const dir = path.join(STATE_ROOT, "dsh");
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `${this.id}.yml`);
+    const body = String(this.appendSystemPrompt.content).replace(/\r\n/g, "\n").replace(/\r/g, "\n").trimEnd();
+    const indented = body.split("\n").map(line => `      ${line}`).join("\n");
+    const yaml = [
+      "# agent-bridge dsh session patch (generated; the bridge deletes it after start)",
+      "- id: system-prompt",
+      "  config:",
+      "    personaPrefix: 'You are a coding agent powered by the {{model}} model.'",
+      "    personaSuffix: |-",
+      indented,
+      "",
+    ].join("\n");
+    fs.writeFileSync(file, yaml, "utf8");
+    return file;
+  }
+
+  #removePatchFile() {
+    if (!this.patchFile) return;
+    try { fs.rmSync(this.patchFile, { force: true }); } catch {}
+    this.patchFile = null;
+  }
+
+  async start() {
+    this.patchFile = this.#writeSessionPatch();
+    const args = this.#buildArgs();
+    let launch;
+    try {
+      launch = resolveDshLaunch(args);
+    } catch (err) {
+      this.#removePatchFile();
+      throw err;
+    }
+    this.launch = launch;
+    appendLog(
+      this.logFile,
+      `$ ${[launch.command, ...launch.args].join(" ")} (via ${launch.via}; DSH_PERMISSION_MODE=${this.access === "write" ? "danger-full-access" : "read-only"})\n`,
+    );
+    // The prompt never travels through argv for this backend (ACP carries it over stdin), so a launcher
+    // path is the only dynamic argv content; the standard-layout branch avoids cmd.exe re-parsing entirely.
+    this.proc = spawn(launch.command, launch.args, {
+      cwd: this.cwd,
+      env: { ...this.#childEnv(), ...launch.env },
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+    });
+    appendLog(this.logFile, `[agent-bridge] spawned dsh acp pid=${this.proc.pid}\n`);
+    this.#writePidRecord();
+
+    this.proc.stderr.setEncoding("utf8");
+    this.proc.stderr.on("data", text => {
+      appendLog(this.logFile, text);
+      this.lastStderr = clampText(stripAnsi(text), 4000);
+    });
+    this.proc.stdout.setEncoding("utf8");
+    this.proc.stdin.on("error", err => {
+      appendLog(this.logFile, `[agent-bridge] dsh stdin error: ${err.message}\n`);
+      this.lastError = err.message;
+      if (this.status !== "closed") {
+        setSessionStatus(this, "failed", false, { source: "stdin_error", error: err.message });
+        this.#rejectAll(err);
+      }
+    });
+    const rl = readline.createInterface({ input: this.proc.stdout, crlfDelay: Infinity });
+    rl.on("line", line => this.#handleLine(line));
+
+    this.proc.on("error", err => {
+      this.lastError = err.message;
+      setSessionStatus(this, "failed", false, { source: "process_error", error: err.message });
+      this.#rejectAll(err);
+    });
+    this.proc.on("close", (code, signal) => {
+      appendLog(this.logFile, `[agent-bridge] dsh acp exited code=${code} signal=${signal || ""}\n`);
+      removePidRecord(this.pidFile);
+      if (this.status === "closed") {
+        setSessionStatus(this, "closed", false, { source: "process_close", code, signal });
+        return;
+      }
+      this.lastError = code === 0 ? this.lastError : `dsh acp exited with code ${code}`;
+      setSessionStatus(this, code === 0 && this.status !== "failed" ? "closed" : "failed", false, { source: "process_close", code, signal });
+      this.#rejectAll(new Error(this.lastError || "dsh acp exited."));
+    });
+
+    try {
+      const initialized = await withTimeout(
+        this.#request("initialize", {
+          protocolVersion: 1,
+          clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
+          clientInfo: { name: "agent-bridge", version: BRIDGE_VERSION },
+        }),
+        DSH_READY_TIMEOUT_MS,
+        "Timed out on dsh initialize (does this DSH version support `--profile acp`?).",
+      );
+      if (!initialized || typeof initialized !== "object") throw new Error("dsh initialize returned an unexpected result.");
+      const created = await withTimeout(
+        this.#request("session/new", { cwd: this.cwd, mcpServers: [] }),
+        DSH_READY_TIMEOUT_MS,
+        "Timed out on dsh session/new.",
+      );
+      const sessionId = created?.sessionId;
+      if (typeof sessionId !== "string" || !sessionId) throw new Error("dsh session/new returned no session id.");
+      this.acpSessionId = sessionId;
+      this.configOptions = Array.isArray(created.configOptions) ? created.configOptions : [];
+      // Pin model/effort AFTER session/new (per-session ACP config options) and BEFORE returning idle:
+      // an invalid user value fails open_session here — fail-fast, no half-usable session.
+      if (this.model) {
+        const value = resolveAcpModelValue(this.configOptions, this.model);
+        const updated = await withTimeout(
+          this.#request("session/set_config_option", { sessionId, configId: "model", value }),
+          DSH_CONFIG_TIMEOUT_MS,
+          "Timed out on dsh model selection.",
+        );
+        this.#absorbConfigOptions(updated);
+      }
+      if (this.effort) {
+        const value = resolveAcpEffortValue(this.configOptions, this.effort);
+        const updated = await withTimeout(
+          this.#request("session/set_config_option", { sessionId, configId: "reasoning_effort", value }),
+          DSH_CONFIG_TIMEOUT_MS,
+          "Timed out on dsh reasoning-effort selection.",
+        );
+        this.#absorbConfigOptions(updated);
+      }
+    } catch (err) {
+      this.#teardownStart();
+      throw err instanceof Error ? err : new Error(String(err));
+    }
+    this.#removePatchFile();
+    if (this.proc.exitCode === null && this.proc.signalCode === null) {
+      setSessionStatus(this, "idle", false, { source: "ready" });
+    }
+    return this;
+  }
+
+  #absorbConfigOptions(payload) {
+    if (Array.isArray(payload?.configOptions)) this.configOptions = payload.configOptions;
+  }
+
+  // Best-effort teardown after a failed start(): kill the process tree and drop the generated patch.
+  // The pid record is deliberately NOT removed here: openSession's start-failure path calls
+  // close({removePidRecord:false}) so that a TERM/SIGKILL-resistant child keeps its reclamation handle
+  // for the next startup sweep — and a child that really dies removes its own record in the process
+  // `close` handler. Removing it eagerly would lose the only pointer to a still-live orphan.
+  #teardownStart() {
+    const pid = this.proc?.pid;
+    try { this.proc?.stdin?.end(); } catch {}
+    if (pid && this.proc.exitCode === null && this.proc.signalCode === null) {
+      terminateProcessTree(pid);
+      scheduleForceKill(pid, 3000, () => this.proc != null && this.proc.exitCode === null && this.proc.signalCode === null);
+    }
+    this.#removePatchFile();
+  }
+
+  #writePidRecord() {
+    writePidRecord(this.pidFile, {
+      id: this.id,
+      agent: this.agent,
+      ownerPid: process.pid,
+      cwd: this.cwd,
+      createdAt: this.createdAt,
+      processes: [
+        { role: AGENTS[this.agent].role, pid: this.proc?.pid || null, command: [this.launch?.command || agentBin("dsh"), ...(this.launch?.args || [])], spawnedAt: nowIso() },
+      ].filter(item => item.pid),
+    });
+  }
+
+  #write(msg) {
+    appendLog(this.logFile, `> ${JSON.stringify(redactForLog(msg)).slice(0, 900)}\n`);
+    const stdin = this.proc?.stdin;
+    if (!stdin || stdin.destroyed || this.proc.exitCode !== null || this.proc.signalCode !== null) {
+      throw new Error("dsh acp stdin is not writable");
+    }
+    stdin.write(`${JSON.stringify(msg)}\n`);
+  }
+
+  #request(method, params) {
+    const id = this.nextId++;
+    const promise = new Promise((resolve, reject) => this.pending.set(id, { resolve, reject }));
+    try {
+      this.#write({ jsonrpc: "2.0", id, method, params });
+    } catch (err) {
+      const pending = this.pending.get(id);
+      this.pending.delete(id);
+      pending?.reject(err);
+    }
+    return promise;
+  }
+
+  #notify(method, params = {}) {
+    try {
+      this.#write({ jsonrpc: "2.0", method, params });
+    } catch (err) {
+      appendLog(this.logFile, `[agent-bridge] dsh notify failed: ${err.message}\n`);
+    }
+  }
+
+  #rejectAll(err) {
+    if (this.turnStartedAt && !this.turnEndedAt) this.turnEndedAt = nowIso();
+    {
+      const a = vz(v => v.activeAttempt(this.id));
+      if (a) {
+        const body = this.lastAssistantText || "";
+        vz(v => v.settleOnce(a, { outcome: "failed", error: err instanceof Error ? err.message : String(err ?? ""), body: body || null, bodyKind: vizBodyKind(body, "failed") }));
+      }
+    }
+    for (const pending of this.pending.values()) pending.reject(err);
+    this.pending.clear();
+    const turn = this.turn;
+    this.turn = null;
+    this.currentTurnId = null;
+    turn?.reject?.(err);
+  }
+
+  // Non-JSON stdout lines are real in this backend (a plugin prints a model-catalog banner at
+  // session creation). Log them, never parse them, never fail the session on them.
+  #handleLine(line) {
+    if (!line.trim()) return;
+    const parsed = parseMessageLine(line);
+    if (!parsed.ok) {
+      appendLog(this.logFile, `[agent-bridge] non-JSON dsh stdout: ${clampText(line, 500)}\n`);
+      return;
+    }
+    const msg = parsed.value;
+    appendLog(this.logFile, `${JSON.stringify(redactForLog(msg)).slice(0, 4000)}\n`);
+    this.updatedAt = nowIso();
+    // Server → client request (has BOTH id and method). Today that is only session/request_permission;
+    // anything else is rejected so the server never waits on us forever.
+    if (msg.id !== undefined && msg.method) {
+      if (msg.method === "session/request_permission") this.#respondPermission(msg);
+      else {
+        try { this.#write({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: `unsupported server request: ${msg.method}` } }); }
+        catch (err) { appendLog(this.logFile, `[agent-bridge] dsh reject-write failed: ${err.message}\n`); }
+      }
+      return;
+    }
+    if (msg.id !== undefined) {
+      const pending = this.pending.get(msg.id);
+      if (!pending) return;
+      this.pending.delete(msg.id);
+      if (msg.error) pending.reject(Object.assign(new Error(msg.error.message || "dsh error"), { rpc: msg.error }));
+      else pending.resolve(msg.result ?? {});
+      return;
+    }
+    if (msg.method === "session/update") this.#onUpdate(msg.params || {});
+    else pushEvent(this, compactEvent(msg));
+  }
+
+  // The ACP permission seam. An unanswered request has NO timeout on the DSH side, so a missing
+  // answer would hang the turn — this responder is load-bearing, not cosmetic:
+  //   read tier  → reject-once  (the write stays blocked; the model sees the tool outcome and moves on)
+  //   write tier → allow-once   (danger-full-access normally never asks; keep a sane answer anyway)
+  #respondPermission(msg) {
+    const params = msg.params || {};
+    const toolCallId = params.toolCall?.toolCallId ?? null;
+    const options = Array.isArray(params.options) ? params.options : [];
+    const pickByKind = (...globs) => {
+      for (const glob of globs) {
+        if (glob.endsWith("*")) {
+          const prefix = glob.slice(0, -1);
+          const hit = options.find(opt => opt && String(opt.kind || "").startsWith(prefix));
+          if (hit) return hit;
+        } else {
+          const hit = options.find(opt => opt && opt.kind === glob);
+          if (hit) return hit;
+        }
+      }
+      return null;
+    };
+    // READ TIER MUST NEVER ALLOW. Look for a reject option; if the server offers none, answer `cancelled`
+    // rather than falling through to allow — a future `allow_always` kind must not become an escalation.
+    // WRITE TIER: prefer allow-once; any allow_* kind is acceptable because the tier is already
+    // danger-full-access (a persistent allow adds no authority here, unlike the read tier).
+    let chosen = null;
+    if (this.access === "write") chosen = pickByKind("allow_once", "allow*");
+    if (!chosen) chosen = pickByKind("reject_once", "reject*");
+    const outcome = chosen && chosen.optionId != null
+      ? { outcome: "selected", optionId: chosen.optionId }
+      : { outcome: "cancelled" };
+    try { this.#write({ jsonrpc: "2.0", id: msg.id, result: { outcome } }); }
+    catch (err) { appendLog(this.logFile, `[agent-bridge] dsh permission reply failed: ${err.message}\n`); }
+    pushEvent(this, { type: "permission", toolCallId, decision: outcome.outcome === "selected" ? chosen.kind : "cancelled" });
+    appendLog(this.logFile, `[agent-bridge] dsh permission ${toolCallId || "(no id)"} → ${JSON.stringify(outcome)}\n`);
+  }
+
+  #markBackendActivity() {
+    if (this._vizSawEvent) return;
+    this._vizSawEvent = true;
+    const a = vz(v => v.activeAttempt(this.id));
+    if (a) vz(v => v.firstBackendEvent(a));
+  }
+
+  #onUpdate(params) {
+    const sessionId = params.sessionId;
+    // ACP carries the session id on every update; ignore updates for a foreign session (defensive).
+    if (sessionId && this.acpSessionId && sessionId !== this.acpSessionId) {
+      pushEvent(this, compactEvent({ method: "session/update", params: { sessionId, update: params.update } }));
+      return;
+    }
+    const update = params.update || {};
+    const kind = update.sessionUpdate;
+    // Late updates after a turn settled / was force-settled by abort(): log only, never contaminate the
+    // next turn's text (the prompt-response handler is the sole settlement point).
+    if (!this.turn) {
+      appendLog(this.logFile, `[agent-bridge] late dsh update ignored: ${kind || "?"}\n`);
+      return;
+    }
+    if (kind === "agent_message_chunk") {
+      const text = update.content?.text;
+      if (typeof text === "string" && text) {
+        this.lastAssistantText = clampText(this.lastAssistantText + text);
+        this.#markBackendActivity();
+        this._vizDrafts += 1;
+        const full = this.lastAssistantText || "";
+        const a = vz(v => v.activeAttempt(this.id));
+        if (a) vz(v => v.progress(a, { charCount: full.length, tail: full, generationCount: this._vizDrafts }));
+      }
+      return;
+    }
+    if (kind === "agent_thought_chunk") {
+      this.#markBackendActivity();
+      pushEvent(this, { type: "thinking", chars: String(update.content?.text || "").length });
+      return;
+    }
+    if (kind === "tool_call" || kind === "tool_call_update") {
+      this.#markBackendActivity();
+      pushEvent(this, { type: kind, toolCallId: update.toolCallId ?? null, title: update.title ?? null, status: update.status ?? null });
+      return;
+    }
+    if (kind === "usage_update") {
+      if (typeof update.used === "number") this.tokenUsage = { used: update.used, size: typeof update.size === "number" ? update.size : null };
+      pushEvent(this, { type: "usage", used: update.used ?? null, size: update.size ?? null });
+      return;
+    }
+    if (kind === "config_option_update") {
+      if (Array.isArray(update.configOptions)) this.configOptions = update.configOptions;
+      pushEvent(this, compactEvent({ method: "session/update", params }));
+      return;
+    }
+    pushEvent(this, compactEvent({ method: "session/update", params }));
+  }
+
+  #beginTurn(turnId) {
+    this.currentTurnId = turnId;
+    this.lastTurnId = turnId;
+    this.turnStartedAt = nowIso();
+    this.turnEndedAt = null;
+    this.lastAssistantText = "";
+    // Reset the per-turn usage reading: if this turn reports no usage_update, contextUsage() must stay
+    // null rather than echoing the previous turn's number as if it were current.
+    this.tokenUsage = null;
+    this._vizSawEvent = false;
+    this._vizDrafts = 0;
+  }
+
+  #settleTurn(err, status) {
+    const turn = this.turn;
+    if (!turn) return;
+    {
+      const a = vz(v => v.activeAttempt(this.id));
+      if (a) {
+        const body = this.lastAssistantText || "";
+        const aborted = status === "cancelled" || status === "aborted" || status === "interrupted";
+        const outcome = aborted ? "aborted" : (err ? "failed" : "completed");
+        vz(v => v.settleOnce(a, {
+          outcome,
+          error: err ? err.message : null,
+          body: body || null,
+          bodyKind: vizBodyKind(body, outcome),
+          backendTurnCount: this.turnCount + 1,
+        }));
+      }
+    }
+    turn.settled = { err: err || null, status: status ?? null };
+    this.lastTurnError = Boolean(err);
+    this.lastTurnErrorMessage = err ? err.message : null;
+    this.turn = null;
+    this.currentTurnId = null;
+    this.turnCount += 1;
+    this.turnEndedAt = nowIso();
+    this.updatedAt = nowIso();
+    if (err) {
+      this.lastError = err.message;
+      setSessionStatus(this, "failed", false, { source: "turn_error", error: err.message });
+      turn.reject(err);
+      return;
+    }
+    this.lastAssistantText = clampText(this.lastAssistantText || "");
+    setSessionStatus(this, "idle", false, { source: "turn/completed", status });
+    turn.resolve();
+  }
+
+  // The single settlement point: `session/prompt` resolves ONLY at turn end, with {stopReason}.
+  #onPromptSettled(turn, result, err) {
+    if (this.turn !== turn) {
+      appendLog(this.logFile, `[agent-bridge] dropped late dsh prompt settlement (turn already settled)\n`);
+      return;
+    }
+    if (err) {
+      this.#settleTurn(err instanceof Error ? err : new Error(String(err)));
+      return;
+    }
+    const reason = result?.stopReason;
+    if (reason === "end_turn") {
+      this.#settleTurn(null, "end_turn");
+      return;
+    }
+    if (reason === "cancelled") {
+      this.#settleTurn(null, "cancelled");
+      return;
+    }
+    this.#settleTurn(new Error(`dsh turn stopped: ${reason ?? "unknown"}`), reason ?? "unknown");
+  }
+
+  async send(message, options = {}) {
+    if (!message || !String(message).trim()) throw new Error("message is required.");
+    if (this.status === "closed") throw new Error(`DSH session ${this.id} is closed.`);
+    if (!this.proc || this.proc.exitCode !== null || this.proc.signalCode !== null) throw new Error(`dsh acp process for ${this.id} is not running.`);
+    if (this.turn) throw new Error(`DSH session ${this.id} already has a running turn.`);
+    if (!this.acpSessionId) throw new Error("DSH session is not started.");
+    // Structured output is not implemented for this backend; openSession/send_message already reject it,
+    // but keep the class contract honest if a future caller reaches here directly.
+    if (options.schema != null) throw new Error("schema (structured output) is not supported for backend \"dsh\" yet; only codex.");
+
+    const turnId = `${this.id}-t${this.turnCount + 1}`;
+    const vizAttempt = vz(v => v.attempt({
+      sessionId: this.id,
+      input: String(message),
+      source: options.source ?? "send_message",
+      blocking: !!options.wait,
+      hasSchema: false,
+    }));
+    setSessionStatus(this, "running", true, { source: "send" });
+    const promise = new Promise((resolve, reject) => { this.turn = { resolve, reject, settled: null }; });
+    this.turn.promise = promise;
+    const myTurn = this.turn;
+    promise.catch(() => {}); // pre-attach: an early rejection must not crash the server
+
+    // session/prompt is a JSON-RPC REQUEST whose response arrives at turn end. Write it by hand (not via
+    // #request) so a dead stdin is reported synchronously and the viz attempt is rejected honestly
+    // instead of being dispatched as if the bytes had reached the backend.
+    const requestId = this.nextId++;
+    this.pending.set(requestId, { resolve: result => this.#onPromptSettled(myTurn, result, null), reject: e => this.#onPromptSettled(myTurn, null, e) });
+    try {
+      this.#write({ jsonrpc: "2.0", id: requestId, method: "session/prompt", params: { sessionId: this.acpSessionId, prompt: [{ type: "text", text: String(message) }] } });
+    } catch (err) {
+      this.pending.delete(requestId);
+      const e = err instanceof Error ? err : new Error(String(err));
+      vz(v => v.reject(vizAttempt, e));
+      if (this.turn === myTurn) {
+        this.turn = null;
+        this.lastError = e.message;
+        if (this.status !== "closed") setSessionStatus(this, "failed", false, { source: "write_error", error: e.message });
+        myTurn.reject(e);
+      }
+      throw e;
+    }
+    this.#beginTurn(turnId);
+    // No turn-start ACK exists on the ACP wire (session/prompt only resolves at the end), so the honest
+    // evidence tier is `pipe_enqueued`: the bytes are on the pipe, the backend has not acknowledged.
+    vz(v => v.dispatch(vizAttempt, { boundary: "pipe_enqueued", backendTurnId: turnId }));
+
+    if (options.wait) {
+      try {
+        return await withTimeout(
+          promise.then(() => this.result({ maxChars: options.maxChars })),
+          options.timeout_ms || DEFAULT_WAIT_TIMEOUT_MS,
+          "Timed out waiting for DSH turn.",
+        );
+      } catch (err) {
+        if (this.turn) { try { await this.abort(); } catch {} }
+        throw err;
+      }
+    }
+    promise.catch(err => { this.lastError = err.message; });
+    return { accepted: true, sessionId: this.id, status: this.status, turnId };
+  }
+
+  async result(options = {}) {
+    return buildSessionResult(this, this.lastAssistantText || "", options);
+  }
+
+  isSettled() {
+    return this.status === "idle" && !this.turn;
+  }
+
+  // Event-driven (the prompt response settles the turn); no live state to poll. Sync no-op keeps status
+  // snapshots synchronous w.r.t. pipelined MCP requests (same rationale as Codex/Claude).
+  refreshStatus() {}
+
+  async abort() {
+    const turn = this.turn;
+    if (!turn || !this.proc || this.proc.exitCode !== null || this.proc.signalCode !== null) {
+      if (this.status !== "closed" && this.proc && this.proc.exitCode === null && this.proc.signalCode === null) {
+        setSessionStatus(this, "idle", false, { source: "abort" });
+      }
+      if (this.turnStartedAt && !this.turnEndedAt) this.turnEndedAt = nowIso();
+      return { aborted: true, sessionId: this.id };
+    }
+    // Graceful path: `session/cancel` is a NOTIFICATION; DSH settles the in-flight prompt with
+    // {stopReason:"cancelled"} (~11 ms observed) and keeps the session reusable.
+    this.#notify("session/cancel", { sessionId: this.acpSessionId });
+    let killed = false;
+    try {
+      await withTimeout(turn.promise, DSH_ABORT_SETTLE_MS, "dsh abort settle timeout");
+    } catch {
+      if (this.turn === turn) {
+        // The ACP server did not answer the cancel within the budget: it is WEDGED, and it still has an
+        // in-flight prompt (a following session/prompt would be rejected with "a prompt is already in
+        // flight"). Do NOT pretend the cancel succeeded and do NOT leave a reusable-looking idle session:
+        // settle as FAILED and kill the process tree; the session must be reopened (same policy as a
+        // poisoned kimi session). A late prompt response is harmless — this.turn is already null.
+        this.#settleTurn(new Error(`dsh session did not settle after cancel within ${DSH_ABORT_SETTLE_MS}ms; the ACP process was terminated and the session is no longer reusable.`));
+        this.#killWedgedProcess();
+        killed = true;
+      }
+    }
+    if (!killed && this.status !== "closed" && this.proc && this.proc.exitCode === null && this.proc.signalCode === null) {
+      setSessionStatus(this, "idle", false, { source: "abort" });
+    }
+    return { aborted: true, sessionId: this.id, ...(killed ? { killed: true, reusable: false } : {}) };
+  }
+
+  // Terminate a process whose ACP turn would not settle after session/cancel. The pid record and the
+  // generated patch are dropped immediately; the process `close` handler turns the session failed/dead.
+  #killWedgedProcess() {
+    this.acpSessionId = null;
+    const child = this.proc;
+    const pid = child?.pid;
+    try { child?.stdin?.end(); } catch {}
+    if (pid && child.exitCode === null && child.signalCode === null) {
+      terminateProcessTree(pid);
+      scheduleForceKill(pid, 3000, () => this.proc != null && this.proc.exitCode === null && this.proc.signalCode === null);
+    }
+    removePidRecord(this.pidFile);
+    this.#removePatchFile();
+  }
+
+  // Normalized current-context occupancy: the last `usage_update.used` reported by the ACP server during
+  // the most recent turn (absolute input tokens, no window/percent), i.e. a last-turn snapshot → live:false
+  // (same semantics as codex/claude). null until a turn reports usage; reset at each turn start.
+  contextUsage() {
+    if (!this.tokenUsage || typeof this.tokenUsage.used !== "number") return null;
+    return { tokens: this.tokenUsage.used, live: false };
+  }
+
+  #configSummary() {
+    const pick = id => {
+      const opt = (Array.isArray(this.configOptions) ? this.configOptions : []).find(o => o && o.id === id);
+      return opt?.currentValue ?? null;
+    };
+    return { model: pick("model"), reasoningEffort: pick("reasoning_effort") };
+  }
+
+  summary() {
+    return {
+      id: this.id,
+      agent: this.agent,
+      cwd: this.cwd,
+      access: this.access,
+      write: this.write,
+      model: this.model,
+      effort: this.effort,
+      status: this.status,
+      pid: this.proc?.pid || null,
+      createdAt: this.createdAt,
+      updatedAt: this.updatedAt,
+      lastError: this.lastError,
+      lastStderr: this.lastStderr ?? null,
+      name: this.name ?? null,
+      health: deriveHealth(this),
+      contextUsage: this.contextUsage(),
+      appendSystemPrompt: appendSystemPromptSummary(this, "system"),
+      logFile: this.logFile,
+      lastTurn: lastTurnOf(this),
+      agentSpecific: { acpSessionId: this.acpSessionId, acpConfig: this.#configSummary(), turnCount: this.turnCount, launchVia: this.launch?.via ?? null },
+    };
+  }
+
+  // Synchronous by contract (closeOne does not await). Send session/close fire-and-forget, then tear the
+  // process down exactly like the other persistent backends; the answer artifact and the generated
+  // profile patch are always removed.
+  close(options = {}) {
+    vz(v => v.sessionClosed(this.id, { reason: options.reason ?? "close", forced: !!options.forced }));
+    setSessionStatus(this, "closed", false, { source: "close" });
+    if (this.proc && this.proc.exitCode === null && this.proc.signalCode === null && this.acpSessionId) {
+      try { this.#write({ jsonrpc: "2.0", id: this.nextId++, method: "session/close", params: { sessionId: this.acpSessionId } }); } catch {}
+    }
+    const child = this.proc;
+    const pid = child?.pid;
+    try { child?.stdin?.end(); } catch {}
+    this.#rejectAll(new Error("session closed"));
+    if (child && child.exitCode === null && child.signalCode === null) {
+      terminateProcessTree(pid);
+      scheduleForceKill(pid, 3000, () => this.proc != null && this.proc.exitCode === null && this.proc.signalCode === null);
+    }
+    if (options.removePidRecord !== false) removePidRecord(this.pidFile);
+    try { fs.rmSync(this.answerFile, { force: true }); } catch {}
+    this.#removePatchFile();
+    this.acpSessionId = null;
+    return { closed: true, sessionId: this.id };
+  }
+}
+
+// ── DSH ACP config-option helpers ────────────────────────────────────────────────────────────────
+// ACP config options are a select whose values are OPAQUE strings; the model value is a JSON-encoded
+// ["provider","model"] pair (e.g. '["deepseek-official","deepseek-v4-pro"]'). Users type friendly names
+// ("deepseek-v4-pro" or "deepseek-official/deepseek-v4-pro"); resolve against what session/new ACTUALLY
+// advertised — never hardcode model ids (the catalog is deployment/settings dependent).
+const DSH_EFFORT_ALIASES = { minimal: "off", low: "low", medium: "high", high: "high", xhigh: "max" };
+
+function acpSelectOption(configOptions, id) {
+  return (Array.isArray(configOptions) ? configOptions : []).find(opt => opt && opt.id === id) || null;
+}
+
+function acpFlattenOptions(option) {
+  const flat = [];
+  for (const entry of option?.options ?? []) {
+    if (entry && Array.isArray(entry.options)) {
+      for (const child of entry.options) if (child && typeof child === "object") flat.push({ ...child, group: entry.group ?? null });
+    } else if (entry && typeof entry === "object") flat.push(entry);
+  }
+  return flat;
+}
+
+function resolveAcpModelValue(configOptions, model) {
+  if (model == null) return null;
+  const option = acpSelectOption(configOptions, "model");
+  if (!option) throw new Error('DSH did not advertise a "model" config option; cannot pin a model.');
+  const flat = acpFlattenOptions(option);
+  const wanted = String(model);
+  const available = flat.map(o => o.name ?? o.value).filter(Boolean).join(", ");
+  let hit = flat.find(o => o.value === wanted || o.name === wanted);
+  // "provider/model" form → compare against the decoded pair.
+  if (!hit && wanted.includes("/")) {
+    const idx = wanted.lastIndexOf("/");
+    const provider = wanted.slice(0, idx);
+    const modelId = wanted.slice(idx + 1);
+    const encoded = JSON.stringify([provider, modelId]);
+    hit = flat.find(o => o.value === encoded) || flat.find(o => {
+      try { const pair = JSON.parse(o.value); return Array.isArray(pair) && pair[0] === provider && pair[1] === modelId; } catch { return false; }
+    });
+  }
+  // Bare model id → match the model half of any advertised pair.
+  if (!hit) {
+    hit = flat.find(o => {
+      try { const pair = JSON.parse(o.value); return Array.isArray(pair) && String(pair[1]) === wanted; } catch { return false; }
+    });
+  }
+  if (!hit) throw new Error(`model "${wanted}" is not offered by this DSH (available: ${available || "none"}).`);
+  return hit.value;
+}
+
+function resolveAcpEffortValue(configOptions, effort) {
+  const wanted = DSH_EFFORT_ALIASES[String(effort)] ?? String(effort);
+  const option = acpSelectOption(configOptions, "reasoning_effort");
+  if (!option) throw new Error('DSH did not advertise a "reasoning_effort" config option; cannot pin effort.');
+  const flat = acpFlattenOptions(option);
+  const hit = flat.find(o => o.value === wanted);
+  if (!hit) {
+    throw new Error(`reasoning effort "${effort}" (mapped to "${wanted}") is not offered by this DSH (available: ${flat.map(o => o.value).join(", ")}).`);
+  }
+  return hit.value;
+}
+
 // Bind the session constructors onto the registry now that both classes exist. AGENTS is declared at
 // the top of the file (TOOLS/agentBin/doctor/assertAgent read it during early module load, when these
 // classes are still in the temporal dead zone), so the class refs can't live in that literal — they
@@ -5958,6 +6837,7 @@ AGENTS.codex.Session = CodexAppServerSession;
 AGENTS.claude.Session = ClaudeCodeSession;
 AGENTS.cursor.Session = CursorAgentSession;
 AGENTS.kimi.Session = KimiCodeSession;
+AGENTS.dsh.Session = DshAcpSession;
 
 function extractAssistantText(value) {
   if (!value || typeof value !== "object") return "";
@@ -6318,7 +7198,7 @@ async function sendFollowupFromViz(sessionId, message) {
  *    而在途那一发用 `beforeId` 判定 —— `lastTurnId` 一旦不等于 `beforeId`,就说明当前末轮
  *    正是这一发铸出来的,它的 source 立刻生效,**不必等 `send()` 返回**。
  *
- * ⚠️ 两件事都不下沉到五个后端各写一遍:那正是本仓反复栽过的「五处纪律迟早漏一处」。
+ * ⚠️ 两件事都不下沉到各后端各写一遍:那正是本仓反复栽过的「五处纪律迟早漏一处」。
  */
 async function sendTurn(session, message, options = {}) {
   /* ⚠️ **槽被占着 ⇒ 当场拒,而且拒在 `sendEpoch` 动之前、`send()` 之前。**
@@ -6676,7 +7556,7 @@ function closeSession(sessionId, { force = false } = {}) {
 // async spawn + a manual timer that calls terminateProcessTree(child.pid) while the tree is still
 // alive (taskkill /T on Windows walks the tree). Resolves to a spawnSync-shaped {status, stdout,
 // stderr, error, timedOut} so doctor()'s classification below stays simple.
-function probeVersion(command, args) {
+function probeVersion(command, args, extraEnv = null) {
   return new Promise(resolve => {
     let stdout = "";
     let stderr = "";
@@ -6690,7 +7570,7 @@ function probeVersion(command, args) {
     };
     let timer;
     try {
-      child = spawn(command, args, { windowsHide: true });
+      child = spawn(command, args, { windowsHide: true, ...(extraEnv ? { env: { ...process.env, ...extraEnv } } : {}) });
     } catch (err) {
       return finish({ status: null, stdout: "", stderr: "", error: err, timedOut: false });
     }
@@ -6740,10 +7620,22 @@ async function doctor() {
         agents.push({ agent, label: config.label, bin, available: false, version: null, error: stripAnsi(err.message) });
         continue;
       }
+    } else if (agent === "dsh") {
+      // DSH: LAZY-resolve the desktop-install launcher (same §5.9 rationale as kimi — a long-lived MCP
+      // client's PATH may not include the installer's runtime\cli\bin dir). Both `dsh --version` and the
+      // ACP profile availability are then implied: open_session fails with a clear error if the installed
+      // version has no `--profile acp` (the design doc's version gate).
+      try {
+        const launch = resolveDshLaunch([...config.versionArgs]);
+        plan = { command: launch.command, args: launch.args, env: launch.env };
+      } catch (err) {
+        agents.push({ agent, label: config.label, bin, available: false, version: null, error: stripAnsi(err.message) });
+        continue;
+      }
     } else {
       plan = spawnPlan(bin, config.versionArgs);
     }
-    const probe = await probeVersion(plan.command, plan.args);
+    const probe = await probeVersion(plan.command, plan.args, plan.env ?? null);
     const ok = probe.status === 0;
     agents.push({
       agent,
